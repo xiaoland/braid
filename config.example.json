@@ -1,0 +1,41 @@
+{
+  "github": {
+    "app_id": 123456,
+    "private_key": {
+      "file": "/absolute/path/to/github-app-private-key.pem"
+    },
+    "webhook_secret": {
+      "environment": "GITHUB_AGENT_BRIDGE_WEBHOOK_SECRET"
+    },
+    "agent_login": "coding-agent-bot",
+    "wrapper_login": "wrapper-app[bot]"
+  },
+  "ingress": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "health_port": 8081
+  },
+  "timing": {
+    "quiet_window_seconds": 30.0,
+    "mirror_interval_seconds": 5.0,
+    "reconciliation_interval_seconds": 60.0,
+    "mirror_comment_bytes": 60000
+  },
+  "paths": {
+    "state_database": "/absolute/path/to/runtime/state.sqlite3",
+    "provider_cwd": "/absolute/path/to/dedicated/issue-worktree",
+    "provider_writable_roots": [],
+    "collaboration_instructions": "/absolute/path/to/user-scope/AGENTS.md"
+  },
+  "app_server": {
+    "executable": "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "version": "codex-cli 0.147.0-alpha.6.5",
+    "stable_schema_sha256": "7d79fe309dd7520843459070f3884ecf0e39cee2620c1c49aad6efb4eca76ecb",
+    "experimental_schema_sha256": "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b5364439063a5c8",
+    "environment_allowlist": [
+      "GH_TOKEN",
+      "HOME",
+      "PATH"
+    ]
+  }
+}
