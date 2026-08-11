@@ -13,32 +13,32 @@ import uuid
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-from github_agent_bridge.app_server import (
+from braid.app_server import (
     DEFAULT_PROVIDER_ENVIRONMENT_NAMES,
     AppServerClient,
     AppServerError,
     AppServerRemoteError,
     provider_environment,
 )
-from github_agent_bridge.config import BridgeConfig, load_secret
-from github_agent_bridge.github_api import GitHubApiError, GitHubAppClient
-from github_agent_bridge.ingress import (
+from braid.config import BridgeConfig, load_secret
+from braid.github_api import GitHubApiError, GitHubAppClient
+from braid.ingress import (
     IngressDependencies,
     create_health_app,
     create_ingress_app,
 )
-from github_agent_bridge.mirror_publisher import (
+from braid.mirror_publisher import (
     MirrorConflict,
     MirrorTarget,
     TurnMirrorPublisher,
 )
-from github_agent_bridge.protocol_probe import inspect_protocol_identity
-from github_agent_bridge.provider_adapter import CodexProviderAdapter
-from github_agent_bridge.quick_tunnel import WranglerQuickTunnel
-from github_agent_bridge.reconciliation import GitHubReconciler
-from github_agent_bridge.store import Binding, StateConflict, TransportStore
-from github_agent_bridge.turn_controller import BindingTurnController
-from github_agent_bridge.turn_projection import TurnProjectionSnapshot
+from braid.protocol_probe import inspect_protocol_identity
+from braid.provider_adapter import CodexProviderAdapter
+from braid.quick_tunnel import WranglerQuickTunnel
+from braid.reconciliation import GitHubReconciler
+from braid.store import Binding, StateConflict, TransportStore
+from braid.turn_controller import BindingTurnController
+from braid.turn_projection import TurnProjectionSnapshot
 
 
 class BridgeRuntimeError(RuntimeError):

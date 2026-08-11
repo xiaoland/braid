@@ -8,17 +8,17 @@ import time
 import uuid
 from typing import Protocol
 
-from github_agent_bridge.github_api import GitHubApiError
-from github_agent_bridge.mirror_publisher import (
+from braid.github_api import GitHubApiError
+from braid.mirror_publisher import (
     MirrorConflict,
     MirrorTarget,
     TurnMirrorPublisher,
 )
-from github_agent_bridge.provider_adapter import (
+from braid.provider_adapter import (
     ProviderNotSteerable,
     ProviderTurn,
 )
-from github_agent_bridge.store import (
+from braid.store import (
     Binding,
     LeaseToken,
     StateConflict,
@@ -26,7 +26,7 @@ from github_agent_bridge.store import (
     StoredMirrorChunk,
     TransportStore,
 )
-from github_agent_bridge.turn_projection import TurnProjection
+from braid.turn_projection import TurnProjection
 
 
 class ProviderBoundary(Protocol):

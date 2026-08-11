@@ -18,8 +18,8 @@ from urllib.parse import quote
 from aiohttp import ClientSession
 import jwt
 
-from github_agent_bridge.store import TRUSTED_URGENT_PERMISSION_ROLES
-from github_agent_bridge.github_webhook import (
+from braid.store import TRUSTED_URGENT_PERMISSION_ROLES
+from braid.github_webhook import (
     digest_comment_body,
     digest_issue_content,
     has_visible_agent_mention,

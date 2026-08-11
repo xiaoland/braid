@@ -12,7 +12,7 @@ a script black-box acceptance.
 These files are operator tools. Running one is not sufficient evidence of
 product acceptance. Each campaign must retain the external GitHub evidence,
 timing observations, protected-worktree snapshots, and Human verdicts required
-by [`docs/acceptance.md`](../../docs/acceptance.md).
+by [`docs/10-prd/acceptance.md`](../../docs/10-prd/acceptance.md).
 
 No prior test qualified for migration into this directory. The file formerly
 named `test_turn_mirror_black_box.py` directly instantiated internal storage,

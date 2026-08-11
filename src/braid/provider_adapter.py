@@ -9,14 +9,14 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from github_agent_bridge.app_server import (
+from braid.app_server import (
     AppServerClient,
     AppServerProtocolError,
     AppServerRemoteError,
     ServerMessage,
 )
-from github_agent_bridge.protocol_probe import WRAPPER_TRANSPORT_INPUT
-from github_agent_bridge.store import Binding, StoredEvent
+from braid.protocol_probe import WRAPPER_TRANSPORT_INPUT
+from braid.store import Binding, StoredEvent
 
 
 @dataclass(frozen=True, slots=True)

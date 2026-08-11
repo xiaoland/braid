@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
-from github_agent_bridge.app_server import (
+from braid.app_server import (
     AppServerClient,
     AppServerProtocolError,
     AppServerRemoteError,

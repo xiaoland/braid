@@ -6,12 +6,12 @@ from dataclasses import dataclass
 import hashlib
 from typing import Protocol
 
-from github_agent_bridge.github_api import GitHubApiError, RemoteComment
-from github_agent_bridge.mirror_render import (
+from braid.github_api import GitHubApiError, RemoteComment
+from braid.mirror_render import (
     RenderedMirrorChunk,
     render_mirror_chunks,
 )
-from github_agent_bridge.store import (
+from braid.store import (
     Binding,
     LeaseToken,
     MirrorChunkIntent,
@@ -21,7 +21,7 @@ from github_agent_bridge.store import (
     StoredOutbox,
     TransportStore,
 )
-from github_agent_bridge.turn_projection import TurnProjectionSnapshot
+from braid.turn_projection import TurnProjectionSnapshot
 
 
 class MirrorConflict(RuntimeError):

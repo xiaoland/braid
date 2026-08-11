@@ -13,7 +13,7 @@ import time
 
 from aiohttp import web
 
-from github_agent_bridge.github_webhook import (
+from braid.github_webhook import (
     HeaderError,
     PayloadError,
     SignatureError,
@@ -22,7 +22,7 @@ from github_agent_bridge.github_webhook import (
     WebhookPing,
     parse_verified_webhook,
 )
-from github_agent_bridge.store import (
+from braid.store import (
     BindingLifecycle,
     LeaseToken,
     StaleLease,

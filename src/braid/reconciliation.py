@@ -14,7 +14,7 @@ import json
 import time
 from typing import Protocol
 
-from github_agent_bridge.github_api import (
+from braid.github_api import (
     GitHubApiError,
     IssueCommentSnapshot,
     IssueReference,
@@ -26,7 +26,7 @@ from github_agent_bridge.github_api import (
     PullRequestSnapshot,
     RepositoryPermission,
 )
-from github_agent_bridge.store import (
+from braid.store import (
     Binding,
     EventEnvelope,
     LeaseToken,

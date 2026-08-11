@@ -7,7 +7,7 @@ import hashlib
 import html
 import re
 
-from github_agent_bridge.turn_projection import (
+from braid.turn_projection import (
     ProjectedMessage,
     ProjectedToolCall,
     TurnProjectionSnapshot,

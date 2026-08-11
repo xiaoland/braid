@@ -53,8 +53,9 @@ mandatory. Query latest comment `updatedAt/lastEditedAt/isMinimized`, review
 state, and `reviewThreads.isResolved`; a missing object after prior observation
 becomes a tombstone rather than an invented empty message.
 
-Acceptance accelerates reconciliation to 60 seconds. The normal operational
-interval remains configurable and independent from the 30-second quiet window.
+The reconciliation interval is configurable and remains independent from the
+quiet window; acceptance-specific timing belongs in
+[`../10-prd/acceptance.md`](../10-prd/acceptance.md).
 
 ## Native Issue-to-PR Association
 

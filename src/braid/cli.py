@@ -11,13 +11,13 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import NoReturn, TextIO
 
-from github_agent_bridge.app_server import AppServerError
-from github_agent_bridge.config import ConfigLoadError, SecretLoadError, load_config
-from github_agent_bridge.github_api import GitHubApiError
-from github_agent_bridge.protocol_probe import ProtocolProbeReport, run_protocol_probe
-from github_agent_bridge.quick_tunnel import QuickTunnelError
-from github_agent_bridge.runtime import BridgeRuntimeError, RuntimeResult, serve_bridge
-from github_agent_bridge.store import StoreError
+from braid.app_server import AppServerError
+from braid.config import ConfigLoadError, SecretLoadError, load_config
+from braid.github_api import GitHubApiError
+from braid.protocol_probe import ProtocolProbeReport, run_protocol_probe
+from braid.quick_tunnel import QuickTunnelError
+from braid.runtime import BridgeRuntimeError, RuntimeResult, serve_bridge
+from braid.store import StoreError
 
 CONFIGURATION_ERROR = 2
 PROBE_ERROR = 3

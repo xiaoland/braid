@@ -7,7 +7,7 @@ import json
 import re
 from typing import Any
 
-from github_agent_bridge.app_server import AppServerProtocolError, ServerMessage
+from braid.app_server import AppServerProtocolError, ServerMessage
 
 
 RAW_REASONING_METHODS = frozenset(

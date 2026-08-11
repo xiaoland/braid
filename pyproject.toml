@@ -13,7 +13,7 @@ dependencies = [
 Repository = "https://github.com/xiaoland/braid"
 
 [project.scripts]
-braid = "github_agent_bridge.cli:entrypoint"
+braid = "braid.cli:entrypoint"
 
 [build-system]
 requires = ["pdm-backend>=2.4,<3"]

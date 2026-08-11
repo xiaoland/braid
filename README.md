@@ -64,10 +64,8 @@ instructions path is only an integrity pin: the persistent workflow lives in
 this project's `AGENTS.md`, where Codex loads it only for this project. The provider cwd
 must be a pre-provisioned, dedicated Issue worktree; the Wrapper launches there
 but never creates, selects, or manages its branch, worktree, or PR.
-The proposed bounded section is documented in
-[`docs/project-scope-collaboration.md`](docs/project-scope-collaboration.md) and
-installed in this project's `AGENTS.md`; ordinary chat outside this project is
-unaffected.
+The bounded section is installed in this project's `AGENTS.md`; ordinary chat
+outside this project is unaffected.
 
 Each Agent turn is one visible GitHub comment: assistant messages and
 provider-labelled reasoning summaries remain readable, while every supported
@@ -78,8 +76,8 @@ or an ownership marker in the GitHub body.
 
 The local runtime and Quick Tunnel supervisor remain building blocks, not full
 product acceptance. The product promise and its real Issue-to-Draft-PR oracle
-are defined in [`docs/product.md`](docs/product.md) and
-[`docs/acceptance.md`](docs/acceptance.md).
+are defined in [`docs/10-prd/README.md`](docs/10-prd/README.md) and
+[`docs/10-prd/acceptance.md`](docs/10-prd/acceptance.md).
 
 Braid deliberately has no unit or component-integration test suite at this
 stage. Executable acceptance helpers belong under
@@ -87,8 +85,8 @@ stage. Executable acceptance helpers belong under
 public boundaries. They are workflow tools, not product acceptance by
 themselves; the retained GitHub evidence and Human verdicts remain the oracle.
 
-See [the architecture](docs/architecture.md), [Codex protocol
-contract](docs/app-server-protocol.md), [GitHub transport
-contract](docs/github-transport-contract.md), and [turn projection
-contract](docs/turn-projection.md). External setup and exclusive handoff are
-specified in the [operator runbook](docs/operator-runbook.md).
+See [the architecture](docs/20-product-tdd/README.md), [Codex protocol
+contract](docs/20-product-tdd/app-server.md), [GitHub transport
+contract](docs/20-product-tdd/github.md), and [turn projection
+contract](docs/20-product-tdd/turn-projection.md). External setup and exclusive
+handoff are specified in the [operator runbook](docs/40-deployment/README.md).

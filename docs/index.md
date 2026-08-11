@@ -6,16 +6,19 @@
 Use `svc lookup` when packaged Sustainable Vibe Coding Corpus guidance is relevant, and discover its browse/search/read grammar through `svc lookup --help`. Project documentation outside this marked block remains Consumer-owned.
 <!-- svc:end navigation -->
 
-## Product and Architecture
+## Knowledge Owners
 
-- [Product truth](product.md)
-- [Architecture](architecture.md)
-- [Turn projection contract](turn-projection.md)
-- [End-to-end acceptance](acceptance.md)
+- [Product truth and evaluation](10-prd/README.md)
+- [End-to-end acceptance oracle](10-prd/acceptance.md)
+- [Cross-unit Product TDD](20-product-tdd/README.md)
+- [Codex app-server contract](20-product-tdd/app-server.md)
+- [GitHub transport contract](20-product-tdd/github.md)
+- [Turn projection contract](20-product-tdd/turn-projection.md)
+- [Deployment and operator runbook](40-deployment/README.md)
 
-## Runtime Contracts
+## Project Scope
 
-- [Codex app-server protocol](app-server-protocol.md)
-- [GitHub transport contract](github-transport-contract.md)
-- [Project-scope collaboration instructions](project-scope-collaboration.md)
-- [Operator runbook](operator-runbook.md)
+The project-scoped collaboration contract is loaded from the root
+[`AGENTS.md`](../AGENTS.md). This index and the documents above remain
+Consumer-owned; SVC framework guidance is queried through the installed `svc`
+CLI rather than copied into this repository.

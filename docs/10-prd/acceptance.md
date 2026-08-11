@@ -21,7 +21,7 @@ health, process, GitHub, and provider boundaries. Never inject an event below
 GitHub, replace the Agent, inspect SQLite as a pass oracle, or use private logs
 as evidence of success.
 
-Acceptance helpers live in [`../scripts/tests/`](../scripts/tests/) while the
+Acceptance helpers live in [`../../scripts/tests/`](../../scripts/tests/) while the
 workflow is still being learned. They are operator tools, not accepted product
 tests, until repeated campaigns stabilize their inputs and evidence contract.
 
@@ -49,8 +49,9 @@ tests, until repeated campaigns stabilize their inputs and evidence contract.
    state never masquerades as completion or failure.
 6. **Turn projection**: one stable comment progresses by logical-message count or
    maximum dirty age and terminates immediately. Raw and rendered bodies satisfy
-   [`turn-projection.md`](turn-projection.md), including tool details, bounds,
-   omission, no-op suppression, and forbidden-content assertions.
+   [`turn-projection.md`](../20-product-tdd/turn-projection.md), including tool
+   details, bounds, omission, no-op suppression, and forbidden-content
+   assertions.
 
 ## Timing and Result Model
 

@@ -5,7 +5,7 @@
       "file": "/absolute/path/to/github-app-private-key.pem"
     },
     "webhook_secret": {
-      "environment": "GITHUB_AGENT_BRIDGE_WEBHOOK_SECRET"
+      "environment": "BRAID_WEBHOOK_SECRET"
     },
     "agent_login": "coding-agent-bot",
     "wrapper_login": "wrapper-app[bot]"

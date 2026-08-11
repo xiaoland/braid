@@ -11,7 +11,7 @@ import json
 import re
 from typing import Any
 
-from github_agent_bridge.store import (
+from braid.store import (
     EventEnvelope,
     TRUSTED_URGENT_PERMISSION_ROLES,
 )

@@ -1,4 +1,4 @@
-# Operator Runbook
+# Deployment and Operator Runbook
 
 This runbook prepares a disposable, real GitHub Issue-to-Draft-PR campaign. It
 does not authorize or perform any external mutation by itself.
@@ -17,11 +17,10 @@ does not authorize or perform any external mutation by itself.
    `git worktree list --porcelain`, branch, HEAD, and `git status --short` for
    the primary, bootstrap, and candidate worktrees. The configured
    `provider_cwd` must be the candidate worktree.
-4. Confirm the bounded section documented in
-   `project-scope-collaboration.md` is present in this project's `AGENTS.md`,
-   then point `collaboration_instructions` at that file. The runtime pins its
-   digest and refuses silent instruction drift. Do not modify user-scope
-   instructions for this campaign.
+4. Confirm the bounded `GitHub-bound Coding Tasks` section is present in this
+   project's root `AGENTS.md`, then point `collaboration_instructions` at that
+   file. The runtime pins its digest and refuses silent instruction drift. Do
+   not modify user-scope instructions for this campaign.
 5. Create a private runtime directory outside every repository worktree. Copy
    `config.example.json` to `config.local.json`; store secret material only in
    its referenced environment variable or file.
@@ -66,11 +65,10 @@ failed webhook; periodic canonical reconciliation is the normal convergence
 path.
 
 This automatic path requires the GitHub App-level webhook configuration API.
-The first external smoke's existing App returned HTTP 404 there, so the runtime
-failed closed before publication. An operator-managed repository webhook plus a
-separately supervised HTTP/2 Quick Tunnel is a viable diagnostic fallback, but
-it is not yet a public runtime command and was not part of the passing Issue 23
-oracle. Do not claim webhook acceptance from the manually signed tunnel ping.
+If that API is unavailable, an operator-managed repository webhook plus a
+separately supervised HTTP/2 Quick Tunnel is a diagnostic fallback only, not a
+public runtime command or acceptance path. Do not claim webhook acceptance
+from a manually signed tunnel ping.
 
 ## Exclusive handoff and rollback
 
@@ -86,7 +84,7 @@ oracle. Do not claim webhook acceptance from the manually signed tunnel ping.
 
 Local preflight checks and health only diagnose implementation. Acceptance is the
 real GitHub → Quick Tunnel → Wrapper → Codex app-server → GitHub journey defined
-in [`acceptance.md`](acceptance.md), including the genuine Draft PR, Human
+in [`../10-prd/acceptance.md`](../10-prd/acceptance.md), including the genuine Draft PR, Human
 discussion and review, lifecycle edits, missed-webhook reconciliation,
 restart/unknown behavior, raw/rendered mirror inspection, and protected
 worktree snapshots.
