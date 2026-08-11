@@ -25,7 +25,7 @@
     "state_database": "/absolute/path/to/runtime/state.sqlite3",
     "provider_cwd": "/absolute/path/to/dedicated/issue-worktree",
     "provider_writable_roots": [],
-    "collaboration_instructions": "/absolute/path/to/user-scope/AGENTS.md"
+    "collaboration_instructions": "/absolute/path/to/project/agent-handoff/AGENTS.md"
   },
   "app_server": {
     "executable": "/Applications/ChatGPT.app/Contents/Resources/codex",

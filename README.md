@@ -56,17 +56,18 @@ loopback-only at `http://127.0.0.1:<health_port>/healthz`.
 
 `serve` fails closed when the installed Codex version or either generated
 schema digest differs from the configured protocol pin. The collaboration
-instructions path is only an integrity pin: the persistent workflow must live
-at the actual user-scope `AGENTS.md` location that Codex loads. The provider cwd
+instructions path is only an integrity pin: the persistent workflow lives in
+this project's `AGENTS.md`, where Codex loads it only for this project. The provider cwd
 must be a pre-provisioned, dedicated Issue worktree; the Wrapper launches there
 but never creates, selects, or manages its branch, worktree, or PR.
 The proposed bounded section is documented in
-[`docs/user-scope-collaboration.md`](docs/user-scope-collaboration.md); installing
-it into user scope is an external mutation and is deliberately not automatic.
+[`docs/project-scope-collaboration.md`](docs/project-scope-collaboration.md) and
+installed in this project's `AGENTS.md`; ordinary chat outside this project is
+unaffected.
 
 The local runtime and Quick Tunnel supervisor are developer-verified building
 blocks, not product acceptance. No GitHub App, webhook, Issue, Cloudflare
-resource, user-scope instruction, or external comment has been created by the
+resource, external instruction, or external comment has been created by the
 implementation work. The real Issue-to-Draft-PR black-box campaign remains the
 only acceptance path.
 

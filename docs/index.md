@@ -10,5 +10,5 @@ Use `svc lookup` when packaged Sustainable Vibe Coding Corpus guidance is releva
 
 - [Codex app-server protocol](app-server-protocol.md)
 - [GitHub transport contract](github-transport-contract.md)
-- [User-scope collaboration instructions](user-scope-collaboration.md)
+- [Project-scope collaboration instructions](project-scope-collaboration.md)
 - [Operator runbook](operator-runbook.md)

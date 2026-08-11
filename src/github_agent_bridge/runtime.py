@@ -91,7 +91,7 @@ async def serve_bridge(
         raise BridgeRuntimeError("configured provider cwd is not a directory")
     if not config.paths.collaboration_instructions.is_file():
         raise BridgeRuntimeError(
-            "configured user-scope collaboration instructions are unavailable"
+            "configured project-scope collaboration instructions are unavailable"
         )
     instruction_digest = "sha256:" + hashlib.sha256(
         config.paths.collaboration_instructions.read_bytes()
@@ -567,7 +567,7 @@ def _require_runtime_binding(
         raise StateConflict("local binding target does not match requested Issue")
     if binding.instruction_digest != instruction_digest:
         raise BridgeRuntimeError(
-            "user-scope collaboration instructions changed; explicit rebind required"
+            "project-scope collaboration instructions changed; explicit rebind required"
         )
     if (
         binding.agent_identity.casefold() != agent_identity.casefold()

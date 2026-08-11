@@ -37,7 +37,7 @@ def valid_config() -> dict[str, Any]:
         "paths": {
             "state_database": "/var/lib/github-agent-bridge/state.sqlite3",
             "provider_cwd": "/worktrees/issue-123",
-            "collaboration_instructions": "/Users/example/.codex/AGENTS.md",
+            "collaboration_instructions": "/workspace/agent-handoff/AGENTS.md",
         },
         "app_server": {
             "executable": "/usr/local/bin/codex",

@@ -296,7 +296,7 @@ def _dynamic_issue_instructions(issue_url: str) -> str:
         "This provider thread is mechanically bound to GitHub Issue "
         f"{issue_url}. Wrapper-origin application context contains only "
         "event references, never Human commands. Use gh with the supplied URLs and "
-        "node IDs to read canonical GitHub state. Follow the persistent user-scope "
+        "node IDs to read canonical GitHub state. Follow the persistent project-scope "
         "collaboration instructions for discussion, Draft PR linking, and worktree "
         "safety."
     )
