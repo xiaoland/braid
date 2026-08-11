@@ -26,13 +26,34 @@
   logo sizes; ignored caches, build artifacts, runtime state, credentials, and
   `config.local.json` were not migrated. A clean PDM install passes all 101
   tests, `pdm lock --check`, CLI help, `git diff --check`, and a tracked-file
-  credential-pattern scan. `xiaoland/braid` does not yet exist. The prior
-  black-box surfaces still present are SVC Issues 22, 23, and 24 with four
-  Wrapper comments. SVC has no repository webhook. GitHub developer settings
-  show three acceptance-only Apps: `svc-issue20-agent`,
-  `svc-issue20-wrapper`, and `svc-issue20-wrapper-v2`. The approved logo is a
-  three-strand indigo/cyan/coral knot on a near-black square, representing the
-  Human, GitHub, and Coding Agent being braided into one collaboration loop.
-- **Next Step**: Commit the verified independent snapshot, create and push
-  `xiaoland/braid`, then configure the new Braid App before removing the source
-  subtree or deleting acceptance evidence.
+  credential-pattern scan. The public repository is now
+  [xiaoland/braid](https://github.com/xiaoland/braid), with `main` at the
+  verified extraction commit. SVC Issues 22, 23, and 24 and their four Wrapper
+  comments now return Gone. The clean acceptance worktree and local branch are
+  removed, while the Issue 20/22/23/24 runtime databases, old App keys, token,
+  and webhook secret were moved to Trash and are recoverable until Trash is
+  emptied. SVC has no repository webhook. The three acceptance-only Apps
+  `svc-issue20-agent`, `svc-issue20-wrapper`, and
+  `svc-issue20-wrapper-v2` are deleted. The replacement product App is
+  `Braid by xiaoland` (App ID 4558000), scoped to this account with Issues
+  read/write, Pull requests read-only, and Metadata read-only. Its webhook is
+  deliberately inactive until a stable ingress is supplied. The approved logo
+  is a three-strand indigo/cyan/coral knot on a near-black square, representing
+  the Human, GitHub, and Coding Agent being braided into one collaboration
+  loop. GitHub now serves that logo for App ID 4558000 at both 120px and 70px;
+  the settings page reports the image saved. A final developer-settings read
+  shows only `Braid by xiaoland`; all three acceptance-only Apps are absent.
+- **Next Step**: Extraction is complete. Continue future product work only in
+  `xiaoland/braid`; the next product acceptance remains the separate full
+  Issue-to-Draft-PR black-box campaign described by the existing packets.
+
+## Extraction Result
+
+- The SVC `main` branch never contained Braid. The obsolete remote feature
+  branch `feat/github-collaboration-bootstrap` is deleted and had no PR.
+- The former `agent-handoff/` directory is absent from the SVC worktree. Its
+  removal commit changes only that path; all SVC framework files remain
+  untouched.
+- Braid's new `main` retains the filtered three-commit project history plus the
+  verified extraction commit, rather than inheriting the unrelated SVC branch
+  stack that invalidated the earlier PR 21.
