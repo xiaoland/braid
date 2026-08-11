@@ -1,7 +1,7 @@
 [project]
-name = "github-agent-bridge"
+name = "braid"
 version = "0.1.0"
-description = "Transport runtime for GitHub and a coding-agent provider"
+description = "Human-readable collaboration between GitHub and a coding agent"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "aiohttp>=3.11,<4",
@@ -9,13 +9,16 @@ dependencies = [
     "PyJWT[crypto]>=2.10,<3",
 ]
 
+[project.urls]
+Repository = "https://github.com/xiaoland/braid"
+
 [dependency-groups]
 test = [
     "pytest>=8.3,<9",
 ]
 
 [project.scripts]
-github-agent-bridge = "github_agent_bridge.cli:entrypoint"
+braid = "github_agent_bridge.cli:entrypoint"
 
 [build-system]
 requires = ["pdm-backend>=2.4,<3"]

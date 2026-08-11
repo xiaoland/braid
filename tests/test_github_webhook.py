@@ -343,6 +343,15 @@ class GitHubWebhookTests(unittest.TestCase):
         self.assertFalse(self_origin.urgent)
         self.assertFalse(self_origin.wake_eligible)
 
+        graphql_spelling = self.parse(
+            issue_comment_payload(body="@agent", sender_login="wrapper-bot"),
+            permission_role="admin",
+            self_logins=frozenset({"wrapper-bot[bot]"}),
+        )
+        assert isinstance(graphql_spelling, NormalizedGitHubEvent)
+        self.assertFalse(graphql_spelling.mention_detected)
+        self.assertFalse(graphql_spelling.wake_eligible)
+
     def test_visible_agent_mention_grammar(self) -> None:
         visible = (
             "please @agent now",

@@ -447,6 +447,8 @@ class GitHubApiTests(unittest.IsolatedAsyncioTestCase):
             "id": comment_id,
             "node_id": f"IC_{comment_id}",
             "html_url": f"https://github.example/comment/{comment_id}",
+            "user": {"login": "wrapper-app[bot]"},
+            "created_at": "2026-08-10T12:00:00Z",
             "updated_at": "2026-08-10T12:00:00Z",
             "body": body,
         }
@@ -559,8 +561,13 @@ class GitHubApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.comment_bodies, [private_body, "updated final"])
         read_back = await self.client.get_issue_comment("owner/repository", 51)
         self.assertEqual(read_back.database_id, 51)
-        found = await self.client.find_issue_comments_by_marker(
-            "owner/repository", 17, "marker-51"
+        found = await self.client.find_issue_comments_by_evidence(
+            "owner/repository",
+            17,
+            author_login="wrapper-app",
+            body_digest=read_back.body_digest,
+            created_after=1_786_363_100.0,
+            created_before=1_786_363_300.0,
         )
         self.assertEqual([comment.database_id for comment in found], [51])
 

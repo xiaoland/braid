@@ -42,7 +42,7 @@ def snapshot(*, status: str | None = None, final: str | None = None) -> TurnProj
     return TurnProjectionSnapshot(
         thread_id="thread-1",
         turn_id="turn-1",
-        items=(),
+        messages=(),
         terminal_status=status,
         final_answer=final,
         raw_reasoning_items_excluded=0,
@@ -56,6 +56,7 @@ class FakeCommentAuthority:
         self.create_calls = 0
         self.update_calls = 0
         self.fail_create_after_remote = False
+        self.recovery_match_mode = "unique"
 
     async def create_issue_comment(self, repository, number, body):
         self.create_calls += 1
@@ -76,12 +77,27 @@ class FakeCommentAuthority:
     async def get_issue_comment(self, repository, comment_id):
         return self._remote(comment_id)
 
-    async def find_issue_comments_by_marker(self, repository, number, marker):
-        return tuple(
+    async def find_issue_comments_by_evidence(
+        self,
+        repository,
+        number,
+        *,
+        author_login,
+        body_digest,
+        created_after,
+        created_before,
+    ):
+        matches = tuple(
             self._remote(comment_id)
             for comment_id, body in self.bodies.items()
-            if marker in body
+            if self._remote(comment_id).body_digest == body_digest
+            and author_login == "wrapper-bot"
         )
+        if self.recovery_match_mode == "none":
+            return ()
+        if self.recovery_match_mode == "multiple" and matches:
+            return matches + (matches[0],)
+        return matches
 
     def _remote(self, comment_id: int) -> RemoteComment:
         body = self.bodies[comment_id]
@@ -89,6 +105,8 @@ class FakeCommentAuthority:
             database_id=comment_id,
             node_id=f"IC_{comment_id}",
             url=f"https://github.example/comment/{comment_id}",
+            author_login="wrapper-bot",
+            created_at="2026-08-10T12:00:00Z",
             updated_at="2026-08-10T12:00:00Z",
             body_digest="sha256:"
             + hashlib.sha256(body.encode("utf-8")).hexdigest(),
@@ -115,7 +133,8 @@ class MirrorPublisherTests(unittest.TestCase):
                 self.assertEqual(authority.create_calls, 1)
                 self.assertEqual(authority.update_calls, 0)
                 self.assertEqual(active[0].remote_id, "51")
-                self.assertTrue(authority.bodies[51].startswith("Agent 已看到"))
+                self.assertTrue(authority.bodies[51].startswith("> ⏳"))
+                self.assertNotIn("<!--", authority.bodies[51])
 
                 final = await publisher.publish(
                     binding=binding(),
@@ -126,7 +145,7 @@ class MirrorPublisherTests(unittest.TestCase):
                 self.assertEqual(authority.create_calls, 1)
                 self.assertEqual(authority.update_calls, 1)
                 self.assertEqual(final[0].remote_id, "51")
-                self.assertTrue(authority.bodies[51].startswith("最终回复"))
+                self.assertTrue(authority.bodies[51].startswith("## Final response"))
 
                 fyi = await publisher.publish_fyi(
                     binding=binding(),
@@ -152,7 +171,7 @@ class MirrorPublisherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             asyncio.run(scenario(Path(directory) / "state.sqlite3"))
 
-    def test_uncertain_create_is_reconciled_by_marker_without_duplicate(self) -> None:
+    def test_uncertain_create_is_reconciled_by_canonical_evidence_without_duplicate(self) -> None:
         async def scenario(path: Path) -> None:
             store = await TransportStore.open(path)
             authority = FakeCommentAuthority()
@@ -206,12 +225,40 @@ class MirrorPublisherTests(unittest.TestCase):
                 self.assertEqual(authority.create_calls, 1)
                 self.assertEqual(authority.update_calls, 1)
                 self.assertEqual(final[0].remote_id, "51")
-                self.assertIn("被中断", authority.bodies[51])
+                self.assertIn("interrupted", authority.bodies[51])
             finally:
                 await store.close()
 
         with tempfile.TemporaryDirectory() as directory:
             asyncio.run(scenario(Path(directory) / "state.sqlite3"))
+
+    def test_uncertain_create_without_unique_evidence_fails_closed(self) -> None:
+        async def scenario(path: Path, mode: str) -> None:
+            store = await TransportStore.open(path)
+            authority = FakeCommentAuthority()
+            authority.fail_create_after_remote = True
+            try:
+                owner = await store.acquire_owner("owner-a", 60)
+                await store.put_binding(owner, binding())
+                publisher = TurnMirrorPublisher(authority, store, owner)
+                arguments = {
+                    "binding": binding(),
+                    "target": MirrorTarget("I_issue", 17),
+                    "snapshot": snapshot(),
+                    "revision": 0,
+                }
+                with self.assertRaises(GitHubApiError):
+                    await publisher.publish(**arguments)
+                authority.recovery_match_mode = mode
+                with self.assertRaisesRegex(MirrorConflict, "no unique"):
+                    await publisher.publish(**arguments)
+                self.assertEqual(authority.create_calls, 1)
+            finally:
+                await store.close()
+
+        for mode in ("none", "multiple"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                asyncio.run(scenario(Path(directory) / "state.sqlite3", mode))
 
     def test_crashed_sending_create_reconciles_remote_before_retry(self) -> None:
         async def scenario(path: Path) -> None:

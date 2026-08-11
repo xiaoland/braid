@@ -157,6 +157,7 @@ async def serve_bridge(
                     issue_url=issue.issue_url,
                     provider_cwd=config.paths.provider_cwd,
                     writable_roots=config.paths.provider_writable_roots,
+                    sandbox=config.paths.provider_sandbox,
                 )
                 binding = Binding(
                     binding_id=str(uuid.uuid4()),
@@ -187,6 +188,7 @@ async def serve_bridge(
                         binding=binding,
                         provider_cwd=config.paths.provider_cwd,
                         writable_roots=config.paths.provider_writable_roots,
+                        sandbox=config.paths.provider_sandbox,
                     )
                 except AppServerRemoteError as error:
                     if error.code != -32600 or "no rollout found" not in error.message:
@@ -201,6 +203,7 @@ async def serve_bridge(
                         issue_url=binding.issue_url,
                         provider_cwd=config.paths.provider_cwd,
                         writable_roots=config.paths.provider_writable_roots,
+                        sandbox=config.paths.provider_sandbox,
                         initialize_client=False,
                     )
                     binding = await store.replace_unmaterialized_thread_address(
@@ -257,7 +260,7 @@ async def serve_bridge(
                                 snapshot=TurnProjectionSnapshot(
                                     thread_id=binding.thread_address,
                                     turn_id=turn_id,
-                                    items=(),
+                                    messages=(),
                                     terminal_status=terminal_status,
                                     final_answer=None,
                                     raw_reasoning_items_excluded=0,
@@ -283,7 +286,15 @@ async def serve_bridge(
                 owner,
                 provider,
                 mirror,
-                mirror_interval_seconds=config.timing.mirror_interval_seconds,
+                mirror_message_count_threshold=(
+                    config.timing.mirror_message_count_threshold
+                ),
+                mirror_maximum_dirty_age_seconds=(
+                    config.timing.mirror_maximum_dirty_age_seconds
+                ),
+                mirror_projection_bytes=config.timing.mirror_projection_bytes,
+                mirror_tool_call_bytes=config.timing.mirror_tool_call_bytes,
+                mirror_tool_result_bytes=config.timing.mirror_tool_result_bytes,
             )
             ingress = create_ingress_app(
                 IngressDependencies(

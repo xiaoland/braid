@@ -42,16 +42,18 @@ local binary: <https://github.com/openai/codex/blob/main/codex-rs/app-server/REA
 `item/completed` is the authoritative item snapshot for publication. Deltas are
 live projections only.
 
-- An `agentMessage` with phase `commentary` may enter the hidden progress
-  projection.
+- An `agentMessage` with phase `commentary` enters the visible chronological
+  activity projection.
 - An `agentMessage` with phase `final_answer` is a final-answer candidate. A
   same-turn steer can produce more than one such item before `turn/completed`;
   at terminal time the last completed candidate is the visible final answer.
 - A `reasoning` item exposes both `summary` and `content`. Only `summary` may
   enter the mirror. `content` and `item/reasoning/textDelta` are raw reasoning
   and must never be published to GitHub.
-- Tool and execution items will use an explicit field allowlist in the mirror.
-  Unknown item types or fields fail closed instead of being serialized wholesale.
+- Tool and execution items use an explicit field allowlist. The renderer gives
+  each logical call one Human-readable `<details>` block with bounded call and
+  result evidence. Unknown item types or fields fail closed instead of being
+  serialized wholesale.
 - Completed-without-final, interrupted, failed, and transport-unknown are
   distinct outcomes. None is inferred to mean that the GitHub task succeeded or
   failed.
@@ -65,7 +67,7 @@ reconstructs the provider transcript and never owns compaction or resume.
 Run the probe from the independent child project:
 
 ```shell
-pdm run github-agent-bridge probe-app-server \
+pdm run braid probe-app-server \
   --codex /absolute/path/to/codex \
   --workspace /absolute/path/to/a/read-only-probe-directory
 ```

@@ -19,11 +19,13 @@ from github_agent_bridge.app_server import (
 )
 
 
-PROBE_CLIENT_NAME = "github-agent-bridge-probe"
+PROBE_CLIENT_NAME = "braid-probe"
 PROBE_CLIENT_VERSION = "0.1.0"
 WRAPPER_TRANSPORT_INPUT = (
     "Wrapper transport notification: canonical GitHub event references are in "
-    "application context. This is not a Human message or command."
+    "application context. This is not a Human message or command. Use gh with "
+    "the supplied URLs and IDs to observe canonical GitHub state before deciding "
+    "whether to discuss, wait, plan, or act."
 )
 REQUIRED_CLIENT_METHODS = frozenset(
     {
@@ -101,7 +103,7 @@ async def inspect_protocol_identity(
         raise ValueError("timeout_seconds must be positive")
     version = await _capture_stdout(executable, "--version", timeout=timeout_seconds)
     with tempfile.TemporaryDirectory(
-        prefix="github-agent-bridge-schema-"
+        prefix="braid-schema-"
     ) as directory:
         schema_root = Path(directory)
         stable_schema_directory = schema_root / "stable"
@@ -448,7 +450,7 @@ async def _probe_failed_turn(
                 "baseInstructions": "Do not call tools.",
                 "cwd": str(workspace),
                 "ephemeral": True,
-                "model": "github-agent-bridge-deliberately-invalid-model",
+                "model": "braid-deliberately-invalid-model",
                 "sandbox": "read-only",
             },
             timeout=timeout,

@@ -18,6 +18,7 @@ from github_agent_bridge.store import (
     OutboxIntent,
     OutboxState,
     StoredMirrorChunk,
+    StoredOutbox,
     TransportStore,
 )
 from github_agent_bridge.turn_projection import TurnProjectionSnapshot
@@ -43,11 +44,15 @@ class GitHubCommentAuthority(Protocol):
         self, repository_full_name: str, comment_database_id: int
     ) -> RemoteComment: ...
 
-    async def find_issue_comments_by_marker(
+    async def find_issue_comments_by_evidence(
         self,
         repository_full_name: str,
         issue_number: int,
-        ownership_marker: str,
+        *,
+        author_login: str,
+        body_digest: str,
+        created_after: float,
+        created_before: float,
     ) -> tuple[RemoteComment, ...]: ...
 
 
@@ -65,13 +70,17 @@ class TurnMirrorPublisher:
         owner_token: LeaseToken,
         *,
         max_comment_bytes: int = 60_000,
+        create_recovery_window_seconds: float = 300.0,
     ) -> None:
         if max_comment_bytes < 1_024:
             raise ValueError("max_comment_bytes is too small for a safe mirror")
+        if create_recovery_window_seconds <= 0:
+            raise ValueError("create recovery window must be positive")
         self._authority = authority
         self._store = store
         self._owner_token = owner_token
         self._max_comment_bytes = max_comment_bytes
+        self._create_recovery_window_seconds = create_recovery_window_seconds
 
     async def publish(
         self,
@@ -166,7 +175,7 @@ class TurnMirrorPublisher:
                     turn_id,
                     chunk,
                     record,
-                    operation_key,
+                    outbox,
                 )
 
     async def publish_fyi(
@@ -179,14 +188,9 @@ class TurnMirrorPublisher:
     ) -> RemoteComment | None:
         if not canonical_comment_url:
             raise ValueError("canonical_comment_url must not be empty")
-        marker_id = hashlib.sha256(
-            f"{turn_id}:{target.surface_node_id}".encode("utf-8")
-        ).hexdigest()[:24]
-        ownership_marker = f"agent-turn-fyi:v1:{marker_id}"
         body = (
             "FYI：本 turn 同时涉及多个 GitHub surface，无法确定唯一回复位置；"
-            f"canonical 回复见 {canonical_comment_url}。\n\n"
-            f"<!-- {ownership_marker} -->"
+            f"canonical 回复见 {canonical_comment_url}。"
         )
         digest = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
         operation_key = f"mirror-fyi:{turn_id}:target:{target.surface_node_id}"
@@ -207,17 +211,18 @@ class TurnMirrorPublisher:
                 self._owner_token, operation_key
             )
         if outbox.state == OutboxState.UNCERTAIN:
-            matches = await self._authority.find_issue_comments_by_marker(
+            matches = await self._authority.find_issue_comments_by_evidence(
                 binding.repository_full_name,
                 target.surface_number,
-                ownership_marker,
+                author_login=binding.wrapper_identity,
+                body_digest=digest,
+                created_after=outbox.created_at - 60.0,
+                created_before=(
+                    outbox.created_at + self._create_recovery_window_seconds
+                ),
             )
-            if len(matches) > 1:
-                raise MirrorConflict("multiple FYI comments claim one turn target")
-            if matches:
+            if len(matches) == 1:
                 remote = matches[0]
-                if remote.body_digest != digest:
-                    raise MirrorConflict("FYI ownership marker body changed")
                 await self._store.acknowledge_outbox(
                     self._owner_token,
                     operation_key,
@@ -225,8 +230,8 @@ class TurnMirrorPublisher:
                     remote_digest=remote.body_digest,
                 )
                 return remote
-            await self._store.reconcile_outbox_absent(
-                self._owner_token, operation_key
+            raise MirrorConflict(
+                "uncertain FYI create has no unique canonical recovery match"
             )
         await self._store.start_outbox_send(self._owner_token, operation_key)
         try:
@@ -311,7 +316,7 @@ class TurnMirrorPublisher:
             )
         if outbox.state == OutboxState.UNCERTAIN:
             recovered = await self._reconcile_uncertain(
-                binding, target, turn_id, chunk, record, outbox.operation_key
+                binding, target, turn_id, chunk, record, outbox
             )
             if recovered:
                 return
@@ -375,28 +380,32 @@ class TurnMirrorPublisher:
         turn_id: str,
         chunk: RenderedMirrorChunk,
         record: StoredMirrorChunk,
-        operation_key: str,
+        outbox: StoredOutbox,
     ) -> bool:
         if record.remote_id is None:
-            matches = await self._authority.find_issue_comments_by_marker(
+            matches = await self._authority.find_issue_comments_by_evidence(
                 binding.repository_full_name,
                 target.surface_number,
-                chunk.ownership_marker,
+                author_login=binding.wrapper_identity,
+                body_digest=chunk.body_digest,
+                created_after=outbox.created_at - 60.0,
+                created_before=(
+                    outbox.created_at + self._create_recovery_window_seconds
+                ),
             )
-            if len(matches) > 1:
-                await self._conflict(turn_id)
-            if matches:
+            if len(matches) == 1:
                 remote = matches[0]
-                if remote.body_digest != chunk.body_digest:
-                    await self._conflict(turn_id)
                 await self._store.acknowledge_outbox(
                     self._owner_token,
-                    operation_key,
+                    outbox.operation_key,
                     remote_id=str(remote.database_id),
                     remote_digest=remote.body_digest,
                 )
                 await self._record_remote(turn_id, chunk, remote)
                 return True
+            raise MirrorConflict(
+                "uncertain mirror create has no unique canonical recovery match"
+            )
         else:
             remote = await self._authority.get_issue_comment(
                 binding.repository_full_name, _database_id(record.remote_id)
@@ -404,7 +413,7 @@ class TurnMirrorPublisher:
             if remote.body_digest == chunk.body_digest:
                 await self._store.acknowledge_outbox(
                     self._owner_token,
-                    operation_key,
+                    outbox.operation_key,
                     remote_id=str(remote.database_id),
                     remote_digest=remote.body_digest,
                 )
@@ -415,7 +424,7 @@ class TurnMirrorPublisher:
             ):
                 await self._conflict(turn_id)
         await self._store.reconcile_outbox_absent(
-            self._owner_token, operation_key
+            self._owner_token, outbox.operation_key
         )
         return False
 

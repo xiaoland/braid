@@ -17,15 +17,20 @@
   },
   "timing": {
     "quiet_window_seconds": 30.0,
-    "mirror_interval_seconds": 5.0,
+    "mirror_message_count_threshold": 10,
+    "mirror_maximum_dirty_age_seconds": 120.0,
     "reconciliation_interval_seconds": 60.0,
-    "mirror_comment_bytes": 60000
+    "mirror_comment_bytes": 60000,
+    "mirror_projection_bytes": 262144,
+    "mirror_tool_call_bytes": 8192,
+    "mirror_tool_result_bytes": 16384
   },
   "paths": {
-    "state_database": "/absolute/path/to/runtime/state.sqlite3",
+    "state_database": "/absolute/path/to/braid-runtime/state.sqlite3",
     "provider_cwd": "/absolute/path/to/dedicated/issue-worktree",
     "provider_writable_roots": [],
-    "collaboration_instructions": "/absolute/path/to/project/agent-handoff/AGENTS.md"
+    "provider_sandbox": "workspace-write",
+    "collaboration_instructions": "/absolute/path/to/braid/AGENTS.md"
   },
   "app_server": {
     "executable": "/Applications/ChatGPT.app/Contents/Resources/codex",

@@ -31,8 +31,8 @@ does not authorize or perform any external mutation by itself.
 ```shell
 pdm install -G test
 pdm run test
-pdm run github-agent-bridge config-check --config /absolute/path/config.local.json
-pdm run github-agent-bridge probe-app-server \
+pdm run braid config-check --config /absolute/path/config.local.json
+pdm run braid probe-app-server \
   --codex /absolute/path/to/codex \
   --workspace /absolute/path/to/read-only-probe-workspace
 ```
@@ -61,6 +61,13 @@ the process is killed, inspect the App configuration before restarting because
 a Quick Tunnel URL is temporary. GitHub does not automatically redeliver a
 failed webhook; periodic canonical reconciliation is the normal convergence
 path.
+
+This automatic path requires the GitHub App-level webhook configuration API.
+The first external smoke's existing App returned HTTP 404 there, so the runtime
+failed closed before publication. An operator-managed repository webhook plus a
+separately supervised HTTP/2 Quick Tunnel is a viable diagnostic fallback, but
+it is not yet a public runtime command and was not part of the passing Issue 23
+oracle. Do not claim webhook acceptance from the manually signed tunnel ping.
 
 ## Exclusive handoff and rollback
 

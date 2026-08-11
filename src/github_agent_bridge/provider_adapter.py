@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from github_agent_bridge.app_server import (
     AppServerClient,
@@ -45,6 +45,7 @@ class CodexProviderAdapter:
         thread_address: str,
         provider_cwd: Path,
         writable_roots: Sequence[Path] = (),
+        sandbox: Literal["read-only", "workspace-write"] = "workspace-write",
         request_timeout_seconds: float = 120.0,
         persisted_turns: Sequence[PersistedProviderTurn] = (),
     ) -> None:
@@ -54,12 +55,15 @@ class CodexProviderAdapter:
             raise ValueError("provider_cwd must be absolute")
         if any(not path.is_absolute() for path in writable_roots):
             raise ValueError("writable roots must be absolute")
+        if sandbox == "read-only" and writable_roots:
+            raise ValueError("read-only provider sandbox cannot add writable roots")
         if request_timeout_seconds <= 0:
             raise ValueError("request timeout must be positive")
         self._client = client
         self.thread_address = thread_address
         self.provider_cwd = provider_cwd
         self.writable_roots = tuple(writable_roots)
+        self.sandbox = sandbox
         self._request_timeout_seconds = request_timeout_seconds
         self._persisted_turns = tuple(persisted_turns)
 
@@ -77,6 +81,7 @@ class CodexProviderAdapter:
         issue_url: str,
         provider_cwd: Path,
         writable_roots: Sequence[Path] = (),
+        sandbox: Literal["read-only", "workspace-write"] = "workspace-write",
         request_timeout_seconds: float = 120.0,
         initialize_client: bool = True,
     ) -> CodexProviderAdapter:
@@ -84,7 +89,7 @@ class CodexProviderAdapter:
             raise ValueError("issue_url must not be empty")
         if initialize_client:
             await client.initialize(
-                client_name="github-agent-bridge",
+                client_name="braid",
                 client_version="0.1.0",
                 experimental_api=True,
                 timeout=request_timeout_seconds,
@@ -97,7 +102,7 @@ class CodexProviderAdapter:
                     "cwd": str(provider_cwd),
                     "developerInstructions": _dynamic_issue_instructions(issue_url),
                     "ephemeral": False,
-                    "sandbox": "workspace-write",
+                    "sandbox": sandbox,
                 },
                 timeout=request_timeout_seconds,
             ),
@@ -110,6 +115,7 @@ class CodexProviderAdapter:
             thread_address=thread_address,
             provider_cwd=provider_cwd,
             writable_roots=writable_roots,
+            sandbox=sandbox,
             request_timeout_seconds=request_timeout_seconds,
         )
 
@@ -121,10 +127,11 @@ class CodexProviderAdapter:
         binding: Binding,
         provider_cwd: Path,
         writable_roots: Sequence[Path] = (),
+        sandbox: Literal["read-only", "workspace-write"] = "workspace-write",
         request_timeout_seconds: float = 120.0,
     ) -> CodexProviderAdapter:
         await client.initialize(
-            client_name="github-agent-bridge",
+            client_name="braid",
             client_version="0.1.0",
             experimental_api=True,
             timeout=request_timeout_seconds,
@@ -135,7 +142,7 @@ class CodexProviderAdapter:
                 {
                     "approvalPolicy": "never",
                     "cwd": str(provider_cwd),
-                    "sandbox": "workspace-write",
+                    "sandbox": sandbox,
                     "threadId": binding.thread_address,
                 },
                 timeout=request_timeout_seconds,
@@ -149,7 +156,7 @@ class CodexProviderAdapter:
                     "cwd": str(provider_cwd),
                     "developerInstructions": _dynamic_binding_instructions(binding),
                     "ephemeral": False,
-                    "sandbox": "workspace-write",
+                    "sandbox": sandbox,
                 },
                 timeout=request_timeout_seconds,
             )
@@ -167,6 +174,7 @@ class CodexProviderAdapter:
             thread_address=thread_address,
             provider_cwd=provider_cwd,
             writable_roots=writable_roots,
+            sandbox=sandbox,
             request_timeout_seconds=request_timeout_seconds,
             persisted_turns=persisted_turns,
         )
@@ -238,6 +246,8 @@ class CodexProviderAdapter:
         await self._client.close()
 
     def _sandbox_policy(self) -> dict[str, object]:
+        if self.sandbox == "read-only":
+            return {"networkAccess": True, "type": "readOnly"}
         return {
             "networkAccess": True,
             "type": "workspaceWrite",

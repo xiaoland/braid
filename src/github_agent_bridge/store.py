@@ -191,6 +191,7 @@ class StoredOutbox:
     remote_id: str | None
     remote_digest: str | None
     reconciliation_checked_at: float | None
+    created_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -1989,6 +1990,7 @@ def _stored_outbox(row: sqlite3.Row) -> StoredOutbox:
         remote_id=row["remote_id"],
         remote_digest=row["remote_digest"],
         reconciliation_checked_at=row["reconciliation_checked_at"],
+        created_at=float(row["created_at"]),
     )
 
 

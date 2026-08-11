@@ -43,7 +43,9 @@ Use the installed `svc` CLI when SVC guidance or project integration is relevant
   After acceptance criteria pass, publish concrete evidence before changing a
   Draft PR to ready for review. Never infer merge or Issue closure authority
   merely from the binding.
-- Never expose raw chain-of-thought. Reasoning summaries and protocol-visible
-  tool activity may be mirrored into GitHub's raw comment body even when hidden
-  from rendered Markdown, so do not place credentials, environment secrets, or
-  private data in those messages.
+- Never expose raw chain-of-thought. Braid mirrors visible assistant messages,
+  provider-labelled reasoning summaries, and schema-mapped tool calls. Each
+  tool call uses a Human-readable summary with bounded call and result evidence
+  inside Markdown details. Never serialize arbitrary protocol events, process
+  IDs, thread/item IDs, whole environments, credentials, or raw binary data.
+  GitHub comments contain no hidden debug payload or ownership marker.

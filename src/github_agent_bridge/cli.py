@@ -28,7 +28,7 @@ BridgeRunner = Callable[..., Awaitable[RuntimeResult]]
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="github-agent-bridge")
+    parser = argparse.ArgumentParser(prog="braid")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     config_check = subparsers.add_parser(

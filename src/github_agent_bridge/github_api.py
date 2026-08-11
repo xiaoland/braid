@@ -23,6 +23,7 @@ from github_agent_bridge.github_webhook import (
     digest_comment_body,
     digest_issue_content,
     has_visible_agent_mention,
+    normalize_github_login,
 )
 
 
@@ -93,6 +94,8 @@ class RemoteComment:
     database_id: int
     node_id: str
     url: str
+    author_login: str | None
+    created_at: str
     updated_at: str
     body_digest: str
 
@@ -359,7 +362,9 @@ class GitHubAppClient:
     ) -> PullRequestCanonicalState:
         """Read one bounded, canonical PR surface without retaining prose."""
 
-        normalized_self_logins = {value.casefold() for value in self_logins}
+        normalized_self_logins = {
+            normalize_github_login(value) for value in self_logins
+        }
         pull_request = await self._pull_request_object(
             reference,
             query=_PULL_REQUEST_STATE_QUERY,
@@ -609,7 +614,9 @@ class GitHubAppClient:
             raise ValueError("issue_number must be positive")
         comments: list[IssueCommentSnapshot] = []
         cursor: str | None = None
-        normalized_self_logins = {value.casefold() for value in self_logins}
+        normalized_self_logins = {
+            normalize_github_login(value) for value in self_logins
+        }
         for _ in range(100):
             data = await self._graphql(
                 repository_full_name,
@@ -649,7 +656,8 @@ class GitHubAppClient:
                 )
                 self_origin = (
                     author_login is not None
-                    and author_login.casefold() in normalized_self_logins
+                    and normalize_github_login(author_login)
+                    in normalized_self_logins
                 )
                 comments.append(
                     IssueCommentSnapshot(
@@ -741,17 +749,23 @@ class GitHubAppClient:
         )
         return _remote_comment(payload)
 
-    async def find_issue_comments_by_marker(
+    async def find_issue_comments_by_evidence(
         self,
         repository_full_name: str,
         issue_number: int,
-        ownership_marker: str,
+        *,
+        author_login: str,
+        body_digest: str,
+        created_after: float,
+        created_before: float,
     ) -> tuple[RemoteComment, ...]:
         owner, repository = _split_repository(repository_full_name)
         if issue_number < 1:
             raise ValueError("issue_number must be positive")
-        if not ownership_marker:
-            raise ValueError("ownership_marker must not be empty")
+        if not author_login or not body_digest:
+            raise ValueError("comment recovery evidence must not be empty")
+        if created_after > created_before:
+            raise ValueError("comment recovery time window is inverted")
         token = await self._installation_token(repository_full_name)
         matches: list[RemoteComment] = []
         for page in range(1, 101):
@@ -774,9 +788,16 @@ class GitHubAppClient:
                     raise GitHubApiError(
                         "GitHub returned malformed Issue comment candidate"
                     )
-                body = _string(candidate, "body", "Issue comment candidate")
-                if ownership_marker in body:
-                    matches.append(_remote_comment(candidate))
+                remote = _remote_comment(candidate)
+                created_at = _parse_timestamp(remote.created_at)
+                if (
+                    remote.author_login is not None
+                    and normalize_github_login(remote.author_login)
+                    == normalize_github_login(author_login)
+                    and remote.body_digest == body_digest
+                    and created_after <= created_at <= created_before
+                ):
+                    matches.append(remote)
             if len(value) < 100:
                 return tuple(matches)
         raise GitHubApiError("GitHub Issue comment pagination exceeded safety bound")
@@ -938,10 +959,19 @@ class GitHubAppClient:
 
 def _remote_comment(value: dict[str, Any]) -> RemoteComment:
     body = _string(value, "body", "comment response")
+    author = value.get("user")
+    if author is not None and not isinstance(author, dict):
+        raise GitHubApiError("GitHub returned malformed comment response.user")
     return RemoteComment(
         database_id=_positive_int(value, "id", "comment response"),
         node_id=_string(value, "node_id", "comment response"),
         url=_string(value, "html_url", "comment response"),
+        author_login=(
+            None
+            if author is None
+            else _nullable_string(author, "login", "comment response.user")
+        ),
+        created_at=_string(value, "created_at", "comment response"),
         updated_at=_string(value, "updated_at", "comment response"),
         body_digest="sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest(),
     )
@@ -1048,7 +1078,10 @@ def _actor_reference(
 
 
 def _is_self_login(actor_login: str | None, self_logins: set[str]) -> bool:
-    return actor_login is not None and actor_login.casefold() in self_logins
+    return (
+        actor_login is not None
+        and normalize_github_login(actor_login) in self_logins
+    )
 
 
 def _known_value(value: str, known: frozenset[str], owner: str) -> str:

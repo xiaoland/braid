@@ -134,6 +134,7 @@ def reasoning_summary_delta() -> ServerMessage:
             "threadId": "thread-1",
             "turnId": "turn-1",
             "itemId": "reasoning-1",
+            "summaryIndex": 0,
             "delta": "正在核对关联。",
         },
     )
@@ -269,7 +270,7 @@ class TurnControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             asyncio.run(scenario(Path(directory) / "state.sqlite3"))
 
-    def test_changed_projection_is_flushed_on_tick_without_another_item(self) -> None:
+    def test_changed_projection_is_flushed_at_maximum_dirty_age(self) -> None:
         async def scenario(path: Path) -> None:
             clock = FakeClock()
             store = await TransportStore.open(path, clock=clock)
@@ -303,15 +304,15 @@ class TurnControllerTests(unittest.TestCase):
                     owner,
                     provider,
                     mirror,  # type: ignore[arg-type]
-                    mirror_interval_seconds=5,
+                    mirror_maximum_dirty_age_seconds=4,
                     clock=clock,
                     claim_factory=lambda: "claim-1",
                 )
                 result = await controller.run_one_ready_turn(binding(), now=30)
                 assert result is not None
                 self.assertEqual(len(mirror.publications), 3)
-                tick_items = mirror.publications[1]["snapshot"].items
-                self.assertEqual(tick_items[0].payload["delta"], "正在核对关联。")
+                tick_messages = mirror.publications[1]["snapshot"].messages
+                self.assertEqual(tick_messages[0].content, "正在核对关联。")
                 self.assertIsNone(
                     mirror.publications[1]["snapshot"].terminal_status
                 )

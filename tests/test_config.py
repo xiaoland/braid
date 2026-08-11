@@ -30,13 +30,18 @@ def valid_config() -> dict[str, Any]:
         "ingress": {"host": "127.0.0.1", "port": 8080, "health_port": 8081},
         "timing": {
             "quiet_window_seconds": 30.0,
-            "mirror_interval_seconds": 5.0,
+            "mirror_message_count_threshold": 10,
+            "mirror_maximum_dirty_age_seconds": 120.0,
             "reconciliation_interval_seconds": 60.0,
             "mirror_comment_bytes": 60000,
+            "mirror_projection_bytes": 262144,
+            "mirror_tool_call_bytes": 8192,
+            "mirror_tool_result_bytes": 16384,
         },
         "paths": {
-            "state_database": "/var/lib/github-agent-bridge/state.sqlite3",
+            "state_database": "/var/lib/braid/state.sqlite3",
             "provider_cwd": "/worktrees/issue-123",
+            "provider_sandbox": "read-only",
             "collaboration_instructions": "/workspace/agent-handoff/AGENTS.md",
         },
         "app_server": {
@@ -63,6 +68,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertTrue(config.ingress.host.is_loopback)
         self.assertEqual(config.github.private_key.file, Path("/run/secrets/github-app.pem"))
         self.assertEqual(config.paths.provider_writable_roots, ())
+        self.assertEqual(config.paths.provider_sandbox, "read-only")
         self.assertEqual(config.github.wrapper_login, "wrapper-app[bot]")
 
     def test_rejects_unknown_fields_in_nested_models(self) -> None:
@@ -101,6 +107,13 @@ class BridgeConfigTests(unittest.TestCase):
 
                 with self.assertRaises(ValidationError):
                     self.parse(value)
+
+    def test_read_only_sandbox_rejects_writable_roots(self) -> None:
+        value = valid_config()
+        value["paths"]["provider_writable_roots"] = ["/repository/.git"]
+
+        with self.assertRaisesRegex(ValidationError, "read-only"):
+            self.parse(value)
 
     def test_secret_reference_requires_exactly_one_source(self) -> None:
         for reference in (

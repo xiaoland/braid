@@ -591,8 +591,20 @@ def _actor(sender: dict[str, Any] | None) -> tuple[str | None, str | None]:
 def _is_self_origin(actor_login: str | None, self_logins: Set[str]) -> bool:
     if actor_login is None:
         return False
-    normalized = {login.casefold() for login in self_logins}
-    return actor_login.casefold() in normalized
+    normalized = {normalize_github_login(login) for login in self_logins}
+    return normalize_github_login(actor_login) in normalized
+
+
+def normalize_github_login(login: str) -> str:
+    """Normalize the REST/webhook and GraphQL spellings of one App bot.
+
+    REST and webhook actors use ``app-slug[bot]`` while GraphQL's ``Actor``
+    interface reports the same App as ``app-slug``. GitHub usernames cannot
+    contain brackets, so stripping this exact suffix is unambiguous.
+    """
+
+    normalized = login.casefold()
+    return normalized[:-5] if normalized.endswith("[bot]") else normalized
 
 
 def _is_urgent(mention_detected: bool, permission_role: str | None) -> bool:

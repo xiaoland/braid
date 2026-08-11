@@ -89,6 +89,10 @@ class ProviderAdapterTests(unittest.TestCase):
                 },
             )
             self.assertIn("clientUserMessageId", params)
+            transport_input = params["input"]
+            self.assertEqual(len(transport_input), 1)
+            self.assertIn("This is not a Human message or command", transport_input[0]["text"])
+            self.assertIn("observe canonical GitHub state", transport_input[0]["text"])
             context = params["additionalContext"]
             assert isinstance(context, dict)
             entry = context["wrapper-event:7"]
@@ -140,6 +144,26 @@ class ProviderAdapterTests(unittest.TestCase):
                 adapter.persisted_turn_status("turn-active"), "interrupted"
             )
             self.assertIsNone(adapter.persisted_turn_status("turn-missing"))
+
+        asyncio.run(scenario())
+
+    def test_read_only_turn_preserves_network_but_has_no_writable_roots(self) -> None:
+        async def scenario() -> None:
+            client = FakeClient()
+            adapter = CodexProviderAdapter(
+                client,  # type: ignore[arg-type]
+                thread_address="thread-1",
+                provider_cwd=Path("/worktrees/issue-17"),
+                sandbox="read-only",
+            )
+
+            await adapter.start_turn((stored_event(),))
+
+            _, params, _ = client.requests[-1]
+            self.assertEqual(
+                params["sandboxPolicy"],
+                {"networkAccess": True, "type": "readOnly"},
+            )
 
         asyncio.run(scenario())
 

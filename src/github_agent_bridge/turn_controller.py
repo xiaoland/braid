@@ -68,18 +68,35 @@ class BindingTurnController:
         provider: ProviderBoundary,
         mirror: TurnMirrorPublisher,
         *,
-        mirror_interval_seconds: float = 5.0,
+        mirror_message_count_threshold: int = 10,
+        mirror_maximum_dirty_age_seconds: float = 120.0,
+        mirror_projection_bytes: int = 256 * 1024,
+        mirror_tool_call_bytes: int = 8 * 1024,
+        mirror_tool_result_bytes: int = 16 * 1024,
         provider_poll_seconds: float = 0.25,
         clock: Callable[[], float] = time.time,
         claim_factory: Callable[[], str] = lambda: str(uuid.uuid4()),
     ) -> None:
-        if mirror_interval_seconds <= 0 or provider_poll_seconds <= 0:
-            raise ValueError("controller intervals must be positive")
+        if (
+            mirror_message_count_threshold < 1
+            or mirror_maximum_dirty_age_seconds <= 0
+            or mirror_projection_bytes < 1
+            or mirror_tool_call_bytes < 1
+            or mirror_tool_result_bytes < 1
+            or provider_poll_seconds <= 0
+        ):
+            raise ValueError("controller thresholds and intervals must be positive")
         self._store = store
         self._owner_token = owner_token
         self._provider = provider
         self._mirror = mirror
-        self._mirror_interval_seconds = mirror_interval_seconds
+        self._mirror_message_count_threshold = mirror_message_count_threshold
+        self._mirror_maximum_dirty_age_seconds = (
+            mirror_maximum_dirty_age_seconds
+        )
+        self._mirror_projection_bytes = mirror_projection_bytes
+        self._mirror_tool_call_bytes = mirror_tool_call_bytes
+        self._mirror_tool_result_bytes = mirror_tool_result_bytes
         self._provider_poll_seconds = provider_poll_seconds
         self._clock = clock
         self._claim_factory = claim_factory
@@ -140,14 +157,19 @@ class BindingTurnController:
             raise
 
         projection = TurnProjection(
-            self._provider.thread_address, provider_turn.turn_id
+            self._provider.thread_address,
+            provider_turn.turn_id,
+            max_projection_bytes=self._mirror_projection_bytes,
+            max_tool_call_bytes=self._mirror_tool_call_bytes,
+            max_tool_result_bytes=self._mirror_tool_result_bytes,
         )
         revision = 0
         mirror_error, published_chunks = await self._publish_best_effort(
             binding, target, projection, revision
         )
-        next_mirror_at = self._clock() + self._mirror_interval_seconds
         projection_dirty = False
+        completed_messages_since_publish = 0
+        oldest_dirty_at: float | None = None
         participating = {event.surface_node_id for event in events}
         steer_rejected = False
         terminal = False
@@ -159,11 +181,15 @@ class BindingTurnController:
                     )
                 except TimeoutError:
                     message = None
-                changed = False
+                change = None
                 if message is not None:
-                    changed = projection.consume(message)
-                    projection_dirty = projection_dirty or changed
-                    terminal = projection.snapshot().terminal_status is not None
+                    change = projection.consume(message)
+                    if change.changed:
+                        projection_dirty = True
+                        if oldest_dirty_at is None:
+                            oldest_dirty_at = self._clock()
+                    completed_messages_since_publish += change.completed_messages
+                    terminal = change.terminal
 
                 ready = await self._store.ready_events_for_active_turn(
                     self._owner_token,
@@ -188,7 +214,14 @@ class BindingTurnController:
 
                 current_time = self._clock()
                 if projection_dirty and (
-                    terminal or current_time >= next_mirror_at
+                    terminal
+                    or completed_messages_since_publish
+                    >= self._mirror_message_count_threshold
+                    or (
+                        oldest_dirty_at is not None
+                        and current_time - oldest_dirty_at
+                        >= self._mirror_maximum_dirty_age_seconds
+                    )
                 ):
                     revision += 1
                     error, published_chunks = await self._publish_best_effort(
@@ -196,7 +229,9 @@ class BindingTurnController:
                     )
                     mirror_error = error or mirror_error
                     projection_dirty = error is not None
-                    next_mirror_at = current_time + self._mirror_interval_seconds
+                    if error is None:
+                        completed_messages_since_publish = 0
+                        oldest_dirty_at = None
         finally:
             # A provider transport exception deliberately leaves the active
             # handle intact: disconnect is not an Agent terminal result.

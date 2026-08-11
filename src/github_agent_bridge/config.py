@@ -6,7 +6,7 @@ from ipaddress import IPv4Address, IPv6Address
 from collections.abc import Mapping
 import os
 from pathlib import Path
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -121,18 +121,45 @@ class IngressConfig(StrictModel):
 
 class TimingConfig(StrictModel):
     quiet_window_seconds: PositiveSeconds = 30.0
-    mirror_interval_seconds: PositiveSeconds = 5.0
+    mirror_message_count_threshold: Annotated[
+        int, Field(strict=True, ge=1, le=1_000)
+    ] = 10
+    mirror_maximum_dirty_age_seconds: PositiveSeconds = 120.0
     reconciliation_interval_seconds: PositiveSeconds = 60.0
     mirror_comment_bytes: Annotated[
         int, Field(strict=True, ge=1_024, le=65_536)
     ] = 60_000
+    mirror_projection_bytes: Annotated[
+        int, Field(strict=True, ge=16_384, le=1_048_576)
+    ] = 262_144
+    mirror_tool_call_bytes: Annotated[
+        int, Field(strict=True, ge=256, le=65_536)
+    ] = 8_192
+    mirror_tool_result_bytes: Annotated[
+        int, Field(strict=True, ge=256, le=131_072)
+    ] = 16_384
+
+    @model_validator(mode="after")
+    def keep_projection_fields_inside_total_bound(self) -> Self:
+        if self.mirror_tool_call_bytes >= self.mirror_projection_bytes:
+            raise ValueError("tool call bound must be below projection bound")
+        if self.mirror_tool_result_bytes >= self.mirror_projection_bytes:
+            raise ValueError("tool result bound must be below projection bound")
+        return self
 
 
 class RuntimePaths(StrictModel):
     state_database: Path
     provider_cwd: Path
     provider_writable_roots: tuple[Path, ...] = ()
+    provider_sandbox: Literal["read-only", "workspace-write"] = "workspace-write"
     collaboration_instructions: Path
+
+    @model_validator(mode="after")
+    def reject_writable_roots_in_read_only_sandbox(self) -> Self:
+        if self.provider_sandbox == "read-only" and self.provider_writable_roots:
+            raise ValueError("read-only provider sandbox cannot add writable roots")
+        return self
 
     @field_validator("state_database", "provider_cwd", "collaboration_instructions")
     @classmethod
