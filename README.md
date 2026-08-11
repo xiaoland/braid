@@ -5,16 +5,17 @@
 # Braid
 
 **Braid** keeps a GitHub Issue and one local Coding Agent thread in a durable
-collaboration loop. This independent prototype has its own SVC markers, task
-packets, Python package, dependency lock, and test commands.
+collaboration loop. This independent prototype has its own SVC integration,
+Python package, dependency lock, and operator commands.
 
 ## Local Setup
 
 Python 3.12 and PDM 2.28 or later are required.
 
 ```shell
-pdm install -G test
-pdm run test
+pdm install
+pdm lock --check
+pdm run braid --help
 ```
 
 Run the real, read-only provider contract probe with explicit absolute paths:
@@ -76,14 +77,18 @@ same comment. Braid never places debug JSON, protocol IDs, raw chain-of-thought,
 or an ownership marker in the GitHub body.
 
 The local runtime and Quick Tunnel supervisor remain building blocks, not full
-product acceptance. The bounded historical smokes and their findings are
-recorded in [`tasks/minimal-mirror-smoke.md`](tasks/minimal-mirror-smoke.md) and
-[`tasks/human-readable-turn-mirror.md`](tasks/human-readable-turn-mirror.md).
-Their disposable GitHub objects were removed during project extraction; the
-task packets preserve the evidence and diagnosed failure modes. The full
-Issue-to-Draft-PR black-box campaign remains separate.
+product acceptance. The product promise and its real Issue-to-Draft-PR oracle
+are defined in [`docs/product.md`](docs/product.md) and
+[`docs/acceptance.md`](docs/acceptance.md).
 
-See [the protocol contract](docs/app-server-protocol.md), the
-[projection reducer contract](tasks/projection-reducer-contract.md), and the
-[implementation packet](tasks/bootstrap-implementation.md). External setup and
-exclusive handoff are specified in the [operator runbook](docs/operator-runbook.md).
+Braid deliberately has no unit or component-integration test suite at this
+stage. Executable acceptance helpers belong under
+[`scripts/tests/`](scripts/tests/) only when they drive the real product through
+public boundaries. They are workflow tools, not product acceptance by
+themselves; the retained GitHub evidence and Human verdicts remain the oracle.
+
+See [the architecture](docs/architecture.md), [Codex protocol
+contract](docs/app-server-protocol.md), [GitHub transport
+contract](docs/github-transport-contract.md), and [turn projection
+contract](docs/turn-projection.md). External setup and exclusive handoff are
+specified in the [operator runbook](docs/operator-runbook.md).

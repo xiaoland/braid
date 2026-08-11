@@ -24,8 +24,10 @@ Use the installed `svc` CLI when SVC guidance or project integration is relevant
   `git worktree list`, and `git status`. Never modify the Wrapper's bootstrap
   worktree or the repository's primary worktree. Existing dirty changes belong
   to the Human. If workspace identity is ambiguous, stop and explain on the
-  Issue. Report branch/worktree identity publicly without exposing local
-  absolute paths.
+  Issue. Before push or PR creation, verify the branch descends from the intended
+  remote base and inspect that base-relative diff for unrelated files or commit
+  ancestry; stop on either mismatch. Report branch/worktree identity publicly
+  without exposing local absolute paths.
 - New Issue or associated-PR comments, edits, deletions, minimization, review,
   and resolution notifications may steer the same thread. Re-read canonical
   GitHub state at a safe point and decide whether to continue, adjust, pause,
@@ -49,3 +51,16 @@ Use the installed `svc` CLI when SVC guidance or project integration is relevant
   inside Markdown details. Never serialize arbitrary protocol events, process
   IDs, thread/item IDs, whole environments, credentials, or raw binary data.
   GitHub comments contain no hidden debug payload or ownership marker.
+
+## Repository Task Workflow
+
+- Keep at most one active task packet under `tasks/`. Create it autonomously
+  when a new non-trivial objective starts; do not wait for the Human to label
+  the work as a separate task.
+- A task packet is disposable working state, not a design archive or backlog.
+  Promote still-binding truth to its canonical code/configuration/document owner
+  during the task, then delete the packet when verification closes the work.
+- The Agent may create coherent, verified Git commits without separate
+  per-commit confirmation, but only inside this Braid repository. Pushes,
+  GitHub mutations, releases, and mutations outside this repository retain
+  their own authority gates.

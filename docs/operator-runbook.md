@@ -29,8 +29,9 @@ does not authorize or perform any external mutation by itself.
 ## Preflight
 
 ```shell
-pdm install -G test
-pdm run test
+pdm install
+pdm lock --check
+pdm run braid --help
 pdm run braid config-check --config /absolute/path/config.local.json
 pdm run braid probe-app-server \
   --codex /absolute/path/to/codex \
@@ -41,9 +42,11 @@ The probe result must match all three configured app-server pin values. Check
 that the configured state-database parent exists and the database does not
 belong to another running Wrapper.
 
-Before implementation, place the required Human worktree-safety comment from
-`tasks/bootstrap-implementation.md` on the source Issue. This is a message and
-constraint, not a Wrapper command.
+Before implementation, place a Human worktree-safety comment on the bound Issue:
+identify the dedicated candidate branch, require it to be rooted at the intended
+remote base, forbid mutation of the primary or Wrapper worktree, and require a
+base-relative diff check before push or PR creation. This is a message and
+constraint, not a Wrapper command; do not expose local absolute paths.
 
 ## Start and observe
 
@@ -81,9 +84,9 @@ oracle. Do not claim webhook acceptance from the manually signed tunnel ping.
 
 ## Acceptance boundary
 
-Developer tests and health only diagnose implementation. Acceptance is the
+Local preflight checks and health only diagnose implementation. Acceptance is the
 real GitHub → Quick Tunnel → Wrapper → Codex app-server → GitHub journey defined
-in `tasks/e2e-acceptance-design.md`, including the genuine Draft PR, Human
+in [`acceptance.md`](acceptance.md), including the genuine Draft PR, Human
 discussion and review, lifecycle edits, missed-webhook reconciliation,
 restart/unknown behavior, raw/rendered mirror inspection, and protected
 worktree snapshots.

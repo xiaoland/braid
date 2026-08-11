@@ -6,6 +6,13 @@
 Use `svc lookup` when packaged Sustainable Vibe Coding Corpus guidance is relevant, and discover its browse/search/read grammar through `svc lookup --help`. Project documentation outside this marked block remains Consumer-owned.
 <!-- svc:end navigation -->
 
+## Product and Architecture
+
+- [Product truth](product.md)
+- [Architecture](architecture.md)
+- [Turn projection contract](turn-projection.md)
+- [End-to-end acceptance](acceptance.md)
+
 ## Runtime Contracts
 
 - [Codex app-server protocol](app-server-protocol.md)

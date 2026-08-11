@@ -12,11 +12,6 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/xiaoland/braid"
 
-[dependency-groups]
-test = [
-    "pytest>=8.3,<9",
-]
-
 [project.scripts]
 braid = "github_agent_bridge.cli:entrypoint"
 
@@ -26,11 +21,3 @@ build-backend = "pdm.backend"
 
 [tool.pdm]
 distribution = true
-
-[tool.pdm.scripts]
-test = "pytest"
-
-[tool.pytest.ini_options]
-addopts = "-q"
-pythonpath = ["src"]
-testpaths = ["tests"]

@@ -61,6 +61,8 @@ live projections only.
 Provider thread history is intentionally lossy for some live item detail. The
 Wrapper therefore observes live items for mirroring but never persists or
 reconstructs the provider transcript and never owns compaction or resume.
+The complete semantic lifecycle, rendering, bounds, batching, and publication
+contract lives in [`turn-projection.md`](turn-projection.md).
 
 ## Executable Probe
 
