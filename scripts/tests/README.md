@@ -13,7 +13,7 @@ through real GitHub Work Items and a clean packaged installation.
 
 `00_clean_install.sh` is the Rust foundation gate. It unpacks the release
 artifact, scrubs Python/PDM/Cargo from the binary's `PATH`, exercises only the
-public CLI, verifies schema 0→5, schema 1→5 with a pre-v5 backup, and
+public CLI, verifies schema 0→6, schema 1→6 with a pre-v6 backup, and
 schema-newer refusal, and uses the adjacent
 bounded OTLP/HTTP capture helper to observe sampling. Its direct SQLite write is
 limited to constructing declared migration-compatibility fixtures; it does not
@@ -53,7 +53,7 @@ repository webhook and accepts optional `BRAID_TEST_INGRESS` and
 subscriptions or App webhook handoff/restoration, and its JSON verdict says so.
 
 `30_issue_agent.sh` is the Slice 3 provider gate. It records the candidate
-version/SHA-256, requires schema 5, and starts that exact packaged
+version/SHA-256 and starts that exact packaged
 Braid binary against the real pinned Codex app-server, creates one temporary
 repository webhook and disposable Issue, and uses the ordinary-App fallback:
 the first trusted `@braid` activates the dormant Issue and starts the turn. It
@@ -91,3 +91,19 @@ scripts/tests/30_issue_agent.sh
 This gate does not prove native Agent App assignment, App-webhook bootstrap,
 Context invalidation/replacement, restart/resume, PR Agents, or the full release
 campaign.
+
+`40_context_lifecycle.sh` begins the Slice 4 lifecycle gate at the public
+boundary. It requires schema 6 and a real App/Codex/Quick Tunnel fixture. A
+plain external Issue-description edit while the Agent is idle must create a new
+physical provider session without starting a turn. The same edit during an
+accepted turn must fence and interrupt that turn, remove its `rocket` without
+claiming success/failure, inject the complete current Issue Context into a third
+session, and run one continuation that demonstrates the edited description was
+seen. The helper observes only GitHub, loopback health, and `braid status`; the
+status command exposes durable reset/session/revision evidence rather than
+requiring SQLite inspection.
+
+This first Slice 4 helper does not yet claim minimize/unminimize/delete,
+unassignment, close/reopen/finalization, provider restart, or context-pressure
+coverage. Those journeys extend the same script only after their public runtime
+seams exist.

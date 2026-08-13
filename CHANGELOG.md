@@ -38,6 +38,13 @@ Versioning once release artifacts are published.
 - Forward-only schema version 5 and desired-state Operational Status Comments
   for provider-outcome unknown, excluded from future GitHub Context by their
   persisted node IDs.
+- Forward-only schema version 6 and durable Hard Invalidation records that
+  fence active turns, replace stale Codex sessions with complete current Issue
+  Context, and expose old/new sessions plus Context revisions through public
+  operator status.
+- The public `scripts/tests/40_context_lifecycle.sh` real GitHub/Quick
+  Tunnel/Codex gate for idle and active Issue-description Hard Invalidation,
+  including stale-turn reaction fencing and current-Context continuation.
 - Desired-state trusted-mention reactions, including removal of stale active
   reactions after terminal convergence, and Agent-origin echo suppression by
   stable actor identity or public Profile attribution.

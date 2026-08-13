@@ -482,13 +482,14 @@ fn status(arguments: &ConfigPath) -> Result<()> {
         println!("OTLP: {} (ratio {})", status.telemetry_endpoint, status.telemetry_sample_ratio);
         if let Some(transport) = &status.transport {
             println!(
-                "transport: deliveries={} duplicates={} pending={} runnable={} writes={}/{}",
+                "transport: deliveries={} duplicates={} pending={} runnable={} writes={}/{} resets={}",
                 transport.deliveries,
                 transport.duplicate_deliveries,
                 transport.pending_batches,
                 transport.runnable_batches,
                 transport.pending_writes,
-                transport.uncertain_writes
+                transport.uncertain_writes,
+                transport.context_resets.len()
             );
         }
     }

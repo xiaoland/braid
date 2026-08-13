@@ -15,19 +15,21 @@ use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 5;
+pub const DATABASE_SCHEMA_VERSION: u32 = 6;
 
 const INITIAL_SQL: &str = include_str!("../migrations/0001_initial.sql");
 const CONTEXT_LEDGER_SQL: &str = include_str!("../migrations/0002_context_ledger.sql");
 const TRANSPORT_RUNTIME_SQL: &str = include_str!("../migrations/0003_transport_runtime.sql");
 const PROVIDER_RUNTIME_SQL: &str = include_str!("../migrations/0004_provider_runtime.sql");
 const OPERATIONAL_STATUS_SQL: &str = include_str!("../migrations/0005_operational_status.sql");
+const CONTEXT_RESETS_SQL: &str = include_str!("../migrations/0006_context_resets.sql");
 const MIGRATIONS: &[Migration] = &[
     Migration { version: 1, name: "initial", sql: INITIAL_SQL },
     Migration { version: 2, name: "context-ledger", sql: CONTEXT_LEDGER_SQL },
     Migration { version: 3, name: "transport-runtime", sql: TRANSPORT_RUNTIME_SQL },
     Migration { version: 4, name: "provider-runtime", sql: PROVIDER_RUNTIME_SQL },
     Migration { version: 5, name: "operational-status", sql: OPERATIONAL_STATUS_SQL },
+    Migration { version: 6, name: "context-resets", sql: CONTEXT_RESETS_SQL },
 ];
 
 #[derive(Debug, Error)]
@@ -163,6 +165,7 @@ pub struct RuntimeStoreStatus {
     pub last_reconciliation: Option<String>,
     pub batches: Vec<WakeBatchSummary>,
     pub agent_groups: Vec<AgentGroupSummary>,
+    pub context_resets: Vec<ContextResetSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -264,6 +267,19 @@ pub struct TurnClaim {
     pub trusted_mention: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ContextResetClaim {
+    pub reset_id: String,
+    pub repository: String,
+    pub number: u64,
+    pub profile_id: String,
+    pub old_provider_session_id: String,
+    pub active_turn_id: Option<String>,
+    pub provider_turn_id: Option<String>,
+    pub references: Vec<String>,
+    pub continuation: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentGroupSummary {
     pub work_item_kind: String,
@@ -275,6 +291,21 @@ pub struct AgentGroupSummary {
     pub session_lifecycle: Option<String>,
     pub active_turn_id: Option<String>,
     pub turn_lifecycle: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextResetSummary {
+    pub reset_id: String,
+    pub repository: String,
+    pub work_item_kind: String,
+    pub work_item_number: u64,
+    pub profile_id: String,
+    pub lifecycle: String,
+    pub continuation: bool,
+    pub old_provider_session_id: String,
+    pub new_provider_session_id: Option<String>,
+    pub context_revision_before: String,
+    pub context_revision_after: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -734,6 +765,66 @@ impl StoreActor {
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
+
+    pub fn begin_context_reset(
+        &self,
+        active_turn_id: Option<String>,
+    ) -> Result<Option<ContextResetClaim>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::BeginContextReset(active_turn_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn ready_context_reset(&self) -> Result<Option<ContextResetClaim>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::ReadyContextReset(reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn mark_context_reset_turn_terminal(
+        &self,
+        reset_id: String,
+        turn_id: String,
+        lifecycle: String,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::MarkContextResetTurnTerminal(reset_id, turn_id, lifecycle, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn complete_context_reset(
+        &self,
+        reset_id: String,
+        provider_session_id: String,
+        context_revision: String,
+        instruction_revision: String,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::CompleteContextReset(
+                reset_id,
+                provider_session_id,
+                context_revision,
+                instruction_revision,
+                reply,
+            ))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn fail_context_reset(&self, reset_id: String, error: String) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::FailContextReset(reset_id, error, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
 }
 
 impl Drop for StoreActor {
@@ -807,6 +898,11 @@ enum Command {
     ConsumeSteerBatch(String, Sender<Result<(), StoreError>>),
     EnqueueTurnReaction(String, String, Sender<Result<(), StoreError>>),
     EnqueueOperationalStatus(String, String, Sender<Result<(), StoreError>>),
+    BeginContextReset(Option<String>, Sender<Result<Option<ContextResetClaim>, StoreError>>),
+    ReadyContextReset(Sender<Result<Option<ContextResetClaim>, StoreError>>),
+    MarkContextResetTurnTerminal(String, String, String, Sender<Result<(), StoreError>>),
+    CompleteContextReset(String, String, String, String, Sender<Result<(), StoreError>>),
+    FailContextReset(String, String, Sender<Result<(), StoreError>>),
     Shutdown,
 }
 
@@ -983,6 +1079,35 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             }
             Command::EnqueueOperationalStatus(turn_id, body, reply) => {
                 let _ = reply.send(enqueue_operational_status(database, &turn_id, &body));
+            }
+            Command::BeginContextReset(active_turn_id, reply) => {
+                let _ = reply.send(begin_context_reset(database, active_turn_id.as_deref()));
+            }
+            Command::ReadyContextReset(reply) => {
+                let _ = reply.send(ready_context_reset(database));
+            }
+            Command::MarkContextResetTurnTerminal(reset_id, turn_id, lifecycle, reply) => {
+                let _ = reply.send(mark_context_reset_turn_terminal(
+                    database, &reset_id, &turn_id, &lifecycle,
+                ));
+            }
+            Command::CompleteContextReset(
+                reset_id,
+                provider_session_id,
+                context_revision,
+                instruction_revision,
+                reply,
+            ) => {
+                let _ = reply.send(complete_context_reset(
+                    database,
+                    &reset_id,
+                    &provider_session_id,
+                    &context_revision,
+                    &instruction_revision,
+                ));
+            }
+            Command::FailContextReset(reset_id, error, reply) => {
+                let _ = reply.send(fail_context_reset(database, &reset_id, &error));
             }
             Command::Shutdown => break,
         }
@@ -1749,6 +1874,7 @@ fn runtime_status(database: &Path) -> Result<RuntimeStoreStatus, StoreError> {
         .optional()?;
     let batches = load_wake_batches(&connection)?;
     let agent_groups = load_agent_groups(&connection)?;
+    let context_resets = load_context_resets(&connection)?;
     Ok(RuntimeStoreStatus {
         owner,
         deliveries: scalar_u64(&connection, "SELECT COUNT(*) FROM deliveries")?,
@@ -1790,6 +1916,7 @@ fn runtime_status(database: &Path) -> Result<RuntimeStoreStatus, StoreError> {
             .optional()?,
         batches,
         agent_groups,
+        context_resets,
     })
 }
 
@@ -1846,6 +1973,38 @@ fn load_agent_groups(
             session_lifecycle: row.get(6)?,
             active_turn_id: row.get(7)?,
             turn_lifecycle: row.get(8)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+}
+
+fn load_context_resets(connection: &Connection) -> Result<Vec<ContextResetSummary>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT cr.reset_id,r.name_with_owner,w.kind,w.number,ai.profile_id,cr.lifecycle,
+                cr.continuation,old.provider_session_id,new.provider_session_id,
+                cr.context_revision_before,cr.context_revision_after
+         FROM context_resets cr
+         JOIN agent_instances ai ON ai.agent_id=cr.agent_id
+         JOIN assignments a ON a.assignment_id=ai.assignment_id
+         JOIN work_items w ON w.node_id=a.work_item_node_id
+         JOIN repositories r ON r.node_id=w.repository_node_id
+         JOIN provider_sessions old ON old.session_id=cr.old_session_id
+         LEFT JOIN provider_sessions new ON new.session_id=cr.new_session_id
+         ORDER BY cr.created_at,cr.reset_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(ContextResetSummary {
+            reset_id: row.get(0)?,
+            repository: row.get(1)?,
+            work_item_kind: row.get(2)?,
+            work_item_number: sqlite_i64_to_u64(row.get(3)?, "context reset Work Item number")?,
+            profile_id: row.get(4)?,
+            lifecycle: row.get(5)?,
+            continuation: row.get::<_, i64>(6)? != 0,
+            old_provider_session_id: row.get(7)?,
+            new_provider_session_id: row.get(8)?,
+            context_revision_before: row.get(9)?,
+            context_revision_after: row.get(10)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -2410,6 +2569,413 @@ fn fail_issue_assignment(
         [assignment_id],
     )?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn begin_context_reset(
+    database: &Path,
+    active_turn_id: Option<&str>,
+) -> Result<Option<ContextResetClaim>, StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let work_item_node_id = context_reset_work_item(&transaction, active_turn_id)?;
+    let Some(work_item_node_id) = work_item_node_id else {
+        transaction.commit()?;
+        return Ok(None);
+    };
+    let (agent_id, old_session_id, prior_revision, selected_turn_id) = transaction.query_row(
+        "SELECT ai.agent_id,ps.session_id,ps.context_revision,t.turn_id
+         FROM assignments a
+         JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
+         JOIN provider_sessions ps ON ps.agent_id=ai.agent_id
+         LEFT JOIN turns t ON t.session_id=ps.session_id AND t.lifecycle='running'
+         WHERE a.work_item_node_id=?1 AND a.lifecycle='active'
+           AND ps.lifecycle IN ('idle','running')
+         ORDER BY ps.started_at DESC LIMIT 1",
+        [&work_item_node_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        },
+    )?;
+    if active_turn_id != selected_turn_id.as_deref() {
+        return Err(StoreError::InvalidData(
+            "context reset active-turn precondition changed".into(),
+        ));
+    }
+    let events = context_reset_events(&transaction, &work_item_node_id)?;
+    if events.is_empty() {
+        transaction.commit()?;
+        return Ok(None);
+    }
+    let reset_id = Uuid::now_v7().to_string();
+    let continuation = selected_turn_id.is_some();
+    let reset_lifecycle = if continuation { "interrupting" } else { "materializing" };
+    transaction.execute(
+        "INSERT INTO context_resets(
+           reset_id,agent_id,old_session_id,active_turn_id,context_revision_before,
+           continuation,lifecycle,created_at,updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)",
+        params![
+            reset_id,
+            agent_id,
+            old_session_id,
+            selected_turn_id,
+            prior_revision,
+            i64::from(continuation),
+            reset_lifecycle,
+            now,
+        ],
+    )?;
+    for (ordinal, event_id) in events.iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO context_reset_events(reset_id,event_id,ordinal) VALUES (?1,?2,?3)",
+            params![reset_id, event_id, sqlite_usize(ordinal, "context reset event ordinal")?],
+        )?;
+        transaction.execute(
+            "UPDATE events SET lifecycle='resetting' WHERE event_id=?1 AND lifecycle='pending'",
+            [event_id],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE agent_instances SET lifecycle='reset_pending' WHERE agent_id=?1",
+        [&agent_id],
+    )?;
+    transaction.execute(
+        "UPDATE provider_sessions SET lifecycle='reset_pending' WHERE session_id=?1",
+        [&old_session_id],
+    )?;
+    let claim = load_context_reset_claim(&transaction, &reset_id)?;
+    transaction.commit()?;
+    Ok(Some(claim))
+}
+
+fn context_reset_work_item(
+    transaction: &rusqlite::Transaction<'_>,
+    active_turn_id: Option<&str>,
+) -> Result<Option<String>, StoreError> {
+    if let Some(turn_id) = active_turn_id {
+        return transaction
+            .query_row(
+                "SELECT w.node_id
+                 FROM turns t
+                 JOIN provider_sessions ps ON ps.session_id=t.session_id
+                 JOIN agent_instances ai ON ai.agent_id=ps.agent_id
+                 JOIN assignments a ON a.assignment_id=ai.assignment_id
+                 JOIN work_items w ON w.node_id=a.work_item_node_id
+                 WHERE t.turn_id=?1 AND t.lifecycle='running' AND ps.lifecycle='running'
+                   AND a.lifecycle='active' AND w.kind='issue'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM context_resets cr
+                     WHERE cr.agent_id=ai.agent_id
+                       AND cr.lifecycle IN ('interrupting','materializing')
+                   )
+                   AND EXISTS (
+                     SELECT 1 FROM events e
+                     WHERE e.work_item_node_id=w.node_id AND e.lifecycle='pending'
+                       AND e.classification='hard_invalidation' AND e.origin!='agent'
+                       AND (e.mention_candidate=0 OR e.trusted_mention=0)
+                   )",
+                [turn_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(StoreError::from);
+    }
+    transaction
+        .query_row(
+            "SELECT w.node_id
+             FROM events e
+             JOIN work_items w ON w.node_id=e.work_item_node_id
+             JOIN assignments a ON a.work_item_node_id=w.node_id AND a.lifecycle='active'
+             JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
+             JOIN provider_sessions ps ON ps.agent_id=ai.agent_id AND ps.lifecycle='idle'
+             WHERE e.lifecycle='pending' AND e.classification='hard_invalidation'
+               AND e.origin!='agent' AND w.kind='issue'
+               AND (e.mention_candidate=0 OR e.trusted_mention=0)
+               AND NOT EXISTS (
+                 SELECT 1 FROM context_resets cr
+                 WHERE cr.agent_id=ai.agent_id
+                   AND cr.lifecycle IN ('interrupting','materializing')
+               )
+             ORDER BY e.observed_at,e.event_id LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn context_reset_events(
+    transaction: &rusqlite::Transaction<'_>,
+    work_item_node_id: &str,
+) -> Result<Vec<String>, StoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT event_id FROM events
+         WHERE work_item_node_id=?1 AND lifecycle='pending'
+           AND classification='hard_invalidation' AND origin!='agent'
+           AND (mention_candidate=0 OR trusted_mention=0)
+         ORDER BY observed_at,event_id",
+    )?;
+    let rows = statement.query_map([work_item_node_id], |row| row.get::<_, String>(0))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+}
+
+fn ready_context_reset(database: &Path) -> Result<Option<ContextResetClaim>, StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_only(database)?;
+    let reset_id = connection
+        .query_row(
+            "SELECT reset_id FROM context_resets
+             WHERE lifecycle='materializing' ORDER BY created_at,reset_id LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    reset_id.map(|reset_id| load_context_reset_claim(&connection, &reset_id)).transpose()
+}
+
+fn load_context_reset_claim(
+    connection: &Connection,
+    reset_id: &str,
+) -> Result<ContextResetClaim, StoreError> {
+    let mut claim = connection.query_row(
+        "SELECT cr.reset_id,r.name_with_owner,w.number,ai.profile_id,
+                ps.provider_session_id,cr.active_turn_id,t.provider_turn_id,cr.continuation
+         FROM context_resets cr
+         JOIN agent_instances ai ON ai.agent_id=cr.agent_id
+         JOIN assignments a ON a.assignment_id=ai.assignment_id
+         JOIN work_items w ON w.node_id=a.work_item_node_id
+         JOIN repositories r ON r.node_id=w.repository_node_id
+         JOIN provider_sessions ps ON ps.session_id=cr.old_session_id
+         LEFT JOIN turns t ON t.turn_id=cr.active_turn_id
+         WHERE cr.reset_id=?1",
+        [reset_id],
+        |row| {
+            Ok(ContextResetClaim {
+                reset_id: row.get(0)?,
+                repository: row.get(1)?,
+                number: sqlite_i64_to_u64(row.get(2)?, "context reset Issue number")?,
+                profile_id: row.get(3)?,
+                old_provider_session_id: row.get(4)?,
+                active_turn_id: row.get(5)?,
+                provider_turn_id: row.get(6)?,
+                references: Vec::new(),
+                continuation: row.get::<_, i64>(7)? != 0,
+            })
+        },
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT e.reference FROM context_reset_events cre
+         JOIN events e ON e.event_id=cre.event_id
+         WHERE cre.reset_id=?1 ORDER BY cre.ordinal",
+    )?;
+    claim.references = statement
+        .query_map([reset_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(claim)
+}
+
+fn mark_context_reset_turn_terminal(
+    database: &Path,
+    reset_id: &str,
+    turn_id: &str,
+    lifecycle: &str,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    if !matches!(lifecycle, "completed" | "interrupted" | "failed") {
+        return Err(StoreError::InvalidData(format!("invalid reset turn terminal {lifecycle}")));
+    }
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let reset_matches = transaction
+        .query_row(
+            "SELECT 1 FROM context_resets
+             WHERE reset_id=?1 AND active_turn_id=?2 AND lifecycle='interrupting'",
+            params![reset_id, turn_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !reset_matches {
+        return Err(StoreError::InvalidData(format!(
+            "context reset {reset_id} is not interrupting turn {turn_id}"
+        )));
+    }
+    let updated = transaction.execute(
+        "UPDATE turns SET lifecycle=?2,ended_at=?3
+         WHERE turn_id=?1 AND lifecycle IN ('starting','running')",
+        params![turn_id, lifecycle, now],
+    )?;
+    if updated != 1 {
+        return Err(StoreError::InvalidData(format!("turn {turn_id} is not active")));
+    }
+    remove_turn_rocket(&transaction, turn_id, &now)?;
+    transaction.execute(
+        "UPDATE context_resets SET lifecycle='materializing',updated_at=?2
+         WHERE reset_id=?1 AND lifecycle='interrupting'",
+        params![reset_id, now],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn complete_context_reset(
+    database: &Path,
+    reset_id: &str,
+    provider_session_id: &str,
+    context_revision: &str,
+    instruction_revision: &str,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let (agent_id, old_session_id, work_item_node_id, continuation) = transaction
+        .query_row(
+            "SELECT cr.agent_id,cr.old_session_id,a.work_item_node_id,cr.continuation
+             FROM context_resets cr
+             JOIN agent_instances ai ON ai.agent_id=cr.agent_id
+             JOIN assignments a ON a.assignment_id=ai.assignment_id
+             WHERE cr.reset_id=?1 AND cr.lifecycle='materializing'",
+            [reset_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::InvalidData(format!("context reset {reset_id} is not materializing"))
+        })?;
+    let new_session_id = Uuid::now_v7().to_string();
+    transaction.execute(
+        "INSERT INTO provider_sessions(
+           session_id,agent_id,provider_kind,provider_session_id,context_revision,
+           instruction_revision,lifecycle,started_at
+         ) VALUES (?1,?2,'codex',?3,?4,?5,'idle',?6)",
+        params![
+            new_session_id,
+            agent_id,
+            provider_session_id,
+            context_revision,
+            instruction_revision,
+            now,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE provider_sessions SET lifecycle='replaced' WHERE session_id=?1",
+        [&old_session_id],
+    )?;
+    transaction
+        .execute("UPDATE agent_instances SET lifecycle='idle' WHERE agent_id=?1", [&agent_id])?;
+    transaction.execute(
+        "UPDATE work_items SET context_revision=?2,observed_at=?3 WHERE node_id=?1",
+        params![work_item_node_id, context_revision, now],
+    )?;
+    transaction.execute(
+        "UPDATE context_resets SET new_session_id=?2,context_revision_after=?3,
+           lifecycle='applied',updated_at=?4 WHERE reset_id=?1",
+        params![reset_id, new_session_id, context_revision, now],
+    )?;
+    let event_ids = {
+        let mut statement = transaction.prepare(
+            "SELECT event_id FROM context_reset_events WHERE reset_id=?1 ORDER BY ordinal",
+        )?;
+        statement
+            .query_map([reset_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if continuation {
+        let policy = SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 };
+        for event_id in &event_ids {
+            schedule_event(&transaction, &work_item_node_id, event_id, policy, true, &now)?;
+        }
+    }
+    for event_id in event_ids {
+        transaction.execute(
+            "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='resetting'",
+            [event_id],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn fail_context_reset(database: &Path, reset_id: &str, error: &str) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let agent_id = transaction
+        .query_row(
+            "SELECT agent_id FROM context_resets
+             WHERE reset_id=?1 AND lifecycle IN ('interrupting','materializing')",
+            [reset_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::InvalidData(format!("context reset {reset_id} is not active"))
+        })?;
+    transaction.execute(
+        "UPDATE context_resets SET lifecycle='blocked',error=?2,updated_at=?3 WHERE reset_id=?1",
+        params![reset_id, error, now],
+    )?;
+    transaction
+        .execute("UPDATE agent_instances SET lifecycle='blocked' WHERE agent_id=?1", [&agent_id])?;
+    transaction.execute(
+        "UPDATE provider_sessions SET lifecycle='blocked'
+         WHERE agent_id=?1 AND lifecycle='reset_pending'",
+        [&agent_id],
+    )?;
+    transaction.execute(
+        "UPDATE events SET lifecycle='blocked' WHERE event_id IN (
+           SELECT event_id FROM context_reset_events WHERE reset_id=?1
+         ) AND lifecycle='resetting'",
+        [reset_id],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn remove_turn_rocket(
+    transaction: &rusqlite::Transaction<'_>,
+    turn_id: &str,
+    now: &str,
+) -> Result<(), StoreError> {
+    let target = transaction
+        .query_row(
+            "SELECT o.repository,o.target_kind,o.target_database_id
+             FROM turns t
+             JOIN wake_batch_events be ON be.batch_id=t.batch_id
+             JOIN events e ON e.event_id=be.event_id AND e.trusted_mention=1
+             JOIN github_write_outbox o ON o.event_id=e.event_id
+             WHERE t.turn_id=?1 LIMIT 1",
+            [turn_id],
+            |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            },
+        )
+        .optional()?;
+    if let Some((repository, target_kind, target_database_id)) = target {
+        enqueue_rocket_removal(transaction, &repository, &target_kind, &target_database_id, now)?;
+    }
     Ok(())
 }
 
