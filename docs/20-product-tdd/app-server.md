@@ -139,4 +139,3 @@ The probe observed distinct provider thread IDs and successful empty responses
 from both injection calls. Earlier executable probes additionally established
 non-steerable compact turns, terminal interrupt behavior, resume after a
 materialized rollout, and the append-only nature of injection.
-
