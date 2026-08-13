@@ -41,3 +41,13 @@ eight-event release threshold, trusted visible `@braid`, canonical
 reconciliation during tunnel loss, pending-batch restart, and graceful webhook
 URL restoration. It observes only public CLI/health/GitHub surfaces and never
 starts a provider turn.
+
+The default `BRAID_TEST_WEBHOOK_MODE=app` also proves App webhook handoff and
+restoration. When GitHub has no App webhook object yet and its settings UI
+cannot bootstrap one, the bounded `repository` mode can prove the transport
+behavior without recreating the App. Start a Quick Tunnel to an unused local
+ingress, then provide its `/webhook` URL through
+`BRAID_TEST_PUBLIC_WEBHOOK_URL`; the helper creates and deletes one temporary
+repository webhook and accepts optional `BRAID_TEST_INGRESS` and
+`BRAID_TEST_HEALTH` loopback addresses. This mode does not prove App event
+subscriptions or App webhook handoff/restoration, and its JSON verdict says so.

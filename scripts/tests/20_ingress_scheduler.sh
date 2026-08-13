@@ -5,11 +5,17 @@ readonly script_name="$(basename "$0")"
 readonly config_path="${BRAID_CONFIG:-}"
 readonly binary="${BRAID_BIN:-$(command -v braid || true)}"
 readonly keep_fixtures="${BRAID_TEST_KEEP_FIXTURES:-0}"
+readonly webhook_mode="${BRAID_TEST_WEBHOOK_MODE:-app}"
+readonly repository_webhook_url="${BRAID_TEST_PUBLIC_WEBHOOK_URL:-}"
+readonly ingress_address="${BRAID_TEST_INGRESS:-127.0.0.1:18080}"
+readonly health_address="${BRAID_TEST_HEALTH:-127.0.0.1:18081}"
+readonly health_url="http://$health_address/healthz"
 
 runtime_pid=""
 temporary_root=""
 fixture_issues=()
 prior_webhook_url=""
+repository_hook_id=""
 
 fail() {
     printf '%s: FAIL: %s\n' "$script_name" "$*" >&2
@@ -35,6 +41,9 @@ stop_runtime() {
 cleanup() {
     local status=$?
     stop_runtime
+    if [[ -n "$repository_hook_id" ]]; then
+        gh api --method DELETE "repos/$repository/hooks/$repository_hook_id" >/dev/null 2>&1 || true
+    fi
     if [[ "$keep_fixtures" != "1" ]]; then
         for issue in "${fixture_issues[@]:-}"; do
             gh issue close "$issue" --repo "$repository" --comment "Braid Slice 2 black-box fixture closed." >/dev/null 2>&1 || true
@@ -56,6 +65,12 @@ trap cleanup EXIT INT TERM
     fail "set BRAID_CONFIG to an absolute acceptance configuration path"
 [[ -n "${BRAID_WEBHOOK_SECRET:-}" ]] || \
     fail "BRAID_WEBHOOK_SECRET must match the dedicated GitHub App webhook secret"
+[[ "$webhook_mode" == "app" || "$webhook_mode" == "repository" ]] || \
+    fail "BRAID_TEST_WEBHOOK_MODE must be app or repository"
+if [[ "$webhook_mode" == "repository" ]]; then
+    [[ "$repository_webhook_url" == https://*.trycloudflare.com/webhook ]] || \
+        fail "repository mode requires BRAID_TEST_PUBLIC_WEBHOOK_URL=https://<quick-tunnel>/webhook"
+fi
 
 for command in curl gh jq sed mktemp; do
     require_command "$command"
@@ -64,7 +79,9 @@ done
 gh auth status >/dev/null 2>&1 || fail "gh must be authenticated as the Human fixture actor"
 repository="$($binary config check --config "$config_path" --json | jq -er '.repository')"
 app_actor="$($binary github probe --config "$config_path" --repository "$repository" --json | jq -er '.actor_login')"
-prior_webhook_url="$($binary github webhook --config "$config_path" --json | jq -er '.url')"
+if [[ "$webhook_mode" == "app" ]]; then
+    prior_webhook_url="$($binary github webhook --config "$config_path" --json | jq -er '.url')"
+fi
 
 temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/braid-slice2.XXXXXX")"
 readonly runtime_root="$temporary_root/runtime"
@@ -75,13 +92,18 @@ mkdir -p "$runtime_root/state/backups"
 awk \
     -v root="$runtime_root" \
     -v database="$runtime_root/state/braid.sqlite3" \
-    -v backups="$runtime_root/state/backups" '
+    -v backups="$runtime_root/state/backups" \
+    -v ingress="$ingress_address" \
+    -v health="$health_address" '
     /^\[runtime\]$/ { in_runtime=1; print; next }
-    /^\[/ && $0 != "[runtime]" { in_runtime=0 }
+    /^\[server\]$/ { in_runtime=0; in_server=1; print; next }
+    /^\[/ && $0 != "[runtime]" && $0 != "[server]" { in_runtime=0; in_server=0 }
     in_runtime && /^root = / { printf "root = \"%s\"\n", root; next }
     in_runtime && /^database = / { printf "database = \"%s\"\n", database; next }
     in_runtime && /^backups = / { printf "backups = \"%s\"\n", backups; next }
     in_runtime && /^auto_migrate = / { print "auto_migrate = false"; next }
+    in_server && /^ingress = / { printf "ingress = \"%s\"\n", ingress; next }
+    in_server && /^health = / { printf "health = \"%s\"\n", health; next }
     { print }
 ' "$config_path" > "$test_config"
 
@@ -98,9 +120,12 @@ batch_json() {
 }
 
 wait_for_health() {
-    local attempt
+    local attempt expected_tunnel
     for attempt in $(seq 1 120); do
-        if curl -fsS http://127.0.0.1:8081/healthz 2>/dev/null | jq -e '.ready == true and .tunnel == "connected"' >/dev/null; then
+        expected_tunnel="connected"
+        [[ "$webhook_mode" == "repository" ]] && expected_tunnel="disabled"
+        if curl -fsS "$health_url" 2>/dev/null | \
+            jq -e --arg tunnel "$expected_tunnel" '.ready == true and .tunnel == $tunnel' >/dev/null; then
             return 0
         fi
         if ! kill -0 "$runtime_pid" 2>/dev/null; then
@@ -113,17 +138,31 @@ wait_for_health() {
 
 start_runtime() {
     : > "$runtime_log"
-    BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" \
-        "$binary" serve --config "$test_config" --tunnel >"$runtime_log" 2>&1 &
+    if [[ "$webhook_mode" == "app" ]]; then
+        BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
+            --config "$test_config" --tunnel >"$runtime_log" 2>&1 &
+    else
+        BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
+            --config "$test_config" >"$runtime_log" 2>&1 &
+    fi
     runtime_pid=$!
     wait_for_health
-    local runtime_url app_url
-    runtime_url="$(curl -fsS http://127.0.0.1:8081/healthz | jq -er '.webhook_url')"
-    app_url="$($binary github webhook --config "$test_config" --json | jq -er '.url')"
-    [[ "$runtime_url" == "$app_url" ]] || fail "runtime and GitHub App webhook URLs diverged"
+    if [[ "$webhook_mode" == "app" ]]; then
+        local runtime_url app_url
+        runtime_url="$(curl -fsS "$health_url" | jq -er '.webhook_url')"
+        app_url="$($binary github webhook --config "$test_config" --json | jq -er '.url')"
+        [[ "$runtime_url" == "$app_url" ]] || fail "runtime and GitHub App webhook URLs diverged"
+    elif [[ -z "$repository_hook_id" ]]; then
+        repository_hook_id="$(jq -cn \
+            --arg url "$repository_webhook_url" \
+            '{name:"web",active:true,events:["issues","issue_comment","pull_request","pull_request_review","pull_request_review_comment"],config:{url:$url,content_type:"json",insecure_ssl:"0",secret:env.BRAID_WEBHOOK_SECRET}}' | \
+            gh api --method POST "repos/$repository/hooks" --input - --jq '.id')"
+        [[ -n "$repository_hook_id" ]] || fail "GitHub did not create the temporary repository webhook"
+    fi
 }
 
 wait_for_restoration() {
+    [[ "$webhook_mode" == "repository" ]] && return 0
     local attempt current
     for attempt in $(seq 1 30); do
         current="$($binary github webhook --config "$test_config" --json | jq -er '.url')"
@@ -185,24 +224,33 @@ wait_for_batch() {
 }
 
 latest_delivery_id() {
-    local after_id=$1 event=$2 action=$3 attempt id
+    local after_id=$1 event=$2 action=$3 attempt id deliveries
     for attempt in $(seq 1 45); do
-        id="$($binary github deliveries --config "$test_config" --json | jq -r \
-            --argjson after "$after_id" --arg event "$event" --arg action "$action" \
-            '[.[] | select(.id > $after and .event == $event and .action == $action)] | max_by(.id) | .id // empty')"
+        if [[ "$webhook_mode" == "app" ]]; then
+            deliveries="$($binary github deliveries --config "$test_config" --json)"
+        else
+            deliveries="$(gh api "repos/$repository/hooks/$repository_hook_id/deliveries?per_page=100")"
+        fi
+        id="$(jq -r --argjson after "$after_id" --arg event "$event" --arg action "$action" \
+            '[.[] | select(.id > $after and .event == $event and .action == $action)] | max_by(.id) | .id // empty' \
+            <<<"$deliveries")"
         [[ -n "$id" ]] && { printf '%s' "$id"; return 0; }
         sleep 1
     done
-    fail "GitHub App delivery $event/$action did not appear"
+    fail "GitHub delivery $event/$action did not appear"
 }
 
-note "starting real Quick Tunnel and GitHub App transport"
+note "starting real Quick Tunnel and GitHub transport ($webhook_mode webhook mode)"
 start_runtime
 
 note "proving durable ingest, eyes, redelivery dedupe, and quiet-window reset"
 basic_issue="$(new_issue "durable ingress")"
 fixture_issues+=("$basic_issue")
-before_delivery="$($binary github deliveries --config "$test_config" --json | jq '[.[].id] | max // 0')"
+if [[ "$webhook_mode" == "app" ]]; then
+    before_delivery="$($binary github deliveries --config "$test_config" --json | jq '[.[].id] | max // 0')"
+else
+    before_delivery="$(gh api "repos/$repository/hooks/$repository_hook_id/deliveries?per_page=100" --jq '[.[].id] | max // 0')"
+fi
 first_comment="$(new_comment "$basic_issue" "first ordinary event")"
 wait_for_eyes "$first_comment"
 created_delivery="$(latest_delivery_id "$before_delivery" issue_comment created)"
@@ -215,7 +263,11 @@ second_batch="$(wait_for_batch "$basic_issue" '.lifecycle == "pending" and .even
 second_deadline="$(jq -r .quiet_deadline <<<"$second_batch")"
 [[ "$second_deadline" > "$first_deadline" ]] || fail "quiet deadline did not move forward"
 
-$binary github redeliver "$created_delivery" --config "$test_config" >/dev/null
+if [[ "$webhook_mode" == "app" ]]; then
+    $binary github redeliver "$created_delivery" --config "$test_config" >/dev/null
+else
+    gh api --method POST "repos/$repository/hooks/$repository_hook_id/deliveries/$created_delivery/attempts" >/dev/null
+fi
 for _ in $(seq 1 30); do
     duplicates="$(status_json | jq -r '.transport.duplicate_deliveries')"
     [[ "$duplicates" -ge 1 ]] && break
@@ -263,7 +315,11 @@ wait_for_batch "$restart_issue" '.lifecycle == "pending" and .event_count == 1' 
 stop_runtime
 wait_for_restoration
 
-before_lost_delivery="$($binary github deliveries --config "$test_config" --json | jq '[.[].id] | max // 0')"
+if [[ "$webhook_mode" == "app" ]]; then
+    before_lost_delivery="$($binary github deliveries --config "$test_config" --json | jq '[.[].id] | max // 0')"
+else
+    before_lost_delivery="$(gh api "repos/$repository/hooks/$repository_hook_id/deliveries?per_page=100" --jq '[.[].id] | max // 0')"
+fi
 lost_comment="$(new_comment "$restart_issue" 'created while the local tunnel is unavailable')"
 lost_delivery="$(latest_delivery_id "$before_lost_delivery" issue_comment created)"
 
@@ -273,7 +329,11 @@ wait_for_batch "$restart_issue" '.event_count >= 2' >/dev/null
 edit_comment "$lost_comment" 'newer canonical body after runtime recovery'
 sleep 3
 count_before_old="$(batch_json "$restart_issue" | jq -r .event_count)"
-$binary github redeliver "$lost_delivery" --config "$test_config" >/dev/null
+if [[ "$webhook_mode" == "app" ]]; then
+    $binary github redeliver "$lost_delivery" --config "$test_config" >/dev/null
+else
+    gh api --method POST "repos/$repository/hooks/$repository_hook_id/deliveries/$lost_delivery/attempts" >/dev/null
+fi
 sleep 5
 count_after_old="$(batch_json "$restart_issue" | jq -r .event_count)"
 [[ "$count_after_old" == "$count_before_old" ]] || \
@@ -285,6 +345,7 @@ wait_for_restoration
 jq -n \
     --arg repository "$repository" \
     --arg app_actor "$app_actor" \
+    --arg webhook_mode "$webhook_mode" \
     --argjson durable_issue "$basic_issue" \
     --argjson threshold_issue "$threshold_issue" \
     --argjson grammar_issue "$grammar_issue" \
@@ -292,7 +353,8 @@ jq -n \
     --argjson restart_issue "$restart_issue" \
     '{
         verdict:"PASS",
-        boundary:"real GitHub App -> Quick Tunnel -> packaged Braid -> GitHub reactions/status",
+        boundary:"real GitHub webhook -> Quick Tunnel -> packaged Braid -> Braid App reactions/status",
+        webhook_mode:$webhook_mode,
         repository:$repository,
         app_actor:$app_actor,
         fixtures:[$durable_issue,$threshold_issue,$grammar_issue,$urgent_issue,$restart_issue]
