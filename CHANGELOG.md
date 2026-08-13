@@ -24,3 +24,11 @@ Versioning once release artifacts are published.
 - Public `github probe` and `context issue|pr` diagnostic commands.
 - A bounded public Context page-size diagnostic for repeatable real GraphQL
   pagination campaigns without manufacturing high-volume comment fixtures.
+- Verified Axum webhook ingress, durable delivery/event ledgers, canonical
+  GitHub reconciliation, debounce/count scheduling, trusted visible mention
+  resolution, Braid-owned `eyes` outbox, and owner fencing.
+- Supervised free Quick Tunnel ingress with signed public readiness, App
+  webhook handoff/restoration, delivery inspection/redelivery, and bounded
+  transport status.
+- The public `scripts/tests/20_ingress_scheduler.sh` real-object campaign for
+  Slice 2 transport behavior, with provider turns intentionally disabled.

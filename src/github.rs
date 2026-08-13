@@ -125,6 +125,8 @@ pub struct GitHubIdentity {
     pub installation_id: u64,
     pub repository: String,
     pub repository_node_id: String,
+    pub actor_node_id: String,
+    pub actor_login: String,
     pub token_expires_at: String,
     pub permissions: BTreeMap<String, String>,
 }
@@ -146,6 +148,7 @@ impl GitHubClient {
         let http = Client::builder()
             .user_agent(format!("braid/{}", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(30))
+            .tls_backend_rustls()
             .build()
             .map_err(GitHubError::Client)?;
         let app_jwt = app_jwt(config)?;
@@ -168,6 +171,7 @@ impl GitHubClient {
         )
         .await?;
         let repository_info = repository_identity(&http, &access.token, repository).await?;
+        let actor = viewer_identity(&http, &access.token).await?;
         validate_read_permissions(&access.permissions, config.projects_v2_enabled)?;
         Ok(Self {
             http,
@@ -181,6 +185,8 @@ impl GitHubClient {
                 installation_id: installation.id,
                 repository: repository_info.name_with_owner,
                 repository_node_id: repository_info.id,
+                actor_node_id: actor.id,
+                actor_login: actor.login,
                 token_expires_at: access.expires_at,
                 permissions: access.permissions,
             },
@@ -232,6 +238,95 @@ impl GitHubClient {
         }
         envelope.data.ok_or(GitHubError::MissingData)
     }
+
+    pub async fn repository_permission(&self, login: &str) -> Result<String, GitHubError> {
+        let path = format!("/repos/{}/collaborators/{login}/permission", self.identity.repository);
+        let permission = rest_get::<PermissionResponse>(
+            &self.http,
+            &path,
+            &self.installation_token,
+            &self.api_version,
+        )
+        .await?;
+        Ok(permission.role_name.unwrap_or(permission.permission))
+    }
+
+    pub async fn add_reaction(
+        &self,
+        target_kind: &str,
+        database_id: &str,
+        content: &str,
+    ) -> Result<u64, GitHubError> {
+        let path = match target_kind {
+            "issue_comment" => format!(
+                "/repos/{}/issues/comments/{database_id}/reactions",
+                self.identity.repository
+            ),
+            "review_comment" => format!(
+                "/repos/{}/pulls/comments/{database_id}/reactions",
+                self.identity.repository
+            ),
+            other => {
+                return Err(GitHubError::GraphQl(format!("unsupported reaction target {other:?}")));
+            }
+        };
+        let reaction: ReactionResponse = rest_post(
+            &self.http,
+            &path,
+            &self.installation_token,
+            &self.api_version,
+            &ReactionRequest { content },
+        )
+        .await?;
+        Ok(reaction.id)
+    }
+
+    pub async fn app_webhook_config(&self) -> Result<AppWebhookConfig, GitHubError> {
+        let jwt = app_jwt(&self.config)?;
+        rest_get(&self.http, "/app/hook/config", &jwt, &self.api_version).await
+    }
+
+    pub async fn update_app_webhook(
+        &self,
+        url: &str,
+        secret: Option<&str>,
+    ) -> Result<AppWebhookConfig, GitHubError> {
+        let jwt = app_jwt(&self.config)?;
+        rest_patch(
+            &self.http,
+            "/app/hook/config",
+            &jwt,
+            &self.api_version,
+            &AppWebhookUpdate { url, content_type: "json", insecure_ssl: "0", secret },
+        )
+        .await
+    }
+
+    pub async fn app_deliveries(&self) -> Result<Vec<AppDeliverySummary>, GitHubError> {
+        let jwt = app_jwt(&self.config)?;
+        rest_get(&self.http, "/app/hook/deliveries?per_page=100", &jwt, &self.api_version).await
+    }
+
+    pub async fn redeliver(&self, delivery_id: u64) -> Result<(), GitHubError> {
+        let jwt = app_jwt(&self.config)?;
+        let response = self
+            .http
+            .post(format!("{API_ROOT}/app/hook/deliveries/{delivery_id}/attempts"))
+            .bearer_auth(jwt)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", &self.api_version)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(GitHubError::Transport)?;
+        let status = response.status();
+        if status == StatusCode::ACCEPTED {
+            Ok(())
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            Err(GitHubError::Http { status, body: bounded(&body, 1024).to_owned() })
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -281,6 +376,48 @@ async fn rest_post_empty<T: DeserializeOwned>(
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", api_version)
             .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(GitHubError::Transport)?,
+    )
+    .await
+}
+
+async fn rest_post<B: Serialize + ?Sized, T: DeserializeOwned>(
+    client: &Client,
+    path: &str,
+    token: &str,
+    api_version: &str,
+    body: &B,
+) -> Result<T, GitHubError> {
+    rest_response(
+        client
+            .post(format!("{API_ROOT}{path}"))
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", api_version)
+            .json(body)
+            .send()
+            .await
+            .map_err(GitHubError::Transport)?,
+    )
+    .await
+}
+
+async fn rest_patch<B: Serialize + ?Sized, T: DeserializeOwned>(
+    client: &Client,
+    path: &str,
+    token: &str,
+    api_version: &str,
+    body: &B,
+) -> Result<T, GitHubError> {
+    rest_response(
+        client
+            .patch(format!("{API_ROOT}{path}"))
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", api_version)
+            .json(body)
             .send()
             .await
             .map_err(GitHubError::Transport)?,
@@ -346,6 +483,61 @@ struct RepositoryIdentityNode {
     name_with_owner: String,
 }
 
+#[derive(Deserialize)]
+struct ViewerIdentityData {
+    viewer: ViewerIdentity,
+}
+
+#[derive(Deserialize)]
+struct ViewerIdentity {
+    id: String,
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct PermissionResponse {
+    permission: String,
+    role_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ReactionRequest<'a> {
+    content: &'a str,
+}
+
+#[derive(Deserialize)]
+struct ReactionResponse {
+    id: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AppWebhookConfig {
+    pub url: String,
+    pub content_type: String,
+    pub insecure_ssl: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AppDeliverySummary {
+    pub id: u64,
+    pub guid: String,
+    pub event: String,
+    pub action: Option<String>,
+    pub status: String,
+    pub status_code: u16,
+    pub delivered_at: String,
+    pub redelivery: bool,
+}
+
+#[derive(Serialize)]
+struct AppWebhookUpdate<'a> {
+    url: &'a str,
+    content_type: &'static str,
+    insecure_ssl: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret: Option<&'a str>,
+}
+
 async fn repository_identity(
     client: &Client,
     token: &str,
@@ -377,6 +569,32 @@ async fn repository_identity(
         ));
     }
     envelope.data.and_then(|data| data.repository).ok_or(GitHubError::MissingData)
+}
+
+async fn viewer_identity(client: &Client, token: &str) -> Result<ViewerIdentity, GitHubError> {
+    let response = client
+        .post(GRAPHQL_URL)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .json(&serde_json::json!({"query":"query{viewer{id login}}","variables":{}}))
+        .send()
+        .await
+        .map_err(GitHubError::Transport)?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(GitHubError::Http { status, body: bounded(&body, 1024).to_owned() });
+    }
+    let envelope = response
+        .json::<GraphQlEnvelope<ViewerIdentityData>>()
+        .await
+        .map_err(GitHubError::Response)?;
+    if !envelope.errors.is_empty() {
+        return Err(GitHubError::GraphQl(
+            envelope.errors.into_iter().map(|error| error.message).collect::<Vec<_>>().join("; "),
+        ));
+    }
+    Ok(envelope.data.ok_or(GitHubError::MissingData)?.viewer)
 }
 
 fn bounded(value: &str, bytes: usize) -> &str {

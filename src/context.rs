@@ -203,6 +203,25 @@ pub struct RenderedContext {
     pub pressure: ContextPressure,
 }
 
+#[derive(Debug, Clone)]
+pub struct CanonicalObservation {
+    pub work_item_node_id: String,
+    pub work_item_kind: &'static str,
+    pub work_item_number: u64,
+    pub work_item_state: String,
+    pub repository_node_id: String,
+    pub repository: String,
+    pub object_node_id: String,
+    pub database_id: String,
+    pub object_kind: &'static str,
+    pub version: String,
+    pub digest: String,
+    pub lifecycle: &'static str,
+    pub author_node_id: Option<String>,
+    pub author_login: Option<String>,
+    pub body: Option<String>,
+}
+
 pub async fn materialize_issue(
     client: &GitHubClient,
     locator: &WorkItemLocator,
@@ -370,6 +389,228 @@ pub fn record_context_revision(
     Ok(())
 }
 
+pub fn canonical_observations(context: &CanonicalContext) -> Vec<CanonicalObservation> {
+    match context {
+        CanonicalContext::Issue(issue) => {
+            let mut observations = vec![issue_observation(issue)];
+            observations.extend(
+                issue
+                    .comments
+                    .iter()
+                    .filter(|comment| !comment.deleted)
+                    .map(|comment| observation(issue, "issue_comment", comment)),
+            );
+            observations
+        }
+        CanonicalContext::PullRequest(pull_request) => {
+            let mut observations = vec![pull_request_observation(pull_request)];
+            observations.extend(
+                pull_request
+                    .conversation
+                    .iter()
+                    .filter(|comment| !comment.deleted)
+                    .map(|comment| pr_observation(pull_request, "pr_comment", comment)),
+            );
+            observations.extend(
+                pull_request.reviews.iter().map(|review| review_observation(pull_request, review)),
+            );
+            observations.extend(
+                pull_request
+                    .review_threads
+                    .iter()
+                    .map(|thread| review_thread_observation(pull_request, thread)),
+            );
+            observations.extend(
+                pull_request
+                    .review_threads
+                    .iter()
+                    .flat_map(|thread| &thread.comments)
+                    .filter(|comment| !comment.deleted)
+                    .map(|comment| pr_observation(pull_request, "review_comment", comment)),
+            );
+            observations
+        }
+    }
+}
+
+fn issue_observation(issue: &IssueSnapshot) -> CanonicalObservation {
+    CanonicalObservation {
+        work_item_node_id: issue.node_id.clone(),
+        work_item_kind: "issue",
+        work_item_number: issue.number,
+        work_item_state: issue.state.clone(),
+        repository_node_id: issue.repository_node_id.clone(),
+        repository: issue.repository.clone(),
+        object_node_id: issue.node_id.clone(),
+        database_id: issue.database_id.clone(),
+        object_kind: "issue",
+        version: issue.updated_at.clone(),
+        digest: root_digest(&issue.node_id, &issue.state, &issue.updated_at),
+        lifecycle: "active",
+        author_node_id: issue.author.as_ref().map(|author| author.node_id.clone()),
+        author_login: issue.author.as_ref().map(|author| author.login.clone()),
+        body: Some(issue.body.clone()),
+    }
+}
+
+fn pull_request_observation(pull_request: &PullRequestSnapshot) -> CanonicalObservation {
+    CanonicalObservation {
+        work_item_node_id: pull_request.node_id.clone(),
+        work_item_kind: "pr",
+        work_item_number: pull_request.number,
+        work_item_state: pull_request.state.clone(),
+        repository_node_id: pull_request.repository_node_id.clone(),
+        repository: pull_request.repository.clone(),
+        object_node_id: pull_request.node_id.clone(),
+        database_id: pull_request.database_id.clone(),
+        object_kind: "pr",
+        version: pull_request.updated_at.clone(),
+        digest: root_digest(&pull_request.node_id, &pull_request.state, &pull_request.updated_at),
+        lifecycle: "active",
+        author_node_id: pull_request.author.as_ref().map(|author| author.node_id.clone()),
+        author_login: pull_request.author.as_ref().map(|author| author.login.clone()),
+        body: Some(pull_request.body.clone()),
+    }
+}
+
+fn review_observation(
+    pull_request: &PullRequestSnapshot,
+    review: &ReviewSnapshot,
+) -> CanonicalObservation {
+    let version = review.updated_at.clone();
+    let lifecycle = if review.minimized {
+        "minimized"
+    } else if review.state.eq_ignore_ascii_case("dismissed") {
+        "dismissed"
+    } else {
+        "active"
+    };
+    CanonicalObservation {
+        work_item_node_id: pull_request.node_id.clone(),
+        work_item_kind: "pr",
+        work_item_number: pull_request.number,
+        work_item_state: pull_request.state.clone(),
+        repository_node_id: pull_request.repository_node_id.clone(),
+        repository: pull_request.repository.clone(),
+        object_node_id: review.node_id.clone(),
+        database_id: review.database_id.clone(),
+        object_kind: "review",
+        digest: object_digest(&review.node_id, &version, Some(&review.body)),
+        version,
+        lifecycle,
+        author_node_id: review.author.as_ref().map(|author| author.node_id.clone()),
+        author_login: review.author.as_ref().map(|author| author.login.clone()),
+        body: Some(review.body.clone()),
+    }
+}
+
+fn review_thread_observation(
+    pull_request: &PullRequestSnapshot,
+    thread: &ReviewThreadSnapshot,
+) -> CanonicalObservation {
+    let lifecycle = if thread.resolved { "resolved" } else { "active" };
+    let version = format!(
+        "{}:{}:{}:{}:{}:{}",
+        lifecycle,
+        thread.collapsed,
+        thread.outdated,
+        thread.path,
+        thread.line.map_or_else(String::new, |line| line.to_string()),
+        thread.comments.iter().map(|comment| comment.updated_at.as_str()).max().unwrap_or("")
+    );
+    CanonicalObservation {
+        work_item_node_id: pull_request.node_id.clone(),
+        work_item_kind: "pr",
+        work_item_number: pull_request.number,
+        work_item_state: pull_request.state.clone(),
+        repository_node_id: pull_request.repository_node_id.clone(),
+        repository: pull_request.repository.clone(),
+        object_node_id: thread.node_id.clone(),
+        database_id: String::new(),
+        object_kind: "review_thread",
+        digest: object_digest(&thread.node_id, &version, None),
+        version,
+        lifecycle,
+        author_node_id: None,
+        author_login: None,
+        body: None,
+    }
+}
+
+fn observation(
+    issue: &IssueSnapshot,
+    object_kind: &'static str,
+    comment: &CommentSnapshot,
+) -> CanonicalObservation {
+    let (version, digest, lifecycle) = comment_identity(comment);
+    CanonicalObservation {
+        work_item_node_id: issue.node_id.clone(),
+        work_item_kind: "issue",
+        work_item_number: issue.number,
+        work_item_state: issue.state.clone(),
+        repository_node_id: issue.repository_node_id.clone(),
+        repository: issue.repository.clone(),
+        object_node_id: comment.node_id.clone(),
+        database_id: comment.database_id.clone(),
+        object_kind,
+        version,
+        digest,
+        lifecycle,
+        author_node_id: comment.author.as_ref().map(|author| author.node_id.clone()),
+        author_login: comment.author.as_ref().map(|author| author.login.clone()),
+        body: comment.body.clone(),
+    }
+}
+
+fn pr_observation(
+    pull_request: &PullRequestSnapshot,
+    object_kind: &'static str,
+    comment: &CommentSnapshot,
+) -> CanonicalObservation {
+    let (version, digest, lifecycle) = comment_identity(comment);
+    CanonicalObservation {
+        work_item_node_id: pull_request.node_id.clone(),
+        work_item_kind: "pr",
+        work_item_number: pull_request.number,
+        work_item_state: pull_request.state.clone(),
+        repository_node_id: pull_request.repository_node_id.clone(),
+        repository: pull_request.repository.clone(),
+        object_node_id: comment.node_id.clone(),
+        database_id: comment.database_id.clone(),
+        object_kind,
+        version,
+        digest,
+        lifecycle,
+        author_node_id: comment.author.as_ref().map(|author| author.node_id.clone()),
+        author_login: comment.author.as_ref().map(|author| author.login.clone()),
+        body: comment.body.clone(),
+    }
+}
+
+fn comment_identity(comment: &CommentSnapshot) -> (String, String, &'static str) {
+    let lifecycle = if comment.minimized { "minimized" } else { "active" };
+    let version = format!(
+        "{}:{}:{}",
+        comment.updated_at,
+        lifecycle,
+        comment.minimized_reason.as_deref().unwrap_or_default()
+    );
+    let digest = object_digest(&comment.node_id, &version, comment.body.as_deref());
+    (version, digest, lifecycle)
+}
+
+fn object_digest(node_id: &str, version: &str, body: Option<&str>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(node_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(version.as_bytes());
+    digest.update(b"\0");
+    if let Some(body) = body {
+        digest.update(body.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
 fn reconcile_issue_comments(
     issue: &mut IssueSnapshot,
     store: &StoreActor,
@@ -435,27 +676,13 @@ fn comment_set(
             .iter()
             .filter(|comment| !comment.deleted)
             .map(|comment| {
-                let lifecycle = if comment.minimized { "minimized" } else { "active" };
-                let version = format!(
-                    "{}:{}:{}",
-                    comment.updated_at,
-                    lifecycle,
-                    comment.minimized_reason.as_deref().unwrap_or_default()
-                );
-                let mut digest = Sha256::new();
-                digest.update(comment.node_id.as_bytes());
-                digest.update(b"\0");
-                digest.update(version.as_bytes());
-                digest.update(b"\0");
-                if let Some(body) = &comment.body {
-                    digest.update(body.as_bytes());
-                }
+                let (version, digest, lifecycle) = comment_identity(comment);
                 CanonicalComment {
                     node_id: comment.node_id.clone(),
                     database_id: comment.database_id.clone(),
                     object_kind,
                     version,
-                    digest: hex::encode(digest.finalize()),
+                    digest,
                     lifecycle,
                     author_node_id: comment.author.as_ref().map(|author| author.node_id.clone()),
                     author_login: comment.author.as_ref().map(|author| author.login.clone()),

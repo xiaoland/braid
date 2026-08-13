@@ -13,7 +13,7 @@ through real GitHub Work Items and a clean packaged installation.
 
 `00_clean_install.sh` is the Rust foundation gate. It unpacks the release
 artifact, scrubs Python/PDM/Cargo from the binary's `PATH`, exercises only the
-public CLI, verifies schema 0→2, schema 1→2 with a pre-v2 backup, and
+public CLI, verifies schema 0→3, schema 1→3 with a pre-v3 backup, and
 schema-newer refusal, and uses the adjacent
 bounded OTLP/HTTP capture helper to observe sampling. Its direct SQLite write is
 limited to constructing declared migration-compatibility fixtures; it does not
@@ -29,3 +29,15 @@ body. Missing fixture inputs return
 `UNAVAILABLE` rather than substituting a user token, mock server, or synthetic
 snapshot. The helper drives only packaged `braid` commands and compares the
 emitted bytes.
+
+`20_ingress_scheduler.sh` is the Slice 2 transport gate. It requires the
+dedicated GitHub App to subscribe to Braid's declared Issue and PR event set,
+an acceptance config, an App-matching `BRAID_WEBHOOK_SECRET`, authenticated
+Human `gh`, and the packaged candidate binary. It creates disposable real
+Issues, lets Braid own a Quick Tunnel only while the helper runs, and proves
+durable webhook admission, App-owned `eyes`, delivery rededuplication,
+older-after-newer non-regression, the 30-second debounce window, the
+eight-event release threshold, trusted visible `@braid`, canonical
+reconciliation during tunnel loss, pending-batch restart, and graceful webhook
+URL restoration. It observes only public CLI/health/GitHub surfaces and never
+starts a provider turn.

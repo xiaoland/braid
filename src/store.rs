@@ -12,15 +12,18 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, backup::Backup, params}
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
+use uuid::Uuid;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 2;
+pub const DATABASE_SCHEMA_VERSION: u32 = 3;
 
 const INITIAL_SQL: &str = include_str!("../migrations/0001_initial.sql");
 const CONTEXT_LEDGER_SQL: &str = include_str!("../migrations/0002_context_ledger.sql");
+const TRANSPORT_RUNTIME_SQL: &str = include_str!("../migrations/0003_transport_runtime.sql");
 const MIGRATIONS: &[Migration] = &[
     Migration { version: 1, name: "initial", sql: INITIAL_SQL },
     Migration { version: 2, name: "context-ledger", sql: CONTEXT_LEDGER_SQL },
+    Migration { version: 3, name: "transport-runtime", sql: TRANSPORT_RUNTIME_SQL },
 ];
 
 #[derive(Debug, Error)]
@@ -51,6 +54,8 @@ pub enum StoreError {
     SchemaNotReady { found: u32, required: u32 },
     #[error("invalid durable state: {0}")]
     InvalidData(String),
+    #[error("another Braid runtime owns {scope} until {expires_at}")]
+    RuntimeBusy { scope: String, expires_at: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,6 +90,138 @@ pub struct StoreStatus {
     pub supported_schema: u32,
     pub pending_migrations: usize,
     pub journal_mode: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IngressEvent {
+    pub delivery_guid: String,
+    pub event_name: String,
+    pub action: Option<String>,
+    pub repository_node_id: String,
+    pub repository: String,
+    pub work_item_node_id: Option<String>,
+    pub work_item_kind: Option<&'static str>,
+    pub work_item_number: Option<u64>,
+    pub work_item_state: Option<String>,
+    pub object_node_id: Option<String>,
+    pub object_version: Option<String>,
+    pub object_digest: Option<String>,
+    pub actor_node_id: Option<String>,
+    pub actor_login: Option<String>,
+    pub classification: &'static str,
+    pub origin: &'static str,
+    pub reference: String,
+    pub mention_candidate: bool,
+    pub reaction_target: Option<ReactionTarget>,
+    pub known: bool,
+    pub raw_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReactionTarget {
+    pub kind: &'static str,
+    pub database_id: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerPolicy {
+    pub quiet_seconds: u64,
+    pub event_threshold: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestResult {
+    pub duplicate: bool,
+    pub delivery_guid: String,
+    pub event_id: Option<String>,
+    pub event_lifecycle: Option<String>,
+    pub batch_id: Option<String>,
+    pub batch_lifecycle: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MentionCandidate {
+    pub event_id: String,
+    pub actor_login: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeStoreStatus {
+    pub owner: Option<LeaseStatus>,
+    pub deliveries: u64,
+    pub duplicate_deliveries: u64,
+    pub unknown_deliveries: u64,
+    pub pending_batches: u64,
+    pub runnable_batches: u64,
+    pub pending_mentions: u64,
+    pub pending_writes: u64,
+    pub uncertain_writes: u64,
+    pub last_reconciliation: Option<String>,
+    pub batches: Vec<WakeBatchSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WakeBatchSummary {
+    pub batch_id: String,
+    pub repository: String,
+    pub work_item_kind: String,
+    pub work_item_number: u64,
+    pub work_item_node_id: String,
+    pub event_count: u64,
+    pub quiet_deadline: String,
+    pub urgent: bool,
+    pub lifecycle: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LeaseStatus {
+    pub scope: String,
+    pub generation: u64,
+    pub owner_id: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeLease {
+    pub scope: String,
+    pub generation: u64,
+    pub owner_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingGitHubWrite {
+    pub intent_id: String,
+    pub repository: String,
+    pub target_kind: String,
+    pub target_database_id: String,
+    pub operation: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackedWorkItem {
+    pub node_id: String,
+    pub repository: String,
+    pub kind: String,
+    pub number: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CanonicalObjectState {
+    pub node_id: String,
+    pub database_id: Option<String>,
+    pub object_kind: String,
+    pub version: String,
+    pub digest: String,
+    pub lifecycle: String,
+    pub author_node_id: Option<String>,
+    pub author_login: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReconciliationRun {
+    pub run_id: String,
+    pub repository_node_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +356,176 @@ impl StoreActor {
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
+
+    pub fn ingest_event(
+        &self,
+        event: IngressEvent,
+        policy: SchedulerPolicy,
+    ) -> Result<IngestResult, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::IngestEvent(Box::new(event), policy, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn mention_candidates(&self, limit: usize) -> Result<Vec<MentionCandidate>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::MentionCandidates(limit, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn resolve_mention(
+        &self,
+        event_id: String,
+        trusted: bool,
+        policy: SchedulerPolicy,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::ResolveMention(event_id, trusted, policy, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn advance_scheduler(&self) -> Result<u64, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::AdvanceScheduler(reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn runtime_status(&self) -> Result<RuntimeStoreStatus, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::RuntimeStatus(reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn acquire_runtime_lease(
+        &self,
+        scope: String,
+        owner_id: String,
+        ttl_seconds: u64,
+    ) -> Result<RuntimeLease, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::AcquireRuntimeLease(scope, owner_id, ttl_seconds, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn renew_runtime_lease(
+        &self,
+        lease: RuntimeLease,
+        ttl_seconds: u64,
+    ) -> Result<RuntimeLease, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::RenewRuntimeLease(lease, ttl_seconds, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn release_runtime_lease(&self, lease: RuntimeLease) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::ReleaseRuntimeLease(lease, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn recover_writes(&self) -> Result<u64, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::RecoverWrites(reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn claim_github_write(&self) -> Result<Option<PendingGitHubWrite>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::ClaimGitHubWrite(reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn finish_github_write(
+        &self,
+        intent_id: String,
+        lifecycle: &'static str,
+        remote_database_id: Option<String>,
+        error: Option<String>,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::FinishGitHubWrite(
+                intent_id,
+                lifecycle,
+                remote_database_id,
+                error,
+                reply,
+            ))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn tracked_work_items(&self) -> Result<Vec<TrackedWorkItem>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::TrackedWorkItems(reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn canonical_objects(
+        &self,
+        work_item_node_id: String,
+    ) -> Result<Vec<CanonicalObjectState>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::CanonicalObjects(work_item_node_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn begin_reconciliation(
+        &self,
+        repository_node_id: String,
+    ) -> Result<ReconciliationRun, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::BeginReconciliation(repository_node_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn finish_reconciliation(
+        &self,
+        run: ReconciliationRun,
+        lifecycle: &'static str,
+        work_item_count: usize,
+        change_count: usize,
+        error: Option<String>,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::FinishReconciliation(
+                run,
+                lifecycle,
+                work_item_count,
+                change_count,
+                error,
+                reply,
+            ))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
 }
 
 impl Drop for StoreActor {
@@ -238,6 +545,34 @@ enum Command {
     SetContextRevision(String, String, Sender<Result<(), StoreError>>),
     OperationalStatusCommentIds(String, Sender<Result<BTreeSet<String>, StoreError>>),
     ReconcileAssociations(AssociationSet, Sender<Result<(), StoreError>>),
+    IngestEvent(Box<IngressEvent>, SchedulerPolicy, Sender<Result<IngestResult, StoreError>>),
+    MentionCandidates(usize, Sender<Result<Vec<MentionCandidate>, StoreError>>),
+    ResolveMention(String, bool, SchedulerPolicy, Sender<Result<(), StoreError>>),
+    AdvanceScheduler(Sender<Result<u64, StoreError>>),
+    RuntimeStatus(Sender<Result<RuntimeStoreStatus, StoreError>>),
+    AcquireRuntimeLease(String, String, u64, Sender<Result<RuntimeLease, StoreError>>),
+    RenewRuntimeLease(RuntimeLease, u64, Sender<Result<RuntimeLease, StoreError>>),
+    ReleaseRuntimeLease(RuntimeLease, Sender<Result<(), StoreError>>),
+    RecoverWrites(Sender<Result<u64, StoreError>>),
+    ClaimGitHubWrite(Sender<Result<Option<PendingGitHubWrite>, StoreError>>),
+    FinishGitHubWrite(
+        String,
+        &'static str,
+        Option<String>,
+        Option<String>,
+        Sender<Result<(), StoreError>>,
+    ),
+    TrackedWorkItems(Sender<Result<Vec<TrackedWorkItem>, StoreError>>),
+    CanonicalObjects(String, Sender<Result<Vec<CanonicalObjectState>, StoreError>>),
+    BeginReconciliation(String, Sender<Result<ReconciliationRun, StoreError>>),
+    FinishReconciliation(
+        ReconciliationRun,
+        &'static str,
+        usize,
+        usize,
+        Option<String>,
+        Sender<Result<(), StoreError>>,
+    ),
     Shutdown,
 }
 
@@ -254,6 +589,7 @@ struct LedgerEntry {
     checksum: String,
 }
 
+#[allow(clippy::too_many_lines)]
 fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
     for command in receiver {
         match command {
@@ -277,6 +613,71 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             }
             Command::ReconcileAssociations(update, reply) => {
                 let _ = reply.send(reconcile_associations(database, &update));
+            }
+            Command::IngestEvent(event, policy, reply) => {
+                let _ = reply.send(ingest_event(database, &event, policy));
+            }
+            Command::MentionCandidates(limit, reply) => {
+                let _ = reply.send(mention_candidates(database, limit));
+            }
+            Command::ResolveMention(event_id, trusted, policy, reply) => {
+                let _ = reply.send(resolve_mention(database, &event_id, trusted, policy));
+            }
+            Command::AdvanceScheduler(reply) => {
+                let _ = reply.send(advance_scheduler(database));
+            }
+            Command::RuntimeStatus(reply) => {
+                let _ = reply.send(runtime_status(database));
+            }
+            Command::AcquireRuntimeLease(scope, owner_id, ttl_seconds, reply) => {
+                let _ = reply.send(acquire_runtime_lease(database, &scope, &owner_id, ttl_seconds));
+            }
+            Command::RenewRuntimeLease(lease, ttl_seconds, reply) => {
+                let _ = reply.send(renew_runtime_lease(database, &lease, ttl_seconds));
+            }
+            Command::ReleaseRuntimeLease(lease, reply) => {
+                let _ = reply.send(release_runtime_lease(database, &lease));
+            }
+            Command::RecoverWrites(reply) => {
+                let _ = reply.send(recover_writes(database));
+            }
+            Command::ClaimGitHubWrite(reply) => {
+                let _ = reply.send(claim_github_write(database));
+            }
+            Command::FinishGitHubWrite(intent_id, lifecycle, remote_database_id, error, reply) => {
+                let _ = reply.send(finish_github_write(
+                    database,
+                    &intent_id,
+                    lifecycle,
+                    remote_database_id.as_deref(),
+                    error.as_deref(),
+                ));
+            }
+            Command::TrackedWorkItems(reply) => {
+                let _ = reply.send(tracked_work_items(database));
+            }
+            Command::CanonicalObjects(work_item_node_id, reply) => {
+                let _ = reply.send(canonical_objects(database, &work_item_node_id));
+            }
+            Command::BeginReconciliation(repository_node_id, reply) => {
+                let _ = reply.send(begin_reconciliation(database, &repository_node_id));
+            }
+            Command::FinishReconciliation(
+                run,
+                lifecycle,
+                work_item_count,
+                change_count,
+                error,
+                reply,
+            ) => {
+                let _ = reply.send(finish_reconciliation(
+                    database,
+                    &run,
+                    lifecycle,
+                    work_item_count,
+                    change_count,
+                    error.as_deref(),
+                ));
             }
             Command::Shutdown => break,
         }
@@ -639,6 +1040,790 @@ fn reconcile_associations(database: &Path, update: &AssociationSet) -> Result<()
     }
     transaction.commit()?;
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn ingest_event(
+    database: &Path,
+    event: &IngressEvent,
+    policy: SchedulerPolicy,
+) -> Result<IngestResult, StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let duplicate = transaction
+        .query_row(
+            "SELECT 1 FROM deliveries WHERE delivery_guid=?1",
+            [&event.delivery_guid],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if duplicate {
+        transaction.execute(
+            "UPDATE deliveries SET duplicate_count=duplicate_count+1 WHERE delivery_guid=?1",
+            [&event.delivery_guid],
+        )?;
+        transaction.commit()?;
+        return Ok(IngestResult {
+            duplicate: true,
+            delivery_guid: event.delivery_guid.clone(),
+            event_id: None,
+            event_lifecycle: None,
+            batch_id: None,
+            batch_lifecycle: None,
+        });
+    }
+
+    transaction.execute(
+        "INSERT INTO repositories(node_id,name_with_owner,observed_at)
+         VALUES (?1,?2,?3)
+         ON CONFLICT(node_id) DO UPDATE SET
+           name_with_owner=excluded.name_with_owner,
+           observed_at=excluded.observed_at",
+        params![event.repository_node_id, event.repository, now],
+    )?;
+    if let (Some(node_id), Some(kind), Some(number), Some(state)) = (
+        event.work_item_node_id.as_deref(),
+        event.work_item_kind,
+        event.work_item_number,
+        event.work_item_state.as_deref(),
+    ) {
+        let number = sqlite_u64(number, "GitHub work-item number")?;
+        transaction.execute(
+            "INSERT INTO work_items(node_id,repository_node_id,kind,number,state,observed_at)
+             VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(node_id) DO UPDATE SET
+               repository_node_id=excluded.repository_node_id,
+               kind=excluded.kind,
+               number=excluded.number,
+               state=excluded.state,
+               observed_at=excluded.observed_at",
+            params![node_id, event.repository_node_id, kind, number, state, now],
+        )?;
+    }
+    transaction.execute(
+        "INSERT INTO deliveries(
+           delivery_guid,repository_node_id,event_name,action,received_at,admitted_at,
+           repository_name,object_node_id,actor_node_id,actor_login,raw_payload,known
+         ) VALUES (?1,?2,?3,?4,?5,?5,?6,?7,?8,?9,?10,?11)",
+        params![
+            event.delivery_guid,
+            event.repository_node_id,
+            event.event_name,
+            event.action,
+            now,
+            event.repository,
+            event.object_node_id,
+            event.actor_node_id,
+            event.actor_login,
+            event.raw_payload,
+            i64::from(event.known),
+        ],
+    )?;
+
+    let event_id = Uuid::now_v7().to_string();
+    let dedupe_key = event_dedupe_key(event);
+    let object_kind = event_object_kind(event);
+    let stale = match (
+        object_kind,
+        event.object_node_id.as_deref(),
+        event.object_version.as_deref(),
+        event.object_digest.as_deref(),
+    ) {
+        (Some(_), Some(node_id), Some(version), Some(digest)) => transaction
+            .query_row(
+                "SELECT version,digest FROM canonical_objects WHERE node_id=?1",
+                [node_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .is_some_and(|(canonical_version, canonical_digest)| {
+                canonical_version.as_str() > version
+                    || (canonical_version == version && canonical_digest == digest)
+            }),
+        _ => false,
+    };
+    let lifecycle = if stale { "superseded" } else { "pending" };
+    let inserted = transaction.execute(
+        "INSERT OR IGNORE INTO events(
+           event_id,delivery_guid,work_item_node_id,object_node_id,object_version,
+           classification,origin,reference,lifecycle,observed_at,dedupe_key,
+           mention_candidate,trusted_mention,body_digest
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,?13)",
+        params![
+            event_id,
+            event.delivery_guid,
+            event.work_item_node_id,
+            event.object_node_id,
+            event.object_version,
+            event.classification,
+            event.origin,
+            event.reference,
+            lifecycle,
+            now,
+            dedupe_key,
+            i64::from(event.mention_candidate),
+            event.object_digest,
+        ],
+    )?;
+    if inserted == 0 {
+        transaction.commit()?;
+        return Ok(IngestResult {
+            duplicate: false,
+            delivery_guid: event.delivery_guid.clone(),
+            event_id: None,
+            event_lifecycle: Some("superseded".into()),
+            batch_id: None,
+            batch_lifecycle: None,
+        });
+    }
+
+    if !stale
+        && let (
+            Some(object_kind),
+            Some(node_id),
+            Some(work_item_node_id),
+            Some(version),
+            Some(digest),
+        ) = (
+            object_kind,
+            event.object_node_id.as_deref(),
+            event.work_item_node_id.as_deref(),
+            event.object_version.as_deref(),
+            event.object_digest.as_deref(),
+        )
+    {
+        let lifecycle = match event.action.as_deref() {
+            Some("deleted") => "deleted",
+            Some("minimized") => "minimized",
+            Some("dismissed") => "dismissed",
+            Some("resolved") => "resolved",
+            _ => "active",
+        };
+        transaction.execute(
+            "INSERT INTO canonical_objects(
+               node_id,work_item_node_id,object_kind,version,digest,lifecycle,observed_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(node_id) DO UPDATE SET
+               work_item_node_id=excluded.work_item_node_id,
+               object_kind=excluded.object_kind,
+               version=excluded.version,
+               digest=excluded.digest,
+               lifecycle=excluded.lifecycle,
+               observed_at=excluded.observed_at",
+            params![node_id, work_item_node_id, object_kind, version, digest, lifecycle, now],
+        )?;
+    }
+
+    let mut batch = None;
+    if lifecycle == "pending"
+        && event.classification == "wake"
+        && let Some(work_item_node_id) = event.work_item_node_id.as_deref()
+    {
+        batch =
+            Some(schedule_event(&transaction, work_item_node_id, &event_id, policy, false, &now)?);
+    }
+    if lifecycle == "pending"
+        && let Some(target) = &event.reaction_target
+    {
+        enqueue_reaction(&transaction, event, &event_id, target, &now)?;
+    }
+    transaction.commit()?;
+    Ok(IngestResult {
+        duplicate: false,
+        delivery_guid: event.delivery_guid.clone(),
+        event_id: Some(event_id),
+        event_lifecycle: Some(lifecycle.into()),
+        batch_id: batch.as_ref().map(|value| value.0.clone()),
+        batch_lifecycle: batch.map(|value| value.1),
+    })
+}
+
+fn event_object_kind(event: &IngressEvent) -> Option<&'static str> {
+    match event.event_name.as_str() {
+        "issues" => Some("issue"),
+        "pull_request" => Some("pr"),
+        "issue_comment" if event.work_item_kind == Some("pr") => Some("pr_comment"),
+        "issue_comment" => Some("issue_comment"),
+        "pull_request_review" => Some("review"),
+        "pull_request_review_comment" => Some("review_comment"),
+        "pull_request_review_thread" => Some("review_thread"),
+        _ => None,
+    }
+}
+
+fn event_dedupe_key(event: &IngressEvent) -> String {
+    let mut digest = Sha256::new();
+    for value in [
+        event.repository_node_id.as_str(),
+        event.object_node_id.as_deref().unwrap_or(""),
+        event.object_version.as_deref().unwrap_or(""),
+        event.object_digest.as_deref().unwrap_or(""),
+        event.action.as_deref().unwrap_or(""),
+        event.classification,
+    ] {
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    hex::encode(digest.finalize())
+}
+
+fn enqueue_reaction(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &IngressEvent,
+    event_id: &str,
+    target: &ReactionTarget,
+    now: &str,
+) -> Result<(), StoreError> {
+    let operation = "reaction_add";
+    let content = "eyes";
+    let request_digest = hex::encode(Sha256::digest(
+        format!("{}\0{}\0{}\0{content}", event.repository, target.kind, target.database_id)
+            .as_bytes(),
+    ));
+    transaction.execute(
+        "INSERT OR IGNORE INTO github_write_outbox(
+           intent_id,event_id,repository,target_kind,target_database_id,operation,content,
+           request_digest,lifecycle,next_attempt_at,created_at,updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'pending',?9,?9,?9)",
+        params![
+            Uuid::now_v7().to_string(),
+            event_id,
+            event.repository,
+            target.kind,
+            target.database_id,
+            operation,
+            content,
+            request_digest,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn schedule_event(
+    transaction: &rusqlite::Transaction<'_>,
+    work_item_node_id: &str,
+    event_id: &str,
+    policy: SchedulerPolicy,
+    urgent: bool,
+    now: &str,
+) -> Result<(String, String), StoreError> {
+    let open = transaction
+        .query_row(
+            "SELECT batch_id,event_count,lifecycle
+             FROM wake_batches
+             WHERE work_item_node_id=?1 AND lifecycle IN ('pending','runnable')",
+            [work_item_node_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+        )
+        .optional()?;
+    let deadline = deadline_rfc3339(policy.quiet_seconds)?;
+    let (batch_id, old_count, old_lifecycle) = if let Some(open) = open {
+        open
+    } else {
+        let batch_id = Uuid::now_v7().to_string();
+        transaction.execute(
+            "INSERT INTO wake_batches(
+               batch_id,work_item_node_id,event_count,quiet_deadline,urgent,lifecycle,created_at,updated_at
+             ) VALUES (?1,?2,0,?3,0,'pending',?4,?4)",
+            params![batch_id, work_item_node_id, deadline, now],
+        )?;
+        (batch_id, 0, "pending".into())
+    };
+    let inserted = transaction.execute(
+        "INSERT OR IGNORE INTO wake_batch_events(batch_id,event_id,ordinal)
+         VALUES (?1,?2,(SELECT COUNT(*) FROM wake_batch_events WHERE batch_id=?1))",
+        params![batch_id, event_id],
+    )?;
+    let count = old_count + i64::try_from(inserted).expect("SQLite change count fits i64");
+    let threshold = i64::from(policy.event_threshold);
+    let lifecycle = if old_lifecycle == "runnable" || urgent || count >= threshold {
+        "runnable"
+    } else {
+        "pending"
+    };
+    transaction.execute(
+        "UPDATE wake_batches SET
+           event_count=?2,
+           quiet_deadline=CASE WHEN lifecycle='runnable' THEN quiet_deadline ELSE ?3 END,
+           urgent=CASE WHEN ?4=1 THEN 1 ELSE urgent END,
+           lifecycle=?5,
+           updated_at=?6
+         WHERE batch_id=?1",
+        params![batch_id, count, deadline, i64::from(urgent), lifecycle, now],
+    )?;
+    Ok((batch_id, lifecycle.into()))
+}
+
+fn mention_candidates(database: &Path, limit: usize) -> Result<Vec<MentionCandidate>, StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_only(database)?;
+    let limit =
+        i64::try_from(limit).map_err(|_| StoreError::InvalidData("limit exceeds i64".into()))?;
+    let mut statement = connection.prepare(
+        "SELECT e.event_id,d.actor_login
+         FROM events e JOIN deliveries d ON d.delivery_guid=e.delivery_guid
+         WHERE e.mention_candidate=1 AND e.trusted_mention IS NULL AND e.lifecycle='pending'
+           AND d.repository_name IS NOT NULL AND d.actor_login IS NOT NULL
+         ORDER BY e.observed_at,e.event_id LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit], |row| {
+        Ok(MentionCandidate { event_id: row.get(0)?, actor_login: row.get(1)? })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+}
+
+fn resolve_mention(
+    database: &Path,
+    event_id: &str,
+    trusted: bool,
+    policy: SchedulerPolicy,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let event = transaction
+        .query_row(
+            "SELECT work_item_node_id,trusted_mention FROM events WHERE event_id=?1",
+            [event_id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?;
+    let Some((work_item_node_id, prior)) = event else {
+        return Err(StoreError::InvalidData(format!("unknown mention event {event_id}")));
+    };
+    if prior.is_some() {
+        transaction.commit()?;
+        return Ok(());
+    }
+    transaction.execute(
+        "UPDATE events SET trusted_mention=?2 WHERE event_id=?1",
+        params![event_id, i64::from(trusted)],
+    )?;
+    if trusted && let Some(work_item_node_id) = work_item_node_id {
+        schedule_event(&transaction, &work_item_node_id, event_id, policy, true, &now)?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn advance_scheduler(database: &Path) -> Result<u64, StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let changed = connection.execute(
+        "UPDATE wake_batches SET lifecycle='runnable',updated_at=?1
+         WHERE lifecycle='pending' AND quiet_deadline<=?1",
+        [now_rfc3339()],
+    )?;
+    Ok(u64::try_from(changed).expect("SQLite change count fits u64"))
+}
+
+fn runtime_status(database: &Path) -> Result<RuntimeStoreStatus, StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_only(database)?;
+    let owner = connection
+        .query_row(
+            "SELECT scope,generation,owner_id,expires_at FROM owner_leases WHERE scope='runtime'",
+            [],
+            |row| {
+                Ok(LeaseStatus {
+                    scope: row.get(0)?,
+                    generation: sqlite_i64_to_u64(row.get(1)?, "owner lease generation")?,
+                    owner_id: row.get(2)?,
+                    expires_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    let batches = {
+        let mut statement = connection.prepare(
+            "SELECT b.batch_id,r.name_with_owner,w.kind,w.number,w.node_id,b.event_count,
+                    b.quiet_deadline,b.urgent,b.lifecycle
+             FROM wake_batches b
+             JOIN work_items w ON w.node_id=b.work_item_node_id
+             JOIN repositories r ON r.node_id=w.repository_node_id
+             WHERE b.lifecycle IN ('pending','runnable')
+             ORDER BY b.created_at,b.batch_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(WakeBatchSummary {
+                batch_id: row.get(0)?,
+                repository: row.get(1)?,
+                work_item_kind: row.get(2)?,
+                work_item_number: sqlite_i64_to_u64(row.get(3)?, "work-item number")?,
+                work_item_node_id: row.get(4)?,
+                event_count: sqlite_i64_to_u64(row.get(5)?, "batch event count")?,
+                quiet_deadline: row.get(6)?,
+                urgent: row.get::<_, i64>(7)? != 0,
+                lifecycle: row.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(RuntimeStoreStatus {
+        owner,
+        deliveries: scalar_u64(&connection, "SELECT COUNT(*) FROM deliveries")?,
+        duplicate_deliveries: scalar_u64(
+            &connection,
+            "SELECT COALESCE(SUM(duplicate_count),0) FROM deliveries",
+        )?,
+        unknown_deliveries: scalar_u64(
+            &connection,
+            "SELECT COUNT(*) FROM deliveries WHERE known=0",
+        )?,
+        pending_batches: scalar_u64(
+            &connection,
+            "SELECT COUNT(*) FROM wake_batches WHERE lifecycle='pending'",
+        )?,
+        runnable_batches: scalar_u64(
+            &connection,
+            "SELECT COUNT(*) FROM wake_batches WHERE lifecycle='runnable'",
+        )?,
+        pending_mentions: scalar_u64(
+            &connection,
+            "SELECT COUNT(*) FROM events WHERE mention_candidate=1 AND trusted_mention IS NULL AND lifecycle='pending'",
+        )?,
+        pending_writes: scalar_u64(
+            &connection,
+            "SELECT COUNT(*) FROM github_write_outbox WHERE lifecycle IN ('pending','sending')",
+        )?,
+        uncertain_writes: scalar_u64(
+            &connection,
+            "SELECT COUNT(*) FROM github_write_outbox WHERE lifecycle='uncertain'",
+        )?,
+        last_reconciliation: connection
+            .query_row(
+                "SELECT completed_at FROM reconciliation_runs
+                 WHERE lifecycle='completed' ORDER BY completed_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?,
+        batches,
+    })
+}
+
+fn acquire_runtime_lease(
+    database: &Path,
+    scope: &str,
+    owner_id: &str,
+    ttl_seconds: u64,
+) -> Result<RuntimeLease, StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let expires_at = deadline_rfc3339(ttl_seconds)?;
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let current = transaction
+        .query_row(
+            "SELECT generation,owner_id,expires_at FROM owner_leases WHERE scope=?1",
+            [scope],
+            |row| {
+                Ok((
+                    sqlite_i64_to_u64(row.get(0)?, "owner lease generation")?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((_, current_owner, current_expiry)) = &current
+        && current_owner != owner_id
+        && current_expiry > &now
+    {
+        return Err(StoreError::RuntimeBusy {
+            scope: scope.into(),
+            expires_at: current_expiry.clone(),
+        });
+    }
+    let generation = current.map_or(1, |(generation, _, _)| generation.saturating_add(1));
+    transaction.execute(
+        "INSERT INTO owner_leases(scope,generation,owner_id,expires_at) VALUES (?1,?2,?3,?4)
+         ON CONFLICT(scope) DO UPDATE SET generation=excluded.generation,
+           owner_id=excluded.owner_id,expires_at=excluded.expires_at",
+        params![scope, sqlite_u64(generation, "owner lease generation")?, owner_id, expires_at],
+    )?;
+    transaction.commit()?;
+    Ok(RuntimeLease { scope: scope.into(), generation, owner_id: owner_id.into() })
+}
+
+fn renew_runtime_lease(
+    database: &Path,
+    lease: &RuntimeLease,
+    ttl_seconds: u64,
+) -> Result<RuntimeLease, StoreError> {
+    require_current_schema(database)?;
+    let expires_at = deadline_rfc3339(ttl_seconds)?;
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let updated = connection.execute(
+        "UPDATE owner_leases SET expires_at=?4
+         WHERE scope=?1 AND generation=?2 AND owner_id=?3",
+        params![
+            lease.scope,
+            sqlite_u64(lease.generation, "owner lease generation")?,
+            lease.owner_id,
+            expires_at
+        ],
+    )?;
+    if updated != 1 {
+        return Err(StoreError::InvalidData("runtime lease ownership was lost".into()));
+    }
+    Ok(lease.clone())
+}
+
+fn release_runtime_lease(database: &Path, lease: &RuntimeLease) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    connection.execute(
+        "DELETE FROM owner_leases WHERE scope=?1 AND generation=?2 AND owner_id=?3",
+        params![
+            lease.scope,
+            sqlite_u64(lease.generation, "owner lease generation")?,
+            lease.owner_id
+        ],
+    )?;
+    Ok(())
+}
+
+fn recover_writes(database: &Path) -> Result<u64, StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let changed = connection.execute(
+        "UPDATE github_write_outbox SET lifecycle='uncertain',next_attempt_at=?1,updated_at=?1
+         WHERE lifecycle='sending'",
+        [now_rfc3339()],
+    )?;
+    Ok(u64::try_from(changed).expect("SQLite change count fits u64"))
+}
+
+fn claim_github_write(database: &Path) -> Result<Option<PendingGitHubWrite>, StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let write = transaction
+        .query_row(
+            "SELECT intent_id,repository,target_kind,target_database_id,operation,content
+             FROM github_write_outbox
+             WHERE lifecycle IN ('pending','uncertain') AND next_attempt_at<=?1
+             ORDER BY created_at,intent_id LIMIT 1",
+            [&now],
+            |row| {
+                Ok(PendingGitHubWrite {
+                    intent_id: row.get(0)?,
+                    repository: row.get(1)?,
+                    target_kind: row.get(2)?,
+                    target_database_id: row.get(3)?,
+                    operation: row.get(4)?,
+                    content: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+    if let Some(write) = &write {
+        transaction.execute(
+            "UPDATE github_write_outbox SET lifecycle='sending',attempts=attempts+1,
+               last_error=NULL,updated_at=?2 WHERE intent_id=?1",
+            params![write.intent_id, now],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(write)
+}
+
+fn finish_github_write(
+    database: &Path,
+    intent_id: &str,
+    lifecycle: &str,
+    remote_database_id: Option<&str>,
+    error: Option<&str>,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    if !matches!(lifecycle, "applied" | "uncertain" | "rejected" | "conflict" | "ambiguous") {
+        return Err(StoreError::InvalidData(format!("invalid write terminal {lifecycle}")));
+    }
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let attempts = connection
+        .query_row(
+            "SELECT attempts FROM github_write_outbox WHERE intent_id=?1 AND lifecycle='sending'",
+            [intent_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::InvalidData(format!("write intent {intent_id} is not sending"))
+        })?;
+    let retry_exponent = u32::try_from(attempts).unwrap_or(6).min(6);
+    let retry_seconds = 2_u64.pow(retry_exponent).min(60);
+    let next_attempt_at =
+        if lifecycle == "uncertain" { deadline_rfc3339(retry_seconds)? } else { now_rfc3339() };
+    let updated = connection.execute(
+        "UPDATE github_write_outbox SET lifecycle=?2,remote_database_id=?3,last_error=?4,
+           next_attempt_at=?5,updated_at=?6 WHERE intent_id=?1 AND lifecycle='sending'",
+        params![intent_id, lifecycle, remote_database_id, error, next_attempt_at, now_rfc3339()],
+    )?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidData(format!("write intent {intent_id} is not sending")))
+    }
+}
+
+fn tracked_work_items(database: &Path) -> Result<Vec<TrackedWorkItem>, StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_only(database)?;
+    let mut statement = connection.prepare(
+        "SELECT w.node_id,r.name_with_owner,w.kind,w.number
+         FROM work_items w JOIN repositories r ON r.node_id=w.repository_node_id
+         ORDER BY r.name_with_owner,w.kind,w.number",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(TrackedWorkItem {
+            node_id: row.get(0)?,
+            repository: row.get(1)?,
+            kind: row.get(2)?,
+            number: sqlite_i64_to_u64(row.get(3)?, "work-item number")?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+}
+
+fn canonical_objects(
+    database: &Path,
+    work_item_node_id: &str,
+) -> Result<Vec<CanonicalObjectState>, StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_only(database)?;
+    let mut statement = connection.prepare(
+        "SELECT node_id,database_id,object_kind,version,digest,lifecycle,
+                author_node_id,author_login
+         FROM canonical_objects WHERE work_item_node_id=?1
+         ORDER BY object_kind,node_id",
+    )?;
+    let rows = statement.query_map([work_item_node_id], |row| {
+        Ok(CanonicalObjectState {
+            node_id: row.get(0)?,
+            database_id: row.get(1)?,
+            object_kind: row.get(2)?,
+            version: row.get(3)?,
+            digest: row.get(4)?,
+            lifecycle: row.get(5)?,
+            author_node_id: row.get(6)?,
+            author_login: row.get(7)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+}
+
+fn begin_reconciliation(
+    database: &Path,
+    repository_node_id: &str,
+) -> Result<ReconciliationRun, StoreError> {
+    require_current_schema(database)?;
+    let run = ReconciliationRun {
+        run_id: Uuid::now_v7().to_string(),
+        repository_node_id: repository_node_id.into(),
+    };
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    connection.execute(
+        "INSERT INTO reconciliation_runs(run_id,repository_node_id,lifecycle,started_at)
+         VALUES (?1,?2,'running',?3)",
+        params![run.run_id, run.repository_node_id, now_rfc3339()],
+    )?;
+    Ok(run)
+}
+
+fn finish_reconciliation(
+    database: &Path,
+    run: &ReconciliationRun,
+    lifecycle: &str,
+    work_item_count: usize,
+    change_count: usize,
+    error: Option<&str>,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    if !matches!(lifecycle, "completed" | "failed") {
+        return Err(StoreError::InvalidData(format!(
+            "invalid reconciliation terminal {lifecycle}"
+        )));
+    }
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let updated = connection.execute(
+        "UPDATE reconciliation_runs SET lifecycle=?2,completed_at=?3,work_item_count=?4,
+           change_count=?5,error=?6 WHERE run_id=?1 AND lifecycle='running'",
+        params![
+            run.run_id,
+            lifecycle,
+            now_rfc3339(),
+            sqlite_usize(work_item_count, "reconciliation work-item count")?,
+            sqlite_usize(change_count, "reconciliation change count")?,
+            error,
+        ],
+    )?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidData(format!("reconciliation run {} is not active", run.run_id)))
+    }
+}
+
+fn scalar_u64(connection: &Connection, query: &str) -> Result<u64, StoreError> {
+    let value = connection.query_row(query, [], |row| row.get::<_, i64>(0))?;
+    Ok(sqlite_i64_to_u64(value, "SQLite count")?)
+}
+
+fn sqlite_u64(value: u64, name: &str) -> Result<i64, StoreError> {
+    i64::try_from(value)
+        .map_err(|_| StoreError::InvalidData(format!("{name} exceeds SQLite INTEGER")))
+}
+
+fn sqlite_usize(value: usize, name: &str) -> Result<i64, StoreError> {
+    i64::try_from(value)
+        .map_err(|_| StoreError::InvalidData(format!("{name} exceeds SQLite INTEGER")))
+}
+
+fn sqlite_i64_to_u64(value: i64, name: &str) -> Result<u64, rusqlite::Error> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(StoreConversionError(format!("{name} is negative: {error}"))),
+        )
+    })
+}
+
+#[derive(Debug)]
+struct StoreConversionError(String);
+
+impl std::fmt::Display for StoreConversionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StoreConversionError {}
+
+fn deadline_rfc3339(seconds: u64) -> Result<String, StoreError> {
+    let seconds = i64::try_from(seconds)
+        .map_err(|_| StoreError::InvalidData("duration exceeds i64 seconds".into()))?;
+    (OffsetDateTime::now_utc() + TimeDuration::seconds(seconds))
+        .format(&Rfc3339)
+        .map_err(|error| StoreError::InvalidData(format!("cannot format deadline: {error}")))
 }
 
 fn require_current_schema(database: &Path) -> Result<(), StoreError> {

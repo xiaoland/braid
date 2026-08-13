@@ -51,6 +51,11 @@ enum Command {
         #[command(subcommand)]
         command: TelemetryCommand,
     },
+    Tunnel {
+        #[command(subcommand)]
+        command: TunnelCommand,
+    },
+    Serve(ServeArguments),
 }
 
 #[derive(Debug, Subcommand)]
@@ -75,6 +80,11 @@ enum TelemetryCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum TunnelCommand {
+    Probe(TunnelProbe),
+}
+
+#[derive(Debug, Subcommand)]
 enum ContextCommand {
     Issue(ContextArguments),
     Pr(ContextArguments),
@@ -83,6 +93,9 @@ enum ContextCommand {
 #[derive(Debug, Subcommand)]
 enum GitHubCommand {
     Probe(GitHubProbe),
+    Webhook(ConfigPath),
+    Deliveries(ConfigPath),
+    Redeliver(GitHubRedeliver),
 }
 
 #[derive(Debug, Args)]
@@ -111,6 +124,14 @@ struct TelemetryProbe {
     marker: String,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct TunnelProbe {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long, value_name = "HTTPS_URL")]
+    url: String,
 }
 
 #[derive(Debug, Args)]
@@ -143,6 +164,25 @@ struct GitHubProbe {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct GitHubRedeliver {
+    #[arg(value_name = "DELIVERY_ID")]
+    delivery_id: u64,
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ServeArguments {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(
+        long,
+        help = "Expose ingress through a free Wrangler Quick Tunnel and own the App webhook while running"
+    )]
+    tunnel: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ContextReport<'a> {
     target: &'a WorkItemLocator,
@@ -162,6 +202,7 @@ struct LocalStatus<'a> {
     telemetry_endpoint: String,
     telemetry_sample_ratio: f64,
     telemetry_incident_mode: bool,
+    transport: Option<crate::store::RuntimeStoreStatus>,
 }
 
 pub async fn run() -> Result<()> {
@@ -180,13 +221,25 @@ pub async fn run() -> Result<()> {
             doctor(&arguments).await?;
         }
         Command::Context { command } => Box::pin(context(command)).await?,
-        Command::Github { command: GitHubCommand::Probe(arguments) } => {
-            github_probe(arguments).await?;
-        }
+        Command::Github { command } => github(command).await?,
         Command::Telemetry { command: TelemetryCommand::Probe(arguments) } => {
             telemetry_probe(arguments).await?;
         }
+        Command::Tunnel { command: TunnelCommand::Probe(arguments) } => {
+            tunnel_probe(arguments).await?;
+        }
+        Command::Serve(arguments) => {
+            let config = load(&arguments.config)?;
+            crate::runtime::serve(config, arguments.tunnel).await?;
+        }
     }
+    Ok(())
+}
+
+async fn tunnel_probe(arguments: TunnelProbe) -> Result<()> {
+    let config = load(&arguments.config)?;
+    crate::runtime::probe_public_webhook(&config, &arguments.url).await?;
+    println!("public webhook probe: accepted");
     Ok(())
 }
 
@@ -258,6 +311,7 @@ async fn github_probe(arguments: GitHubProbe) -> Result<()> {
         println!("installation: {}", identity.installation_id);
         println!("repository: {}", identity.repository);
         println!("repository node: {}", identity.repository_node_id);
+        println!("App actor: {} ({})", identity.actor_login, identity.actor_node_id);
         println!("token expires: {}", identity.token_expires_at);
         println!(
             "permissions: {}",
@@ -270,6 +324,55 @@ async fn github_probe(arguments: GitHubProbe) -> Result<()> {
         );
     }
     Ok(())
+}
+
+async fn github(command: GitHubCommand) -> Result<()> {
+    match command {
+        GitHubCommand::Probe(arguments) => github_probe(arguments).await,
+        GitHubCommand::Webhook(arguments) => {
+            let config = load(&arguments.config)?;
+            let repository = config.github.repository.parse::<RepositoryName>()?;
+            let client = GitHubClient::connect(&config.github, &repository).await?;
+            let webhook = client.app_webhook_config().await?;
+            if arguments.json {
+                print_json(&webhook)?;
+            } else {
+                println!("URL: {}", webhook.url);
+                println!("content type: {}", webhook.content_type);
+                println!("insecure SSL: {}", webhook.insecure_ssl);
+            }
+            Ok(())
+        }
+        GitHubCommand::Deliveries(arguments) => {
+            let config = load(&arguments.config)?;
+            let repository = config.github.repository.parse::<RepositoryName>()?;
+            let client = GitHubClient::connect(&config.github, &repository).await?;
+            let deliveries = client.app_deliveries().await?;
+            if arguments.json {
+                print_json(&deliveries)?;
+            } else {
+                for delivery in deliveries {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        delivery.id,
+                        delivery.guid,
+                        delivery.event,
+                        delivery.action.as_deref().unwrap_or(""),
+                        delivery.status
+                    );
+                }
+            }
+            Ok(())
+        }
+        GitHubCommand::Redeliver(arguments) => {
+            let config = load(&arguments.config)?;
+            let repository = config.github.repository.parse::<RepositoryName>()?;
+            let client = GitHubClient::connect(&config.github, &repository).await?;
+            client.redeliver(arguments.delivery_id).await?;
+            println!("redelivery requested: {}", arguments.delivery_id);
+            Ok(())
+        }
+    }
 }
 
 fn config_check(arguments: &ConfigPath) -> Result<()> {
@@ -346,6 +449,11 @@ fn migrate(command: MigrateCommand) -> Result<()> {
 fn status(arguments: &ConfigPath) -> Result<()> {
     let config = load(&arguments.config)?;
     let database = store(&config)?.status()?;
+    let transport = if database.pending_migrations == 0 {
+        Some(store(&config)?.runtime_status()?)
+    } else {
+        None
+    };
     let status = LocalStatus {
         binary_version: env!("CARGO_PKG_VERSION"),
         config_schema: config.schema_version,
@@ -355,6 +463,7 @@ fn status(arguments: &ConfigPath) -> Result<()> {
         telemetry_endpoint: config.telemetry.endpoint.to_string(),
         telemetry_sample_ratio: config.telemetry.effective_sample_ratio(),
         telemetry_incident_mode: config.telemetry.incident_mode,
+        transport,
     };
     if arguments.json {
         print_json(&status)?;
@@ -369,6 +478,17 @@ fn status(arguments: &ConfigPath) -> Result<()> {
         );
         println!("database: {}", status.database.database.display());
         println!("OTLP: {} (ratio {})", status.telemetry_endpoint, status.telemetry_sample_ratio);
+        if let Some(transport) = &status.transport {
+            println!(
+                "transport: deliveries={} duplicates={} pending={} runnable={} writes={}/{}",
+                transport.deliveries,
+                transport.duplicate_deliveries,
+                transport.pending_batches,
+                transport.runnable_batches,
+                transport.pending_writes,
+                transport.uncertain_writes
+            );
+        }
     }
     Ok(())
 }

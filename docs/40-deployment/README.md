@@ -120,6 +120,17 @@ after a graceful Quick Tunnel stop, releases leases, and closes SQLite.
 Quick Tunnel URLs are temporary. After ungraceful death the operator checks and
 repairs the App webhook before restart. GitHub does not automatically redeliver
 failed webhooks; reconciliation is the recovery path.
+On networks that block outbound QUIC, the Quick Tunnel supervisor explicitly
+uses Cloudflare's TCP HTTP/2 transport. Readiness requires both cloudflared's
+registered-connection signal and a signed request that traverses the public URL
+back into Braid's verified ingress.
+
+GitHub exposes no API that creates the App webhook configuration from its
+disabled state. The dedicated App therefore needs a one-time Human-confirmed
+bootstrap in App settings: enable the webhook with a non-routable baseline URL
+and stable secret, then select the events declared in the GitHub boundary
+contract. Once that hook exists, `serve --tunnel` reads its prior URL, patches
+the verified temporary URL, and restores the prior URL on graceful shutdown.
 
 ## Health and Status
 
@@ -148,7 +159,7 @@ braid config check --config /absolute/path/braid.toml
 braid doctor --config /absolute/path/braid.toml
 braid migrate plan --config /absolute/path/braid.toml
 braid migrate apply --config /absolute/path/braid.toml
-braid serve --config /absolute/path/braid.toml
+braid serve --config /absolute/path/braid.toml --tunnel
 ```
 
 Then drive only the real campaign in
