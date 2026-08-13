@@ -1,74 +1,178 @@
-# Product TDD: Braid Transport Contract
+# Product TDD: GitHub Working Memory Runtime
 
-This document is the cross-unit contract between GitHub, Braid, the Coding
-Agent, and Codex app-server. It owns authority, topology, and compatibility
-boundaries that cannot be recovered safely from one unit's implementation.
+This document owns Braid's cross-unit authority, topology, state ownership, and
+Rust realization. It deliberately excludes unit algorithms that are evident
+from typed code and external wire details owned by the linked contracts.
 
 ## Admission
 
-- **Dependent units**: GitHub ingress/API and reconciliation, durable store and
-  scheduler, provider adapter, turn controller, mirror projection/publisher,
-  and the operator runtime.
-- **Failure if lost**: a unit could interpret collaboration state, provider
-  context, or remote publication as its own authority, causing duplicate turns,
-  stale work, or irreversible GitHub side effects.
-- **Why code is insufficient**: the contract spans independent authorities and
-  external protocols; a local implementation cannot make the ownership split
-  obvious to every participating unit.
+- **Dependent units**: GitHub ingress/API/reconciliation, Context projector,
+  event classifier and scheduler, Agent Group/session manager, Codex adapter,
+  worktree provisioner, Braid GitHub writer, durable store/outbox,
+  observability, tunnel supervisor, and CLI/runtime.
+- **Failure if lost**: GitHub edits could leave stale provider context active,
+  direct Agent writes could feed back indefinitely, Issue and PR profiles could
+  share the wrong memory/worktree, or a process restart could duplicate turns
+  and GitHub mutations.
+- **Why code is insufficient**: the contract crosses GitHub, provider,
+  filesystem, database, telemetry, and Human-visible lifecycle authorities.
 
 ## Authority and Topology
 
 ```text
-GitHub webhook -> temporary Tunnel -> loopback ingress
-  -> durable event inbox -> quiet/urgent scheduler
-  -> one bound Codex app-server thread
+GitHub webhook ──verify/durable ingest──┐
+                                       ├─> canonical object ledger
+GitHub GraphQL/REST reconciliation ────┘          │
+                                                  v
+                                        Context materializer
+                                                  │
+                                  canonical diff + Event References
+                                                  │
+                              event classifier / debounce scheduler
+                                                  │
+                              Agent Group + logical session manager
+                                                  │
+                                     provider adapter (Codex v1)
 
-GitHub GraphQL reconciliation -> same event inbox
-app-server turn items -> bounded projection -> comment outbox
-  -> one canonical GitHub comment + link-only FYIs
+Agent ── braid gh ──> Braid write outbox ──> GitHub ──> origin-correlated echo
+Agent ── ordinary gh/git ─────────────────> GitHub ──> ordinary external event
+
+Quick Tunnel ──> loopback webhook ingress
+OTel SDK ──sampled OTLP──> operator-selected endpoint
 ```
 
-- **GitHub** owns repository, Issue, PR, comment, review, review-thread,
-  association, identity, and permission state.
-- **Codex app-server** owns provider thread data, compaction, active-turn
-  lifecycle, execution, and resume semantics.
-- **Coding Agent** owns interpretation, readiness, plans, code, verification,
-  and authorized Git/GitHub actions.
-- **Braid** owns one Issue-to-opaque-thread binding, canonical event delivery,
-  mechanical scheduling, turn projection, comment publication, and transport
-  idempotency state. It stores no provider transcript or semantic task state.
+- **GitHub** owns current Issue/PR bodies, metadata, relationships, comments,
+  reviews, lifecycle, identity, and App permissions.
+- **GitHub Context** is a deterministic, complete projection of that state plus
+  durable deletion tombstones. It is the collaboration memory authority.
+- **Provider** owns physical session data, model execution, provider-native
+  compaction, turn lifecycle, and resume availability.
+- **Coding Agent** owns interpretation, design/implementation choices, code,
+  verification, and its Git/GitHub operations.
+- **Braid** owns canonical reads, projection, logical Agent Group/session
+  generations, scheduling, Context fencing/replacement, provider addressing,
+  PR worktree provisioning, Braid-authored GitHub writes, and mechanical
+  idempotency/reconciliation.
 
-## Cross-Unit Contract
+SQLite stores enough canonical object metadata and lifecycle tombstones to
+compare versions, but it does not become an alternate Issue/PR or provider
+transcript authority. A full Context is rebuilt from GitHub before every turn.
 
-- One active binding admits at most one Agent turn. Ordinary canonical events
-  reset a quiet deadline; a trusted exact visible `@agent` hint bypasses that
-  delay or attempts same-turn steering. A non-steerable provider leaves refs
-  pending for the next safe boundary rather than starting a parallel turn.
-- Issue events route by exact Issue node ID. Pull-request conversation, review,
-  diff-comment, review-thread, and synchronize events route only while GitHub's
-  native association resolves to the bound Issue. Missing or ambiguous
-  association fails closed; raw repository push is not a wake source.
-- Wrapper-origin provider context contains only event/action/actor/object and
-  surface references plus digests. GitHub-authored prose remains canonical
-  state that the Agent fetches through `gh`.
-- A turn freezes one canonical response surface. Other participating surfaces
-  receive at most one short FYI link and never a copied projection.
-- SQLite persists transport facts—provider addresses, object refs,
-  versions/digests, delivery GUIDs, pending/urgent state, mirror remote IDs,
-  outbox state, and sync cursors—not task meaning.
-- A transport disconnect never becomes Agent completion or failure and never
-  creates a replacement thread. Once a remote comment ID is known, updates use
-  it directly; uncertain creation recovers only from one matching canonical
-  comment and otherwise fails closed. Human edits and deletion remain conflict
-  or lifecycle facts and are never silently undone.
+## Rust Runtime Shape
+
+MVP is one Rust package and one `braid` binary rather than a workspace of thin
+crates. Modules are deep and align with authority boundaries:
+
+| Module | Owned interface |
+| --- | --- |
+| `config` | Versioned config/Profile loading, validation, effective defaults, and diagnostic projection. |
+| `github::webhook` | Raw-body HMAC verification and typed open-enum webhook admission. |
+| `github::client` | GitHub App auth, bounded typed GraphQL pagination, REST writes, reactions, and canonical rereads. |
+| `context` | Canonical snapshot model, HTML-comment removal, deterministic Markdown rendering, budget, and revision. |
+| `events` | Canonical diff classification and compact Event Reference rendering. |
+| `store` | One dedicated SQLite actor, transactions, migrations, leases, ledgers, sessions, batches, and outbox. |
+| `scheduler` | Quiet/count/urgent coalescing and single-flight group turn claims. |
+| `sessions` | Assignment generation, Context generation, invalidation fencing, finalization, and provider/worktree handles. |
+| `provider` | Provider-neutral capability contract and Codex NDJSON implementation. |
+| `worktree` | One default PR worktree per Implementation Agent and recovery diagnostics; no Git-operation sandbox. |
+| `writer` | `braid gh`, attribution, reaction/status desired state, and write-outbox convergence. |
+| `telemetry` | Trace/metric/log creation, payload events, sampling configuration, and OTLP export. |
+| `tunnel` | Wrangler Quick Tunnel supervision and webhook URL handoff. |
+| `runtime` | Owner lease, supervisors, shutdown ordering, health, and public operator state. |
+| `cli` | `serve`, `config`, `doctor`, `profile`, `gh`, `status`, and migration/version surfaces. |
+
+Selected dependency baseline, verified against crates.io on 2026-08-13:
+
+- Tokio 1.53 for async runtime/process/I/O/signal ownership;
+- Axum 0.8 for loopback HTTP and Reqwest 0.13 with rustls for GitHub/OTLP HTTP;
+- Serde 1.0 and serde_json 1.0 for external JSON boundaries;
+- rusqlite 0.40 with bundled SQLite, used only by a dedicated blocking DB
+  actor so network awaits never occur inside transactions;
+- Clap 4.6, `thiserror` for boundary errors, and `anyhow` only at CLI/runtime
+  composition boundaries;
+- HMAC 0.13/SHA-2 0.11 for webhook verification and context revisions,
+  `jsonwebtoken` 11 for GitHub App JWTs;
+- Comrak 0.54 to identify actual Markdown HTML comment nodes while preserving
+  code literals;
+- OpenTelemetry/SDK/OTLP 0.32 plus tracing-opentelemetry 0.33;
+- UUID 1.24, `time` 0.3, and `url` for typed identities and timestamps.
+
+Versions become lower/upper compatible ranges in `Cargo.toml`; `Cargo.lock` is
+committed for the released binary. Rust 1.93 is the first verified toolchain.
+
+## Cross-Unit Invariants
+
+1. Every provider turn belongs to exactly one Work Item, Profile,
+   Assignment Generation, Context Revision, and physical Provider Session.
+2. A group admits one active turn in MVP. A stale Context Revision cannot
+   publish Braid-owned writes after fencing.
+3. Every turn uses a freshly materialized complete Context. Required pagination
+   or hard-budget failure blocks before provider input.
+4. A Provider Session is reusable only while Context schema/revision and
+   effective instruction revision remain compatible. Hard Invalidation creates
+   a fresh physical session in Codex v1.
+5. Event References contain no copied GitHub prose. They identify what changed
+   and where; current Context supplies durable content and `gh` supplies detail.
+6. Braid App writes carrying durable operation correlation and direct writes
+   from the Profile's explicitly configured stable GitHub actor are Agent-origin
+   for self-wake/reset suppression. Other direct `gh` writes remain allowed but
+   are processed as external activity.
+7. Braid never mirrors turn output. Its only unsolicited comments are mutable
+   Operational Status Comments.
+8. Ordinary batches have no active/terminal reactions. Those states apply only
+   to the exact trusted `@braid` comment that started the turn.
+9. GitHub/network I/O never occurs in a SQLite transaction. Every Braid-owned
+   mutation has a durable intent before leaving the process.
+10. Provider terminal means only that a turn ended; it never proves task,
+    implementation, review, or acceptance success.
+
+## Durable State and Migrations
+
+SQLite starts in WAL mode with foreign keys, a busy timeout, and FULL
+synchronous durability. One DB actor serializes writes. Schema v1 owns:
+
+- `schema_migrations(version, name, checksum, applied_at)`;
+- `owner_leases(scope, generation, owner_id, expires_at)`;
+- `repositories` and `work_items` keyed by stable GitHub node IDs;
+- `profiles` with immutable revision and effective-config digest;
+- `assignments` and `agent_instances` with group/profile/generation/lifecycle;
+- `provider_sessions` and `turns` with opaque provider IDs and Context revision;
+- `worktrees` for the default PR Implementation Agent workspace;
+- `associations` for direct Issue↔PR edges and observed version;
+- `canonical_objects` for latest object metadata/digest and deletion tombstones;
+- `deliveries` and `events` for webhook/reconciliation dedupe/classification;
+- `scheduler_batches` and `batch_events` for quiet/count/urgent state;
+- `write_intents`, `reaction_targets`, and `status_comments` for Braid-owned
+  GitHub convergence;
+- `sync_cursors` for repository reconciliation.
+
+Migration files are embedded, monotonically numbered, forward-only, and never
+edited after release. Startup takes an exclusive migration lease, verifies all
+previous checksums, applies each migration in one transaction, and rejects a DB
+newer than the binary. Compatible application rollback is declared per release;
+an incompatible schema rollback restores the pre-migration backup rather than
+running a down migration.
+
+## Error and Concurrency Model
+
+External shapes deserialize into typed structures with explicit unknown
+variants; unknown methods/actions/unions become bounded `unsupported` evidence
+rather than generic JSON forwarded to the Agent. Boundary errors carry a stable
+category plus source error; Human-facing status never exposes Rust backtraces as
+Agent prose.
+
+The runtime has one repository owner lease and per-Agent-Group single-flight
+turn ownership. Lease generation fences stopped processes. Braid-owned creates
+and updates use the write-outbox state machine; direct Agent `gh`/`git` actions
+are outside it and converge only when GitHub reports them.
 
 ## Realization Pointers
 
-- Provider wire and lifecycle: [`app-server.md`](app-server.md).
-- GitHub ingress, identity, reconciliation, and native association:
-  [`github.md`](github.md).
-- Turn item reduction, Markdown publication, bounds, and recovery:
-  [`turn-projection.md`](turn-projection.md).
-- Isolation, preflight, handoff, rollback, and runtime operations:
-  [`../40-deployment/README.md`](../40-deployment/README.md).
-
+- Exact Context and revision: [`context.md`](context.md)
+- Event, group, session, and reaction state machines: [`lifecycle.md`](lifecycle.md)
+- Codex mapping and provider seam: [`app-server.md`](app-server.md)
+- GitHub ingress, canonical reads, associations, identity, and writes:
+  [`github.md`](github.md)
+- Packaging, OTel, tunnel, migration, and operation:
+  [`../40-deployment/README.md`](../40-deployment/README.md)
+- External acceptance oracle: [`../10-prd/acceptance.md`](../10-prd/acceptance.md)

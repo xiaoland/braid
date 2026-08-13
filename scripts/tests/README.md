@@ -1,20 +1,12 @@
 # Acceptance Helpers
 
-This directory is the only home for executable Braid acceptance helpers while
-the product workflow is still being discovered.
+This directory contains operator scripts that exercise public boundaries while
+the real Braid workflow is being stabilized. A helper may invoke the installed
+`braid` binary, GitHub/`gh`, Git/Codex/Wrangler, loopback health, OTLP, and
+process controls. It must not import Braid internals, inject SQLite rows/events,
+or replace GitHub/provider with fakes and then claim product acceptance.
 
-A helper belongs here only when it drives Braid through public boundaries:
-real GitHub objects, the public `braid` CLI and health surface, a real webhook
-ingress, and a real Codex app-server. Importing internal Braid modules, replacing
-GitHub or app-server with fakes, or inspecting the local database does not make
-a script black-box acceptance.
-
-These files are operator tools. Running one is not sufficient evidence of
-product acceptance. Each campaign must retain the external GitHub evidence,
-timing observations, protected-worktree snapshots, and Human verdicts required
-by [`docs/10-prd/acceptance.md`](../../docs/10-prd/acceptance.md).
-
-No prior test qualified for migration into this directory. The file formerly
-named `test_turn_mirror_black_box.py` directly instantiated internal storage,
-controller, publisher, fake-provider, and fake-GitHub objects; it was a
-component integration test and was retired with the rest of the suite.
+Scripts should capture bounded machine-readable evidence and leave Human
+verdicts explicit. Running a helper is not acceptance: every release candidate
+must satisfy [`docs/10-prd/acceptance.md`](../../docs/10-prd/acceptance.md)
+through real GitHub Work Items and a clean packaged installation.

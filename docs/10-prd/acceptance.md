@@ -1,83 +1,211 @@
 # End-to-End Acceptance
 
-Braid is accepted only through a real Issue-to-Draft-PR collaboration. Unit,
-component, fake-transport, database, internal-log, provider-completion, and
-health results may diagnose a run but never substitute for the external oracle.
+Braid is accepted only through real GitHub Work Items, the packaged Rust
+binary, a real public webhook path, a real Codex app-server, and observable
+Agent behavior. Unit/component/fake transport checks may diagnose code but do
+not satisfy this contract.
 
 ## Boundary and Fixture
 
-The campaign uses the real `xiaoland/braid` repository or an approved disposable
-mirror of the same pinned revision, a genuine backlog Issue with merge intent,
-real GitHub, the real Braid process, a real Cloudflare-backed webhook path, a
-real Codex app-server/Coding Agent, and the Agent's real `gh` actions. Braid and
-the candidate implementation run from separately pinned worktrees, branches,
-runtime directories, and process identities. The primary Human worktree is
-never a provider worktree.
+The campaign uses:
 
-Use separate Wrapper App and Agent identities, non-production credentials, two
-trusted Human actors where the journey needs independent semantic review, and
-one untrusted actor for urgent-hint policy. Drive Braid only through public CLI,
-health, process, GitHub, and provider boundaries. Never inject an event below
-GitHub, replace the Agent, inspect SQLite as a pass oracle, or use private logs
-as evidence of success.
+- a tagged, checksummed macOS arm64 Braid artifact installed into a clean
+  directory without source, Python, or Cargo;
+- the real `xiaoland/braid` repository or an approved disposable mirror at a
+  pinned revision;
+- a dedicated non-production Braid Agent App and webhook secret;
+- a free Cloudflare Quick Tunnel to loopback ingress;
+- the pinned real Codex app-server and a real Coding Agent login;
+- one dedicated repository checkout for the Issue Profile and Braid-provisioned
+  PR worktree;
+- one maintainer actor and one actor without MAINTAIN/ADMIN permission;
+- an OTLP endpoint suitable for retaining the campaign's full sensitive trace
+  payload.
 
-Acceptance helpers live in [`../../scripts/tests/`](../../scripts/tests/) while the
-workflow is still being learned. They are operator tools, not accepted product
-tests, until repeated campaigns stabilize their inputs and evidence contract.
+Drive the product only through GitHub, public `braid` CLI/health/status, process
+control, provider executable, Git, installed artifact, and OTLP export. SQLite
+inspection, internal Rust APIs, fake providers/GitHub, and hand-injected inbox
+events are never pass oracles.
+
+Acceptance helpers under [`../../scripts/tests/`](../../scripts/tests/) remain
+operator scripts until the workflow stabilizes. GitHub objects and Human
+verdicts are the product oracle.
+
+## Campaign Setup
+
+Create a real Issue whose description contains a distinguishable design fact,
+one well-formed HTML comment containing a forbidden sentinel, and an ordinary
+visible sentinel. Add labels and at least one available relationship/Project or
+Development branch. Configure one `issue` Profile and one `pr` Profile with
+different instructions that produce externally distinguishable behavior.
+
+Set the campaign Quiet Window to 30 seconds, Wake count threshold to eight,
+reconciliation interval to 60 seconds, and OpenTelemetry sample ratio to 1.0.
+Record the installed Braid/Codex/Git/gh/Wrangler versions, config/profile
+revisions, repository revision, App identity/permissions, process start time,
+and pristine worktree states before assigning Braid.
 
 ## Required Journeys
 
-1. **Golden collaboration**: Humans discuss an unresolved real Braid change; the
-   Agent waits or discusses rather than treating comments as commands, then
-   naturally creates a natively linked Draft PR in its dedicated worktree,
-   implements, verifies, responds to review through the same thread, records
-   material design changes on the Issue, and readies the PR only after evidence.
-2. **Settling and mixed surfaces**: ordinary events reset quiet and coalesce;
-   trusted `@agent` starts promptly, untrusted/duplicate hints do not multiply
-   turns, active input steers one turn, and Issue/PR participation produces one
-   canonical response plus deduplicated link-only FYIs.
-3. **Canonical lifecycle**: controlled create/edit/delete/minimize, review
-   dismissal, diff-comment lifecycle, and review-thread resolve/unresolve are
-   reflected from current GitHub state; superseded requirements do not continue
-   driving work.
-4. **Synchronization**: normal webhook, repeated delivery, temporary tunnel loss,
-   canonical reconciliation, and older-after-newer arrival converge without
-   duplicate logical turns or mirror comments.
-5. **Process continuity**: restart Braid with pending and active work and
-   disconnect/resume app-server. Transport/outbox state converges without
-   replacement threads or repeated Agent-owned side effects; unknown provider
-   state never masquerades as completion or failure.
-6. **Turn projection**: one stable comment progresses by logical-message count or
-   maximum dirty age and terminates immediately. Raw and rendered bodies satisfy
-   [`turn-projection.md`](../20-product-tdd/turn-projection.md), including tool
-   details, bounds, omission, no-op suppression, and forbidden-content
-   assertions.
+### 1. Assignment and Initial Context
+
+Assign the Braid Agent App to the Issue. Braid must create one Issue Agent
+generation and physical Codex thread, inject complete current Issue Context,
+and remain idle without inventing a turn or Agent comment. The Context must:
+
+- use plain `GitHub Issue: owner/repo#number` identity;
+- include title, description, selected metadata/relationships, and visible
+  comments in deterministic order;
+- include the visible sentinel and exclude the HTML-comment sentinel;
+- contain no JSON envelope, GraphQL node IDs, duplicate URL, Operational Status
+  body, or folded body.
+
+Unassign and reassign once. Unassignment must wait for debounce and stop the old
+generation; reassignment must create a new generation/session, not resume stale
+provider memory.
+
+### 2. Debounce, Count, and Trusted Mention
+
+Create one ordinary Human comment. It must receive `eyes` after durable ingest,
+must not show `rocket/+1/confused`, and must not start before the 30-second quiet
+deadline. The resulting Agent message is published by the Agent itself under
+the configured identity and attribution.
+
+Create eight distinct ordinary comments faster than the Quiet Window. They must
+coalesce into one turn released by the count threshold. Then create:
+
+- an unprivileged `@braid` comment;
+- `@braid` inside code, quote, and HTML comment;
+- one maintainer visible `@braid` comment.
+
+Only the last bypasses debounce. It receives `rocket` after provider acceptance
+and `+1` after normal terminal. Edit that mention after delivery; while the turn
+is active the new version must steer the same expected turn, not create a
+parallel turn. A controlled unexpected terminal replaces `rocket` with
+`confused`. Ordinary turn failure instead updates Operational Status and never
+adds a terminal reaction to its trigger comments.
+
+### 3. Canonical Lifecycle and Context Replacement
+
+With an Issue turn active, edit a visible comment and the Issue description,
+then minimize one visible comment and delete another. Braid must fence the old
+Context Revision, safely interrupt/settle the old turn, create a new physical
+Codex thread, and inject current complete Context. The replacement must contain
+new description/comment bodies, only metadata for the minimized/deleted
+comments, and no stale body or provider transcript.
+
+Repeat equivalent lifecycle on an idle group. Context/session is replaced but
+no turn starts until a Wake Event. Unminimizing the comment restores its body and
+creates a Wake Event. Older-after-newer webhook redelivery must not regress the
+projection or create a duplicate turn.
+
+### 4. Implementation Request and PR Profile
+
+Have the Issue Agent publish a concise implementation request and call
+`braid gh pr ensure` with that Issue comment ID twice concurrently. Exactly one
+Draft PR, native association, ActivationIntent, PR Agent generation, PR Profile,
+and dedicated worktree must result. When the selected branch initially equals
+base, the PR contains exactly one Braid App bootstrap commit whose tree equals
+its parent and whose message identifies the request comment; it changes no
+file. A second distinct request comment may create a second PR; 1:N and N:1
+associations must not be rejected.
+
+The PR Agent's initial Context must contain all current directly Associated
+Issues followed by the PR section. Open Issues are complete; a closed Issue is
+metadata/reference only. It must omit head SHA, commit/diff/check summaries and
+normally reviewers. The Implementation Agent must operate from the dedicated
+worktree, create a real diff, verify it, publish concise PR comments itself, and
+use ordinary Git/gh freely.
+
+Edit an open Associated Issue description while the PR Agent turn is active.
+After debounce it must Cross-surface invalidate and replace the PR session with
+the new Issue design. Change a label/comment instead: it may schedule a PR turn
+and must refresh Context before that turn, but must not interrupt the active PR
+turn. Close the Issue: its description/comments disappear from future PR
+Context while reference/state remain. Reopen restores full Context.
+
+### 5. Origin and Working-Memory Maintenance
+
+Use `braid gh` from each Agent to update its description/body and create one
+attributed concise comment. The correlated webhook echo enters future canonical
+Context but does not wake/reset the originating group. Confirm the quote-block
+Profile/role attribution cannot be supplied or altered by the Agent body.
+
+Then let the Agent perform an ordinary direct `gh` edit under its Profile's
+configured stable GitHub actor. Braid must not block it, and the exact actor
+match suppresses self-wake/reset. Repeat under an unconfigured/shared Human
+identity: it remains allowed but is processed as a normal external change and
+may wake/invalidate. This is the explicit autonomy/attribution tradeoff.
+
+### 6. Close, Merge, Reopen, and Finalization
+
+Close an active Issue and an active PR without merging. Current turns must not
+be interrupted; each group receives at most one Finalization Turn, then sleeps.
+Additional deliveries while closed grant none. Reopen and observe one current
+Context plus one ordinary debounced turn.
+
+Merge the PR in the controlled fixture. It receives at most one Finalization
+Turn and then retires; later events do not reactivate it automatically.
+
+### 7. Context Pressure
+
+Run with a campaign-only low Context byte budget. At soft pressure Braid still
+starts the complete turn and updates status. Above hard pressure, and separately
+with an intentionally unavailable pagination/permission boundary, it must start
+no provider turn and update one mutable `context-too-large` or
+`context-unavailable` Operational Status Comment on configured surfaces.
+No partial, truncated, or generated summary may reach Codex.
+
+### 8. Synchronization, Restart, and Unknown State
+
+Exercise duplicate delivery, temporary tunnel loss, 60-second reconciliation,
+and an out-of-order edit. GitHub state must converge without duplicate logical
+turns, reactions, status comments, or `pr ensure` PRs.
+
+Restart Braid while debouncing, while a reaction/status write is uncertain, and
+while a provider turn is active. Repository owner lease, batches, outbox, and
+same compatible physical thread must converge without parallel turns. Disconnect
+app-server without terminal evidence: Braid keeps the turn unknown, preserves
+the trusted mention's `rocket`, and updates Operational Status rather than
+claiming success/failure.
+
+### 9. Telemetry, Migration, and Distribution
+
+With sample ratio 1.0, the retained OTLP trace must correlate webhook receipt,
+canonical reread, Context materialization, scheduler/session/provider lifecycle,
+GitHub writes, and terminal result. It must contain the controlled comment body,
+summary, raw webhook payload, provider transcript/input/output, credential
+sentinel, and local path sentinel. Large payloads must be log/event bodies rather
+than metric labels. Metrics remain available independently of trace sampling.
+
+Repeat a bounded run at ratio 0.10 and verify trace-level consistent selection:
+a retained trace has its complete evidence and a dropped trace does not export
+orphan spans. Enable incident mode at 1.0 and verify all new root traces export.
+
+Install a prior schema artifact, create its DB, upgrade with the candidate, and
+restart. Verify the forward-only migration ledger/checksums and retained
+binding state. A binary declaring the DB schema too new must refuse startup.
+Perform one declared compatible binary rollback; for an incompatible fixture,
+restore the pre-migration backup rather than executing a down migration.
 
 ## Timing and Result Model
 
-Acceptance configuration uses a 30-second quiet window: ordinary processing must
-not appear before 30 seconds after the last relevant event and should appear by
-45 seconds absent a recorded GitHub outage. Trusted `@agent` should expose
-processing within 15 seconds. Canonical reconciliation runs every 60 seconds and
-missed webhook state should expose processing within 105 seconds.
+- ordinary one-event turn: no earlier than 30 seconds after the latest Wake and
+  observable by 45 seconds absent recorded GitHub/provider outage;
+- eight-event threshold or trusted mention: provider acceptance/reaction by 15
+  seconds;
+- reconciliation-only missed event: observable processing by 105 seconds with
+  a 60-second interval;
+- unassignment and Cross-surface description invalidation: debounce before
+  retirement/interruption.
 
-Each mechanical assertion is `pass`, `fail`, or `unavailable`, backed by public
-object URLs/IDs, timestamps, bodies, refs/SHAs, checks, actor permissions, and
-process-control observations. Each trusted Human independently records whether
-premature action, settled interpretation, steering, and final evidence are
-acceptable. `Unavailable` never counts as pass.
+Each assertion is `pass`, `fail`, or `unavailable`. `Unavailable` never counts
+as pass. Public evidence includes Work Item/comment/reaction IDs and timestamps,
+App/actor identity and permissions, native associations, Draft/Ready/lifecycle,
+refs/diff/checks, packaged binary/version/checksum, process control, and Human
+verdicts. OTLP and provider evidence may prove Context/telemetry-specific
+assertions but cannot substitute for public product behavior.
 
-The golden Braid Issue-to-PR journey must pass without corrective operator
-intervention. Before the source PR is ready, a clean candidate installation with
-a fresh binding must pass the full adversarial campaign three consecutive times.
-Dogfood on the source binding and clean-candidate campaigns are distinct
-evidence and cannot substitute for each other.
-
-## Evidence Bundle
-
-Retain fixture identities and pinned versions, Issue/PR links and native
-association snapshots, comment IDs plus raw/rendered bodies over time, available
-webhook delivery IDs, actor permissions, refs/SHAs, Draft/Ready transitions,
-review/thread/check state, process stop/start timestamps, protected-worktree
-snapshots, and both Human verdicts. Private Braid storage, provider transcript,
-and internal logs may diagnose failure but remain outside the pass oracle.
+The golden Issue-to-PR journey must pass without corrective operator action. A
+fresh installation and fixture must pass the entire campaign three consecutive
+times before the implementation PR becomes ready.
