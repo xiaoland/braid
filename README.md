@@ -9,9 +9,8 @@ local Coding Agents. GitHub holds the current design, implementation state,
 metadata, relationships, and discussion; Braid rebuilds a provider session from
 that state whenever prior context becomes stale.
 
-The repository is transitioning from an obsolete Python turn-mirroring
-prototype to a clean Rust runtime. The active product and implementation
-contracts are:
+Braid is implemented as one Rust package and one portable `braid` binary. The
+active product and implementation contracts are:
 
 - [Product Truth](docs/10-prd/README.md)
 - [Real end-to-end acceptance](docs/10-prd/acceptance.md)
@@ -24,8 +23,18 @@ contracts are:
 - [Glossary](glossary.md)
 
 The first supported delivery target is a packaged macOS arm64 binary; Linux
-x86_64 follows. The current Python/PDM commands describe withdrawn behavior and
-must not be used as product evidence.
+x86_64 follows. Build and inspect the public operator surface with:
+
+```shell
+cargo build --locked
+cargo run --locked -- --version
+cargo run --locked -- config check --config /absolute/path/to/braid.toml
+cargo run --locked -- migrate plan --config /absolute/path/to/braid.toml
+```
+
+Copy [`config.example.toml`](config.example.toml) outside the checkout and
+replace every placeholder path before running diagnostics. A packaged release
+does not require Python, PDM, Cargo, or a source checkout.
 
 Braid deliberately avoids a large internal fake/unit-test surface while the
 workflow is being established. Diagnostic and real black-box campaign helpers

@@ -36,9 +36,9 @@ names. The main sections are:
 - OTLP endpoint/protocol, trace sample ratio, and incident override;
 - log format and bounded health/status settings.
 
-`braid config check` prints the effective non-secret config and all external
-preconditions. `braid doctor` additionally runs read-only GitHub, Codex schema,
-SQLite directory, Git/worktree, port, OTLP, and Wrangler probes. Profiles expose
+`braid config check` prints the effective non-secret declaration and validates
+its static invariants. `braid doctor` runs filesystem, SQLite, GitHub, Codex
+schema, Git/gh, OTLP, and Wrangler precondition probes. Profiles expose
 their effective mapped provider settings through `braid profile inspect`.
 
 ## Filesystem Layout
