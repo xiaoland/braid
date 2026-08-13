@@ -281,6 +281,28 @@ impl GitHubClient {
         Ok(reaction.id)
     }
 
+    pub async fn delete_reaction(
+        &self,
+        target_kind: &str,
+        database_id: &str,
+        reaction_id: u64,
+    ) -> Result<(), GitHubError> {
+        let path = match target_kind {
+            "issue_comment" => format!(
+                "/repos/{}/issues/comments/{database_id}/reactions/{reaction_id}",
+                self.identity.repository
+            ),
+            "review_comment" => format!(
+                "/repos/{}/pulls/comments/{database_id}/reactions/{reaction_id}",
+                self.identity.repository
+            ),
+            other => {
+                return Err(GitHubError::GraphQl(format!("unsupported reaction target {other:?}")));
+            }
+        };
+        rest_delete(&self.http, &path, &self.installation_token, &self.api_version).await
+    }
+
     pub async fn app_webhook_config(&self) -> Result<AppWebhookConfig, GitHubError> {
         let jwt = app_jwt(&self.config)?;
         rest_get(&self.http, "/app/hook/config", &jwt, &self.api_version).await
@@ -423,6 +445,29 @@ async fn rest_patch<B: Serialize + ?Sized, T: DeserializeOwned>(
             .map_err(GitHubError::Transport)?,
     )
     .await
+}
+
+async fn rest_delete(
+    client: &Client,
+    path: &str,
+    token: &str,
+    api_version: &str,
+) -> Result<(), GitHubError> {
+    let response = client
+        .delete(format!("{API_ROOT}{path}"))
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", api_version)
+        .send()
+        .await
+        .map_err(GitHubError::Transport)?;
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        let body = response.text().await.unwrap_or_default();
+        Err(GitHubError::Http { status, body: bounded(&body, 1024).to_owned() })
+    }
 }
 
 async fn rest_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, GitHubError> {

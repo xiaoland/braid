@@ -46,9 +46,12 @@ GitHub edits instead of manipulating a private Agent transcript.
 
 ### Work Items and Context
 
-- A **GitHub Issue** becomes an Issue Work Item when the Braid Agent App is
-  assigned. Assignment creates a new Issue Agent Group and physical Provider
-  Session but does not by itself fabricate a Human message or start a turn.
+- A **GitHub Issue** becomes an Issue Work Item through an Issue Activation.
+  A provisioned GitHub Agent App assignment is the preferred native signal;
+  an ordinary GitHub App is not a standard assignable user, so the PoC also
+  accepts the first Trusted Braid Mention on a dormant Issue. Native assignment
+  creates a session and remains idle; mention fallback carries the comment as
+  a Wake Event and starts the first turn after materialization.
 - A **GitHub PR** becomes a PR Work Item through a trusted `@braid` PR comment
   or the ActivationIntent produced by `braid gh pr ensure`.
 - **Issue Context** contains the repository-qualified Issue identity, current
@@ -91,7 +94,10 @@ arbitration, and convergence are outside the MVP correctness claim.
 
 ### Discuss
 
-Assigning Braid creates the Issue session. New Human comments, newly populated
+Issue Activation creates the Issue session. A native assignment does not
+invent a turn. On installations without the special Agent App assignment
+capability, the first trusted visible `@braid` both activates the dormant Issue
+and supplies the first Wake Event. Later Human comments, newly populated
 included metadata, and unfolded content are Wake Events. They accumulate until
 the Quiet Window expires or the count threshold is reached. The Issue Agent
 receives one current Context plus coalesced Event References and decides

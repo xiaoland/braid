@@ -140,10 +140,10 @@ start_runtime() {
     : > "$runtime_log"
     if [[ "$webhook_mode" == "app" ]]; then
         BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
-            --config "$test_config" --tunnel >"$runtime_log" 2>&1 &
+            --config "$test_config" --tunnel --transport-only >"$runtime_log" 2>&1 &
     else
         BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
-            --config "$test_config" >"$runtime_log" 2>&1 &
+            --config "$test_config" --transport-only >"$runtime_log" 2>&1 &
     fi
     runtime_pid=$!
     wait_for_health

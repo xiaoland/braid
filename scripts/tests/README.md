@@ -13,7 +13,7 @@ through real GitHub Work Items and a clean packaged installation.
 
 `00_clean_install.sh` is the Rust foundation gate. It unpacks the release
 artifact, scrubs Python/PDM/Cargo from the binary's `PATH`, exercises only the
-public CLI, verifies schema 0→3, schema 1→3 with a pre-v3 backup, and
+public CLI, verifies schema 0→4, schema 1→4 with a pre-v4 backup, and
 schema-newer refusal, and uses the adjacent
 bounded OTLP/HTTP capture helper to observe sampling. Its direct SQLite write is
 limited to constructing declared migration-compatibility fixtures; it does not
@@ -51,3 +51,28 @@ ingress, then provide its `/webhook` URL through
 repository webhook and accepts optional `BRAID_TEST_INGRESS` and
 `BRAID_TEST_HEALTH` loopback addresses. This mode does not prove App event
 subscriptions or App webhook handoff/restoration, and its JSON verdict says so.
+
+`30_issue_agent.sh` is the first Slice 3 provider gate. It starts the packaged
+Braid binary against the real pinned Codex app-server, creates one temporary
+repository webhook and disposable Issue, and uses the ordinary-App fallback:
+the first trusted `@braid` activates the dormant Issue and starts the turn. It
+then edits that mention while the turn is active and proves one expected-turn
+steer, `eyes`/`rocket` to `eyes`/`+1` convergence, one Agent-authored attributed
+comment, one idle physical session, and zero Braid turn-mirror comments. The
+helper deletes its temporary webhook and closes the Issue unless
+`BRAID_TEST_KEEP_FIXTURES=1`.
+
+Run it with a real authenticated Agent `gh` identity and an acceptance config
+whose Codex home already has provider authentication:
+
+```shell
+BRAID_CONFIG=/absolute/path/to/braid.toml \
+BRAID_BIN=/absolute/path/to/braid \
+BRAID_TEST_WRANGLER=/absolute/path/to/wrangler \
+BRAID_WEBHOOK_SECRET='acceptance-secret' \
+scripts/tests/30_issue_agent.sh
+```
+
+This bounded gate does not yet prove ordinary debounced/count-threshold turns,
+unexpected terminal reactions, provider-disconnect unknown state, native Agent
+App assignment, or the full release campaign.

@@ -4,6 +4,7 @@ mod context;
 mod doctor;
 mod github;
 mod protocol;
+mod provider;
 mod runtime;
 mod store;
 mod telemetry;

@@ -20,11 +20,13 @@ Each Work Item/Profile pair has an Assignment Generation and one state:
 | `retired` | Merged PR or superseded generation; no automatic resume. |
 | `blocked` | Complete Context, Profile, provider, worktree, or external authority is unavailable. |
 
-Issue assignment to the configured Braid App starts a fresh generation,
-materializes Context, and creates a physical session, ending in `idle`; it does
-not synthesize a turn. PR Activation from a Trusted Braid Mention or
-`pr ensure` starts a generation and also carries an explicit Wake reference, so
-the initial PR turn starts once materialization succeeds.
+Issue Activation starts a fresh generation, materializes Context, and creates a
+physical session. A canonically confirmed native Agent App assignment ends in
+`idle` and does not synthesize a turn. When that special GitHub capability is
+unavailable, the first Trusted Braid Mention on a dormant Issue is both the
+ActivationIntent and an urgent Wake reference, so the initial Issue turn starts
+after materialization. PR Activation from a Trusted Braid Mention or `pr
+ensure` likewise carries an explicit Wake reference.
 
 ## Event Classification
 
@@ -89,9 +91,11 @@ continuing.
 
 ## Assignment and Terminal Lifecycle
 
-- Issue unassignment starts/resets the same Quiet Window. Once settled, Braid
-  safely interrupts an active turn, archives its physical session, and moves
-  the generation to `sleeping`. Reassignment starts a new generation/session.
+- In native Agent App assignment mode, Issue unassignment starts/resets the
+  same Quiet Window. Once settled, Braid safely interrupts an active turn,
+  archives its physical session, and moves the generation to `sleeping`.
+  Reassignment starts a new generation/session. Ordinary-App mention fallback
+  does not fabricate assign/unassign lifecycle events.
 - Issue/PR close or PR merge never interrupts the current turn. The lifecycle
   event grants exactly one Finalization Turn after the current terminal, or
   immediately when idle. Afterwards closed Issue and closed-unmerged PR groups

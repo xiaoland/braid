@@ -33,6 +33,7 @@ cargo run --locked -- migrate plan --config /absolute/path/to/braid.toml
 cargo run --locked -- github probe --config /absolute/path/to/braid.toml --repository owner/repository
 cargo run --locked -- context issue owner/repository#123 --config /absolute/path/to/braid.toml
 cargo run --locked -- serve --config /absolute/path/to/braid.toml --tunnel
+cargo run --locked -- serve --config /absolute/path/to/braid.toml --transport-only
 cargo run --locked -- status --config /absolute/path/to/braid.toml --json
 ```
 
@@ -41,9 +42,10 @@ only mechanical versions, associations, and deleted-comment tombstones while
 GitHub remains the content authority.
 The diagnostic `--page-size` defaults to GitHub's maximum of 100; real campaign
 helpers may lower it to force pagination while requiring byte-identical Context.
-`serve --tunnel` owns only transport in the current slice: verified webhook
-ingress, canonical reconciliation, reactions, and runnable debounce batches.
-It does not start a Coding Agent turn until the provider slice is enabled.
+`serve` owns the configured Codex app-server and Issue Agent turns;
+`--transport-only` deliberately stops at verified webhook ingress, canonical
+reconciliation, reactions, and runnable debounce batches. `--tunnel` adds the
+free supervised Quick Tunnel to either mode.
 
 Copy [`config.example.toml`](config.example.toml) outside the checkout and
 replace every placeholder path before running diagnostics. A packaged release

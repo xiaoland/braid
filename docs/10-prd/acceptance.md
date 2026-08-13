@@ -43,15 +43,23 @@ Set the campaign Quiet Window to 30 seconds, Wake count threshold to eight,
 reconciliation interval to 60 seconds, and OpenTelemetry sample ratio to 1.0.
 Record the installed Braid/Codex/Git/gh/Wrangler versions, config/profile
 revisions, repository revision, App identity/permissions, process start time,
-and pristine worktree states before assigning Braid.
+and pristine worktree states before activating Braid. Record whether the
+installation exposes native Agent App assignment or uses the Trusted Braid
+Mention fallback; the campaign must not claim one mode while exercising the
+other.
 
 ## Required Journeys
 
-### 1. Assignment and Initial Context
+### 1. Activation and Initial Context
 
-Assign the Braid Agent App to the Issue. Braid must create one Issue Agent
-generation and physical Codex thread, inject complete current Issue Context,
-and remain idle without inventing a turn or Agent comment. The Context must:
+If the installation exposes native Agent App assignment, assign it to the
+Issue. Braid must create one Issue Agent generation and physical Codex thread,
+inject complete current Issue Context, and remain idle without inventing a turn
+or Agent comment. If it is an ordinary GitHub App, create one maintainer
+Trusted Braid Mention on the dormant Issue instead. That same comment must
+produce one generation and one initial turn after complete Context injection;
+Braid must not fabricate an assignee or a second Wake. In both modes the
+Context must:
 
 - use plain `GitHub Issue: owner/repo#number` identity;
 - include title, description, selected metadata/relationships, and visible
@@ -60,9 +68,10 @@ and remain idle without inventing a turn or Agent comment. The Context must:
 - contain no JSON envelope, GraphQL node IDs, duplicate URL, Operational Status
   body, or folded body.
 
-Unassign and reassign once. Unassignment must wait for debounce and stop the old
-generation; reassignment must create a new generation/session, not resume stale
-provider memory.
+In native assignment mode, unassign and reassign once. Unassignment must wait
+for debounce and stop the old generation; reassignment must create a new
+generation/session, not resume stale provider memory. The ordinary-App fallback
+does not claim this native lifecycle.
 
 ### 2. Debounce, Count, and Trusted Mention
 

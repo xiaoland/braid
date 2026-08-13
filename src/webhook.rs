@@ -33,14 +33,21 @@ pub struct WebhookHeaders<'a> {
     pub event: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ActorPolicy<'a> {
+    pub app_node_id: &'a str,
+    pub app_login: &'a str,
+    pub agent_node_ids: &'a [String],
+    pub profile_ids: &'a [String],
+}
+
 pub fn parse_verified(
     headers: WebhookHeaders<'_>,
     body: &[u8],
     secret: &[u8],
     configured_repository: &str,
     configured_handle: &str,
-    app_actor_node_id: &str,
-    app_actor_login: &str,
+    actors: ActorPolicy<'_>,
 ) -> Result<IngressEvent, WebhookError> {
     verify_signature(headers.signature.ok_or(WebhookError::MissingSignature)?, body, secret)?;
     let delivery = headers.delivery.ok_or(WebhookError::MissingDelivery)?;
@@ -57,17 +64,19 @@ pub fn parse_verified(
     let action = payload.action.clone();
     let actor_node_id = payload.sender.as_ref().and_then(|actor| actor.node_id.clone());
     let actor_login = payload.sender.as_ref().map(|actor| actor.login.clone());
-    let agent_origin = actor_node_id.as_deref() == Some(app_actor_node_id)
-        || actor_login.as_deref() == Some(app_actor_login);
-    let target = target(event_name, &payload, action.as_deref());
-    let known = is_known_event(event_name);
-    let classification =
-        if agent_origin { "agent_origin" } else { classify(event_name, action.as_deref()) };
     let body_text = payload
         .comment
         .as_ref()
         .and_then(|comment| comment.body.as_deref())
         .or_else(|| payload.review.as_ref().and_then(|review| review.body.as_deref()));
+    let agent_origin = actor_node_id.as_deref() == Some(actors.app_node_id)
+        || actor_login.as_deref() == Some(actors.app_login)
+        || actor_node_id.as_ref().is_some_and(|node_id| actors.agent_node_ids.contains(node_id))
+        || body_text.is_some_and(|body| has_agent_attribution(body, actors.profile_ids));
+    let target = target(event_name, &payload, action.as_deref());
+    let known = is_known_event(event_name);
+    let classification =
+        if agent_origin { "agent_origin" } else { classify(event_name, action.as_deref()) };
     let mention_candidate = !agent_origin
         && matches!(action.as_deref(), Some("created" | "edited"))
         && body_text.is_some_and(|body| has_visible_mention(body, configured_handle));
@@ -314,6 +323,14 @@ pub fn has_visible_mention(markdown: &str, handle: &str) -> bool {
         stack.extend(node.children());
     }
     false
+}
+
+pub fn has_agent_attribution(markdown: &str, profile_ids: &[String]) -> bool {
+    let Some(first_line) = markdown.lines().next() else { return false };
+    first_line.starts_with("> **Braid Agent · ")
+        && profile_ids
+            .iter()
+            .any(|profile_id| first_line.ends_with(&format!(" · `{profile_id}`**")))
 }
 
 fn contains_exact_mention(text: &str, mention: &str) -> bool {

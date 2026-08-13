@@ -181,6 +181,8 @@ struct ServeArguments {
         help = "Expose ingress through a free Wrangler Quick Tunnel and own the App webhook while running"
     )]
     tunnel: bool,
+    #[arg(long, help = "Run GitHub transport without starting the configured Coding Agent")]
+    transport_only: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -230,7 +232,7 @@ pub async fn run() -> Result<()> {
         }
         Command::Serve(arguments) => {
             let config = load(&arguments.config)?;
-            crate::runtime::serve(config, arguments.tunnel).await?;
+            crate::runtime::serve(config, arguments.tunnel, !arguments.transport_only).await?;
         }
     }
     Ok(())

@@ -15,15 +15,17 @@ use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 3;
+pub const DATABASE_SCHEMA_VERSION: u32 = 4;
 
 const INITIAL_SQL: &str = include_str!("../migrations/0001_initial.sql");
 const CONTEXT_LEDGER_SQL: &str = include_str!("../migrations/0002_context_ledger.sql");
 const TRANSPORT_RUNTIME_SQL: &str = include_str!("../migrations/0003_transport_runtime.sql");
+const PROVIDER_RUNTIME_SQL: &str = include_str!("../migrations/0004_provider_runtime.sql");
 const MIGRATIONS: &[Migration] = &[
     Migration { version: 1, name: "initial", sql: INITIAL_SQL },
     Migration { version: 2, name: "context-ledger", sql: CONTEXT_LEDGER_SQL },
     Migration { version: 3, name: "transport-runtime", sql: TRANSPORT_RUNTIME_SQL },
+    Migration { version: 4, name: "provider-runtime", sql: PROVIDER_RUNTIME_SQL },
 ];
 
 #[derive(Debug, Error)]
@@ -158,6 +160,7 @@ pub struct RuntimeStoreStatus {
     pub uncertain_writes: u64,
     pub last_reconciliation: Option<String>,
     pub batches: Vec<WakeBatchSummary>,
+    pub agent_groups: Vec<AgentGroupSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,6 +199,7 @@ pub struct PendingGitHubWrite {
     pub target_database_id: String,
     pub operation: String,
     pub content: String,
+    pub remote_database_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +220,58 @@ pub struct CanonicalObjectState {
     pub lifecycle: String,
     pub author_node_id: Option<String>,
     pub author_login: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileRecord {
+    pub profile_id: String,
+    pub revision: u64,
+    pub effective_digest: String,
+    pub provider_kind: String,
+    pub tags: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssignmentCandidate {
+    pub event_id: String,
+    pub action: String,
+    pub repository: String,
+    pub number: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentMaterialization {
+    pub assignment_id: String,
+    pub agent_id: String,
+    pub work_item_node_id: String,
+    pub generation: u64,
+    pub profile_id: String,
+    pub profile_revision: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TurnClaim {
+    pub turn_id: String,
+    pub batch_id: String,
+    pub provider_session_id: String,
+    pub repository: String,
+    pub number: u64,
+    pub context_revision: String,
+    pub references: Vec<String>,
+    pub trusted_mention: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentGroupSummary {
+    pub work_item_kind: String,
+    pub work_item_number: u64,
+    pub profile_id: String,
+    pub assignment_generation: u64,
+    pub assignment_lifecycle: String,
+    pub provider_session_id: Option<String>,
+    pub session_lifecycle: Option<String>,
+    pub active_turn_id: Option<String>,
+    pub turn_lifecycle: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -526,6 +582,141 @@ impl StoreActor {
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
+
+    pub fn register_profile(&self, profile: ProfileRecord) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::RegisterProfile(profile, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn assignment_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AssignmentCandidate>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::AssignmentCandidates(limit, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn begin_issue_assignment(
+        &self,
+        event_id: String,
+        profile: ProfileRecord,
+        context_revision: String,
+        preserve_wake_batch: bool,
+    ) -> Result<Option<AgentMaterialization>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::BeginIssueAssignment(
+                event_id,
+                profile,
+                context_revision,
+                preserve_wake_batch,
+                reply,
+            ))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn ignore_assignment_event(&self, event_id: String) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::IgnoreAssignmentEvent(event_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn complete_issue_assignment(
+        &self,
+        materialization: AgentMaterialization,
+        provider_session_id: String,
+        context_revision: String,
+        instruction_revision: String,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::CompleteIssueAssignment(
+                materialization,
+                provider_session_id,
+                context_revision,
+                instruction_revision,
+                reply,
+            ))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn fail_issue_assignment(
+        &self,
+        assignment_id: String,
+        error: String,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::FailIssueAssignment(assignment_id, error, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn claim_runnable_turn(&self) -> Result<Option<TurnClaim>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::ClaimRunnableTurn(reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn mark_turn_started(
+        &self,
+        turn_id: String,
+        provider_turn_id: String,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::MarkTurnStarted(turn_id, provider_turn_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn mark_turn_terminal(&self, turn_id: String, lifecycle: String) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::MarkTurnTerminal(turn_id, lifecycle, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn claim_urgent_steer(&self, turn_id: String) -> Result<Option<TurnClaim>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::ClaimUrgentSteer(turn_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn consume_steer_batch(&self, batch_id: String) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::ConsumeSteerBatch(batch_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn enqueue_turn_reaction(
+        &self,
+        turn_id: String,
+        content: String,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::EnqueueTurnReaction(turn_id, content, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
 }
 
 impl Drop for StoreActor {
@@ -573,6 +764,30 @@ enum Command {
         Option<String>,
         Sender<Result<(), StoreError>>,
     ),
+    RegisterProfile(ProfileRecord, Sender<Result<(), StoreError>>),
+    AssignmentCandidates(usize, Sender<Result<Vec<AssignmentCandidate>, StoreError>>),
+    BeginIssueAssignment(
+        String,
+        ProfileRecord,
+        String,
+        bool,
+        Sender<Result<Option<AgentMaterialization>, StoreError>>,
+    ),
+    IgnoreAssignmentEvent(String, Sender<Result<(), StoreError>>),
+    CompleteIssueAssignment(
+        AgentMaterialization,
+        String,
+        String,
+        String,
+        Sender<Result<(), StoreError>>,
+    ),
+    FailIssueAssignment(String, String, Sender<Result<(), StoreError>>),
+    ClaimRunnableTurn(Sender<Result<Option<TurnClaim>, StoreError>>),
+    MarkTurnStarted(String, String, Sender<Result<(), StoreError>>),
+    MarkTurnTerminal(String, String, Sender<Result<(), StoreError>>),
+    ClaimUrgentSteer(String, Sender<Result<Option<TurnClaim>, StoreError>>),
+    ConsumeSteerBatch(String, Sender<Result<(), StoreError>>),
+    EnqueueTurnReaction(String, String, Sender<Result<(), StoreError>>),
     Shutdown,
 }
 
@@ -678,6 +893,66 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
                     change_count,
                     error.as_deref(),
                 ));
+            }
+            Command::RegisterProfile(profile, reply) => {
+                let _ = reply.send(register_profile(database, &profile));
+            }
+            Command::AssignmentCandidates(limit, reply) => {
+                let _ = reply.send(assignment_candidates(database, limit));
+            }
+            Command::BeginIssueAssignment(
+                event_id,
+                profile,
+                context_revision,
+                preserve_wake_batch,
+                reply,
+            ) => {
+                let _ = reply.send(begin_issue_assignment(
+                    database,
+                    &event_id,
+                    &profile,
+                    &context_revision,
+                    preserve_wake_batch,
+                ));
+            }
+            Command::IgnoreAssignmentEvent(event_id, reply) => {
+                let _ = reply.send(ignore_assignment_event(database, &event_id));
+            }
+            Command::CompleteIssueAssignment(
+                materialization,
+                provider_session_id,
+                context_revision,
+                instruction_revision,
+                reply,
+            ) => {
+                let _ = reply.send(complete_issue_assignment(
+                    database,
+                    &materialization,
+                    &provider_session_id,
+                    &context_revision,
+                    &instruction_revision,
+                ));
+            }
+            Command::FailIssueAssignment(assignment_id, error, reply) => {
+                let _ = reply.send(fail_issue_assignment(database, &assignment_id, &error));
+            }
+            Command::ClaimRunnableTurn(reply) => {
+                let _ = reply.send(claim_runnable_turn(database));
+            }
+            Command::MarkTurnStarted(turn_id, provider_turn_id, reply) => {
+                let _ = reply.send(mark_turn_started(database, &turn_id, &provider_turn_id));
+            }
+            Command::MarkTurnTerminal(turn_id, lifecycle, reply) => {
+                let _ = reply.send(mark_turn_terminal(database, &turn_id, &lifecycle));
+            }
+            Command::ClaimUrgentSteer(turn_id, reply) => {
+                let _ = reply.send(claim_urgent_steer(database, &turn_id));
+            }
+            Command::ConsumeSteerBatch(batch_id, reply) => {
+                let _ = reply.send(consume_steer_batch(database, &batch_id));
+            }
+            Command::EnqueueTurnReaction(turn_id, content, reply) => {
+                let _ = reply.send(enqueue_turn_reaction(database, &turn_id, &content));
             }
             Command::Shutdown => break,
         }
@@ -1442,31 +1717,8 @@ fn runtime_status(database: &Path) -> Result<RuntimeStoreStatus, StoreError> {
             },
         )
         .optional()?;
-    let batches = {
-        let mut statement = connection.prepare(
-            "SELECT b.batch_id,r.name_with_owner,w.kind,w.number,w.node_id,b.event_count,
-                    b.quiet_deadline,b.urgent,b.lifecycle
-             FROM wake_batches b
-             JOIN work_items w ON w.node_id=b.work_item_node_id
-             JOIN repositories r ON r.node_id=w.repository_node_id
-             WHERE b.lifecycle IN ('pending','runnable')
-             ORDER BY b.created_at,b.batch_id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok(WakeBatchSummary {
-                batch_id: row.get(0)?,
-                repository: row.get(1)?,
-                work_item_kind: row.get(2)?,
-                work_item_number: sqlite_i64_to_u64(row.get(3)?, "work-item number")?,
-                work_item_node_id: row.get(4)?,
-                event_count: sqlite_i64_to_u64(row.get(5)?, "batch event count")?,
-                quiet_deadline: row.get(6)?,
-                urgent: row.get::<_, i64>(7)? != 0,
-                lifecycle: row.get(8)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    };
+    let batches = load_wake_batches(&connection)?;
+    let agent_groups = load_agent_groups(&connection)?;
     Ok(RuntimeStoreStatus {
         owner,
         deliveries: scalar_u64(&connection, "SELECT COUNT(*) FROM deliveries")?,
@@ -1507,7 +1759,66 @@ fn runtime_status(database: &Path) -> Result<RuntimeStoreStatus, StoreError> {
             )
             .optional()?,
         batches,
+        agent_groups,
     })
+}
+
+fn load_wake_batches(
+    connection: &rusqlite::Connection,
+) -> Result<Vec<WakeBatchSummary>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT b.batch_id,r.name_with_owner,w.kind,w.number,w.node_id,b.event_count,
+                b.quiet_deadline,b.urgent,b.lifecycle
+         FROM wake_batches b
+         JOIN work_items w ON w.node_id=b.work_item_node_id
+         JOIN repositories r ON r.node_id=w.repository_node_id
+         WHERE b.lifecycle IN ('pending','runnable')
+         ORDER BY b.created_at,b.batch_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(WakeBatchSummary {
+            batch_id: row.get(0)?,
+            repository: row.get(1)?,
+            work_item_kind: row.get(2)?,
+            work_item_number: sqlite_i64_to_u64(row.get(3)?, "work-item number")?,
+            work_item_node_id: row.get(4)?,
+            event_count: sqlite_i64_to_u64(row.get(5)?, "batch event count")?,
+            quiet_deadline: row.get(6)?,
+            urgent: row.get::<_, i64>(7)? != 0,
+            lifecycle: row.get(8)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+}
+
+fn load_agent_groups(
+    connection: &rusqlite::Connection,
+) -> Result<Vec<AgentGroupSummary>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT w.kind,w.number,ai.profile_id,a.generation,a.lifecycle,
+                ps.provider_session_id,ps.lifecycle,t.provider_turn_id,t.lifecycle
+         FROM assignments a
+         JOIN work_items w ON w.node_id=a.work_item_node_id
+         JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
+         LEFT JOIN provider_sessions ps ON ps.agent_id=ai.agent_id
+         LEFT JOIN turns t ON t.session_id=ps.session_id
+           AND t.lifecycle IN ('starting','running','unknown')
+         ORDER BY a.assigned_at,a.assignment_id,ps.started_at",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(AgentGroupSummary {
+            work_item_kind: row.get(0)?,
+            work_item_number: sqlite_i64_to_u64(row.get(1)?, "agent Work Item number")?,
+            profile_id: row.get(2)?,
+            assignment_generation: sqlite_i64_to_u64(row.get(3)?, "assignment generation")?,
+            assignment_lifecycle: row.get(4)?,
+            provider_session_id: row.get(5)?,
+            session_lifecycle: row.get(6)?,
+            active_turn_id: row.get(7)?,
+            turn_lifecycle: row.get(8)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
 }
 
 fn acquire_runtime_lease(
@@ -1615,7 +1926,8 @@ fn claim_github_write(database: &Path) -> Result<Option<PendingGitHubWrite>, Sto
     let transaction = connection.transaction()?;
     let write = transaction
         .query_row(
-            "SELECT intent_id,repository,target_kind,target_database_id,operation,content
+            "SELECT intent_id,repository,target_kind,target_database_id,operation,content,
+                    remote_database_id
              FROM github_write_outbox
              WHERE lifecycle IN ('pending','uncertain') AND next_attempt_at<=?1
              ORDER BY created_at,intent_id LIMIT 1",
@@ -1628,6 +1940,7 @@ fn claim_github_write(database: &Path) -> Result<Option<PendingGitHubWrite>, Sto
                     target_database_id: row.get(3)?,
                     operation: row.get(4)?,
                     content: row.get(5)?,
+                    remote_database_id: row.get(6)?,
                 })
             },
         )
@@ -1654,13 +1967,24 @@ fn finish_github_write(
     if !matches!(lifecycle, "applied" | "uncertain" | "rejected" | "conflict" | "ambiguous") {
         return Err(StoreError::InvalidData(format!("invalid write terminal {lifecycle}")));
     }
-    let connection = open_read_write(database)?;
+    let mut connection = open_read_write(database)?;
     configure_connection(&connection)?;
-    let attempts = connection
+    let transaction = connection.transaction()?;
+    let (attempts, operation, repository, target_kind, target_database_id, content) = transaction
         .query_row(
-            "SELECT attempts FROM github_write_outbox WHERE intent_id=?1 AND lifecycle='sending'",
+            "SELECT attempts,operation,repository,target_kind,target_database_id,content
+             FROM github_write_outbox WHERE intent_id=?1 AND lifecycle='sending'",
             [intent_id],
-            |row| row.get::<_, i64>(0),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
         )
         .optional()?
         .ok_or_else(|| {
@@ -1670,16 +1994,38 @@ fn finish_github_write(
     let retry_seconds = 2_u64.pow(retry_exponent).min(60);
     let next_attempt_at =
         if lifecycle == "uncertain" { deadline_rfc3339(retry_seconds)? } else { now_rfc3339() };
-    let updated = connection.execute(
+    let updated = transaction.execute(
         "UPDATE github_write_outbox SET lifecycle=?2,remote_database_id=?3,last_error=?4,
            next_attempt_at=?5,updated_at=?6 WHERE intent_id=?1 AND lifecycle='sending'",
         params![intent_id, lifecycle, remote_database_id, error, next_attempt_at, now_rfc3339()],
     )?;
-    if updated == 1 {
-        Ok(())
-    } else {
-        Err(StoreError::InvalidData(format!("write intent {intent_id} is not sending")))
+    if updated != 1 {
+        return Err(StoreError::InvalidData(format!("write intent {intent_id} is not sending")));
     }
+    if lifecycle == "applied" && operation == "reaction_add" && content == "rocket" {
+        let terminal_exists = transaction
+            .query_row(
+                "SELECT 1 FROM github_write_outbox
+                 WHERE repository=?1 AND target_kind=?2 AND target_database_id=?3
+                   AND operation='reaction_add' AND content IN ('+1','confused')
+                   AND lifecycle NOT IN ('rejected','conflict','ambiguous','superseded') LIMIT 1",
+                params![repository, target_kind, target_database_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if terminal_exists {
+            enqueue_rocket_removal(
+                &transaction,
+                &repository,
+                &target_kind,
+                &target_database_id,
+                &now_rfc3339(),
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 fn tracked_work_items(database: &Path) -> Result<Vec<TrackedWorkItem>, StoreError> {
@@ -1780,6 +2126,570 @@ fn finish_reconciliation(
     } else {
         Err(StoreError::InvalidData(format!("reconciliation run {} is not active", run.run_id)))
     }
+}
+
+fn register_profile(database: &Path, profile: &ProfileRecord) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    if profile.effective_digest.len() != 64 {
+        return Err(StoreError::InvalidData("Profile digest is not SHA-256".into()));
+    }
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    connection.execute(
+        "INSERT INTO profiles(profile_id,revision,effective_digest,provider_kind,tags)
+         VALUES (?1,?2,?3,?4,?5)
+         ON CONFLICT(profile_id,revision) DO UPDATE SET
+           effective_digest=excluded.effective_digest,
+           provider_kind=excluded.provider_kind,
+           tags=excluded.tags",
+        params![
+            profile.profile_id,
+            sqlite_u64(profile.revision, "Profile revision")?,
+            profile.effective_digest,
+            profile.provider_kind,
+            profile.tags,
+        ],
+    )?;
+    Ok(())
+}
+
+fn assignment_candidates(
+    database: &Path,
+    limit: usize,
+) -> Result<Vec<AssignmentCandidate>, StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_only(database)?;
+    let limit = i64::try_from(limit)
+        .map_err(|_| StoreError::InvalidData("assignment candidate limit exceeds i64".into()))?;
+    let mut statement = connection.prepare(
+        "SELECT e.event_id,
+                CASE WHEN e.trusted_mention=1 THEN 'trusted_mention' ELSE d.action END,
+                r.name_with_owner,w.number
+         FROM events e
+         JOIN deliveries d ON d.delivery_guid=e.delivery_guid
+         JOIN work_items w ON w.node_id=e.work_item_node_id
+         JOIN repositories r ON r.node_id=w.repository_node_id
+         WHERE e.lifecycle='pending' AND w.kind='issue'
+           AND ((e.classification='lifecycle' AND d.event_name='issues'
+                 AND d.action IN ('assigned','unassigned'))
+                OR e.trusted_mention=1)
+         ORDER BY e.observed_at,e.event_id LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit], |row| {
+        Ok(AssignmentCandidate {
+            event_id: row.get(0)?,
+            action: row.get(1)?,
+            repository: row.get(2)?,
+            number: sqlite_i64_to_u64(row.get(3)?, "assignment Issue number")?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+}
+
+fn begin_issue_assignment(
+    database: &Path,
+    event_id: &str,
+    profile: &ProfileRecord,
+    context_revision: &str,
+    preserve_wake_batch: bool,
+) -> Result<Option<AgentMaterialization>, StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let work_item_node_id = transaction
+        .query_row(
+            "SELECT work_item_node_id FROM events WHERE event_id=?1 AND lifecycle='pending'",
+            [event_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::InvalidData(format!("assignment event {event_id} is not pending"))
+        })?;
+    transaction.execute(
+        "INSERT INTO profiles(profile_id,revision,effective_digest,provider_kind,tags)
+         VALUES (?1,?2,?3,?4,?5)
+         ON CONFLICT(profile_id,revision) DO UPDATE SET
+           effective_digest=excluded.effective_digest,
+           provider_kind=excluded.provider_kind,
+           tags=excluded.tags",
+        params![
+            profile.profile_id,
+            sqlite_u64(profile.revision, "Profile revision")?,
+            profile.effective_digest,
+            profile.provider_kind,
+            profile.tags,
+        ],
+    )?;
+    if !preserve_wake_batch {
+        transaction.execute(
+            "UPDATE wake_batches SET lifecycle='consumed',updated_at=?2
+             WHERE work_item_node_id=?1 AND lifecycle IN ('pending','runnable')",
+            params![work_item_node_id, now],
+        )?;
+    }
+    transaction.execute("UPDATE events SET lifecycle='consumed' WHERE event_id=?1", [event_id])?;
+    let active = transaction
+        .query_row(
+            "SELECT 1 FROM assignments
+             WHERE work_item_node_id=?1 AND lifecycle IN ('materializing','active')",
+            [&work_item_node_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if active {
+        transaction.commit()?;
+        return Ok(None);
+    }
+    let generation = transaction.query_row(
+        "SELECT COALESCE(MAX(generation),0)+1 FROM assignments WHERE work_item_node_id=?1",
+        [&work_item_node_id],
+        |row| sqlite_i64_to_u64(row.get(0)?, "assignment generation"),
+    )?;
+    let materialization = AgentMaterialization {
+        assignment_id: Uuid::now_v7().to_string(),
+        agent_id: Uuid::now_v7().to_string(),
+        work_item_node_id: work_item_node_id.clone(),
+        generation,
+        profile_id: profile.profile_id.clone(),
+        profile_revision: profile.revision,
+    };
+    transaction.execute(
+        "INSERT INTO assignments(
+           assignment_id,work_item_node_id,generation,lifecycle,assigned_at
+         ) VALUES (?1,?2,?3,'materializing',?4)",
+        params![
+            materialization.assignment_id,
+            materialization.work_item_node_id,
+            sqlite_u64(materialization.generation, "assignment generation")?,
+            now,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO agent_instances(
+           agent_id,assignment_id,profile_id,profile_revision,role,lifecycle
+         ) VALUES (?1,?2,?3,?4,'issue_agent','materializing')",
+        params![
+            materialization.agent_id,
+            materialization.assignment_id,
+            materialization.profile_id,
+            sqlite_u64(materialization.profile_revision, "Profile revision")?,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE work_items SET context_revision=?2,observed_at=?3 WHERE node_id=?1",
+        params![work_item_node_id, context_revision, now],
+    )?;
+    transaction.commit()?;
+    Ok(Some(materialization))
+}
+
+fn ignore_assignment_event(database: &Path, event_id: &str) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    connection.execute(
+        "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
+        [event_id],
+    )?;
+    Ok(())
+}
+
+fn complete_issue_assignment(
+    database: &Path,
+    materialization: &AgentMaterialization,
+    provider_session_id: &str,
+    context_revision: &str,
+    instruction_revision: &str,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let session_id = Uuid::now_v7().to_string();
+    transaction.execute(
+        "INSERT INTO provider_sessions(
+           session_id,agent_id,provider_kind,provider_session_id,context_revision,
+           instruction_revision,lifecycle,started_at
+         ) VALUES (?1,?2,'codex',?3,?4,?5,'idle',?6)",
+        params![
+            session_id,
+            materialization.agent_id,
+            provider_session_id,
+            context_revision,
+            instruction_revision,
+            now,
+        ],
+    )?;
+    let assignment = transaction.execute(
+        "UPDATE assignments SET lifecycle='active'
+         WHERE assignment_id=?1 AND lifecycle='materializing'",
+        [&materialization.assignment_id],
+    )?;
+    let agent = transaction.execute(
+        "UPDATE agent_instances SET lifecycle='idle'
+         WHERE agent_id=?1 AND lifecycle='materializing'",
+        [&materialization.agent_id],
+    )?;
+    if assignment != 1 || agent != 1 {
+        return Err(StoreError::InvalidData(format!(
+            "assignment {} is no longer materializing",
+            materialization.assignment_id
+        )));
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn fail_issue_assignment(
+    database: &Path,
+    assignment_id: &str,
+    _error: &str,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "UPDATE assignments SET lifecycle='blocked',retired_at=?2
+         WHERE assignment_id=?1 AND lifecycle='materializing'",
+        params![assignment_id, now],
+    )?;
+    transaction.execute(
+        "UPDATE agent_instances SET lifecycle='blocked'
+         WHERE assignment_id=?1 AND lifecycle='materializing'",
+        [assignment_id],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn claim_runnable_turn(database: &Path) -> Result<Option<TurnClaim>, StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let selected = transaction
+        .query_row(
+            "SELECT b.batch_id,ps.session_id,ps.provider_session_id,
+                    r.name_with_owner,w.number,COALESCE(w.context_revision,ps.context_revision)
+             FROM wake_batches b
+             JOIN work_items w ON w.node_id=b.work_item_node_id
+             JOIN repositories r ON r.node_id=w.repository_node_id
+             JOIN assignments a ON a.work_item_node_id=w.node_id AND a.lifecycle='active'
+             JOIN agent_instances ai ON ai.assignment_id=a.assignment_id AND ai.lifecycle='idle'
+             JOIN provider_sessions ps ON ps.agent_id=ai.agent_id AND ps.lifecycle='idle'
+             WHERE b.lifecycle='runnable' AND w.kind='issue'
+             ORDER BY b.created_at,b.batch_id LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    sqlite_i64_to_u64(row.get(4)?, "turn Issue number")?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((batch_id, session_id, provider_session_id, repository, number, context_revision)) =
+        selected
+    else {
+        transaction.commit()?;
+        return Ok(None);
+    };
+    let (references, trusted_mention) = batch_references(&transaction, &batch_id)?;
+    let turn_id = Uuid::now_v7().to_string();
+    transaction.execute(
+        "UPDATE wake_batches SET lifecycle='consumed',updated_at=?2
+         WHERE batch_id=?1 AND lifecycle='runnable'",
+        params![batch_id, now],
+    )?;
+    transaction.execute(
+        "UPDATE provider_sessions SET lifecycle='running'
+         WHERE session_id=?1 AND lifecycle='idle'",
+        [&session_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO turns(
+           turn_id,session_id,context_revision,trigger_kind,lifecycle,batch_id
+         ) VALUES (?1,?2,?3,?4,'starting',?5)",
+        params![
+            turn_id,
+            session_id,
+            context_revision,
+            if trusted_mention { "trusted_mention" } else { "wake_batch" },
+            batch_id,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(Some(TurnClaim {
+        turn_id,
+        batch_id,
+        provider_session_id,
+        repository,
+        number,
+        context_revision,
+        references,
+        trusted_mention,
+    }))
+}
+
+fn mark_turn_started(
+    database: &Path,
+    turn_id: &str,
+    provider_turn_id: &str,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let updated = connection.execute(
+        "UPDATE turns SET provider_turn_id=?2,lifecycle='running',started_at=?3
+         WHERE turn_id=?1 AND lifecycle='starting'",
+        params![turn_id, provider_turn_id, now_rfc3339()],
+    )?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidData(format!("turn {turn_id} is not starting")))
+    }
+}
+
+fn mark_turn_terminal(database: &Path, turn_id: &str, lifecycle: &str) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    if !matches!(lifecycle, "completed" | "interrupted" | "failed" | "unknown") {
+        return Err(StoreError::InvalidData(format!("invalid turn terminal {lifecycle}")));
+    }
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let session_id = transaction
+        .query_row(
+            "SELECT session_id FROM turns
+             WHERE turn_id=?1 AND lifecycle IN ('starting','running')",
+            [turn_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::InvalidData(format!("turn {turn_id} is not active")))?;
+    transaction.execute(
+        "UPDATE turns SET lifecycle=?2,ended_at=?3 WHERE turn_id=?1",
+        params![turn_id, lifecycle, now],
+    )?;
+    transaction.execute(
+        "UPDATE provider_sessions SET lifecycle=?2 WHERE session_id=?1",
+        params![session_id, if lifecycle == "unknown" { "unknown" } else { "idle" }],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn claim_urgent_steer(database: &Path, turn_id: &str) -> Result<Option<TurnClaim>, StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_only(database)?;
+    let selected = connection
+        .query_row(
+            "SELECT b.batch_id,ps.provider_session_id,
+                    r.name_with_owner,w.number,COALESCE(w.context_revision,ps.context_revision)
+             FROM turns t
+             JOIN provider_sessions ps ON ps.session_id=t.session_id
+             JOIN agent_instances ai ON ai.agent_id=ps.agent_id
+             JOIN assignments a ON a.assignment_id=ai.assignment_id
+             JOIN work_items w ON w.node_id=a.work_item_node_id
+             JOIN repositories r ON r.node_id=w.repository_node_id
+             JOIN wake_batches b ON b.work_item_node_id=w.node_id
+             WHERE t.turn_id=?1 AND t.lifecycle='running'
+               AND b.lifecycle='runnable' AND b.urgent=1
+             ORDER BY b.created_at,b.batch_id LIMIT 1",
+            [turn_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    sqlite_i64_to_u64(row.get(3)?, "steer Issue number")?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((batch_id, provider_session_id, repository, number, context_revision)) = selected
+    else {
+        return Ok(None);
+    };
+    let (references, trusted_mention) = batch_references_connection(&connection, &batch_id)?;
+    Ok(Some(TurnClaim {
+        turn_id: turn_id.into(),
+        batch_id,
+        provider_session_id,
+        repository,
+        number,
+        context_revision,
+        references,
+        trusted_mention,
+    }))
+}
+
+fn consume_steer_batch(database: &Path, batch_id: &str) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let updated = connection.execute(
+        "UPDATE wake_batches SET lifecycle='consumed',updated_at=?2
+         WHERE batch_id=?1 AND lifecycle='runnable' AND urgent=1",
+        params![batch_id, now_rfc3339()],
+    )?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidData(format!("urgent batch {batch_id} is not runnable")))
+    }
+}
+
+fn batch_references(
+    transaction: &rusqlite::Transaction<'_>,
+    batch_id: &str,
+) -> Result<(Vec<String>, bool), StoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT e.reference,COALESCE(e.trusted_mention,0)
+         FROM wake_batch_events be JOIN events e ON e.event_id=be.event_id
+         WHERE be.batch_id=?1 ORDER BY be.ordinal",
+    )?;
+    let rows = statement
+        .query_map([batch_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)))?;
+    let values = rows.collect::<Result<Vec<_>, _>>()?;
+    let trusted = values.iter().any(|value| value.1);
+    Ok((values.into_iter().map(|value| value.0).collect(), trusted))
+}
+
+fn batch_references_connection(
+    connection: &Connection,
+    batch_id: &str,
+) -> Result<(Vec<String>, bool), StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT e.reference,COALESCE(e.trusted_mention,0)
+         FROM wake_batch_events be JOIN events e ON e.event_id=be.event_id
+         WHERE be.batch_id=?1 ORDER BY be.ordinal",
+    )?;
+    let rows = statement
+        .query_map([batch_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)))?;
+    let values = rows.collect::<Result<Vec<_>, _>>()?;
+    let trusted = values.iter().any(|value| value.1);
+    Ok((values.into_iter().map(|value| value.0).collect(), trusted))
+}
+
+fn enqueue_turn_reaction(database: &Path, turn_id: &str, content: &str) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    if !matches!(content, "rocket" | "+1" | "confused") {
+        return Err(StoreError::InvalidData(format!("invalid turn reaction {content}")));
+    }
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let target = transaction
+        .query_row(
+            "SELECT o.repository,o.target_kind,o.target_database_id
+             FROM turns t
+             JOIN wake_batch_events be ON be.batch_id=t.batch_id
+             JOIN events e ON e.event_id=be.event_id AND e.trusted_mention=1
+             JOIN github_write_outbox o ON o.event_id=e.event_id
+             WHERE t.turn_id=?1 LIMIT 1",
+            [turn_id],
+            |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            },
+        )
+        .optional()?;
+    if let Some((repository, target_kind, target_database_id)) = target {
+        if content != "rocket" {
+            enqueue_rocket_removal(
+                &transaction,
+                &repository,
+                &target_kind,
+                &target_database_id,
+                &now,
+            )?;
+        }
+        let request_digest = hex::encode(Sha256::digest(
+            format!("{repository}\0{target_kind}\0{target_database_id}\0{content}").as_bytes(),
+        ));
+        transaction.execute(
+            "INSERT OR IGNORE INTO github_write_outbox(
+               intent_id,repository,target_kind,target_database_id,operation,content,
+               request_digest,lifecycle,next_attempt_at,created_at,updated_at
+             ) VALUES (?1,?2,?3,?4,'reaction_add',?5,?6,'pending',?7,?7,?7)",
+            params![
+                Uuid::now_v7().to_string(),
+                repository,
+                target_kind,
+                target_database_id,
+                content,
+                request_digest,
+                now,
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn enqueue_rocket_removal(
+    transaction: &rusqlite::Transaction<'_>,
+    repository: &str,
+    target_kind: &str,
+    target_database_id: &str,
+    now: &str,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "UPDATE github_write_outbox SET lifecycle='superseded',updated_at=?4
+         WHERE repository=?1 AND target_kind=?2 AND target_database_id=?3
+           AND operation='reaction_add' AND content='rocket' AND lifecycle='pending'",
+        params![repository, target_kind, target_database_id, now],
+    )?;
+    let remote = transaction
+        .query_row(
+            "SELECT remote_database_id FROM github_write_outbox
+             WHERE repository=?1 AND target_kind=?2 AND target_database_id=?3
+               AND operation='reaction_add' AND content='rocket' AND lifecycle='applied'
+               AND remote_database_id IS NOT NULL
+             ORDER BY updated_at DESC LIMIT 1",
+            params![repository, target_kind, target_database_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(remote_database_id) = remote else { return Ok(()) };
+    let request_digest = hex::encode(Sha256::digest(
+        format!(
+            "{repository}\0{target_kind}\0{target_database_id}\0reaction_delete\0{remote_database_id}"
+        )
+        .as_bytes(),
+    ));
+    transaction.execute(
+        "INSERT OR IGNORE INTO github_write_outbox(
+           intent_id,repository,target_kind,target_database_id,operation,content,
+           request_digest,remote_database_id,lifecycle,next_attempt_at,created_at,updated_at
+         ) VALUES (?1,?2,?3,?4,'reaction_delete','rocket',?5,?6,'pending',?7,?7,?7)",
+        params![
+            Uuid::now_v7().to_string(),
+            repository,
+            target_kind,
+            target_database_id,
+            request_digest,
+            remote_database_id,
+            now,
+        ],
+    )?;
+    Ok(())
 }
 
 fn scalar_u64(connection: &Connection, query: &str) -> Result<u64, StoreError> {

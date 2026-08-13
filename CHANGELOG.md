@@ -32,3 +32,13 @@ Versioning once release artifacts are published.
   transport status.
 - The public `scripts/tests/20_ingress_scheduler.sh` real-object campaign for
   Slice 2 transport behavior, with provider turns intentionally disabled.
+- Codex app-server NDJSON ownership, Profile materialization, complete Markdown
+  Context injection, Issue Agent sessions/turns/steer, sampled provider
+  evidence, and durable assignment/turn lifecycle state in schema version 4.
+- Desired-state trusted-mention reactions, including removal of stale active
+  reactions after terminal convergence, and Agent-origin echo suppression by
+  stable actor identity or public Profile attribution.
+- `serve --transport-only` for the bounded transport campaign and the public
+  `scripts/tests/30_issue_agent.sh` real GitHub/Quick Tunnel/Codex Issue Agent
+  gate. The PoC uses trusted `@braid` to activate a dormant Issue because an
+  ordinary GitHub App is not a standard assignable user.

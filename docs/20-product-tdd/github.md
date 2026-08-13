@@ -8,10 +8,13 @@ truth. Arrival order is never canonical order.
 
 The configured Braid Agent App supplies:
 
-- the Issue assignment target and stable Bot/App-authored comment identity;
+- the stable Bot/App-authored write and reaction identity;
 - repository installation scope;
 - webhook deliveries;
 - canonical read and `braid gh` write credentials.
+
+An installation is an Issue assignment target only when GitHub has provisioned
+it as an Agent App. Ordinary GitHub Apps are not standard user assignees.
 
 MVP App permissions are:
 
@@ -57,16 +60,29 @@ The official [webhook payload](https://docs.github.com/en/webhooks/webhook-event
 and [delivery](https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks)
 contracts are the source authority.
 
-## Assignment and PR Activation
+## Issue and PR Activation
 
-An `issues.assigned` delivery starts a new Issue generation only when its
-assignee matches the configured Braid Agent App identity and the canonical
-Issue reread confirms the assignment. Unassignment is likewise confirmed from
-canonical assignees and enters debounce.
+GitHub's Agent App assignment is a special product capability, not a permission
+granted to every ordinary GitHub App. A live 2026-08-13 probe against the Braid
+installation confirmed that adding its Bot login through the standard Issue
+assignee API is rejected with HTTP 403. Braid therefore exposes two Issue
+activation modes:
 
-GitHub documents assigning Agent Apps to Issues, but not a general native PR
-assignee workflow. PR activation therefore has two sources that produce the
-same durable `ActivationIntent`:
+1. when the installation is a provisioned Agent App, an `issues.assigned`
+   delivery starts a generation only after a canonical reread confirms the
+   exact assignee; the activation creates an idle session and does not invent a
+   turn;
+2. otherwise, the first Trusted Braid Mention on a dormant Issue produces one
+   `ActivationIntent` and preserves that same comment as an urgent Wake Event,
+   so materialization is followed by the first turn.
+
+Native unassignment is likewise available only in the first mode and must be
+confirmed from canonical assignees before entering debounce. The fallback is
+not presented as a fabricated assignment.
+
+GitHub does not expose a general native PR Agent assignee workflow. PR
+activation therefore has two sources that produce the same durable
+`ActivationIntent`:
 
 1. a Trusted Braid Mention in a PR conversation comment;
 2. successful convergence of `braid gh pr ensure` for an Issue comment ID.
@@ -75,7 +91,7 @@ The configured handle defaults to `@braid`. Permission is checked at delivery
 time with current repository permission and requires `MAINTAIN` or `ADMIN`;
 `author_association`, sender login, and stale cached permission are insufficient.
 
-GitHub's current Agent App entry points are documented in
+GitHub's special Agent App entry points are documented in
 [Using agent apps](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/cloud-agent/use-agent-apps).
 
 ## Canonical Reads
