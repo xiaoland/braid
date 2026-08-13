@@ -27,7 +27,9 @@ use uuid::Uuid;
 use crate::{
     config::{Config, Profile},
     context::{self, CanonicalContext, CanonicalObservation},
-    github::{AppWebhookConfig, GitHubClient, RepositoryName, WorkItemLocator},
+    github::{
+        AppWebhookConfig, CreatedIssueComment, GitHubClient, RepositoryName, WorkItemLocator,
+    },
     protocol,
     provider::{CodexClient, ProviderError, ProviderNotification},
     store::{
@@ -449,23 +451,41 @@ async fn drain_one_write(store: &StoreActor, github: &GitHubClient) {
             write.intent_id,
             "rejected",
             None,
+            None,
             Some("write repository does not match connected installation".into()),
         );
         return;
     }
     let result = match write.operation.as_str() {
-        "reaction_add" => {
-            github.add_reaction(&write.target_kind, &write.target_database_id, &write.content).await
-        }
+        "reaction_add" => github
+            .add_reaction(&write.target_kind, &write.target_database_id, &write.content)
+            .await
+            .map(|id| AppliedWrite { database_id: Some(id.to_string()), node_id: None }),
         "reaction_delete" => {
             match write.remote_database_id.as_deref().and_then(|value| value.parse::<u64>().ok()) {
                 Some(reaction_id) => github
                     .delete_reaction(&write.target_kind, &write.target_database_id, reaction_id)
                     .await
-                    .map(|()| reaction_id),
+                    .map(|()| AppliedWrite {
+                        database_id: Some(reaction_id.to_string()),
+                        node_id: None,
+                    }),
                 None => bail_unknown_write("reaction_delete without a reaction ID"),
             }
         }
+        "comment_create" => match write.target_database_id.parse::<u64>() {
+            Ok(issue_number) => github
+                .create_issue_comment(issue_number, &write.content)
+                .await
+                .map(AppliedWrite::from),
+            Err(_) => {
+                Err(crate::github::GitHubError::GraphQl("invalid status Issue number".into()))
+            }
+        },
+        "comment_update" => github
+            .update_issue_comment(&write.target_database_id, &write.content)
+            .await
+            .map(AppliedWrite::from),
         operation => bail_unknown_write(operation),
     };
     match result {
@@ -473,7 +493,8 @@ async fn drain_one_write(store: &StoreActor, github: &GitHubClient) {
             if let Err(error) = store.finish_github_write(
                 write.intent_id,
                 "applied",
-                Some(remote_id.to_string()),
+                remote_id.database_id,
+                remote_id.node_id,
                 None,
             ) {
                 tracing::error!(%error, "cannot acknowledge GitHub write");
@@ -481,16 +502,31 @@ async fn drain_one_write(store: &StoreActor, github: &GitHubClient) {
         }
         Err(error) => {
             let lifecycle = if error.is_unavailable() { "uncertain" } else { "rejected" };
-            if let Err(store_error) =
-                store.finish_github_write(write.intent_id, lifecycle, None, Some(error.to_string()))
-            {
+            if let Err(store_error) = store.finish_github_write(
+                write.intent_id,
+                lifecycle,
+                None,
+                None,
+                Some(error.to_string()),
+            ) {
                 tracing::error!(%store_error, "cannot record GitHub write failure");
             }
         }
     }
 }
 
-fn bail_unknown_write(operation: &str) -> Result<u64, crate::github::GitHubError> {
+struct AppliedWrite {
+    database_id: Option<String>,
+    node_id: Option<String>,
+}
+
+impl From<CreatedIssueComment> for AppliedWrite {
+    fn from(comment: CreatedIssueComment) -> Self {
+        Self { database_id: Some(comment.id.to_string()), node_id: Some(comment.node_id) }
+    }
+}
+
+fn bail_unknown_write(operation: &str) -> Result<AppliedWrite, crate::github::GitHubError> {
     Err(crate::github::GitHubError::GraphQl(format!("unsupported outbox operation {operation:?}")))
 }
 
@@ -1132,15 +1168,30 @@ async fn handle_provider_notification(
             false
         }
         ProviderNotification::Disconnected => {
-            if let Some(active) = running.take()
-                && let Err(error) = store.mark_turn_terminal(active.claim.turn_id, "unknown".into())
-            {
-                tracing::error!(%error, "cannot record unknown turn after provider disconnect");
+            if let Some(active) = running.take() {
+                if let Err(error) =
+                    store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into())
+                {
+                    tracing::error!(%error, "cannot record unknown turn after provider disconnect");
+                }
+                let body = operational_status_unknown(&active.claim);
+                if let Err(error) = store.enqueue_operational_status(active.claim.turn_id, body) {
+                    tracing::error!(%error, "cannot enqueue provider-unknown Operational Status");
+                }
             }
             set_provider_unavailable(health, "Codex app-server disconnected").await;
             true
         }
     }
+}
+
+fn operational_status_unknown(claim: &TurnClaim) -> String {
+    format!(
+        "> **Braid Operational Status · `{}`**\n\n\
+         **Provider outcome unknown**\n\n\
+         Braid lost contact with the Coding Agent while a turn was active. No parallel turn was started, and Braid has not classified the task as completed or failed. Resume or operator repair is required.",
+        claim.profile_id,
+    )
 }
 
 fn materialized_profile(profile: &Profile) -> Result<ProfileRecord> {

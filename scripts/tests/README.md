@@ -13,7 +13,7 @@ through real GitHub Work Items and a clean packaged installation.
 
 `00_clean_install.sh` is the Rust foundation gate. It unpacks the release
 artifact, scrubs Python/PDM/Cargo from the binary's `PATH`, exercises only the
-public CLI, verifies schema 0→4, schema 1→4 with a pre-v4 backup, and
+public CLI, verifies schema 0→5, schema 1→5 with a pre-v5 backup, and
 schema-newer refusal, and uses the adjacent
 bounded OTLP/HTTP capture helper to observe sampling. Its direct SQLite write is
 limited to constructing declared migration-compatibility fixtures; it does not
@@ -52,14 +52,29 @@ repository webhook and accepts optional `BRAID_TEST_INGRESS` and
 `BRAID_TEST_HEALTH` loopback addresses. This mode does not prove App event
 subscriptions or App webhook handoff/restoration, and its JSON verdict says so.
 
-`30_issue_agent.sh` is the first Slice 3 provider gate. It starts the packaged
+`30_issue_agent.sh` is the Slice 3 provider gate. It records the candidate
+version/SHA-256, requires schema 5, and starts that exact packaged
 Braid binary against the real pinned Codex app-server, creates one temporary
 repository webhook and disposable Issue, and uses the ordinary-App fallback:
 the first trusted `@braid` activates the dormant Issue and starts the turn. It
-then edits that mention while the turn is active and proves one expected-turn
-steer, `eyes`/`rocket` to `eyes`/`+1` convergence, one Agent-authored attributed
-comment, one idle physical session, and zero Braid turn-mirror comments. The
-helper deletes its temporary webhook and closes the Issue unless
+then proves:
+
+- one expected-turn edit steer and `eyes`/`rocket` to `eyes`/`+1` convergence;
+- one ordinary turn only after the complete 30-second debounce window, with no
+  request-style reactions;
+- eight durably received events releasing one threshold turn, also without
+  request-style reactions;
+- real app-server process loss preserving an unknown turn and `rocket` while
+  publishing one App-authored Operational Status Comment;
+- a separate accepted turn using an intentionally unsupported model receiving
+  a real Codex `turn.failed`, converging from observed `rocket` to `confused`;
+- Agent-authored attributed comments, one session per fixture, and zero Braid
+  turn-mirror comments.
+
+The count timing begins only after all eight `eyes` acknowledgements prove
+durable Braid receipt; GitHub webhook delivery latency is not mislabeled as
+scheduler latency. The helper deletes its temporary webhook and closes both
+Issues unless
 `BRAID_TEST_KEEP_FIXTURES=1`.
 
 Run it with a real authenticated Agent `gh` identity and an acceptance config
@@ -73,6 +88,6 @@ BRAID_WEBHOOK_SECRET='acceptance-secret' \
 scripts/tests/30_issue_agent.sh
 ```
 
-This bounded gate does not yet prove ordinary debounced/count-threshold turns,
-unexpected terminal reactions, provider-disconnect unknown state, native Agent
-App assignment, or the full release campaign.
+This gate does not prove native Agent App assignment, App-webhook bootstrap,
+Context invalidation/replacement, restart/resume, PR Agents, or the full release
+campaign.

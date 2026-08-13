@@ -303,6 +303,36 @@ impl GitHubClient {
         rest_delete(&self.http, &path, &self.installation_token, &self.api_version).await
     }
 
+    pub async fn create_issue_comment(
+        &self,
+        issue_number: u64,
+        body: &str,
+    ) -> Result<CreatedIssueComment, GitHubError> {
+        rest_post(
+            &self.http,
+            &format!("/repos/{}/issues/{issue_number}/comments", self.identity.repository),
+            &self.installation_token,
+            &self.api_version,
+            &IssueCommentRequest { body },
+        )
+        .await
+    }
+
+    pub async fn update_issue_comment(
+        &self,
+        comment_id: &str,
+        body: &str,
+    ) -> Result<CreatedIssueComment, GitHubError> {
+        rest_patch(
+            &self.http,
+            &format!("/repos/{}/issues/comments/{comment_id}", self.identity.repository),
+            &self.installation_token,
+            &self.api_version,
+            &IssueCommentRequest { body },
+        )
+        .await
+    }
+
     pub async fn app_webhook_config(&self) -> Result<AppWebhookConfig, GitHubError> {
         let jwt = app_jwt(&self.config)?;
         rest_get(&self.http, "/app/hook/config", &jwt, &self.api_version).await
@@ -553,6 +583,17 @@ struct ReactionRequest<'a> {
 #[derive(Deserialize)]
 struct ReactionResponse {
     id: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreatedIssueComment {
+    pub id: u64,
+    pub node_id: String,
+}
+
+#[derive(Serialize)]
+struct IssueCommentRequest<'a> {
+    body: &'a str,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

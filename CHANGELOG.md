@@ -35,10 +35,15 @@ Versioning once release artifacts are published.
 - Codex app-server NDJSON ownership, Profile materialization, complete Markdown
   Context injection, Issue Agent sessions/turns/steer, sampled provider
   evidence, and durable assignment/turn lifecycle state in schema version 4.
+- Forward-only schema version 5 and desired-state Operational Status Comments
+  for provider-outcome unknown, excluded from future GitHub Context by their
+  persisted node IDs.
 - Desired-state trusted-mention reactions, including removal of stale active
   reactions after terminal convergence, and Agent-origin echo suppression by
   stable actor identity or public Profile attribution.
 - `serve --transport-only` for the bounded transport campaign and the public
   `scripts/tests/30_issue_agent.sh` real GitHub/Quick Tunnel/Codex Issue Agent
-  gate. The PoC uses trusted `@braid` to activate a dormant Issue because an
-  ordinary GitHub App is not a standard assignable user.
+  gate, covering debounce/count turns, edit steer, normal/failed/unknown
+  outcomes, lifecycle reactions, Agent self-publication, and absence of Braid
+  turn mirroring. The PoC uses trusted `@braid` to activate a dormant Issue
+  because an ordinary GitHub App is not a standard assignable user.

@@ -15,17 +15,19 @@ use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 4;
+pub const DATABASE_SCHEMA_VERSION: u32 = 5;
 
 const INITIAL_SQL: &str = include_str!("../migrations/0001_initial.sql");
 const CONTEXT_LEDGER_SQL: &str = include_str!("../migrations/0002_context_ledger.sql");
 const TRANSPORT_RUNTIME_SQL: &str = include_str!("../migrations/0003_transport_runtime.sql");
 const PROVIDER_RUNTIME_SQL: &str = include_str!("../migrations/0004_provider_runtime.sql");
+const OPERATIONAL_STATUS_SQL: &str = include_str!("../migrations/0005_operational_status.sql");
 const MIGRATIONS: &[Migration] = &[
     Migration { version: 1, name: "initial", sql: INITIAL_SQL },
     Migration { version: 2, name: "context-ledger", sql: CONTEXT_LEDGER_SQL },
     Migration { version: 3, name: "transport-runtime", sql: TRANSPORT_RUNTIME_SQL },
     Migration { version: 4, name: "provider-runtime", sql: PROVIDER_RUNTIME_SQL },
+    Migration { version: 5, name: "operational-status", sql: OPERATIONAL_STATUS_SQL },
 ];
 
 #[derive(Debug, Error)]
@@ -257,6 +259,7 @@ pub struct TurnClaim {
     pub repository: String,
     pub number: u64,
     pub context_revision: String,
+    pub profile_id: String,
     pub references: Vec<String>,
     pub trusted_mention: bool,
 }
@@ -516,6 +519,7 @@ impl StoreActor {
         intent_id: String,
         lifecycle: &'static str,
         remote_database_id: Option<String>,
+        remote_node_id: Option<String>,
         error: Option<String>,
     ) -> Result<(), StoreError> {
         let (reply, receiver) = mpsc::channel();
@@ -524,6 +528,7 @@ impl StoreActor {
                 intent_id,
                 lifecycle,
                 remote_database_id,
+                remote_node_id,
                 error,
                 reply,
             ))
@@ -717,6 +722,18 @@ impl StoreActor {
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
+
+    pub fn enqueue_operational_status(
+        &self,
+        turn_id: String,
+        body: String,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::EnqueueOperationalStatus(turn_id, body, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
 }
 
 impl Drop for StoreActor {
@@ -749,6 +766,7 @@ enum Command {
     FinishGitHubWrite(
         String,
         &'static str,
+        Option<String>,
         Option<String>,
         Option<String>,
         Sender<Result<(), StoreError>>,
@@ -788,6 +806,7 @@ enum Command {
     ClaimUrgentSteer(String, Sender<Result<Option<TurnClaim>, StoreError>>),
     ConsumeSteerBatch(String, Sender<Result<(), StoreError>>),
     EnqueueTurnReaction(String, String, Sender<Result<(), StoreError>>),
+    EnqueueOperationalStatus(String, String, Sender<Result<(), StoreError>>),
     Shutdown,
 }
 
@@ -859,12 +878,20 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::ClaimGitHubWrite(reply) => {
                 let _ = reply.send(claim_github_write(database));
             }
-            Command::FinishGitHubWrite(intent_id, lifecycle, remote_database_id, error, reply) => {
+            Command::FinishGitHubWrite(
+                intent_id,
+                lifecycle,
+                remote_database_id,
+                remote_node_id,
+                error,
+                reply,
+            ) => {
                 let _ = reply.send(finish_github_write(
                     database,
                     &intent_id,
                     lifecycle,
                     remote_database_id.as_deref(),
+                    remote_node_id.as_deref(),
                     error.as_deref(),
                 ));
             }
@@ -953,6 +980,9 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             }
             Command::EnqueueTurnReaction(turn_id, content, reply) => {
                 let _ = reply.send(enqueue_turn_reaction(database, &turn_id, &content));
+            }
+            Command::EnqueueOperationalStatus(turn_id, body, reply) => {
+                let _ = reply.send(enqueue_operational_status(database, &turn_id, &body));
             }
             Command::Shutdown => break,
         }
@@ -1961,6 +1991,7 @@ fn finish_github_write(
     intent_id: &str,
     lifecycle: &str,
     remote_database_id: Option<&str>,
+    remote_node_id: Option<&str>,
     error: Option<&str>,
 ) -> Result<(), StoreError> {
     require_current_schema(database)?;
@@ -2023,6 +2054,19 @@ fn finish_github_write(
                 &now_rfc3339(),
             )?;
         }
+    }
+    if matches!(operation.as_str(), "comment_create" | "comment_update") {
+        settle_operational_status(
+            &transaction,
+            &repository,
+            &target_kind,
+            &target_database_id,
+            &content,
+            lifecycle,
+            remote_database_id,
+            remote_node_id,
+            &now_rfc3339(),
+        )?;
     }
     transaction.commit()?;
     Ok(())
@@ -2378,7 +2422,8 @@ fn claim_runnable_turn(database: &Path) -> Result<Option<TurnClaim>, StoreError>
     let selected = transaction
         .query_row(
             "SELECT b.batch_id,ps.session_id,ps.provider_session_id,
-                    r.name_with_owner,w.number,COALESCE(w.context_revision,ps.context_revision)
+                    r.name_with_owner,w.number,COALESCE(w.context_revision,ps.context_revision),
+                    ai.profile_id
              FROM wake_batches b
              JOIN work_items w ON w.node_id=b.work_item_node_id
              JOIN repositories r ON r.node_id=w.repository_node_id
@@ -2396,12 +2441,20 @@ fn claim_runnable_turn(database: &Path) -> Result<Option<TurnClaim>, StoreError>
                     row.get::<_, String>(3)?,
                     sqlite_i64_to_u64(row.get(4)?, "turn Issue number")?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((batch_id, session_id, provider_session_id, repository, number, context_revision)) =
-        selected
+    let Some((
+        batch_id,
+        session_id,
+        provider_session_id,
+        repository,
+        number,
+        context_revision,
+        profile_id,
+    )) = selected
     else {
         transaction.commit()?;
         return Ok(None);
@@ -2438,6 +2491,7 @@ fn claim_runnable_turn(database: &Path) -> Result<Option<TurnClaim>, StoreError>
         repository,
         number,
         context_revision,
+        profile_id,
         references,
         trusted_mention,
     }))
@@ -2499,7 +2553,8 @@ fn claim_urgent_steer(database: &Path, turn_id: &str) -> Result<Option<TurnClaim
     let selected = connection
         .query_row(
             "SELECT b.batch_id,ps.provider_session_id,
-                    r.name_with_owner,w.number,COALESCE(w.context_revision,ps.context_revision)
+                    r.name_with_owner,w.number,COALESCE(w.context_revision,ps.context_revision),
+                    ai.profile_id
              FROM turns t
              JOIN provider_sessions ps ON ps.session_id=t.session_id
              JOIN agent_instances ai ON ai.agent_id=ps.agent_id
@@ -2518,11 +2573,13 @@ fn claim_urgent_steer(database: &Path, turn_id: &str) -> Result<Option<TurnClaim
                     row.get::<_, String>(2)?,
                     sqlite_i64_to_u64(row.get(3)?, "steer Issue number")?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((batch_id, provider_session_id, repository, number, context_revision)) = selected
+    let Some((batch_id, provider_session_id, repository, number, context_revision, profile_id)) =
+        selected
     else {
         return Ok(None);
     };
@@ -2534,6 +2591,7 @@ fn claim_urgent_steer(database: &Path, turn_id: &str) -> Result<Option<TurnClaim
         repository,
         number,
         context_revision,
+        profile_id,
         references,
         trusted_mention,
     }))
@@ -2640,6 +2698,128 @@ fn enqueue_turn_reaction(database: &Path, turn_id: &str, content: &str) -> Resul
         )?;
     }
     transaction.commit()?;
+    Ok(())
+}
+
+fn enqueue_operational_status(
+    database: &Path,
+    turn_id: &str,
+    body: &str,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    if body.trim().is_empty() {
+        return Err(StoreError::InvalidData("Operational Status body is empty".into()));
+    }
+    let now = now_rfc3339();
+    let body_digest = hex::encode(Sha256::digest(body.as_bytes()));
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let (work_item_node_id, repository, number, profile_id, generation, remote_node, remote_id) =
+        transaction.query_row(
+            "SELECT w.node_id,r.name_with_owner,w.number,ai.profile_id,a.generation,
+                    sc.remote_comment_node_id,sc.remote_comment_database_id
+             FROM turns t
+             JOIN provider_sessions ps ON ps.session_id=t.session_id
+             JOIN agent_instances ai ON ai.agent_id=ps.agent_id
+             JOIN assignments a ON a.assignment_id=ai.assignment_id
+             JOIN work_items w ON w.node_id=a.work_item_node_id
+             JOIN repositories r ON r.node_id=w.repository_node_id
+             LEFT JOIN status_comments sc
+               ON sc.work_item_node_id=w.node_id AND sc.profile_id=ai.profile_id
+             WHERE t.turn_id=?1",
+            [turn_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    sqlite_i64_to_u64(row.get(2)?, "status Issue number")?,
+                    row.get::<_, String>(3)?,
+                    sqlite_i64_to_u64(row.get(4)?, "status assignment generation")?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )?;
+    let (operation, target_kind, target_database_id) = match (remote_node, remote_id) {
+        (Some(_), Some(database_id)) => ("comment_update", "issue_comment", database_id),
+        _ => ("comment_create", "issue", number.to_string()),
+    };
+    transaction.execute(
+        "INSERT INTO status_comments(
+           work_item_node_id,profile_id,remote_comment_node_id,remote_comment_database_id,
+           body_digest,lifecycle,updated_at
+         ) VALUES (?1,?2,NULL,NULL,?3,'pending',?4)
+         ON CONFLICT(work_item_node_id,profile_id) DO UPDATE SET
+           body_digest=excluded.body_digest,lifecycle='pending',updated_at=excluded.updated_at",
+        params![work_item_node_id, profile_id, body_digest, now],
+    )?;
+    let request_digest = hex::encode(Sha256::digest(
+        format!(
+            "operational-status\0{repository}\0{work_item_node_id}\0{profile_id}\0{generation}\0{body_digest}"
+        )
+        .as_bytes(),
+    ));
+    transaction.execute(
+        "INSERT OR IGNORE INTO github_write_outbox(
+           intent_id,repository,target_kind,target_database_id,operation,content,
+           request_digest,lifecycle,next_attempt_at,created_at,updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?8,?8)",
+        params![
+            Uuid::now_v7().to_string(),
+            repository,
+            target_kind,
+            target_database_id,
+            operation,
+            body,
+            request_digest,
+            now,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_operational_status(
+    transaction: &rusqlite::Transaction<'_>,
+    repository: &str,
+    target_kind: &str,
+    target_database_id: &str,
+    body: &str,
+    lifecycle: &str,
+    remote_database_id: Option<&str>,
+    remote_node_id: Option<&str>,
+    now: &str,
+) -> Result<(), StoreError> {
+    let body_digest = hex::encode(Sha256::digest(body.as_bytes()));
+    if target_kind == "issue" {
+        transaction.execute(
+            "UPDATE status_comments SET remote_comment_node_id=COALESCE(?4,remote_comment_node_id),
+               remote_comment_database_id=COALESCE(?5,remote_comment_database_id),
+               lifecycle=?6,updated_at=?7
+             WHERE work_item_node_id=(
+               SELECT w.node_id FROM work_items w
+               JOIN repositories r ON r.node_id=w.repository_node_id
+               WHERE r.name_with_owner=?1 AND w.kind='issue' AND w.number=?2
+             ) AND body_digest=?3",
+            params![
+                repository,
+                target_database_id,
+                body_digest,
+                remote_node_id,
+                remote_database_id,
+                lifecycle,
+                now,
+            ],
+        )?;
+    } else if target_kind == "issue_comment" {
+        transaction.execute(
+            "UPDATE status_comments SET body_digest=?2,lifecycle=?3,updated_at=?4
+             WHERE remote_comment_database_id=?1",
+            params![target_database_id, body_digest, lifecycle, now],
+        )?;
+    }
     Ok(())
 }
 
