@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io::{self, Write as _},
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -6,7 +9,9 @@ use serde::Serialize;
 
 use crate::{
     config::Config,
+    context::{self, CanonicalContext, ContextPressure},
     doctor,
+    github::{GitHubClient, RepositoryName, WorkItemLocator},
     store::{MigrationPlan, MigrationResult, StoreActor, StoreStatus},
     telemetry,
 };
@@ -34,6 +39,14 @@ enum Command {
     },
     Status(ConfigPath),
     Doctor(ConfigPath),
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
+    },
+    Github {
+        #[command(subcommand)]
+        command: GitHubCommand,
+    },
     Telemetry {
         #[command(subcommand)]
         command: TelemetryCommand,
@@ -59,6 +72,17 @@ enum MigrateCommand {
 #[derive(Debug, Subcommand)]
 enum TelemetryCommand {
     Probe(TelemetryProbe),
+}
+
+#[derive(Debug, Subcommand)]
+enum ContextCommand {
+    Issue(ContextArguments),
+    Pr(ContextArguments),
+}
+
+#[derive(Debug, Subcommand)]
+enum GitHubCommand {
+    Probe(GitHubProbe),
 }
 
 #[derive(Debug, Args)]
@@ -89,6 +113,37 @@ struct TelemetryProbe {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct ContextArguments {
+    #[arg(value_name = "OWNER/REPOSITORY#NUMBER")]
+    target: String,
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long)]
+    profile: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct GitHubProbe {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long, value_name = "OWNER/REPOSITORY")]
+    repository: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextReport<'a> {
+    target: &'a WorkItemLocator,
+    profile: &'a str,
+    revision: &'a str,
+    bytes: usize,
+    pressure: ContextPressure,
+}
+
 #[derive(Debug, Serialize)]
 struct LocalStatus<'a> {
     binary_version: &'static str,
@@ -116,9 +171,91 @@ pub async fn run() -> Result<()> {
         Command::Doctor(arguments) => {
             doctor(&arguments).await?;
         }
+        Command::Context { command } => Box::pin(context(command)).await?,
+        Command::Github { command: GitHubCommand::Probe(arguments) } => {
+            github_probe(arguments).await?;
+        }
         Command::Telemetry { command: TelemetryCommand::Probe(arguments) } => {
             telemetry_probe(arguments).await?;
         }
+    }
+    Ok(())
+}
+
+async fn context(command: ContextCommand) -> Result<()> {
+    let (arguments, kind) = match command {
+        ContextCommand::Issue(arguments) => (arguments, "issue"),
+        ContextCommand::Pr(arguments) => (arguments, "pr"),
+    };
+    let config = load(&arguments.config)?;
+    let locator = arguments.target.parse::<WorkItemLocator>()?;
+    let profile = match arguments.profile.as_deref() {
+        Some(profile) => config.profile(profile)?,
+        None if kind == "pr" => config.profile(&config.profile_selection.default_pr_profile)?,
+        None => config
+            .profiles
+            .iter()
+            .find(|profile| profile.has_tag("issue"))
+            .context("configuration has no Profile tagged issue")?,
+    };
+    if !profile.has_tag(kind) {
+        bail!("Profile {:?} is not tagged {kind}", profile.id);
+    }
+    let client = GitHubClient::connect(&config.github, &locator.repository)
+        .await
+        .context("GitHub Context is unavailable")?;
+    let mut canonical = if kind == "issue" {
+        CanonicalContext::Issue(context::materialize_issue(&client, &locator).await?)
+    } else {
+        CanonicalContext::PullRequest(context::materialize_pull_request(&client, &locator).await?)
+    };
+    let store = store(&config)?;
+    context::reconcile_local_state(&mut canonical, &store)?;
+    let rendered = context::render(
+        &canonical,
+        profile.github_context_soft_ratio,
+        profile.github_context_hard_bytes,
+    )?;
+    context::record_context_revision(&canonical, &rendered, &store)?;
+    if arguments.json {
+        print_json(&ContextReport {
+            target: &locator,
+            profile: &profile.id,
+            revision: &rendered.revision,
+            bytes: rendered.bytes,
+            pressure: rendered.pressure,
+        })?;
+    } else {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(rendered.text.as_bytes())?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+async fn github_probe(arguments: GitHubProbe) -> Result<()> {
+    let config = load(&arguments.config)?;
+    let repository = arguments.repository.parse::<RepositoryName>()?;
+    let client =
+        GitHubClient::connect(&config.github, &repository).await.context("GitHub probe failed")?;
+    if arguments.json {
+        print_json(client.identity())?;
+    } else {
+        let identity = client.identity();
+        println!("GitHub App: {} ({})", identity.app_slug, identity.app_id);
+        println!("installation: {}", identity.installation_id);
+        println!("repository: {}", identity.repository);
+        println!("repository node: {}", identity.repository_node_id);
+        println!("token expires: {}", identity.token_expires_at);
+        println!(
+            "permissions: {}",
+            identity
+                .permissions
+                .iter()
+                .map(|(name, level)| format!("{name}={level}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     Ok(())
 }
@@ -161,8 +298,8 @@ fn profile_inspect(arguments: &ProfileInspect) -> Result<()> {
         println!("status surfaces: {}", profile.status_surfaces.join(", "));
         println!(
             "context budget: {:.0}% / {} bytes hard",
-            profile.context_soft_ratio * 100.0,
-            profile.context_hard_bytes
+            profile.github_context_soft_ratio * 100.0,
+            profile.github_context_hard_bytes
         );
         println!("user instructions:\n{}", profile.user_instructions);
     }

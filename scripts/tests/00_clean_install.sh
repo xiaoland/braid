@@ -45,6 +45,7 @@ handle = "braid"
 api_version = "2022-11-28"
 private_key_file = "$private_key"
 webhook_secret_environment = "BRAID_WEBHOOK_SECRET"
+projects_v2_enabled = false
 [scheduler]
 quiet_seconds = 30
 event_threshold = 8
@@ -79,8 +80,8 @@ reasoning = "high"
 user_instructions = "Use the Issue as working memory."
 workspace = "$runtime/workspace"
 status_surfaces = ["issue"]
-context_soft_ratio = 0.75
-context_hard_bytes = 524288
+github_context_soft_ratio = 0.80
+github_context_hard_bytes = 524288
 [[profiles]]
 id = "pr-codex"
 display_name = "PR Codex"
@@ -91,8 +92,8 @@ reasoning = "high"
 user_instructions = "Use linked Issues and the PR as working memory."
 workspace = "$runtime/workspace"
 status_surfaces = ["pr"]
-context_soft_ratio = 0.75
-context_hard_bytes = 524288
+github_context_soft_ratio = 0.80
+github_context_hard_bytes = 524288
 [profile_selection]
 default_pr_profile = "pr-codex"
 EOF
@@ -124,17 +125,30 @@ fi
 /usr/bin/grep -q 'Codex app-server' "$temporary_root/doctor.json"
 
 schema=$(run_clean "$braid" status --config "$config" --json | /usr/bin/sed -n 's/.*"schema_version": \([0-9][0-9]*\).*/\1/p')
-test "$schema" = "1"
+test "$schema" = "2"
+
+v1="$runtime/state/v1.sqlite3"
+/usr/bin/sqlite3 "$v1" < "$repository_root/migrations/0001_initial.sql"
+v1_checksum=$(/usr/bin/shasum -a 256 "$repository_root/migrations/0001_initial.sql" | /usr/bin/awk '{print $1}')
+/usr/bin/sqlite3 "$v1" "INSERT INTO schema_migrations VALUES (1,'initial','$v1_checksum','fixture');"
+v1_config="$temporary_root/v1.toml"
+write_config "$v1_config" "$v1" 1.0 43189
+backup_count_before=$(find "$runtime/state/backups" -type f -name '*.sqlite3' | wc -l | tr -d ' ')
+run_clean "$braid" migrate apply --config "$v1_config"
+backup_count_after=$(find "$runtime/state/backups" -type f -name '*.sqlite3' | wc -l | tr -d ' ')
+test "$backup_count_after" = "$((backup_count_before + 1))"
+v1_schema=$(run_clean "$braid" status --config "$v1_config" --json | /usr/bin/sed -n 's/.*"schema_version": \([0-9][0-9]*\).*/\1/p')
+test "$v1_schema" = "2"
 
 newer="$runtime/state/newer.sqlite3"
-/usr/bin/sqlite3 "$newer" 'CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (2,"future","0000000000000000000000000000000000000000000000000000000000000000","future");'
+/usr/bin/sqlite3 "$newer" 'CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (3,"future","0000000000000000000000000000000000000000000000000000000000000000","future");'
 newer_config="$temporary_root/newer.toml"
 write_config "$newer_config" "$newer" 1.0 43189
 if run_clean "$braid" migrate plan --config "$newer_config" > "$temporary_root/newer.out" 2>&1; then
     echo "schema-newer fixture was accepted unexpectedly" >&2
     exit 1
 fi
-/usr/bin/grep -q 'schema 2 is newer' "$temporary_root/newer.out"
+/usr/bin/grep -q 'schema 3 is newer' "$temporary_root/newer.out"
 
 foreign="$runtime/state/foreign.sqlite3"
 /usr/bin/sqlite3 "$foreign" 'CREATE TABLE prototype_state(id INTEGER PRIMARY KEY);'

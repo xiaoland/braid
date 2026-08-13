@@ -13,6 +13,7 @@ handle = "braid"
 api_version = "2022-11-28"
 private_key_file = "/absolute/path/to/github-app-private-key.pem"
 webhook_secret_environment = "BRAID_WEBHOOK_SECRET"
+projects_v2_enabled = false
 
 [scheduler]
 quiet_seconds = 30
@@ -54,8 +55,8 @@ user_instructions = "Keep design discussion concise and maintain the Issue descr
 workspace = "/absolute/path/to/issue-workspace"
 github_actor_node_id = "MDQ6VXNlcjEyMzQ1"
 status_surfaces = ["issue"]
-context_soft_ratio = 0.75
-context_hard_bytes = 524288
+github_context_soft_ratio = 0.80
+github_context_hard_bytes = 524288
 
 [[profiles]]
 id = "pr-codex"
@@ -68,8 +69,8 @@ user_instructions = "Implement from linked Issue working memory and keep GitHub 
 workspace = "/absolute/path/to/worktree-root"
 github_actor_node_id = "MDQ6VXNlcjEyMzQ1"
 status_surfaces = ["pr"]
-context_soft_ratio = 0.75
-context_hard_bytes = 524288
+github_context_soft_ratio = 0.80
+github_context_hard_bytes = 524288
 
 [profile_selection]
 default_pr_profile = "pr-codex"

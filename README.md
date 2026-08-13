@@ -30,7 +30,13 @@ cargo build --locked
 cargo run --locked -- --version
 cargo run --locked -- config check --config /absolute/path/to/braid.toml
 cargo run --locked -- migrate plan --config /absolute/path/to/braid.toml
+cargo run --locked -- github probe --config /absolute/path/to/braid.toml --repository owner/repository
+cargo run --locked -- context issue owner/repository#123 --config /absolute/path/to/braid.toml
 ```
+
+Apply all pending migrations before `context`; the local canonical ledger keeps
+only mechanical versions, associations, and deleted-comment tombstones while
+GitHub remains the content authority.
 
 Copy [`config.example.toml`](config.example.toml) outside the checkout and
 replace every placeholder path before running diagnostics. A packaged release

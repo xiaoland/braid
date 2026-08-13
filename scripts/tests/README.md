@@ -13,7 +13,16 @@ through real GitHub Work Items and a clean packaged installation.
 
 `00_clean_install.sh` is the Rust foundation gate. It unpacks the release
 artifact, scrubs Python/PDM/Cargo from the binary's `PATH`, exercises only the
-public CLI, verifies schema 0→1 and schema-newer refusal, and uses the adjacent
+public CLI, verifies schema 0→2, schema 1→2 with a pre-v2 backup, and
+schema-newer refusal, and uses the adjacent
 bounded OTLP/HTTP capture helper to observe sampling. Its direct SQLite write is
-limited to constructing the declared future-schema compatibility fixture; it
-does not inject product events or count as workflow acceptance.
+limited to constructing declared migration-compatibility fixtures; it does not
+inject product events or count as workflow acceptance.
+
+`10_context_projection.sh` is the Slice 1 real-object gate. It requires an
+absolute App-backed config, a controlled Issue and PR, plus explicit fixture
+expectations for visible/filtered/folded/deleted/paginated evidence and the
+number of directly Associated Issues. Missing fixture inputs return
+`UNAVAILABLE` rather than substituting a user token, mock server, or synthetic
+snapshot. The helper drives only packaged `braid` commands and compares the
+emitted bytes.

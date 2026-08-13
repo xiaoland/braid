@@ -57,6 +57,7 @@ pub struct GitHubConfig {
     pub api_version: String,
     pub private_key_file: PathBuf,
     pub webhook_secret_environment: String,
+    pub projects_v2_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -131,8 +132,8 @@ pub struct Profile {
     pub workspace: PathBuf,
     pub github_actor_node_id: Option<String>,
     pub status_surfaces: Vec<String>,
-    pub context_soft_ratio: f64,
-    pub context_hard_bytes: usize,
+    pub github_context_soft_ratio: f64,
+    pub github_context_hard_bytes: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -342,9 +343,11 @@ impl Profile {
                 self.id
             )));
         }
-        if !(0.0..1.0).contains(&self.context_soft_ratio) || self.context_hard_bytes == 0 {
+        if !(0.0..1.0).contains(&self.github_context_soft_ratio)
+            || self.github_context_hard_bytes == 0
+        {
             return Err(ConfigError::Invalid(format!(
-                "profile {:?} requires context_soft_ratio in (0,1) and positive context_hard_bytes",
+                "profile {:?} requires github_context_soft_ratio in (0,1) and positive github_context_hard_bytes",
                 self.id
             )));
         }

@@ -1,5 +1,4 @@
 use std::{
-    fs,
     net::{TcpStream, ToSocketAddrs},
     path::Path,
     process::Stdio,
@@ -7,11 +6,11 @@ use std::{
 };
 
 use serde::Serialize;
-use time::OffsetDateTime;
 use tokio::{process::Command, time::timeout};
 
 use crate::{
     config::Config,
+    github::{GitHubClient, RepositoryName},
     protocol::{inspect_codex, verify_identity},
     store::StoreActor,
 };
@@ -103,27 +102,9 @@ pub async fn run(config: &Config) -> DoctorReport {
     DoctorReport { ready, checks }
 }
 
-#[derive(Serialize)]
-struct AppClaims {
-    iat: i64,
-    exp: i64,
-    iss: String,
-}
-
-#[derive(serde::Deserialize)]
-struct GitHubAppResponse {
-    id: u64,
-    slug: String,
-}
-
-#[derive(serde::Deserialize)]
-struct GitHubInstallationResponse {
-    id: u64,
-}
-
 async fn github_app_check(config: &Config) -> Check {
-    let key = match fs::read(&config.github.private_key_file) {
-        Ok(key) => key,
+    let repository = match config.github.repository.parse::<RepositoryName>() {
+        Ok(repository) => repository,
         Err(error) => {
             return Check {
                 name: "GitHub App".into(),
@@ -132,132 +113,27 @@ async fn github_app_check(config: &Config) -> Check {
             };
         }
     };
-    let encoding_key = match jsonwebtoken::EncodingKey::from_rsa_pem(&key) {
-        Ok(key) => key,
-        Err(error) => {
-            return Check {
+    match GitHubClient::connect(&config.github, &repository).await {
+        Ok(client) => {
+            let identity = client.identity();
+            Check {
                 name: "GitHub App".into(),
-                state: CheckState::Fail,
-                detail: format!("private key is not a usable RSA PEM: {error}"),
-            };
+                state: CheckState::Pass,
+                detail: format!(
+                    "{} (App {}, installation {}) can address {}",
+                    identity.app_slug,
+                    identity.app_id,
+                    identity.installation_id,
+                    identity.repository
+                ),
+            }
         }
-    };
-    let now = OffsetDateTime::now_utc().unix_timestamp();
-    let claims = AppClaims { iat: now - 60, exp: now + 540, iss: config.github.app_id.to_string() };
-    let token = match jsonwebtoken::encode(
-        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
-        &claims,
-        &encoding_key,
-    ) {
-        Ok(token) => token,
-        Err(error) => {
-            return Check {
-                name: "GitHub App".into(),
-                state: CheckState::Fail,
-                detail: format!("cannot sign App JWT: {error}"),
-            };
-        }
-    };
-    let client = match reqwest::Client::builder()
-        .user_agent(format!("braid/{}", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            return Check {
-                name: "GitHub App".into(),
-                state: CheckState::Fail,
-                detail: error.to_string(),
-            };
-        }
-    };
-    let app = match github_get::<GitHubAppResponse>(
-        &client,
-        "https://api.github.com/app",
-        &token,
-        &config.github.api_version,
-    )
-    .await
-    {
-        Ok(app) => app,
-        Err(check) => return check,
-    };
-    if app.id != config.github.app_id {
-        return Check {
+        Err(error) => Check {
             name: "GitHub App".into(),
-            state: CheckState::Fail,
-            detail: format!(
-                "credential resolved App {}, expected {}",
-                app.id, config.github.app_id
-            ),
-        };
-    }
-    let installation_url =
-        format!("https://api.github.com/repos/{}/installation", config.github.repository);
-    match github_get::<GitHubInstallationResponse>(
-        &client,
-        &installation_url,
-        &token,
-        &config.github.api_version,
-    )
-    .await
-    {
-        Ok(installation) => Check {
-            name: "GitHub App".into(),
-            state: CheckState::Pass,
-            detail: format!(
-                "{} (App {}, installation {}) can address {}",
-                app.slug, app.id, installation.id, config.github.repository
-            ),
-        },
-        Err(check) => check,
-    }
-}
-
-async fn github_get<T: serde::de::DeserializeOwned>(
-    client: &reqwest::Client,
-    url: &str,
-    token: &str,
-    api_version: &str,
-) -> Result<T, Check> {
-    let response = client
-        .get(url)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", api_version)
-        .send()
-        .await
-        .map_err(|error| Check {
-            name: "GitHub App".into(),
-            state: CheckState::Unavailable,
+            state: if error.is_unavailable() { CheckState::Unavailable } else { CheckState::Fail },
             detail: error.to_string(),
-        })?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(Check {
-            name: "GitHub App".into(),
-            state: CheckState::Fail,
-            detail: format!("GitHub returned {status}: {}", bounded(&body, 512)),
-        });
+        },
     }
-    response.json().await.map_err(|error| Check {
-        name: "GitHub App".into(),
-        state: CheckState::Fail,
-        detail: format!("GitHub response shape is unsupported: {error}"),
-    })
-}
-
-fn bounded(value: &str, bytes: usize) -> &str {
-    if value.len() <= bytes {
-        return value;
-    }
-    let mut end = bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
 }
 
 fn path_check(name: &str, path: &Path, directory: bool) -> Check {
