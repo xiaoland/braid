@@ -123,6 +123,14 @@ struct ContextArguments {
     profile: Option<String>,
     #[arg(long)]
     json: bool,
+    /// GraphQL connection page size. Lower values are useful for live pagination diagnostics.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 100,
+        value_parser = parse_page_size
+    )]
+    page_size: usize,
 }
 
 #[derive(Debug, Args)]
@@ -205,9 +213,13 @@ async fn context(command: ContextCommand) -> Result<()> {
         .await
         .context("GitHub Context is unavailable")?;
     let mut canonical = if kind == "issue" {
-        CanonicalContext::Issue(context::materialize_issue(&client, &locator).await?)
+        CanonicalContext::Issue(
+            context::materialize_issue(&client, &locator, arguments.page_size).await?,
+        )
     } else {
-        CanonicalContext::PullRequest(context::materialize_pull_request(&client, &locator).await?)
+        CanonicalContext::PullRequest(
+            context::materialize_pull_request(&client, &locator, arguments.page_size).await?,
+        )
     };
     let store = store(&config)?;
     context::reconcile_local_state(&mut canonical, &store)?;
@@ -400,6 +412,14 @@ fn load(path: &Path) -> Result<Config> {
         bail!("--config must be an absolute path: {}", path.display());
     }
     Config::load(path).with_context(|| format!("configuration rejected: {}", path.display()))
+}
+
+fn parse_page_size(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|page_size| (1..=100).contains(page_size))
+        .ok_or_else(|| "page size must be between 1 and 100".to_owned())
 }
 
 fn store(config: &Config) -> Result<StoreActor> {

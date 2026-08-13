@@ -16,6 +16,10 @@ for required in \
     BRAID_EXPECT_FOLDED_REFERENCE \
     BRAID_EXPECT_DELETED_REFERENCE \
     BRAID_EXPECT_PAGINATED_REFERENCE \
+    BRAID_EXPECT_METADATA_LINE \
+    BRAID_EXPECT_ISSUE_PR_COUNT \
+    BRAID_EXPECT_CLOSED_ISSUE_REFERENCE \
+    BRAID_EXPECT_CLOSED_ISSUE_FILTERED_TEXT \
     BRAID_EXPECT_PR_ISSUE_COUNT
 do
     eval "value=\${$required:-}"
@@ -47,15 +51,15 @@ braid="$package_root/bin/braid"
 repository=${issue%#*}
 "$braid" github probe --config "$config" --repository "$repository" --json > "$temporary_root/github.json"
 
-"$braid" context issue "$issue" --config "$config" > "$temporary_root/issue-a.md"
-"$braid" context issue "$issue" --config "$config" > "$temporary_root/issue-b.md"
+"$braid" context issue "$issue" --config "$config" --page-size 1 > "$temporary_root/issue-a.md"
+"$braid" context issue "$issue" --config "$config" --page-size 1 > "$temporary_root/issue-b.md"
 cmp "$temporary_root/issue-a.md" "$temporary_root/issue-b.md"
 
-"$braid" context pr "$pull_request" --config "$config" > "$temporary_root/pr-a.md"
-"$braid" context pr "$pull_request" --config "$config" > "$temporary_root/pr-b.md"
+"$braid" context pr "$pull_request" --config "$config" --page-size 1 > "$temporary_root/pr-a.md"
+"$braid" context pr "$pull_request" --config "$config" --page-size 1 > "$temporary_root/pr-b.md"
 cmp "$temporary_root/pr-a.md" "$temporary_root/pr-b.md"
 
-"$braid" context issue "$issue" --config "$config" --json > "$temporary_root/issue.json"
+"$braid" context issue "$issue" --config "$config" --page-size 1 --json > "$temporary_root/issue.json"
 revision=$(sed -n 's/.*"revision": "\([0-9a-f][0-9a-f]*\)".*/\1/p' "$temporary_root/issue.json")
 test "${#revision}" = "64"
 
@@ -67,13 +71,22 @@ fi
 grep -F -q "$BRAID_EXPECT_FOLDED_REFERENCE" "$temporary_root/issue-a.md"
 grep -F -q "$BRAID_EXPECT_DELETED_REFERENCE" "$temporary_root/issue-a.md"
 grep -F -q "$BRAID_EXPECT_PAGINATED_REFERENCE" "$temporary_root/issue-a.md"
+grep -F -q "$BRAID_EXPECT_METADATA_LINE" "$temporary_root/issue-a.md"
+
+issue_pr_count=$(grep -o 'GitHub PR:' "$temporary_root/issue-a.md" | wc -l | tr -d ' ')
+test "$issue_pr_count" = "$BRAID_EXPECT_ISSUE_PR_COUNT"
 
 issue_count=$(grep -c '^# GitHub Issue: ' "$temporary_root/pr-a.md")
 test "$issue_count" = "$BRAID_EXPECT_PR_ISSUE_COUNT"
+grep -F -q "$BRAID_EXPECT_CLOSED_ISSUE_REFERENCE" "$temporary_root/pr-a.md"
+if grep -F -q "$BRAID_EXPECT_CLOSED_ISSUE_FILTERED_TEXT" "$temporary_root/pr-a.md"; then
+    echo "closed Issue body leaked into PR Context" >&2
+    exit 1
+fi
 
 tiny_config="$temporary_root/tiny.toml"
 sed 's/^github_context_hard_bytes = .*/github_context_hard_bytes = 1/' "$config" > "$tiny_config"
-if "$braid" context issue "$issue" --config "$tiny_config" > "$temporary_root/tiny.out" 2>&1; then
+if "$braid" context issue "$issue" --config "$tiny_config" --page-size 1 > "$temporary_root/tiny.out" 2>&1; then
     echo "hard Context budget unexpectedly emitted a partial Context" >&2
     exit 1
 fi

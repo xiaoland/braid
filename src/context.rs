@@ -16,7 +16,7 @@ use crate::{
 };
 
 const CONTEXT_REVISION_DOMAIN: &[u8] = b"braid-context-v1\0";
-const PAGE_SIZE: usize = 100;
+const MAX_PAGE_SIZE: usize = 100;
 const MAX_PAGES: usize = 100;
 const MAX_MATERIALIZATION_ATTEMPTS: usize = 3;
 
@@ -34,6 +34,8 @@ pub enum ContextError {
     Drift(String),
     #[error("GitHub Context is {bytes} bytes, above the Profile hard limit of {hard_bytes} bytes")]
     TooLarge { bytes: usize, hard_bytes: usize },
+    #[error("GitHub page size must be between 1 and {MAX_PAGE_SIZE}, got {0}")]
+    InvalidPageSize(usize),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -204,11 +206,13 @@ pub struct RenderedContext {
 pub async fn materialize_issue(
     client: &GitHubClient,
     locator: &WorkItemLocator,
+    page_size: usize,
 ) -> Result<IssueSnapshot, ContextError> {
+    validate_page_size(page_size)?;
     for _ in 0..MAX_MATERIALIZATION_ATTEMPTS {
-        let before = read_issue_marker(client, locator).await?;
-        let snapshot = read_issue_snapshot(client, locator, before.clone()).await?;
-        let after = read_issue_marker(client, locator).await?;
+        let before = read_issue_marker(client, locator, page_size).await?;
+        let snapshot = read_issue_snapshot(client, locator, before.clone(), page_size).await?;
+        let after = read_issue_marker(client, locator, page_size).await?;
         if before == after {
             return Ok(snapshot);
         }
@@ -219,16 +223,26 @@ pub async fn materialize_issue(
 pub async fn materialize_pull_request(
     client: &GitHubClient,
     locator: &WorkItemLocator,
+    page_size: usize,
 ) -> Result<PullRequestSnapshot, ContextError> {
+    validate_page_size(page_size)?;
     for _ in 0..MAX_MATERIALIZATION_ATTEMPTS {
-        let before = read_pr_marker(client, locator).await?;
-        let snapshot = read_pr_snapshot(client, locator, before.clone()).await?;
-        let after = read_pr_marker(client, locator).await?;
+        let before = read_pr_marker(client, locator, page_size).await?;
+        let snapshot = read_pr_snapshot(client, locator, before.clone(), page_size).await?;
+        let after = read_pr_marker(client, locator, page_size).await?;
         if before == after {
             return Ok(snapshot);
         }
     }
     Err(ContextError::Drift(locator.to_string()))
+}
+
+fn validate_page_size(page_size: usize) -> Result<(), ContextError> {
+    if (1..=MAX_PAGE_SIZE).contains(&page_size) {
+        Ok(())
+    } else {
+        Err(ContextError::InvalidPageSize(page_size))
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -1040,6 +1054,8 @@ struct ConnectionVariables<'a> {
     name: &'a str,
     number: u64,
     cursor: Option<&'a str>,
+    #[serde(rename = "pageSize")]
+    page_size: usize,
 }
 
 const ISSUE_CORE_QUERY: &str = r#"
@@ -1070,37 +1086,37 @@ query($owner:String!,$name:String!,$number:Int!){
 }"#;
 
 const ISSUE_ASSIGNEES_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){issue(number:$number){
-    items:assignees(first:100,after:$cursor){nodes{id login} pageInfo{hasNextPage endCursor}}
+    items:assignees(first:$pageSize,after:$cursor){nodes{id login} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const ISSUE_LABELS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){issue(number:$number){
-    items:labels(first:100,after:$cursor){nodes{name} pageInfo{hasNextPage endCursor}}
+    items:labels(first:$pageSize,after:$cursor){nodes{name} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const ISSUE_PROJECTS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){issue(number:$number){
-    items:projectItems(first:100,after:$cursor){nodes{id project{title}} pageInfo{hasNextPage endCursor}}
+    items:projectItems(first:$pageSize,after:$cursor){nodes{id project{title}} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const PR_PROJECTS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){pullRequest(number:$number){
-    items:projectItems(first:100,after:$cursor){nodes{id project{title}} pageInfo{hasNextPage endCursor}}
+    items:projectItems(first:$pageSize,after:$cursor){nodes{id project{title}} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const PROJECT_FIELD_VALUES_QUERY: &str = r#"
-query($id:ID!,$cursor:String){
+query($id:ID!,$cursor:String,$pageSize:Int!){
   node(id:$id){... on ProjectV2Item{
-    items:fieldValues(first:100,after:$cursor){
+    items:fieldValues(first:$pageSize,after:$cursor){
       nodes{
         __typename
         ... on ProjectV2ItemFieldTextValue{field{... on ProjectV2FieldCommon{name}} text}
@@ -1133,37 +1149,37 @@ query($id:ID!,$cursor:String){
 }"#;
 
 const ISSUE_LINKED_BRANCHES_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){issue(number:$number){
-    items:linkedBranches(first:100,after:$cursor){nodes{id ref{name repository{id nameWithOwner}}} pageInfo{hasNextPage endCursor}}
+    items:linkedBranches(first:$pageSize,after:$cursor){nodes{id ref{name repository{id nameWithOwner}}} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const ISSUE_SUB_ISSUES_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){issue(number:$number){
-    items:subIssues(first:100,after:$cursor){nodes{id number title state stateReason repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}
+    items:subIssues(first:$pageSize,after:$cursor){nodes{id number title state stateReason repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const ISSUE_BLOCKED_BY_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){issue(number:$number){
-    items:blockedBy(first:100,after:$cursor){nodes{id number title state stateReason repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}
+    items:blockedBy(first:$pageSize,after:$cursor){nodes{id number title state stateReason repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const ISSUE_BLOCKING_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){issue(number:$number){
-    items:blocking(first:100,after:$cursor){nodes{id number title state stateReason repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}
+    items:blocking(first:$pageSize,after:$cursor){nodes{id number title state stateReason repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const ISSUE_ASSOCIATED_PRS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){issue(number:$number){
-    items:closedByPullRequestsReferences(first:100,after:$cursor,includeClosedPrs:true){
+    items:closedByPullRequestsReferences(first:$pageSize,after:$cursor,includeClosedPrs:true){
       nodes{id number title state repository{id nameWithOwner}}
       pageInfo{hasNextPage endCursor}
     }
@@ -1171,9 +1187,9 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String){
 }"#;
 
 const ISSUE_COMMENTS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){issue(number:$number){
-    items:comments(first:100,after:$cursor){nodes{
+    items:comments(first:$pageSize,after:$cursor){nodes{
       id fullDatabaseId author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}} createdAt updatedAt lastEditedAt
       body isMinimized minimizedReason isPinned
     } pageInfo{hasNextPage endCursor}}
@@ -1181,9 +1197,9 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String){
 }"#;
 
 const ISSUE_DUPLICATES_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){issue(number:$number){
-    items:timelineItems(first:100,after:$cursor,itemTypes:[MARKED_AS_DUPLICATE_EVENT]){
+    items:timelineItems(first:$pageSize,after:$cursor,itemTypes:[MARKED_AS_DUPLICATE_EVENT]){
       nodes{... on MarkedAsDuplicateEvent{
         id
         duplicate{__typename ... on Issue{id number title state stateReason repository{id nameWithOwner}} ... on PullRequest{id number title state repository{id nameWithOwner}}}
@@ -1195,23 +1211,23 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String){
 }"#;
 
 const PR_ASSIGNEES_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){pullRequest(number:$number){
-    items:assignees(first:100,after:$cursor){nodes{id login} pageInfo{hasNextPage endCursor}}
+    items:assignees(first:$pageSize,after:$cursor){nodes{id login} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const PR_LABELS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){pullRequest(number:$number){
-    items:labels(first:100,after:$cursor){nodes{name} pageInfo{hasNextPage endCursor}}
+    items:labels(first:$pageSize,after:$cursor){nodes{name} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const PR_ASSOCIATED_ISSUES_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){pullRequest(number:$number){
-    items:closingIssuesReferences(first:100,after:$cursor){
+    items:closingIssuesReferences(first:$pageSize,after:$cursor){
       nodes{id number title state stateReason repository{id nameWithOwner}}
       pageInfo{hasNextPage endCursor}
     }
@@ -1219,9 +1235,9 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String){
 }"#;
 
 const PR_COMMENTS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){pullRequest(number:$number){
-    items:comments(first:100,after:$cursor){nodes{
+    items:comments(first:$pageSize,after:$cursor){nodes{
       id fullDatabaseId author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}} createdAt updatedAt lastEditedAt
       body isMinimized minimizedReason isPinned
     } pageInfo{hasNextPage endCursor}}
@@ -1229,9 +1245,9 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String){
 }"#;
 
 const PR_REVIEWS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){pullRequest(number:$number){
-    items:reviews(first:100,after:$cursor){nodes{
+    items:reviews(first:$pageSize,after:$cursor){nodes{
       id fullDatabaseId author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}} state createdAt submittedAt updatedAt
       body isMinimized minimizedReason
     } pageInfo{hasNextPage endCursor}}
@@ -1239,18 +1255,18 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String){
 }"#;
 
 const PR_REVIEW_THREADS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){pullRequest(number:$number){
-    items:reviewThreads(first:100,after:$cursor){nodes{
+    items:reviewThreads(first:$pageSize,after:$cursor){nodes{
       id path line startLine isResolved isCollapsed isOutdated
     } pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const REVIEW_THREAD_COMMENTS_QUERY: &str = r#"
-query($id:ID!,$cursor:String){
+query($id:ID!,$cursor:String,$pageSize:Int!){
   node(id:$id){... on PullRequestReviewThread{
-    items:comments(first:100,after:$cursor){nodes{
+    items:comments(first:$pageSize,after:$cursor){nodes{
       id fullDatabaseId author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}} createdAt updatedAt lastEditedAt
       body isMinimized minimizedReason
     } pageInfo{hasNextPage endCursor}}
@@ -1527,6 +1543,8 @@ struct NodeConnectionRoot<T> {
 struct NodeConnectionVariables<'a> {
     id: &'a str,
     cursor: Option<&'a str>,
+    #[serde(rename = "pageSize")]
+    page_size: usize,
 }
 
 async fn read_issue_core(
@@ -1575,11 +1593,13 @@ async fn read_pr_core(
 async fn read_issue_marker(
     client: &GitHubClient,
     locator: &WorkItemLocator,
+    page_size: usize,
 ) -> Result<IssueMarker, ContextError> {
     let (repository, core) = read_issue_core(client, locator).await?;
     let mut association_ids = paginate_issue::<ReferenceRaw>(
         client,
         locator,
+        page_size,
         ISSUE_ASSOCIATED_PRS_QUERY,
         "associated pull requests",
     )
@@ -1594,11 +1614,13 @@ async fn read_issue_marker(
 async fn read_pr_marker(
     client: &GitHubClient,
     locator: &WorkItemLocator,
+    page_size: usize,
 ) -> Result<PullRequestMarker, ContextError> {
     let (repository, core) = read_pr_core(client, locator).await?;
     let mut association_ids = paginate_pr::<ReferenceRaw>(
         client,
         locator,
+        page_size,
         PR_ASSOCIATED_ISSUES_QUERY,
         "associated issues",
     )
@@ -1613,6 +1635,7 @@ async fn read_pr_marker(
 async fn paginate_issue<T: for<'de> Deserialize<'de>>(
     client: &GitHubClient,
     locator: &WorkItemLocator,
+    page_size: usize,
     query: &str,
     connection: &'static str,
 ) -> Result<Vec<T>, ContextError> {
@@ -1625,6 +1648,7 @@ async fn paginate_issue<T: for<'de> Deserialize<'de>>(
             name: &locator.repository.name,
             number: locator.number,
             cursor: cursor.as_deref(),
+            page_size,
         };
         let data: IssueConnectionData<T> = client.graphql(query, &variables).await?;
         let page = data
@@ -1653,13 +1677,14 @@ async fn paginate_issue<T: for<'de> Deserialize<'de>>(
     Err(ContextError::Incomplete {
         connection,
         target: locator.to_string(),
-        reason: format!("exceeded the bounded limit of {MAX_PAGES} pages × {PAGE_SIZE} nodes"),
+        reason: format!("exceeded the bounded limit of {MAX_PAGES} pages × {page_size} nodes"),
     })
 }
 
 async fn paginate_pr<T: for<'de> Deserialize<'de>>(
     client: &GitHubClient,
     locator: &WorkItemLocator,
+    page_size: usize,
     query: &str,
     connection: &'static str,
 ) -> Result<Vec<T>, ContextError> {
@@ -1672,6 +1697,7 @@ async fn paginate_pr<T: for<'de> Deserialize<'de>>(
             name: &locator.repository.name,
             number: locator.number,
             cursor: cursor.as_deref(),
+            page_size,
         };
         let data: PullRequestConnectionData<T> = client.graphql(query, &variables).await?;
         let page = data
@@ -1700,13 +1726,14 @@ async fn paginate_pr<T: for<'de> Deserialize<'de>>(
     Err(ContextError::Incomplete {
         connection,
         target: locator.to_string(),
-        reason: format!("exceeded the bounded limit of {MAX_PAGES} pages × {PAGE_SIZE} nodes"),
+        reason: format!("exceeded the bounded limit of {MAX_PAGES} pages × {page_size} nodes"),
     })
 }
 
 async fn paginate_node<T: for<'de> Deserialize<'de>>(
     client: &GitHubClient,
     id: &str,
+    page_size: usize,
     query: &str,
     connection: &'static str,
 ) -> Result<Vec<T>, ContextError> {
@@ -1714,7 +1741,7 @@ async fn paginate_node<T: for<'de> Deserialize<'de>>(
     let mut cursor: Option<String> = None;
     let mut seen = BTreeSet::new();
     for _ in 0..MAX_PAGES {
-        let variables = NodeConnectionVariables { id, cursor: cursor.as_deref() };
+        let variables = NodeConnectionVariables { id, cursor: cursor.as_deref(), page_size };
         let data: NodeConnectionData<T> = client.graphql(query, &variables).await?;
         let page = data
             .node
@@ -1740,7 +1767,7 @@ async fn paginate_node<T: for<'de> Deserialize<'de>>(
     Err(ContextError::Incomplete {
         connection,
         target: id.to_owned(),
-        reason: format!("exceeded the bounded limit of {MAX_PAGES} pages × {PAGE_SIZE} nodes"),
+        reason: format!("exceeded the bounded limit of {MAX_PAGES} pages × {page_size} nodes"),
     })
 }
 
@@ -1749,6 +1776,7 @@ async fn read_issue_snapshot(
     client: &GitHubClient,
     locator: &WorkItemLocator,
     marker: IssueMarker,
+    page_size: usize,
 ) -> Result<IssueSnapshot, ContextError> {
     let core = marker.core;
     let (
@@ -1763,28 +1791,49 @@ async fn read_issue_snapshot(
         comments,
         duplicate_events,
     ) = tokio::try_join!(
-        paginate_issue::<ActorRaw>(client, locator, ISSUE_ASSIGNEES_QUERY, "assignees"),
-        paginate_issue::<LabelRaw>(client, locator, ISSUE_LABELS_QUERY, "labels"),
-        read_issue_project_items(client, locator),
+        paginate_issue::<ActorRaw>(client, locator, page_size, ISSUE_ASSIGNEES_QUERY, "assignees"),
+        paginate_issue::<LabelRaw>(client, locator, page_size, ISSUE_LABELS_QUERY, "labels"),
+        read_issue_project_items(client, locator, page_size),
         paginate_issue::<LinkedBranchRaw>(
             client,
             locator,
+            page_size,
             ISSUE_LINKED_BRANCHES_QUERY,
             "linked branches"
         ),
-        paginate_issue::<ReferenceRaw>(client, locator, ISSUE_SUB_ISSUES_QUERY, "sub-issues"),
-        paginate_issue::<ReferenceRaw>(client, locator, ISSUE_BLOCKED_BY_QUERY, "blocked-by"),
-        paginate_issue::<ReferenceRaw>(client, locator, ISSUE_BLOCKING_QUERY, "blocking"),
         paginate_issue::<ReferenceRaw>(
             client,
             locator,
+            page_size,
+            ISSUE_SUB_ISSUES_QUERY,
+            "sub-issues"
+        ),
+        paginate_issue::<ReferenceRaw>(
+            client,
+            locator,
+            page_size,
+            ISSUE_BLOCKED_BY_QUERY,
+            "blocked-by"
+        ),
+        paginate_issue::<ReferenceRaw>(
+            client,
+            locator,
+            page_size,
+            ISSUE_BLOCKING_QUERY,
+            "blocking"
+        ),
+        paginate_issue::<ReferenceRaw>(
+            client,
+            locator,
+            page_size,
             ISSUE_ASSOCIATED_PRS_QUERY,
             "associated pull requests"
         ),
-        paginate_issue::<CommentRaw>(client, locator, ISSUE_COMMENTS_QUERY, "comments"),
+        paginate_issue::<CommentRaw>(client, locator, page_size, ISSUE_COMMENTS_QUERY, "comments"),
         paginate_issue::<DuplicateEventRaw>(
             client,
             locator,
+            page_size,
             ISSUE_DUPLICATES_QUERY,
             "duplicate events"
         ),
@@ -1796,7 +1845,7 @@ async fn read_issue_snapshot(
     let mut labels = labels.into_iter().map(|label| label.name).collect::<Vec<_>>();
     labels.sort();
     labels.dedup();
-    let projects = materialize_projects(client, project_items).await?;
+    let projects = materialize_projects(client, project_items, page_size).await?;
     let mut linked_branches = linked_branches
         .into_iter()
         .filter_map(|branch| branch.r#ref)
@@ -1868,21 +1917,29 @@ async fn read_pr_snapshot(
     client: &GitHubClient,
     locator: &WorkItemLocator,
     marker: PullRequestMarker,
+    page_size: usize,
 ) -> Result<PullRequestSnapshot, ContextError> {
     let core = marker.core;
     let (assignees, labels, project_items, associated_issue_refs, comments, reviews, threads) = tokio::try_join!(
-        paginate_pr::<ActorRaw>(client, locator, PR_ASSIGNEES_QUERY, "assignees"),
-        paginate_pr::<LabelRaw>(client, locator, PR_LABELS_QUERY, "labels"),
-        read_pr_project_items(client, locator),
+        paginate_pr::<ActorRaw>(client, locator, page_size, PR_ASSIGNEES_QUERY, "assignees"),
+        paginate_pr::<LabelRaw>(client, locator, page_size, PR_LABELS_QUERY, "labels"),
+        read_pr_project_items(client, locator, page_size),
         paginate_pr::<ReferenceRaw>(
             client,
             locator,
+            page_size,
             PR_ASSOCIATED_ISSUES_QUERY,
             "associated issues"
         ),
-        paginate_pr::<CommentRaw>(client, locator, PR_COMMENTS_QUERY, "conversation"),
-        paginate_pr::<ReviewRaw>(client, locator, PR_REVIEWS_QUERY, "reviews"),
-        paginate_pr::<ReviewThreadRaw>(client, locator, PR_REVIEW_THREADS_QUERY, "review threads"),
+        paginate_pr::<CommentRaw>(client, locator, page_size, PR_COMMENTS_QUERY, "conversation"),
+        paginate_pr::<ReviewRaw>(client, locator, page_size, PR_REVIEWS_QUERY, "reviews"),
+        paginate_pr::<ReviewThreadRaw>(
+            client,
+            locator,
+            page_size,
+            PR_REVIEW_THREADS_QUERY,
+            "review threads"
+        ),
     )?;
 
     let mut associated_issue_locators = associated_issue_refs
@@ -1899,10 +1956,10 @@ async fn read_pr_snapshot(
     let mut associated_issues = Vec::with_capacity(associated_issue_locators.len());
     for issue_locator in associated_issue_locators {
         let issue = if issue_locator.repository == locator.repository {
-            materialize_issue(client, &issue_locator).await?
+            materialize_issue(client, &issue_locator, page_size).await?
         } else {
             let associated_client = client.for_repository(&issue_locator.repository).await?;
-            materialize_issue(&associated_client, &issue_locator).await?
+            materialize_issue(&associated_client, &issue_locator, page_size).await?
         };
         if !issue.associated_prs.iter().any(|associated_pr| {
             associated_pr.repository == locator.repository.name_with_owner()
@@ -1923,7 +1980,7 @@ async fn read_pr_snapshot(
     let mut labels = labels.into_iter().map(|label| label.name).collect::<Vec<_>>();
     labels.sort();
     labels.dedup();
-    let projects = materialize_projects(client, project_items).await?;
+    let projects = materialize_projects(client, project_items, page_size).await?;
     let mut conversation = comments
         .into_iter()
         .map(|comment| comment.snapshot(&locator.repository.name_with_owner(), locator.number))
@@ -1953,6 +2010,7 @@ async fn read_pr_snapshot(
         let mut thread_comments = paginate_node::<CommentRaw>(
             client,
             &thread.id,
+            page_size,
             REVIEW_THREAD_COMMENTS_QUERY,
             "review thread comments",
         )
@@ -2010,12 +2068,14 @@ async fn read_pr_snapshot(
 async fn materialize_projects(
     client: &GitHubClient,
     project_items: Vec<ProjectRaw>,
+    page_size: usize,
 ) -> Result<Vec<ProjectEntry>, ContextError> {
     let mut projects = Vec::with_capacity(project_items.len());
     for project_item in project_items {
         let values = paginate_node::<ProjectFieldRaw>(
             client,
             &project_item.id,
+            page_size,
             PROJECT_FIELD_VALUES_QUERY,
             "project field values",
         )
@@ -2037,9 +2097,10 @@ async fn materialize_projects(
 async fn read_issue_project_items(
     client: &GitHubClient,
     locator: &WorkItemLocator,
+    page_size: usize,
 ) -> Result<Vec<ProjectRaw>, ContextError> {
     if client.projects_v2_enabled() {
-        paginate_issue(client, locator, ISSUE_PROJECTS_QUERY, "project items").await
+        paginate_issue(client, locator, page_size, ISSUE_PROJECTS_QUERY, "project items").await
     } else {
         Ok(Vec::new())
     }
@@ -2048,9 +2109,10 @@ async fn read_issue_project_items(
 async fn read_pr_project_items(
     client: &GitHubClient,
     locator: &WorkItemLocator,
+    page_size: usize,
 ) -> Result<Vec<ProjectRaw>, ContextError> {
     if client.projects_v2_enabled() {
-        paginate_pr(client, locator, PR_PROJECTS_QUERY, "project items").await
+        paginate_pr(client, locator, page_size, PR_PROJECTS_QUERY, "project items").await
     } else {
         Ok(Vec::new())
     }
@@ -2148,7 +2210,7 @@ fn ensure_nested_complete(
         Err(ContextError::Incomplete {
             connection,
             target: target.to_owned(),
-            reason: format!("nested value exceeded the bounded {PAGE_SIZE}-node selection"),
+            reason: format!("nested value exceeded the bounded {MAX_PAGE_SIZE}-node selection"),
         })
     } else {
         Ok(())

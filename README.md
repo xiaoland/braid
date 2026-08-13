@@ -37,6 +37,8 @@ cargo run --locked -- context issue owner/repository#123 --config /absolute/path
 Apply all pending migrations before `context`; the local canonical ledger keeps
 only mechanical versions, associations, and deleted-comment tombstones while
 GitHub remains the content authority.
+The diagnostic `--page-size` defaults to GitHub's maximum of 100; real campaign
+helpers may lower it to force pagination while requiring byte-identical Context.
 
 Copy [`config.example.toml`](config.example.toml) outside the checkout and
 replace every placeholder path before running diagnostics. A packaged release

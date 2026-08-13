@@ -22,7 +22,10 @@ inject product events or count as workflow acceptance.
 `10_context_projection.sh` is the Slice 1 real-object gate. It requires an
 absolute App-backed config, a controlled Issue and PR, plus explicit fixture
 expectations for visible/filtered/folded/deleted/paginated evidence and the
-number of directly Associated Issues. Missing fixture inputs return
+number of directly Associated Issues/PRs. It lowers the public diagnostic
+GraphQL page size to one, proving the real page walkers without manufacturing
+hundreds of comments, and checks that a closed Associated Issue contributes no
+body. Missing fixture inputs return
 `UNAVAILABLE` rather than substituting a user token, mock server, or synthetic
 snapshot. The helper drives only packaged `braid` commands and compares the
 emitted bytes.

@@ -22,3 +22,5 @@ Versioning once release artifacts are published.
 - Deterministic agent-facing Markdown Context, HTML-comment filtering,
   Context Revision/pressure enforcement, and durable deletion tombstones.
 - Public `github probe` and `context issue|pr` diagnostic commands.
+- A bounded public Context page-size diagnostic for repeatable real GraphQL
+  pagination campaigns without manufacturing high-volume comment fixtures.
