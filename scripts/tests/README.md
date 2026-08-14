@@ -13,7 +13,7 @@ through real GitHub Work Items and a clean packaged installation.
 
 `00_clean_install.sh` is the Rust foundation gate. It unpacks the release
 artifact, scrubs Python/PDM/Cargo from the binary's `PATH`, exercises only the
-public CLI, verifies schema 0→6, schema 1→6 with a pre-v6 backup, and
+public CLI, verifies schema 0→7, schema 1→7 with a pre-v7 backup, and
 schema-newer refusal, and uses the adjacent
 bounded OTLP/HTTP capture helper to observe sampling. Its direct SQLite write is
 limited to constructing declared migration-compatibility fixtures; it does not
@@ -92,8 +92,8 @@ This gate does not prove native Agent App assignment, App-webhook bootstrap,
 Context invalidation/replacement, restart/resume, PR Agents, or the full release
 campaign.
 
-`40_context_lifecycle.sh` begins the Slice 4 lifecycle gate at the public
-boundary. It requires schema 6 and a real App/Codex/Quick Tunnel fixture. A
+`40_context_lifecycle.sh` is the Slice 4 lifecycle gate at the public boundary.
+It requires schema 7 and a real App/Codex/Quick Tunnel fixture. A
 plain external Issue-description edit while the Agent is idle must create a new
 physical provider session without starting a turn. The same edit during an
 accepted turn must fence and interrupt that turn, remove its `rocket` without
@@ -117,6 +117,13 @@ the complete current GitHub Context and releases exactly one ordinary Wake
 after the normal debounce window. Public status exposes the bounded
 finalization count and terminal lifecycle so the helper never reads SQLite.
 
-This Slice 4 helper does not yet claim native unassignment, provider restart,
-or context-pressure coverage. Those journeys extend the same script only after
-their public runtime seams exist.
+The helper also terminates the idle app-server child and requires Braid to
+reconnect, resume the exact same provider thread, expose the resume through
+public status, and process the next ordinary Wake after the debounce window.
+Two additional fresh-runtime fixtures exercise the Profile pressure policy:
+soft pressure publishes one Operational Status Comment but supplies the full
+Context and completes a turn; hard pressure publishes one status, starts no
+provider session or turn, and never truncates or summarizes the Context.
+
+This Slice 4 helper does not yet claim native unassignment, active-turn
+app-server loss, Context-unavailable recovery, or PR Agent coverage.

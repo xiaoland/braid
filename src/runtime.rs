@@ -26,7 +26,10 @@ use uuid::Uuid;
 
 use crate::{
     config::{Config, Profile},
-    context::{self, CanonicalContext, CanonicalObservation},
+    context::{
+        self, CanonicalContext, CanonicalObservation, ContextError, ContextPressure,
+        RenderedContext,
+    },
     github::{
         AppWebhookConfig, CreatedIssueComment, GitHubClient, RepositoryName, WorkItemLocator,
     },
@@ -686,11 +689,11 @@ async fn reconcile_work_items(
                 .find(|profile| profile.has_tag("issue"))
                 .context("configuration has no Issue Profile")?
         };
-        let rendered = context::render(
+        let rendered = context::render_complete(
             &canonical,
             profile.github_context_soft_ratio,
             profile.github_context_hard_bytes,
-        )?;
+        );
         context::record_context_revision(&canonical, &rendered, store)?;
     }
     Ok((tracked.len(), changes))
@@ -912,7 +915,7 @@ async fn issue_agent_worker(
     store: Arc<StoreActor>,
     github: Arc<GitHubClient>,
     config: Config,
-    provider: CodexClient,
+    mut provider: CodexClient,
     health: Arc<RwLock<HealthSnapshot>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -932,18 +935,84 @@ async fn issue_agent_worker(
         set_provider_unavailable(&health, &error.to_string()).await;
         return;
     }
+
+    loop {
+        let convergence_failed = if let Err(error) =
+            resume_issue_provider_sessions(&store, &config, &provider, &profile, &profile_record)
+                .await
+        {
+            tracing::error!(%error, "cannot converge persisted provider sessions");
+            set_provider_unavailable(&health, &error.to_string()).await;
+            true
+        } else {
+            let mut current = health.write().await;
+            current.provider = "connected";
+            current.last_error = None;
+            false
+        };
+        let disconnected = if convergence_failed {
+            true
+        } else {
+            Box::pin(drive_issue_agent_connection(
+                &store,
+                &github,
+                &config,
+                &provider,
+                &profile,
+                &profile_record,
+                &health,
+                &mut shutdown,
+            ))
+            .await
+        };
+        if !disconnected || *shutdown.borrow() {
+            return;
+        }
+        drop(provider);
+        health.write().await.provider = "reconnecting";
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                result = CodexClient::connect(&config.provider.codex) => {
+                    match result {
+                        Ok(connected) => {
+                            provider = connected;
+                            break;
+                        }
+                        Err(error) => {
+                            set_provider_unavailable(&health, &error.to_string()).await;
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_issue_agent_connection(
+    store: &StoreActor,
+    github: &GitHubClient,
+    config: &Config,
+    provider: &CodexClient,
+    profile: &Profile,
+    profile_record: &ProfileRecord,
+    health: &RwLock<HealthSnapshot>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
     let mut notifications = provider.subscribe();
     let mut running: Option<RunningIssueTurn> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            _ = shutdown.changed() => break,
+            _ = shutdown.changed() => return false,
             notification = notifications.recv() => {
                 match notification {
                     Ok(notification) => {
-                        if handle_provider_notification(&store, &health, &mut running, notification).await {
-                            break;
+                        if handle_provider_notification(store, health, &mut running, notification).await {
+                            return true;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -951,45 +1020,134 @@ async fn issue_agent_worker(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         if let Some(active) = running.take() {
-                            let _ = store.mark_turn_terminal(active.claim.turn_id, "unknown".into());
+                            let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
+                            let _ = store.enqueue_operational_status(
+                                active.claim.turn_id,
+                                operational_status_unknown_profile(&active.claim.profile_id),
+                            );
                         }
-                        set_provider_unavailable(&health, "Codex notification stream closed").await;
-                        break;
+                        set_provider_unavailable(health, "Codex notification stream closed").await;
+                        return true;
                     }
                 }
             }
             _ = tick.tick() => {
                 if let Some(active) = &mut running {
-                    begin_active_context_reset(&store, &provider, active).await;
+                    begin_active_context_reset(store, provider, active).await;
                     if active.reset_id.is_none() {
-                        forward_urgent_steer(&store, &provider, active).await;
+                        forward_urgent_steer(store, provider, active).await;
                     }
                     continue;
                 }
                 let (handled_lifecycle, lifecycle_turn) = handle_next_issue_lifecycle(
-                    &store,
-                    &github,
-                    &config,
-                    &provider,
-                    &profile,
-                    policy_from_config(&config),
+                    store,
+                    github,
+                    config,
+                    provider,
+                    profile,
+                    policy_from_config(config),
                 ).await;
                 if handled_lifecycle {
                     running = lifecycle_turn;
                     continue;
                 }
                 if materialize_next_context_reset(
-                    &store, &github, &config, &provider, &profile,
+                    store, github, config, provider, profile,
                 ).await {
                     continue;
                 }
                 materialize_next_issue_assignment(
-                    &store, &github, &config, &provider, &profile, &profile_record,
+                    store, github, config, provider, profile, profile_record,
                 ).await;
-                running = start_next_issue_turn(&store, &provider, &profile).await;
+                running = start_next_issue_turn(store, provider, profile).await;
             }
         }
     }
+}
+
+async fn resume_issue_provider_sessions(
+    store: &StoreActor,
+    config: &Config,
+    provider: &CodexClient,
+    profile: &Profile,
+    profile_record: &ProfileRecord,
+) -> Result<()> {
+    let candidates = store.provider_resume_candidates(profile.id.clone())?;
+    for candidate in candidates {
+        let instructions = issue_system_prompt(config, profile, candidate.number);
+        let instruction_revision = hex::encode(Sha256::digest(instructions.as_bytes()));
+        let compatible = candidate.repository == config.github.repository
+            && candidate.profile_id == profile.id
+            && candidate.profile_revision == profile_record.revision
+            && candidate.instruction_revision == instruction_revision
+            && profile.workspace.is_dir();
+        if !compatible {
+            let message = "persisted provider session is incompatible with the effective Profile";
+            store.block_provider_session(candidate.provider_session_id.clone(), message.into())?;
+            enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
+            continue;
+        }
+        if candidate
+            .active_turn_lifecycle
+            .as_deref()
+            .is_some_and(|lifecycle| matches!(lifecycle, "starting" | "running"))
+            && let Some(turn_id) = &candidate.active_turn_id
+        {
+            store.mark_turn_terminal(turn_id.clone(), "unknown".into())?;
+            store.enqueue_operational_status(
+                turn_id.clone(),
+                operational_status_unknown_profile(&profile.id),
+            )?;
+        }
+        match provider.resume_session(&candidate.provider_session_id, profile, &instructions).await
+        {
+            Ok(session) => {
+                store.record_provider_resume(session.thread_id.clone())?;
+                tracing::info!(
+                    issue = candidate.number,
+                    provider_session = %session.thread_id,
+                    prior_lifecycle = %candidate.session_lifecycle,
+                    "resumed compatible Issue Agent provider session"
+                );
+            }
+            Err(error) if provider_error_lifecycle(&error) == "unknown" => {
+                return Err(error.into());
+            }
+            Err(error) => {
+                store.block_provider_session(
+                    candidate.provider_session_id.clone(),
+                    error.to_string(),
+                )?;
+                enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
+                tracing::error!(
+                    %error,
+                    issue = candidate.number,
+                    provider_session = %candidate.provider_session_id,
+                    "cannot resume Issue Agent provider session"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn enqueue_provider_blocked_status(
+    store: &StoreActor,
+    profile: &Profile,
+    assignment_id: &str,
+) -> Result<()> {
+    if profile.status_surfaces.iter().any(|surface| surface == "issue") {
+        store.enqueue_assignment_operational_status(
+            assignment_id.into(),
+            format!(
+                "> **Braid Operational Status · `{}`**\n\n\
+                 **Provider session unavailable**\n\n\
+                 Braid could not resume the compatible Coding Agent session. The Agent Group is blocked; no replacement turn or provider side effect was started. Operator repair or a new activation generation is required.",
+                profile.id,
+            ),
+        )?;
+    }
+    Ok(())
 }
 
 fn policy_from_config(config: &Config) -> SchedulerPolicy {
@@ -1077,12 +1235,26 @@ async fn reactivate_issue_agent(
         let mut canonical =
             CanonicalContext::Issue(context::materialize_issue(github, &locator, 100).await?);
         context::reconcile_local_state(&mut canonical, store)?;
-        let rendered = context::render(
+        let rendered = context::render_complete(
             &canonical,
             profile.github_context_soft_ratio,
             profile.github_context_hard_bytes,
-        )?;
+        );
         context::record_context_revision(&canonical, &rendered, store)?;
+        record_context_pressure(store, &materialization.assignment_id, &rendered, None)?;
+        if rendered.pressure == ContextPressure::Hard {
+            enqueue_context_pressure_status(
+                store,
+                profile,
+                &materialization.assignment_id,
+                &rendered,
+            )?;
+            return Err(ContextError::TooLarge {
+                bytes: rendered.bytes,
+                hard_bytes: profile.github_context_hard_bytes,
+            }
+            .into());
+        }
         let instructions = issue_system_prompt(config, profile, candidate.number);
         let instruction_revision = hex::encode(Sha256::digest(instructions.as_bytes()));
         let session = provider.start_session(profile, &instructions).await?;
@@ -1099,12 +1271,20 @@ async fn reactivate_issue_agent(
         Ok((session, rendered, instruction_revision)) => {
             store.complete_issue_reactivation(
                 candidate.event_id,
-                materialization,
+                materialization.clone(),
                 session.thread_id,
-                rendered.revision,
+                rendered.revision.clone(),
                 instruction_revision,
                 policy,
             )?;
+            if rendered.pressure == ContextPressure::Soft {
+                enqueue_context_pressure_status(
+                    store,
+                    profile,
+                    &materialization.assignment_id,
+                    &rendered,
+                )?;
+            }
             tracing::info!(
                 issue = candidate.number,
                 "reopened Issue Agent has current Context and a debounced Wake"
@@ -1112,6 +1292,9 @@ async fn reactivate_issue_agent(
             Ok(())
         }
         Err(error) => {
+            if !is_context_too_large(&error) {
+                record_context_unavailable(store, profile, &materialization.assignment_id, &error)?;
+            }
             store.fail_issue_reactivation(
                 candidate.event_id,
                 materialization.assignment_id,
@@ -1177,9 +1360,16 @@ async fn materialize_next_context_reset(
     };
     let Some(reset) = reset else { return false };
     let reset_id = reset.reset_id.clone();
+    let assignment_id = reset.assignment_id.clone();
     if let Err(error) =
         materialize_context_reset(store, github, config, provider, profile, reset).await
     {
+        if !is_context_too_large(&error)
+            && let Err(status_error) =
+                record_context_unavailable(store, profile, &assignment_id, &error)
+        {
+            tracing::error!(%status_error, reset = %reset_id, "cannot publish unavailable Context status");
+        }
         if let Err(store_error) = store.fail_context_reset(reset_id.clone(), error.to_string()) {
             tracing::error!(%store_error, reset = %reset_id, "cannot block failed Context reset");
         }
@@ -1208,12 +1398,21 @@ async fn materialize_context_reset(
     let mut canonical =
         CanonicalContext::Issue(context::materialize_issue(github, &locator, 100).await?);
     context::reconcile_local_state(&mut canonical, store)?;
-    let rendered = context::render(
+    let rendered = context::render_complete(
         &canonical,
         profile.github_context_soft_ratio,
         profile.github_context_hard_bytes,
-    )?;
+    );
     context::record_context_revision(&canonical, &rendered, store)?;
+    record_context_pressure(store, &reset.assignment_id, &rendered, None)?;
+    if rendered.pressure == ContextPressure::Hard {
+        enqueue_context_pressure_status(store, profile, &reset.assignment_id, &rendered)?;
+        return Err(ContextError::TooLarge {
+            bytes: rendered.bytes,
+            hard_bytes: profile.github_context_hard_bytes,
+        }
+        .into());
+    }
     let instructions = issue_system_prompt(config, profile, reset.number);
     let instruction_revision = hex::encode(Sha256::digest(instructions.as_bytes()));
     let session = provider.start_session(profile, &instructions).await?;
@@ -1226,9 +1425,12 @@ async fn materialize_context_reset(
     store.complete_context_reset(
         reset.reset_id.clone(),
         session.thread_id.clone(),
-        rendered.revision,
+        rendered.revision.clone(),
         instruction_revision,
     )?;
+    if rendered.pressure == ContextPressure::Soft {
+        enqueue_context_pressure_status(store, profile, &reset.assignment_id, &rendered)?;
+    }
     tracing::info!(
         reset = %reset.reset_id,
         issue = reset.number,
@@ -1348,10 +1550,11 @@ async fn materialize_issue_assignment(
         store.ignore_assignment_event(candidate.event_id)?;
         return Ok(());
     }
-    let repository = candidate.repository.parse::<RepositoryName>()?;
-    let locator = WorkItemLocator { repository, number: candidate.number };
-    let mut canonical =
-        CanonicalContext::Issue(context::materialize_issue(github, &locator, 100).await?);
+    let Some(mut canonical) =
+        materialize_assignment_context(store, github, profile, profile_record, &candidate).await?
+    else {
+        return Ok(());
+    };
     let assigned_to_braid = matches!(&canonical, CanonicalContext::Issue(issue) if issue.assignees.iter().any(|assignee| {
         assignee.node_id == github.identity().actor_node_id
             || assignee.login == github.identity().actor_login
@@ -1361,21 +1564,32 @@ async fn materialize_issue_assignment(
         return Ok(());
     }
     context::reconcile_local_state(&mut canonical, store)?;
-    let rendered = context::render(
+    let rendered = context::render_complete(
         &canonical,
         profile.github_context_soft_ratio,
         profile.github_context_hard_bytes,
-    )?;
+    );
     context::record_context_revision(&canonical, &rendered, store)?;
+    let preserve_wake = mention_activation && rendered.pressure != ContextPressure::Hard;
     let Some(materialization) = store.begin_issue_assignment(
         candidate.event_id,
         profile_record.clone(),
-        rendered.revision.clone(),
-        mention_activation,
+        Some(rendered.revision.clone()),
+        preserve_wake,
     )?
     else {
         return Ok(());
     };
+    record_context_pressure(store, &materialization.assignment_id, &rendered, None)?;
+    if rendered.pressure == ContextPressure::Hard {
+        let message = format!(
+            "GitHub Context is {} bytes, above the Profile hard limit of {} bytes",
+            rendered.bytes, profile.github_context_hard_bytes
+        );
+        store.fail_issue_assignment(materialization.assignment_id.clone(), message)?;
+        enqueue_context_pressure_status(store, profile, &materialization.assignment_id, &rendered)?;
+        return Ok(());
+    }
     if !profile.workspace.is_dir() {
         let message = format!("Profile workspace does not exist: {}", profile.workspace.display());
         store.fail_issue_assignment(materialization.assignment_id, message.clone())?;
@@ -1397,11 +1611,19 @@ async fn materialize_issue_assignment(
     match result {
         Ok(session) => {
             store.complete_issue_assignment(
-                materialization,
+                materialization.clone(),
                 session.thread_id,
-                rendered.revision,
+                rendered.revision.clone(),
                 instruction_revision,
             )?;
+            if rendered.pressure == ContextPressure::Soft {
+                enqueue_context_pressure_status(
+                    store,
+                    profile,
+                    &materialization.assignment_id,
+                    &rendered,
+                )?;
+            }
             tracing::info!(
                 issue = candidate.number,
                 model = %session.model,
@@ -1414,6 +1636,113 @@ async fn materialize_issue_assignment(
             Err(error.into())
         }
     }
+}
+
+async fn materialize_assignment_context(
+    store: &StoreActor,
+    github: &GitHubClient,
+    profile: &Profile,
+    profile_record: &ProfileRecord,
+    candidate: &AssignmentCandidate,
+) -> Result<Option<CanonicalContext>> {
+    let repository = candidate.repository.parse::<RepositoryName>()?;
+    let locator = WorkItemLocator { repository, number: candidate.number };
+    match context::materialize_issue(github, &locator, 100).await {
+        Ok(issue) => Ok(Some(CanonicalContext::Issue(issue))),
+        Err(context_error) => {
+            let Some(materialization) = store.begin_issue_assignment(
+                candidate.event_id.clone(),
+                profile_record.clone(),
+                None,
+                false,
+            )?
+            else {
+                return Ok(None);
+            };
+            let error = anyhow::Error::from(context_error);
+            record_context_unavailable(store, profile, &materialization.assignment_id, &error)?;
+            store.fail_issue_assignment(materialization.assignment_id, error.to_string())?;
+            Err(error)
+        }
+    }
+}
+
+fn record_context_pressure(
+    store: &StoreActor,
+    assignment_id: &str,
+    rendered: &RenderedContext,
+    error: Option<String>,
+) -> Result<()> {
+    let pressure = match rendered.pressure {
+        ContextPressure::Normal => "normal",
+        ContextPressure::Soft => "soft",
+        ContextPressure::Hard => "hard",
+    };
+    store.set_assignment_context_pressure(
+        assignment_id.into(),
+        pressure.into(),
+        Some(u64::try_from(rendered.bytes).context("Context byte count exceeds u64")?),
+        error,
+    )?;
+    Ok(())
+}
+
+fn is_context_too_large(error: &anyhow::Error) -> bool {
+    matches!(error.downcast_ref::<ContextError>(), Some(ContextError::TooLarge { .. }))
+}
+
+fn record_context_unavailable(
+    store: &StoreActor,
+    profile: &Profile,
+    assignment_id: &str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    store.set_assignment_context_pressure(
+        assignment_id.into(),
+        "unavailable".into(),
+        None,
+        Some(error.to_string()),
+    )?;
+    if profile.status_surfaces.iter().any(|surface| surface == "issue") {
+        store.enqueue_assignment_operational_status(
+            assignment_id.into(),
+            format!(
+                "> **Braid Operational Status · `{}`**\n\n\
+                 **GitHub Context is unavailable**\n\n\
+                 Braid could not obtain one complete canonical GitHub Context. No provider session or turn was started, and no partial, truncated, cached, or generated summary was supplied. Restore GitHub visibility or pagination completeness, then activate a new generation.",
+                profile.id,
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn enqueue_context_pressure_status(
+    store: &StoreActor,
+    profile: &Profile,
+    assignment_id: &str,
+    rendered: &RenderedContext,
+) -> Result<()> {
+    if !profile.status_surfaces.iter().any(|surface| surface == "issue") {
+        return Ok(());
+    }
+    let body = match rendered.pressure {
+        ContextPressure::Soft => format!(
+            "> **Braid Operational Status · `{}`**\n\n\
+             **GitHub Context is near the Profile limit**\n\n\
+             The complete Context is {} bytes; the configured hard limit is {} bytes. Braid supplied the complete Context without truncation and allowed the Agent turn to proceed.",
+            profile.id, rendered.bytes, profile.github_context_hard_bytes,
+        ),
+        ContextPressure::Hard => format!(
+            "> **Braid Operational Status · `{}`**\n\n\
+             **GitHub Context is too large**\n\n\
+             The complete Context is {} bytes; the configured hard limit is {} bytes. Braid started no provider session or turn and supplied no partial, truncated, or generated summary. Reduce the GitHub Context or raise the Profile limit, then activate a new generation.",
+            profile.id, rendered.bytes, profile.github_context_hard_bytes,
+        ),
+        ContextPressure::Normal => return Ok(()),
+    };
+    store.enqueue_assignment_operational_status(assignment_id.into(), body)?;
+    Ok(())
 }
 
 async fn handle_provider_notification(
@@ -1504,11 +1833,14 @@ async fn handle_provider_notification(
 }
 
 fn operational_status_unknown(claim: &TurnClaim) -> String {
+    operational_status_unknown_profile(&claim.profile_id)
+}
+
+fn operational_status_unknown_profile(profile_id: &str) -> String {
     format!(
-        "> **Braid Operational Status · `{}`**\n\n\
+        "> **Braid Operational Status · `{profile_id}`**\n\n\
          **Provider outcome unknown**\n\n\
          Braid lost contact with the Coding Agent while a turn was active. No parallel turn was started, and Braid has not classified the task as completed or failed. Resume or operator repair is required.",
-        claim.profile_id,
     )
 }
 

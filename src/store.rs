@@ -15,7 +15,7 @@ use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 6;
+pub const DATABASE_SCHEMA_VERSION: u32 = 7;
 
 const INITIAL_SQL: &str = include_str!("../migrations/0001_initial.sql");
 const CONTEXT_LEDGER_SQL: &str = include_str!("../migrations/0002_context_ledger.sql");
@@ -23,6 +23,8 @@ const TRANSPORT_RUNTIME_SQL: &str = include_str!("../migrations/0003_transport_r
 const PROVIDER_RUNTIME_SQL: &str = include_str!("../migrations/0004_provider_runtime.sql");
 const OPERATIONAL_STATUS_SQL: &str = include_str!("../migrations/0005_operational_status.sql");
 const CONTEXT_RESETS_SQL: &str = include_str!("../migrations/0006_context_resets.sql");
+const OPERATIONAL_CONVERGENCE_SQL: &str =
+    include_str!("../migrations/0007_operational_convergence.sql");
 const MIGRATIONS: &[Migration] = &[
     Migration { version: 1, name: "initial", sql: INITIAL_SQL },
     Migration { version: 2, name: "context-ledger", sql: CONTEXT_LEDGER_SQL },
@@ -30,6 +32,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration { version: 4, name: "provider-runtime", sql: PROVIDER_RUNTIME_SQL },
     Migration { version: 5, name: "operational-status", sql: OPERATIONAL_STATUS_SQL },
     Migration { version: 6, name: "context-resets", sql: CONTEXT_RESETS_SQL },
+    Migration { version: 7, name: "operational-convergence", sql: OPERATIONAL_CONVERGENCE_SQL },
 ];
 
 #[derive(Debug, Error)]
@@ -279,6 +282,7 @@ pub struct TurnClaim {
 #[derive(Debug, Clone)]
 pub struct ContextResetClaim {
     pub reset_id: String,
+    pub assignment_id: String,
     pub repository: String,
     pub number: u64,
     pub profile_id: String,
@@ -302,6 +306,25 @@ pub struct AgentGroupSummary {
     pub turn_lifecycle: Option<String>,
     pub finalization_turns: u64,
     pub last_finalization_lifecycle: Option<String>,
+    pub provider_resume_count: u64,
+    pub last_provider_resume: Option<String>,
+    pub context_pressure: String,
+    pub context_bytes: Option<u64>,
+    pub context_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderResumeCandidate {
+    pub assignment_id: String,
+    pub provider_session_id: String,
+    pub repository: String,
+    pub number: u64,
+    pub profile_id: String,
+    pub profile_revision: u64,
+    pub instruction_revision: String,
+    pub session_lifecycle: String,
+    pub active_turn_id: Option<String>,
+    pub active_turn_lifecycle: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -638,6 +661,37 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
+    pub fn provider_resume_candidates(
+        &self,
+        profile_id: String,
+    ) -> Result<Vec<ProviderResumeCandidate>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::ProviderResumeCandidates(profile_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn record_provider_resume(&self, provider_session_id: String) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::RecordProviderResume(provider_session_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn block_provider_session(
+        &self,
+        provider_session_id: String,
+        error: String,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::BlockProviderSession(provider_session_id, error, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
     pub fn assignment_candidates(
         &self,
         limit: usize,
@@ -739,7 +793,7 @@ impl StoreActor {
         &self,
         event_id: String,
         profile: ProfileRecord,
-        context_revision: String,
+        context_revision: Option<String>,
         preserve_wake_batch: bool,
     ) -> Result<Option<AgentMaterialization>, StoreError> {
         let (reply, receiver) = mpsc::channel();
@@ -791,6 +845,38 @@ impl StoreActor {
         let (reply, receiver) = mpsc::channel();
         self.sender
             .send(Command::FailIssueAssignment(assignment_id, error, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn set_assignment_context_pressure(
+        &self,
+        assignment_id: String,
+        pressure: String,
+        bytes: Option<u64>,
+        error: Option<String>,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::SetAssignmentContextPressure(
+                assignment_id,
+                pressure,
+                bytes,
+                error,
+                reply,
+            ))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn enqueue_assignment_operational_status(
+        &self,
+        assignment_id: String,
+        body: String,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::EnqueueAssignmentOperationalStatus(assignment_id, body, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -971,6 +1057,9 @@ enum Command {
         Sender<Result<(), StoreError>>,
     ),
     RegisterProfile(ProfileRecord, Sender<Result<(), StoreError>>),
+    ProviderResumeCandidates(String, Sender<Result<Vec<ProviderResumeCandidate>, StoreError>>),
+    RecordProviderResume(String, Sender<Result<(), StoreError>>),
+    BlockProviderSession(String, String, Sender<Result<(), StoreError>>),
     AssignmentCandidates(usize, Sender<Result<Vec<AssignmentCandidate>, StoreError>>),
     IssueLifecycleCandidates(usize, Sender<Result<Vec<IssueLifecycleCandidate>, StoreError>>),
     PrepareIssueFinalization(String, Sender<Result<bool, StoreError>>),
@@ -989,7 +1078,7 @@ enum Command {
     BeginIssueAssignment(
         String,
         ProfileRecord,
-        String,
+        Option<String>,
         bool,
         Sender<Result<Option<AgentMaterialization>, StoreError>>,
     ),
@@ -1002,6 +1091,14 @@ enum Command {
         Sender<Result<(), StoreError>>,
     ),
     FailIssueAssignment(String, String, Sender<Result<(), StoreError>>),
+    SetAssignmentContextPressure(
+        String,
+        String,
+        Option<u64>,
+        Option<String>,
+        Sender<Result<(), StoreError>>,
+    ),
+    EnqueueAssignmentOperationalStatus(String, String, Sender<Result<(), StoreError>>),
     ClaimRunnableTurn(Sender<Result<Option<TurnClaim>, StoreError>>),
     MarkTurnStarted(String, String, Sender<Result<(), StoreError>>),
     MarkTurnTerminal(String, String, Sender<Result<(), StoreError>>),
@@ -1131,6 +1228,15 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::RegisterProfile(profile, reply) => {
                 let _ = reply.send(register_profile(database, &profile));
             }
+            Command::ProviderResumeCandidates(profile_id, reply) => {
+                let _ = reply.send(provider_resume_candidates(database, &profile_id));
+            }
+            Command::RecordProviderResume(provider_session_id, reply) => {
+                let _ = reply.send(record_provider_resume(database, &provider_session_id));
+            }
+            Command::BlockProviderSession(provider_session_id, error, reply) => {
+                let _ = reply.send(block_provider_session(database, &provider_session_id, &error));
+            }
             Command::AssignmentCandidates(limit, reply) => {
                 let _ = reply.send(assignment_candidates(database, limit));
             }
@@ -1189,7 +1295,7 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
                     database,
                     &event_id,
                     &profile,
-                    &context_revision,
+                    context_revision.as_deref(),
                     preserve_wake_batch,
                 ));
             }
@@ -1213,6 +1319,22 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             }
             Command::FailIssueAssignment(assignment_id, error, reply) => {
                 let _ = reply.send(fail_issue_assignment(database, &assignment_id, &error));
+            }
+            Command::SetAssignmentContextPressure(assignment_id, pressure, bytes, error, reply) => {
+                let _ = reply.send(set_assignment_context_pressure(
+                    database,
+                    &assignment_id,
+                    &pressure,
+                    bytes,
+                    error.as_deref(),
+                ));
+            }
+            Command::EnqueueAssignmentOperationalStatus(assignment_id, body, reply) => {
+                let _ = reply.send(enqueue_assignment_operational_status(
+                    database,
+                    &assignment_id,
+                    &body,
+                ));
             }
             Command::ClaimRunnableTurn(reply) => {
                 let _ = reply.send(claim_runnable_turn(database));
@@ -2128,7 +2250,9 @@ fn load_agent_groups(
                 (SELECT ft.lifecycle FROM turns ft
                  JOIN provider_sessions fps ON fps.session_id=ft.session_id
                  WHERE fps.agent_id=ai.agent_id AND ft.trigger_kind='finalization'
-                 ORDER BY ft.rowid DESC LIMIT 1)
+                 ORDER BY ft.rowid DESC LIMIT 1),
+                COALESCE(ps.resume_count,0),ps.last_resumed_at,
+                ai.context_pressure,ai.context_bytes,ai.context_error
          FROM assignments a
          JOIN work_items w ON w.node_id=a.work_item_node_id
          JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
@@ -2150,6 +2274,14 @@ fn load_agent_groups(
             turn_lifecycle: row.get(8)?,
             finalization_turns: sqlite_i64_to_u64(row.get(9)?, "finalization turn count")?,
             last_finalization_lifecycle: row.get(10)?,
+            provider_resume_count: sqlite_i64_to_u64(row.get(11)?, "provider resume count")?,
+            last_provider_resume: row.get(12)?,
+            context_pressure: row.get(13)?,
+            context_bytes: row
+                .get::<_, Option<i64>>(14)?
+                .map(|value| sqlite_i64_to_u64(value, "Context bytes"))
+                .transpose()?,
+            context_error: row.get(15)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -2394,10 +2526,7 @@ fn finish_github_write(
     if matches!(operation.as_str(), "comment_create" | "comment_update") {
         settle_operational_status(
             &transaction,
-            &repository,
-            &target_kind,
-            &target_database_id,
-            &content,
+            intent_id,
             lifecycle,
             remote_database_id,
             remote_node_id,
@@ -2530,6 +2659,106 @@ fn register_profile(database: &Path, profile: &ProfileRecord) -> Result<(), Stor
             profile.tags,
         ],
     )?;
+    Ok(())
+}
+
+fn provider_resume_candidates(
+    database: &Path,
+    profile_id: &str,
+) -> Result<Vec<ProviderResumeCandidate>, StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_only(database)?;
+    let mut statement = connection.prepare(
+        "SELECT a.assignment_id,ps.provider_session_id,r.name_with_owner,w.number,
+                ai.profile_id,ai.profile_revision,ps.instruction_revision,ps.lifecycle,
+                t.turn_id,t.lifecycle
+         FROM assignments a
+         JOIN work_items w ON w.node_id=a.work_item_node_id AND w.kind='issue'
+         JOIN repositories r ON r.node_id=w.repository_node_id
+         JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
+         JOIN provider_sessions ps ON ps.agent_id=ai.agent_id
+           AND ps.lifecycle IN ('idle','running','unknown')
+         LEFT JOIN turns t ON t.session_id=ps.session_id
+           AND t.lifecycle IN ('starting','running','unknown')
+         WHERE a.lifecycle IN ('active','finalizing') AND ai.profile_id=?1
+         ORDER BY a.assigned_at,a.assignment_id,ps.started_at",
+    )?;
+    let rows = statement.query_map([profile_id], |row| {
+        Ok(ProviderResumeCandidate {
+            assignment_id: row.get(0)?,
+            provider_session_id: row.get(1)?,
+            repository: row.get(2)?,
+            number: sqlite_i64_to_u64(row.get(3)?, "resume Issue number")?,
+            profile_id: row.get(4)?,
+            profile_revision: sqlite_i64_to_u64(row.get(5)?, "resume Profile revision")?,
+            instruction_revision: row.get(6)?,
+            session_lifecycle: row.get(7)?,
+            active_turn_id: row.get(8)?,
+            active_turn_lifecycle: row.get(9)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+}
+
+fn record_provider_resume(database: &Path, provider_session_id: &str) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let updated = connection.execute(
+        "UPDATE provider_sessions SET resume_count=resume_count+1,last_resumed_at=?2,
+           last_resume_error=NULL WHERE provider_session_id=?1
+           AND lifecycle IN ('idle','running','unknown')",
+        params![provider_session_id, now_rfc3339()],
+    )?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidData(format!(
+            "provider session {provider_session_id} is not resumable"
+        )))
+    }
+}
+
+fn block_provider_session(
+    database: &Path,
+    provider_session_id: &str,
+    error: &str,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let agent_id = transaction
+        .query_row(
+            "SELECT agent_id FROM provider_sessions
+             WHERE provider_session_id=?1 AND lifecycle IN ('idle','running','unknown')",
+            [provider_session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::InvalidData(format!(
+                "provider session {provider_session_id} is not resumable"
+            ))
+        })?;
+    transaction.execute(
+        "UPDATE provider_sessions SET lifecycle='blocked',last_resume_error=?2
+         WHERE provider_session_id=?1",
+        params![provider_session_id, error],
+    )?;
+    transaction.execute(
+        "UPDATE agent_instances SET lifecycle='blocked',context_error=?2
+         WHERE agent_id=?1",
+        params![agent_id, error],
+    )?;
+    transaction.execute(
+        "UPDATE assignments SET lifecycle='blocked',retired_at=?2
+         WHERE assignment_id=(SELECT assignment_id FROM agent_instances WHERE agent_id=?1)
+           AND lifecycle IN ('active','finalizing')",
+        params![agent_id, now],
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -2884,7 +3113,7 @@ fn fail_issue_reactivation(
     database: &Path,
     event_id: &str,
     assignment_id: &str,
-    _error: &str,
+    error: &str,
 ) -> Result<(), StoreError> {
     require_current_schema(database)?;
     let now = now_rfc3339();
@@ -2901,9 +3130,9 @@ fn fail_issue_reactivation(
         params![assignment_id, now],
     )?;
     transaction.execute(
-        "UPDATE agent_instances SET lifecycle='blocked'
+        "UPDATE agent_instances SET lifecycle='blocked',context_error=?2
          WHERE assignment_id=?1 AND lifecycle='materializing'",
-        [assignment_id],
+        params![assignment_id, error],
     )?;
     transaction.commit()?;
     Ok(())
@@ -2934,7 +3163,7 @@ fn begin_issue_assignment(
     database: &Path,
     event_id: &str,
     profile: &ProfileRecord,
-    context_revision: &str,
+    context_revision: Option<&str>,
     preserve_wake_batch: bool,
 ) -> Result<Option<AgentMaterialization>, StoreError> {
     require_current_schema(database)?;
@@ -3023,10 +3252,12 @@ fn begin_issue_assignment(
             sqlite_u64(materialization.profile_revision, "Profile revision")?,
         ],
     )?;
-    transaction.execute(
-        "UPDATE work_items SET context_revision=?2,observed_at=?3 WHERE node_id=?1",
-        params![work_item_node_id, context_revision, now],
-    )?;
+    if let Some(context_revision) = context_revision {
+        transaction.execute(
+            "UPDATE work_items SET context_revision=?2,observed_at=?3 WHERE node_id=?1",
+            params![work_item_node_id, context_revision, now],
+        )?;
+    }
     transaction.commit()?;
     Ok(Some(materialization))
 }
@@ -3092,7 +3323,7 @@ fn complete_issue_assignment(
 fn fail_issue_assignment(
     database: &Path,
     assignment_id: &str,
-    _error: &str,
+    error: &str,
 ) -> Result<(), StoreError> {
     require_current_schema(database)?;
     let now = now_rfc3339();
@@ -3105,12 +3336,38 @@ fn fail_issue_assignment(
         params![assignment_id, now],
     )?;
     transaction.execute(
-        "UPDATE agent_instances SET lifecycle='blocked'
+        "UPDATE agent_instances SET lifecycle='blocked',context_error=?2
          WHERE assignment_id=?1 AND lifecycle='materializing'",
-        [assignment_id],
+        params![assignment_id, error],
     )?;
     transaction.commit()?;
     Ok(())
+}
+
+fn set_assignment_context_pressure(
+    database: &Path,
+    assignment_id: &str,
+    pressure: &str,
+    bytes: Option<u64>,
+    error: Option<&str>,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    if !matches!(pressure, "normal" | "soft" | "hard" | "unavailable") {
+        return Err(StoreError::InvalidData(format!("invalid Context pressure {pressure}")));
+    }
+    let bytes = bytes.map(|value| sqlite_u64(value, "Context bytes")).transpose()?;
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let updated = connection.execute(
+        "UPDATE agent_instances SET context_pressure=?2,context_bytes=?3,context_error=?4
+         WHERE assignment_id=?1",
+        params![assignment_id, pressure, bytes, error],
+    )?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidData(format!("assignment {assignment_id} has no Agent instance")))
+    }
 }
 
 fn begin_context_reset(
@@ -3288,7 +3545,7 @@ fn load_context_reset_claim(
     reset_id: &str,
 ) -> Result<ContextResetClaim, StoreError> {
     let mut claim = connection.query_row(
-        "SELECT cr.reset_id,r.name_with_owner,w.number,ai.profile_id,
+        "SELECT cr.reset_id,a.assignment_id,r.name_with_owner,w.number,ai.profile_id,
                 ps.provider_session_id,cr.active_turn_id,t.provider_turn_id,cr.continuation
          FROM context_resets cr
          JOIN agent_instances ai ON ai.agent_id=cr.agent_id
@@ -3302,14 +3559,15 @@ fn load_context_reset_claim(
         |row| {
             Ok(ContextResetClaim {
                 reset_id: row.get(0)?,
-                repository: row.get(1)?,
-                number: sqlite_i64_to_u64(row.get(2)?, "context reset Issue number")?,
-                profile_id: row.get(3)?,
-                old_provider_session_id: row.get(4)?,
-                active_turn_id: row.get(5)?,
-                provider_turn_id: row.get(6)?,
+                assignment_id: row.get(1)?,
+                repository: row.get(2)?,
+                number: sqlite_i64_to_u64(row.get(3)?, "context reset Issue number")?,
+                profile_id: row.get(4)?,
+                old_provider_session_id: row.get(5)?,
+                active_turn_id: row.get(6)?,
+                provider_turn_id: row.get(7)?,
                 references: Vec::new(),
-                continuation: row.get::<_, i64>(7)? != 0,
+                continuation: row.get::<_, i64>(8)? != 0,
             })
         },
     )?;
@@ -3478,8 +3736,10 @@ fn fail_context_reset(database: &Path, reset_id: &str, error: &str) -> Result<()
         "UPDATE context_resets SET lifecycle='blocked',error=?2,updated_at=?3 WHERE reset_id=?1",
         params![reset_id, error, now],
     )?;
-    transaction
-        .execute("UPDATE agent_instances SET lifecycle='blocked' WHERE agent_id=?1", [&agent_id])?;
+    transaction.execute(
+        "UPDATE agent_instances SET lifecycle='blocked',context_error=?2 WHERE agent_id=?1",
+        params![agent_id, error],
+    )?;
     transaction.execute(
         "UPDATE provider_sessions SET lifecycle='blocked'
          WHERE agent_id=?1 AND lifecycle='reset_pending'",
@@ -3868,6 +4128,24 @@ fn enqueue_operational_status(
     body: &str,
 ) -> Result<(), StoreError> {
     require_current_schema(database)?;
+    let connection = open_read_only(database)?;
+    let assignment_id = connection.query_row(
+        "SELECT ai.assignment_id FROM turns t
+         JOIN provider_sessions ps ON ps.session_id=t.session_id
+         JOIN agent_instances ai ON ai.agent_id=ps.agent_id
+         WHERE t.turn_id=?1",
+        [turn_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    enqueue_assignment_operational_status(database, &assignment_id, body)
+}
+
+fn enqueue_assignment_operational_status(
+    database: &Path,
+    assignment_id: &str,
+    body: &str,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
     if body.trim().is_empty() {
         return Err(StoreError::InvalidData("Operational Status body is empty".into()));
     }
@@ -3880,16 +4158,15 @@ fn enqueue_operational_status(
         transaction.query_row(
             "SELECT w.node_id,r.name_with_owner,w.number,ai.profile_id,a.generation,
                     sc.remote_comment_node_id,sc.remote_comment_database_id
-             FROM turns t
-             JOIN provider_sessions ps ON ps.session_id=t.session_id
-             JOIN agent_instances ai ON ai.agent_id=ps.agent_id
-             JOIN assignments a ON a.assignment_id=ai.assignment_id
+             FROM assignments a
+             JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
              JOIN work_items w ON w.node_id=a.work_item_node_id
              JOIN repositories r ON r.node_id=w.repository_node_id
              LEFT JOIN status_comments sc
                ON sc.work_item_node_id=w.node_id AND sc.profile_id=ai.profile_id
-             WHERE t.turn_id=?1",
-            [turn_id],
+              AND sc.assignment_generation=a.generation
+             WHERE a.assignment_id=?1",
+            [assignment_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -3906,14 +4183,23 @@ fn enqueue_operational_status(
         (Some(_), Some(database_id)) => ("comment_update", "issue_comment", database_id),
         _ => ("comment_create", "issue", number.to_string()),
     };
+    let intent_id = Uuid::now_v7().to_string();
     transaction.execute(
         "INSERT INTO status_comments(
-           work_item_node_id,profile_id,remote_comment_node_id,remote_comment_database_id,
-           body_digest,lifecycle,updated_at
-         ) VALUES (?1,?2,NULL,NULL,?3,'pending',?4)
-         ON CONFLICT(work_item_node_id,profile_id) DO UPDATE SET
-           body_digest=excluded.body_digest,lifecycle='pending',updated_at=excluded.updated_at",
-        params![work_item_node_id, profile_id, body_digest, now],
+           work_item_node_id,profile_id,assignment_generation,remote_comment_node_id,
+           remote_comment_database_id,write_intent_id,body_digest,lifecycle,updated_at
+         ) VALUES (?1,?2,?3,NULL,NULL,?4,?5,'pending',?6)
+         ON CONFLICT(work_item_node_id,profile_id,assignment_generation) DO UPDATE SET
+           write_intent_id=excluded.write_intent_id,body_digest=excluded.body_digest,
+           lifecycle='pending',updated_at=excluded.updated_at",
+        params![
+            work_item_node_id,
+            profile_id,
+            sqlite_u64(generation, "status generation")?,
+            intent_id,
+            body_digest,
+            now
+        ],
     )?;
     let request_digest = hex::encode(Sha256::digest(
         format!(
@@ -3927,7 +4213,7 @@ fn enqueue_operational_status(
            request_digest,lifecycle,next_attempt_at,created_at,updated_at
          ) VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?8,?8)",
         params![
-            Uuid::now_v7().to_string(),
+            intent_id,
             repository,
             target_kind,
             target_database_id,
@@ -3941,46 +4227,20 @@ fn enqueue_operational_status(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn settle_operational_status(
     transaction: &rusqlite::Transaction<'_>,
-    repository: &str,
-    target_kind: &str,
-    target_database_id: &str,
-    body: &str,
+    intent_id: &str,
     lifecycle: &str,
     remote_database_id: Option<&str>,
     remote_node_id: Option<&str>,
     now: &str,
 ) -> Result<(), StoreError> {
-    let body_digest = hex::encode(Sha256::digest(body.as_bytes()));
-    if target_kind == "issue" {
-        transaction.execute(
-            "UPDATE status_comments SET remote_comment_node_id=COALESCE(?4,remote_comment_node_id),
-               remote_comment_database_id=COALESCE(?5,remote_comment_database_id),
-               lifecycle=?6,updated_at=?7
-             WHERE work_item_node_id=(
-               SELECT w.node_id FROM work_items w
-               JOIN repositories r ON r.node_id=w.repository_node_id
-               WHERE r.name_with_owner=?1 AND w.kind='issue' AND w.number=?2
-             ) AND body_digest=?3",
-            params![
-                repository,
-                target_database_id,
-                body_digest,
-                remote_node_id,
-                remote_database_id,
-                lifecycle,
-                now,
-            ],
-        )?;
-    } else if target_kind == "issue_comment" {
-        transaction.execute(
-            "UPDATE status_comments SET body_digest=?2,lifecycle=?3,updated_at=?4
-             WHERE remote_comment_database_id=?1",
-            params![target_database_id, body_digest, lifecycle, now],
-        )?;
-    }
+    transaction.execute(
+        "UPDATE status_comments SET remote_comment_node_id=COALESCE(?3,remote_comment_node_id),
+           remote_comment_database_id=COALESCE(?4,remote_comment_database_id),
+           lifecycle=?2,updated_at=?5 WHERE write_intent_id=?1",
+        params![intent_id, lifecycle, remote_node_id, remote_database_id, now],
+    )?;
     Ok(())
 }
 

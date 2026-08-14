@@ -193,6 +193,7 @@ pub enum CanonicalContext {
 pub enum ContextPressure {
     Normal,
     Soft,
+    Hard,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -270,16 +271,28 @@ pub fn render(
     soft_ratio: f64,
     hard_bytes: usize,
 ) -> Result<RenderedContext, ContextError> {
+    let rendered = render_complete(context, soft_ratio, hard_bytes);
+    if rendered.pressure == ContextPressure::Hard {
+        return Err(ContextError::TooLarge { bytes: rendered.bytes, hard_bytes });
+    }
+    Ok(rendered)
+}
+
+#[allow(clippy::cast_precision_loss)]
+pub fn render_complete(
+    context: &CanonicalContext,
+    soft_ratio: f64,
+    hard_bytes: usize,
+) -> RenderedContext {
     let mut text = String::new();
     match context {
         CanonicalContext::Issue(issue) => render_issue(&mut text, issue, true),
         CanonicalContext::PullRequest(pull_request) => render_pull_request(&mut text, pull_request),
     }
     let bytes = text.len();
-    if bytes > hard_bytes {
-        return Err(ContextError::TooLarge { bytes, hard_bytes });
-    }
-    let pressure = if bytes as f64 > hard_bytes as f64 * soft_ratio {
+    let pressure = if bytes > hard_bytes {
+        ContextPressure::Hard
+    } else if bytes as f64 > hard_bytes as f64 * soft_ratio {
         ContextPressure::Soft
     } else {
         ContextPressure::Normal
@@ -287,7 +300,7 @@ pub fn render(
     let mut digest = Sha256::new();
     digest.update(CONTEXT_REVISION_DOMAIN);
     digest.update(text.as_bytes());
-    Ok(RenderedContext { text, revision: hex::encode(digest.finalize()), bytes, pressure })
+    RenderedContext { text, revision: hex::encode(digest.finalize()), bytes, pressure }
 }
 
 pub fn reconcile_local_state(

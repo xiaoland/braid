@@ -53,6 +53,15 @@ Versioning once release artifacts are published.
   Closed activity cannot grant another turn; reopen rebuilds complete current
   GitHub Context in a fresh provider session and releases one ordinary
   debounced Wake. Public status reports bounded finalization evidence.
+- Forward-only schema version 7 adds provider-session resume evidence,
+  assignment-generation-scoped Operational Status ownership, and observable
+  normal/soft/hard/unavailable Context pressure. Braid reconnects a lost
+  app-server, resumes the same compatible physical thread, and keeps transport
+  loss distinct from provider protocol failure.
+- The expanded Slice 4 public campaign now proves in-place provider resume plus
+  a subsequent debounced Wake, complete soft-pressure Context delivery with one
+  Operational Status Comment, and hard-pressure refusal with no provider
+  session, turn, truncation, or generated summary.
 - Desired-state trusted-mention reactions, including removal of stale active
   reactions after terminal convergence, and Agent-origin echo suppression by
   stable actor identity or public Profile attribution.

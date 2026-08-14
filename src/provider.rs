@@ -23,7 +23,7 @@ use crate::{
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-type PendingRequests = BTreeMap<i64, oneshot::Sender<Result<Value, String>>>;
+type PendingRequests = BTreeMap<i64, oneshot::Sender<Result<Value, ProviderError>>>;
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
@@ -181,6 +181,44 @@ impl CodexClient {
         Ok(())
     }
 
+    pub async fn resume_session(
+        &self,
+        thread_id: &str,
+        profile: &Profile,
+        developer_instructions: &str,
+    ) -> Result<ProviderSession, ProviderError> {
+        let result = self
+            .request(
+                "thread/resume",
+                json!({
+                    "threadId":thread_id,
+                    "cwd":path_text(&profile.workspace)?,
+                    "model":profile.model,
+                    "developerInstructions":developer_instructions,
+                    "approvalPolicy":"never",
+                    "sandbox":"danger-full-access"
+                }),
+            )
+            .await?;
+        let thread = result
+            .get("thread")
+            .ok_or_else(|| ProviderError::Protocol("thread/resume omitted result.thread".into()))?;
+        let resumed_id = required_string(thread, "id", "thread/resume result.thread")?;
+        if resumed_id != thread_id {
+            return Err(ProviderError::Protocol(format!(
+                "thread/resume returned {resumed_id} for requested thread {thread_id}"
+            )));
+        }
+        Ok(ProviderSession {
+            thread_id: resumed_id,
+            model: result
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("provider-default")
+                .to_owned(),
+        })
+    }
+
     pub async fn start_turn(
         &self,
         thread_id: &str,
@@ -236,8 +274,7 @@ impl CodexClient {
             return Err(error);
         }
         match timeout(REQUEST_TIMEOUT, receiver).await {
-            Ok(Ok(Ok(response))) => Ok(response),
-            Ok(Ok(Err(error))) => Err(ProviderError::Protocol(error)),
+            Ok(Ok(response)) => response,
             Ok(Err(_)) => Err(ProviderError::Disconnected),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
@@ -287,11 +324,13 @@ fn spawn_stdout(
             if let Some(id) = frame.get("id").and_then(Value::as_i64) {
                 if let Some(sender) = pending.lock().await.remove(&id) {
                     let response = if let Some(error) = frame.get("error") {
-                        Err(error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown app-server error")
-                            .to_owned())
+                        Err(ProviderError::Protocol(
+                            error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown app-server error")
+                                .to_owned(),
+                        ))
                     } else {
                         Ok(frame.get("result").cloned().unwrap_or(Value::Null))
                     };
@@ -305,7 +344,7 @@ fn spawn_stdout(
         }
         let drained = std::mem::take(&mut *pending.lock().await);
         for sender in drained.into_values() {
-            let _ = sender.send(Err("app-server disconnected".into()));
+            let _ = sender.send(Err(ProviderError::Disconnected));
         }
         let _ = notifications.send(ProviderNotification::Disconnected);
     });
