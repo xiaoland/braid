@@ -8,8 +8,8 @@ use crate::{
     context,
     github::{GitHubClient, GitHubError, PullRequest, WorkItemLocator},
     store::{
-        GhWriteReceipt, ImplementationProgress, ImplementationRequestReceipt, NewGhWriteIntent,
-        NewImplementationRequest, StoreActor,
+        GhWriteReceipt, ImplementationProgress, ImplementationRequestReceipt, IngressEvent,
+        NewGhWriteIntent, NewImplementationRequest, SchedulerPolicy, StoreActor,
     },
 };
 
@@ -95,7 +95,7 @@ pub async fn ensure_pull_request(
     match claim_or_wait(store, &receipt.write.intent_id).await? {
         Claim::Done(_) => completed_implementation_receipt(store, &receipt.write.intent_id),
         Claim::Owned(_) => {
-            let result = converge_pull_request(&github, store, &receipt).await;
+            let result = converge_pull_request(config, &github, store, &receipt).await;
             match result {
                 Ok(pull_request) => store.finish_gh_write(
                     receipt.write.intent_id.clone(),
@@ -290,6 +290,7 @@ async fn converge_comment(
 }
 
 async fn converge_pull_request(
+    config: &Config,
     github: &GitHubClient,
     store: &StoreActor,
     receipt: &ImplementationRequestReceipt,
@@ -354,7 +355,54 @@ async fn converge_pull_request(
             },
         )
         .map_err(|error| store_as_github_error(&error))?;
+    record_pr_activation(config, github, store, receipt, &pull_request)?;
     Ok(pull_request)
+}
+
+fn record_pr_activation(
+    config: &Config,
+    github: &GitHubClient,
+    store: &StoreActor,
+    receipt: &ImplementationRequestReceipt,
+    pull_request: &PullRequest,
+) -> Result<(), GitHubError> {
+    let repository = &github.identity().repository;
+    let reference = format!(
+        "Implementation Request comment {repository}#issuecomment-{} ensured GitHub PR {repository}#{}.",
+        receipt.comment_database_id, pull_request.number,
+    );
+    store
+        .ingest_event(
+            IngressEvent {
+                delivery_guid: format!("braid-pr-ensure-{}", receipt.write.intent_id),
+                event_name: "braid".into(),
+                action: Some("pr_ensure".into()),
+                repository_node_id: github.identity().repository_node_id.clone(),
+                repository: repository.clone(),
+                work_item_node_id: Some(pull_request.node_id.clone()),
+                work_item_kind: Some("pr"),
+                work_item_number: Some(pull_request.number),
+                work_item_state: Some(pull_request.state.clone()),
+                object_node_id: None,
+                object_version: Some(receipt.write.request_digest.clone()),
+                object_digest: None,
+                actor_node_id: Some(github.identity().actor_node_id.clone()),
+                actor_login: Some(github.identity().actor_login.clone()),
+                classification: "wake",
+                origin: "braid",
+                reference,
+                mention_candidate: false,
+                reaction_target: None,
+                known: true,
+                raw_payload: Vec::new(),
+            },
+            SchedulerPolicy {
+                quiet_seconds: config.scheduler.quiet_seconds,
+                event_threshold: config.scheduler.event_threshold,
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| store_as_github_error(&error))
 }
 
 async fn ensure_head(

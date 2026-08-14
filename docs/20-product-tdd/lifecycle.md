@@ -26,7 +26,9 @@ physical session. A canonically confirmed native Agent App assignment ends in
 unavailable, the first Trusted Braid Mention on a dormant Issue is both the
 ActivationIntent and an urgent Wake reference, so the initial Issue turn starts
 after materialization. PR Activation from a Trusted Braid Mention or `pr
-ensure` likewise carries an explicit Wake reference.
+ensure` likewise carries an explicit Wake reference. A successful `pr ensure`
+is also the explicit implementation authorization for the initial PR turn; the
+Implementation Agent must not wait for a second Human start message.
 
 ## Event Classification
 

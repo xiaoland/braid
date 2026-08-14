@@ -13,7 +13,7 @@ through real GitHub Work Items and a clean packaged installation.
 
 `00_clean_install.sh` is the Rust foundation gate. It unpacks the release
 artifact, scrubs Python/PDM/Cargo from the binary's `PATH`, exercises only the
-public CLI, verifies schema 0→8, schema 1→8 with a pre-v8 backup, and
+public CLI, verifies schema 0→9, schema 1→9 with a pre-v9 backup, and
 schema-newer refusal, and uses the adjacent
 bounded OTLP/HTTP capture helper to observe sampling. Its direct SQLite write is
 limited to constructing declared migration-compatibility fixtures; it does not
@@ -129,13 +129,17 @@ provider session or turn, and never truncates or summarizes the Context.
 This Slice 4 helper does not yet claim native unassignment, active-turn
 app-server loss, Context-unavailable recovery, or PR Agent coverage.
 
-`50_issue_to_pr.sh` begins the Slice 5 public gate without claiming the full
+`50_issue_to_pr.sh` is the growing Slice 5 public gate without claiming the full
 Issue-to-implementation journey. It creates a disposable real Issue, publishes
-one App-authored attributed Agent comment through `braid gh`, verifies its
-durable receipt, invokes `braid gh pr ensure` twice concurrently, and requires
-one deterministic branch, one same-tree bootstrap commit, one Draft PR, and one
-native Issue association. Cleanup closes the PR/Issue and deletes the fixture
-branch. Set `BRAID_TEST_KEEP_FIXTURES=1` to retain evidence intentionally.
+one App-authored attributed Implementation Request through `braid gh`, verifies
+its durable receipt, and invokes `braid gh pr ensure` twice concurrently. It
+requires one deterministic branch, one same-tree bootstrap commit, one Draft PR,
+one native Issue association, one PR Profile/session, and one generation-scoped
+worktree provisioned from a fresh source clone. The real Codex Implementation
+Agent must then push one exact requested file and publish one concise attributed
+PR comment; the PR must contain no Braid turn mirror. Cleanup closes the PR and
+Issue, deletes the fixture branch, and removes the isolated runtime/source.
+Set `BRAID_TEST_KEEP_FIXTURES=1` to retain evidence intentionally.
 
 The helper requires the installed Braid App to expose `Issues: write`, `Pull
 requests: write`, and `Contents: write` and a schema-current config/private key:
@@ -146,7 +150,9 @@ BRAID_BIN=/absolute/path/to/braid \
 scripts/tests/50_issue_to_pr.sh
 ```
 
-Its PASS is deliberately bounded: PR Agent Group materialization, isolated
-worktree, implementation diff, review, cross-surface invalidation, and PR
-lifecycle remain unproven until this same helper is expanded in later Slice 5
-increments.
+Its PASS is deliberately bounded. It now proves PR Agent Group materialization,
+isolated worktree execution, a real pushed diff, Agent-authored PR prose, and
+absence of Braid turn mirroring. Review/review-thread routing, cross-surface
+invalidation, configured and unconfigured direct-`gh` origins, PR
+finalization/reopen/merge, and restart recovery remain unproven until later
+Slice 5/6 increments.

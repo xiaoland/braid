@@ -10,6 +10,7 @@ mod store;
 mod telemetry;
 mod tunnel;
 mod webhook;
+mod worktree;
 mod writer;
 
 #[tokio::main]

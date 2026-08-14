@@ -70,6 +70,16 @@ Versioning once release artifacts are published.
   Issue #33 and App comment `5294048165` to one durable receipt, one same-tree
   bootstrap branch, and Draft PR #34 with its native Issue association. Cleanup
   closed both Work Items and deleted the temporary branch.
+- Forward-only schema version 9 records PR worktree source/head/branch identity.
+  A successful `pr ensure` now activates the selected PR Profile immediately,
+  materializes current Associated-Issue plus PR Context, provisions a dedicated
+  generation-scoped worktree, and starts a distinct Codex session there.
+- The expanded `scripts/tests/50_issue_to_pr.sh` campaign passed against Issue
+  #43 and Draft PR #44. The PR Implementation Agent pushed one exact requested
+  file from its runtime-owned worktree and published its own concise attributed
+  PR comment; no turn mirror appeared. The campaign closed both Work Items,
+  removed all five attempted fixture branches, and left review, cross-surface
+  invalidation, direct-identity variants, and PR lifecycle as explicit gaps.
 - The expanded Slice 4 public campaign now proves in-place provider resume plus
   a subsequent debounced Wake, complete soft-pressure Context delivery with one
   Operational Status Comment, and hard-pressure refusal with no provider

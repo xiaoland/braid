@@ -74,7 +74,7 @@ crates. Modules are deep and align with authority boundaries:
 | `scheduler` | Quiet/count/urgent coalescing and single-flight group turn claims. |
 | `sessions` | Assignment generation, Context generation, invalidation fencing, finalization, and provider/worktree handles. |
 | `provider` | Provider-neutral capability contract and Codex NDJSON implementation. |
-| `worktree` | One default PR worktree per Implementation Agent and recovery diagnostics; no Git-operation sandbox. |
+| `worktree` | Validate a Profile source checkout, fetch the bound PR head, provision one generation-scoped worktree per Implementation Agent, and expose recovery diagnostics; no Git-operation sandbox. |
 | `writer` | `braid gh`, attribution, reaction/status desired state, and write-outbox convergence. |
 | `telemetry` | Trace/metric/log creation, payload events, sampling configuration, and OTLP export. |
 | `tunnel` | Wrangler Quick Tunnel supervision and webhook URL handoff. |
@@ -152,6 +152,15 @@ previous checksums, applies each migration in one transaction, and rejects a DB
 newer than the binary. Compatible application rollback is declared per release;
 an incompatible schema rollback restores the pre-migration backup rather than
 running a down migration.
+
+For a PR-capable Profile, `workspace` names a clean source Git checkout of the
+configured repository, not the directory in which the Agent edits. Braid
+fetches the PR head from that checkout and provisions the actual Agent cwd under
+`runtime.root/worktrees/pr-<number>/<profile>-g<generation>`. SQLite records the
+resolved source, worktree, remote head, and local branch as operational facts.
+The provider session is started and later resumed only against that worktree.
+This provides isolation and recovery identity without turning Braid into a Git
+policy engine.
 
 ## Error and Concurrency Model
 

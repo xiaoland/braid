@@ -26,7 +26,7 @@ use gh_writes::{
     prepare_gh_write, prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 8;
+pub const DATABASE_SCHEMA_VERSION: u32 = 9;
 
 const INITIAL_SQL: &str = include_str!("../migrations/0001_initial.sql");
 const CONTEXT_LEDGER_SQL: &str = include_str!("../migrations/0002_context_ledger.sql");
@@ -37,6 +37,7 @@ const CONTEXT_RESETS_SQL: &str = include_str!("../migrations/0006_context_resets
 const OPERATIONAL_CONVERGENCE_SQL: &str =
     include_str!("../migrations/0007_operational_convergence.sql");
 const BRAID_GH_SQL: &str = include_str!("../migrations/0008_braid_gh.sql");
+const PR_AGENT_WORKTREE_SQL: &str = include_str!("../migrations/0009_pr_agent_worktree.sql");
 const MIGRATIONS: &[Migration] = &[
     Migration { version: 1, name: "initial", sql: INITIAL_SQL },
     Migration { version: 2, name: "context-ledger", sql: CONTEXT_LEDGER_SQL },
@@ -46,6 +47,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration { version: 6, name: "context-resets", sql: CONTEXT_RESETS_SQL },
     Migration { version: 7, name: "operational-convergence", sql: OPERATIONAL_CONVERGENCE_SQL },
     Migration { version: 8, name: "braid-gh", sql: BRAID_GH_SQL },
+    Migration { version: 9, name: "pr-agent-worktree", sql: PR_AGENT_WORKTREE_SQL },
 ];
 
 #[derive(Debug, Error)]
@@ -257,6 +259,7 @@ pub struct AssignmentCandidate {
     pub event_id: String,
     pub action: String,
     pub repository: String,
+    pub work_item_kind: String,
     pub number: u64,
 }
 
@@ -284,6 +287,7 @@ pub struct TurnClaim {
     pub batch_id: String,
     pub provider_session_id: String,
     pub repository: String,
+    pub work_item_kind: String,
     pub number: u64,
     pub context_revision: String,
     pub profile_id: String,
@@ -324,6 +328,9 @@ pub struct AgentGroupSummary {
     pub context_pressure: String,
     pub context_bytes: Option<u64>,
     pub context_error: Option<String>,
+    pub worktree_path: Option<PathBuf>,
+    pub worktree_lifecycle: Option<String>,
+    pub worktree_head_ref: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -331,6 +338,7 @@ pub struct ProviderResumeCandidate {
     pub assignment_id: String,
     pub provider_session_id: String,
     pub repository: String,
+    pub work_item_kind: String,
     pub number: u64,
     pub profile_id: String,
     pub profile_revision: u64,
@@ -338,6 +346,8 @@ pub struct ProviderResumeCandidate {
     pub session_lifecycle: String,
     pub active_turn_id: Option<String>,
     pub active_turn_lifecycle: Option<String>,
+    pub worktree_path: Option<PathBuf>,
+    pub worktree_head_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -762,10 +772,11 @@ impl StoreActor {
     pub fn provider_resume_candidates(
         &self,
         profile_id: String,
+        work_item_kind: String,
     ) -> Result<Vec<ProviderResumeCandidate>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::ProviderResumeCandidates(profile_id, reply))
+            .send(Command::ProviderResumeCandidates(profile_id, work_item_kind, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -792,11 +803,12 @@ impl StoreActor {
 
     pub fn assignment_candidates(
         &self,
+        work_item_kind: String,
         limit: usize,
     ) -> Result<Vec<AssignmentCandidate>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::AssignmentCandidates(limit, reply))
+            .send(Command::AssignmentCandidates(work_item_kind, limit, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -887,7 +899,7 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub fn begin_issue_assignment(
+    pub fn begin_agent_assignment(
         &self,
         event_id: String,
         profile: ProfileRecord,
@@ -896,7 +908,7 @@ impl StoreActor {
     ) -> Result<Option<AgentMaterialization>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::BeginIssueAssignment(
+            .send(Command::BeginAgentAssignment(
                 event_id,
                 profile,
                 context_revision,
@@ -915,7 +927,7 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub fn complete_issue_assignment(
+    pub fn complete_agent_assignment(
         &self,
         materialization: AgentMaterialization,
         provider_session_id: String,
@@ -924,7 +936,7 @@ impl StoreActor {
     ) -> Result<(), StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::CompleteIssueAssignment(
+            .send(Command::CompleteAgentAssignment(
                 materialization,
                 provider_session_id,
                 context_revision,
@@ -935,14 +947,14 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub fn fail_issue_assignment(
+    pub fn fail_agent_assignment(
         &self,
         assignment_id: String,
         error: String,
     ) -> Result<(), StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::FailIssueAssignment(assignment_id, error, reply))
+            .send(Command::FailAgentAssignment(assignment_id, error, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -979,10 +991,39 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub fn claim_runnable_turn(&self) -> Result<Option<TurnClaim>, StoreError> {
+    pub fn claim_runnable_turn(
+        &self,
+        work_item_kind: String,
+        profile_id: String,
+    ) -> Result<Option<TurnClaim>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::ClaimRunnableTurn(reply))
+            .send(Command::ClaimRunnableTurn(work_item_kind, profile_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_agent_worktree(
+        &self,
+        materialization: AgentMaterialization,
+        repository_node_id: String,
+        path: PathBuf,
+        source_path: PathBuf,
+        head_ref: String,
+        local_branch: String,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::RecordAgentWorktree(
+                materialization,
+                repository_node_id,
+                path,
+                source_path,
+                head_ref,
+                local_branch,
+                reply,
+            ))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1176,10 +1217,14 @@ enum Command {
         Sender<Result<(), StoreError>>,
     ),
     RegisterProfile(ProfileRecord, Sender<Result<(), StoreError>>),
-    ProviderResumeCandidates(String, Sender<Result<Vec<ProviderResumeCandidate>, StoreError>>),
+    ProviderResumeCandidates(
+        String,
+        String,
+        Sender<Result<Vec<ProviderResumeCandidate>, StoreError>>,
+    ),
     RecordProviderResume(String, Sender<Result<(), StoreError>>),
     BlockProviderSession(String, String, Sender<Result<(), StoreError>>),
-    AssignmentCandidates(usize, Sender<Result<Vec<AssignmentCandidate>, StoreError>>),
+    AssignmentCandidates(String, usize, Sender<Result<Vec<AssignmentCandidate>, StoreError>>),
     IssueLifecycleCandidates(usize, Sender<Result<Vec<IssueLifecycleCandidate>, StoreError>>),
     PrepareIssueFinalization(String, Sender<Result<bool, StoreError>>),
     BeginIssueReactivation(String, Sender<Result<Option<AgentMaterialization>, StoreError>>),
@@ -1194,7 +1239,7 @@ enum Command {
     ),
     FailIssueReactivation(String, String, String, Sender<Result<(), StoreError>>),
     HasLifecycleObservation(String, String, String, Sender<Result<bool, StoreError>>),
-    BeginIssueAssignment(
+    BeginAgentAssignment(
         String,
         ProfileRecord,
         Option<String>,
@@ -1202,14 +1247,14 @@ enum Command {
         Sender<Result<Option<AgentMaterialization>, StoreError>>,
     ),
     IgnoreAssignmentEvent(String, Sender<Result<(), StoreError>>),
-    CompleteIssueAssignment(
+    CompleteAgentAssignment(
         AgentMaterialization,
         String,
         String,
         String,
         Sender<Result<(), StoreError>>,
     ),
-    FailIssueAssignment(String, String, Sender<Result<(), StoreError>>),
+    FailAgentAssignment(String, String, Sender<Result<(), StoreError>>),
     SetAssignmentContextPressure(
         String,
         String,
@@ -1218,7 +1263,16 @@ enum Command {
         Sender<Result<(), StoreError>>,
     ),
     EnqueueAssignmentOperationalStatus(String, String, Sender<Result<(), StoreError>>),
-    ClaimRunnableTurn(Sender<Result<Option<TurnClaim>, StoreError>>),
+    ClaimRunnableTurn(String, String, Sender<Result<Option<TurnClaim>, StoreError>>),
+    RecordAgentWorktree(
+        AgentMaterialization,
+        String,
+        PathBuf,
+        PathBuf,
+        String,
+        String,
+        Sender<Result<(), StoreError>>,
+    ),
     MarkTurnStarted(String, String, Sender<Result<(), StoreError>>),
     MarkTurnTerminal(String, String, Sender<Result<(), StoreError>>),
     ClaimUrgentSteer(String, Sender<Result<Option<TurnClaim>, StoreError>>),
@@ -1384,8 +1438,9 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::RegisterProfile(profile, reply) => {
                 let _ = reply.send(register_profile(database, &profile));
             }
-            Command::ProviderResumeCandidates(profile_id, reply) => {
-                let _ = reply.send(provider_resume_candidates(database, &profile_id));
+            Command::ProviderResumeCandidates(profile_id, work_item_kind, reply) => {
+                let _ =
+                    reply.send(provider_resume_candidates(database, &profile_id, &work_item_kind));
             }
             Command::RecordProviderResume(provider_session_id, reply) => {
                 let _ = reply.send(record_provider_resume(database, &provider_session_id));
@@ -1393,8 +1448,8 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::BlockProviderSession(provider_session_id, error, reply) => {
                 let _ = reply.send(block_provider_session(database, &provider_session_id, &error));
             }
-            Command::AssignmentCandidates(limit, reply) => {
-                let _ = reply.send(assignment_candidates(database, limit));
+            Command::AssignmentCandidates(work_item_kind, limit, reply) => {
+                let _ = reply.send(assignment_candidates(database, &work_item_kind, limit));
             }
             Command::IssueLifecycleCandidates(limit, reply) => {
                 let _ = reply.send(issue_lifecycle_candidates(database, limit));
@@ -1440,14 +1495,14 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
                     &object_version,
                 ));
             }
-            Command::BeginIssueAssignment(
+            Command::BeginAgentAssignment(
                 event_id,
                 profile,
                 context_revision,
                 preserve_wake_batch,
                 reply,
             ) => {
-                let _ = reply.send(begin_issue_assignment(
+                let _ = reply.send(begin_agent_assignment(
                     database,
                     &event_id,
                     &profile,
@@ -1458,14 +1513,14 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::IgnoreAssignmentEvent(event_id, reply) => {
                 let _ = reply.send(ignore_assignment_event(database, &event_id));
             }
-            Command::CompleteIssueAssignment(
+            Command::CompleteAgentAssignment(
                 materialization,
                 provider_session_id,
                 context_revision,
                 instruction_revision,
                 reply,
             ) => {
-                let _ = reply.send(complete_issue_assignment(
+                let _ = reply.send(complete_agent_assignment(
                     database,
                     &materialization,
                     &provider_session_id,
@@ -1473,8 +1528,8 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
                     &instruction_revision,
                 ));
             }
-            Command::FailIssueAssignment(assignment_id, error, reply) => {
-                let _ = reply.send(fail_issue_assignment(database, &assignment_id, &error));
+            Command::FailAgentAssignment(assignment_id, error, reply) => {
+                let _ = reply.send(fail_agent_assignment(database, &assignment_id, &error));
             }
             Command::SetAssignmentContextPressure(assignment_id, pressure, bytes, error, reply) => {
                 let _ = reply.send(set_assignment_context_pressure(
@@ -1492,8 +1547,27 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
                     &body,
                 ));
             }
-            Command::ClaimRunnableTurn(reply) => {
-                let _ = reply.send(claim_runnable_turn(database));
+            Command::ClaimRunnableTurn(work_item_kind, profile_id, reply) => {
+                let _ = reply.send(claim_runnable_turn(database, &work_item_kind, &profile_id));
+            }
+            Command::RecordAgentWorktree(
+                materialization,
+                repository_node_id,
+                path,
+                source_path,
+                head_ref,
+                local_branch,
+                reply,
+            ) => {
+                let _ = reply.send(record_agent_worktree(
+                    database,
+                    &materialization,
+                    &repository_node_id,
+                    &path,
+                    &source_path,
+                    &head_ref,
+                    &local_branch,
+                ));
             }
             Command::MarkTurnStarted(turn_id, provider_turn_id, reply) => {
                 let _ = reply.send(mark_turn_started(database, &turn_id, &provider_turn_id));
@@ -2099,8 +2173,16 @@ fn ingest_event(
         && event.classification == "wake"
         && let Some(work_item_node_id) = event.work_item_node_id.as_deref()
     {
-        batch =
-            Some(schedule_event(&transaction, work_item_node_id, &event_id, policy, false, &now)?);
+        let activation =
+            event.event_name == "braid" && event.action.as_deref() == Some("pr_ensure");
+        batch = Some(schedule_event(
+            &transaction,
+            work_item_node_id,
+            &event_id,
+            policy,
+            activation,
+            &now,
+        )?);
     }
     if lifecycle == "pending"
         && let Some(target) = &event.reaction_target
@@ -2408,10 +2490,12 @@ fn load_agent_groups(
                  WHERE fps.agent_id=ai.agent_id AND ft.trigger_kind='finalization'
                  ORDER BY ft.rowid DESC LIMIT 1),
                 COALESCE(ps.resume_count,0),ps.last_resumed_at,
-                ai.context_pressure,ai.context_bytes,ai.context_error
+                ai.context_pressure,ai.context_bytes,ai.context_error,
+                wt.path,wt.lifecycle,wt.head_ref
          FROM assignments a
          JOIN work_items w ON w.node_id=a.work_item_node_id
          JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
+         LEFT JOIN worktrees wt ON wt.agent_id=ai.agent_id
          LEFT JOIN provider_sessions ps ON ps.agent_id=ai.agent_id
          LEFT JOIN turns t ON t.session_id=ps.session_id
            AND t.lifecycle IN ('starting','running','unknown')
@@ -2438,6 +2522,9 @@ fn load_agent_groups(
                 .map(|value| sqlite_i64_to_u64(value, "Context bytes"))
                 .transpose()?,
             context_error: row.get(15)?,
+            worktree_path: row.get::<_, Option<String>>(16)?.map(PathBuf::from),
+            worktree_lifecycle: row.get(17)?,
+            worktree_head_ref: row.get(18)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -2821,25 +2908,28 @@ fn register_profile(database: &Path, profile: &ProfileRecord) -> Result<(), Stor
 fn provider_resume_candidates(
     database: &Path,
     profile_id: &str,
+    work_item_kind: &str,
 ) -> Result<Vec<ProviderResumeCandidate>, StoreError> {
     require_current_schema(database)?;
+    validate_work_item_kind(work_item_kind)?;
     let connection = open_read_only(database)?;
     let mut statement = connection.prepare(
         "SELECT a.assignment_id,ps.provider_session_id,r.name_with_owner,w.number,
                 ai.profile_id,ai.profile_revision,ps.instruction_revision,ps.lifecycle,
-                t.turn_id,t.lifecycle
+                t.turn_id,t.lifecycle,wt.path,wt.head_ref,w.kind
          FROM assignments a
-         JOIN work_items w ON w.node_id=a.work_item_node_id AND w.kind='issue'
+         JOIN work_items w ON w.node_id=a.work_item_node_id AND w.kind=?2
          JOIN repositories r ON r.node_id=w.repository_node_id
          JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
          JOIN provider_sessions ps ON ps.agent_id=ai.agent_id
            AND ps.lifecycle IN ('idle','running','unknown')
+         LEFT JOIN worktrees wt ON wt.agent_id=ai.agent_id AND wt.lifecycle='active'
          LEFT JOIN turns t ON t.session_id=ps.session_id
            AND t.lifecycle IN ('starting','running','unknown')
          WHERE a.lifecycle IN ('active','finalizing') AND ai.profile_id=?1
          ORDER BY a.assigned_at,a.assignment_id,ps.started_at",
     )?;
-    let rows = statement.query_map([profile_id], |row| {
+    let rows = statement.query_map(params![profile_id, work_item_kind], |row| {
         Ok(ProviderResumeCandidate {
             assignment_id: row.get(0)?,
             provider_session_id: row.get(1)?,
@@ -2851,6 +2941,9 @@ fn provider_resume_candidates(
             session_lifecycle: row.get(7)?,
             active_turn_id: row.get(8)?,
             active_turn_lifecycle: row.get(9)?,
+            worktree_path: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
+            worktree_head_ref: row.get(11)?,
+            work_item_kind: row.get(12)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -2920,32 +3013,36 @@ fn block_provider_session(
 
 fn assignment_candidates(
     database: &Path,
+    work_item_kind: &str,
     limit: usize,
 ) -> Result<Vec<AssignmentCandidate>, StoreError> {
     require_current_schema(database)?;
+    validate_work_item_kind(work_item_kind)?;
     let connection = open_read_only(database)?;
     let limit = i64::try_from(limit)
         .map_err(|_| StoreError::InvalidData("assignment candidate limit exceeds i64".into()))?;
     let mut statement = connection.prepare(
         "SELECT e.event_id,
                 CASE WHEN e.trusted_mention=1 THEN 'trusted_mention' ELSE d.action END,
-                r.name_with_owner,w.number
+                r.name_with_owner,w.kind,w.number
          FROM events e
          JOIN deliveries d ON d.delivery_guid=e.delivery_guid
          JOIN work_items w ON w.node_id=e.work_item_node_id
          JOIN repositories r ON r.node_id=w.repository_node_id
-         WHERE e.lifecycle='pending' AND w.kind='issue'
-           AND ((e.classification='lifecycle' AND d.event_name='issues'
+         WHERE e.lifecycle='pending' AND w.kind=?1
+           AND ((?1='issue' AND e.classification='lifecycle' AND d.event_name='issues'
                  AND d.action IN ('assigned','unassigned'))
+                OR (?1='pr' AND d.event_name='braid' AND d.action='pr_ensure')
                 OR e.trusted_mention=1)
-         ORDER BY e.observed_at,e.event_id LIMIT ?1",
+         ORDER BY e.observed_at,e.event_id LIMIT ?2",
     )?;
-    let rows = statement.query_map([limit], |row| {
+    let rows = statement.query_map(params![work_item_kind, limit], |row| {
         Ok(AssignmentCandidate {
             event_id: row.get(0)?,
             action: row.get(1)?,
             repository: row.get(2)?,
-            number: sqlite_i64_to_u64(row.get(3)?, "assignment Issue number")?,
+            work_item_kind: row.get(3)?,
+            number: sqlite_i64_to_u64(row.get(4)?, "assignment Work Item number")?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -3315,7 +3412,7 @@ fn has_lifecycle_observation(
         .is_some())
 }
 
-fn begin_issue_assignment(
+fn begin_agent_assignment(
     database: &Path,
     event_id: &str,
     profile: &ProfileRecord,
@@ -3327,16 +3424,19 @@ fn begin_issue_assignment(
     let mut connection = open_read_write(database)?;
     configure_connection(&connection)?;
     let transaction = connection.transaction()?;
-    let work_item_node_id = transaction
+    let (work_item_node_id, work_item_kind) = transaction
         .query_row(
-            "SELECT work_item_node_id FROM events WHERE event_id=?1 AND lifecycle='pending'",
+            "SELECT e.work_item_node_id,w.kind FROM events e
+             JOIN work_items w ON w.node_id=e.work_item_node_id
+             WHERE e.event_id=?1 AND e.lifecycle='pending'",
             [event_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?
         .ok_or_else(|| {
             StoreError::InvalidData(format!("assignment event {event_id} is not pending"))
         })?;
+    let role = agent_role_for_kind(&work_item_kind)?;
     transaction.execute(
         "INSERT INTO profiles(profile_id,revision,effective_digest,provider_kind,tags)
          VALUES (?1,?2,?3,?4,?5)
@@ -3400,12 +3500,13 @@ fn begin_issue_assignment(
     transaction.execute(
         "INSERT INTO agent_instances(
            agent_id,assignment_id,profile_id,profile_revision,role,lifecycle
-         ) VALUES (?1,?2,?3,?4,'issue_agent','materializing')",
+         ) VALUES (?1,?2,?3,?4,?5,'materializing')",
         params![
             materialization.agent_id,
             materialization.assignment_id,
             materialization.profile_id,
             sqlite_u64(materialization.profile_revision, "Profile revision")?,
+            role,
         ],
     )?;
     if let Some(context_revision) = context_revision {
@@ -3429,7 +3530,63 @@ fn ignore_assignment_event(database: &Path, event_id: &str) -> Result<(), StoreE
     Ok(())
 }
 
-fn complete_issue_assignment(
+#[allow(clippy::too_many_arguments)]
+fn record_agent_worktree(
+    database: &Path,
+    materialization: &AgentMaterialization,
+    repository_node_id: &str,
+    path: &Path,
+    source_path: &Path,
+    head_ref: &str,
+    local_branch: &str,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let path = path
+        .to_str()
+        .ok_or_else(|| StoreError::InvalidData("worktree path is not valid UTF-8".into()))?;
+    let source_path = source_path
+        .to_str()
+        .ok_or_else(|| StoreError::InvalidData("worktree source is not valid UTF-8".into()))?;
+    if head_ref.is_empty() || local_branch.is_empty() {
+        return Err(StoreError::InvalidData("worktree branch identity is empty".into()));
+    }
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let inserted = connection.execute(
+        "INSERT INTO worktrees(
+           worktree_id,agent_id,path,repository_node_id,lifecycle,observed_at,
+           source_path,head_ref,local_branch
+         )
+         SELECT ?1,ai.agent_id,?3,?4,'active',?5,?6,?7,?8
+         FROM agent_instances ai
+         JOIN assignments a ON a.assignment_id=ai.assignment_id
+         JOIN work_items w ON w.node_id=a.work_item_node_id
+         WHERE ai.agent_id=?2 AND ai.lifecycle='materializing'
+           AND a.assignment_id=?9 AND a.lifecycle='materializing'
+           AND w.kind='pr' AND w.repository_node_id=?4",
+        params![
+            Uuid::now_v7().to_string(),
+            materialization.agent_id,
+            path,
+            repository_node_id,
+            now_rfc3339(),
+            source_path,
+            head_ref,
+            local_branch,
+            materialization.assignment_id,
+        ],
+    )?;
+    if inserted == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidData(format!(
+            "PR Agent {} is not awaiting a worktree",
+            materialization.agent_id
+        )))
+    }
+}
+
+fn complete_agent_assignment(
     database: &Path,
     materialization: &AgentMaterialization,
     provider_session_id: &str,
@@ -3441,6 +3598,26 @@ fn complete_issue_assignment(
     let mut connection = open_read_write(database)?;
     configure_connection(&connection)?;
     let transaction = connection.transaction()?;
+    let role = transaction.query_row(
+        "SELECT role FROM agent_instances WHERE agent_id=?1 AND lifecycle='materializing'",
+        [&materialization.agent_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    if role == "pr_implementation_agent"
+        && transaction
+            .query_row(
+                "SELECT 1 FROM worktrees WHERE agent_id=?1 AND lifecycle='active'",
+                [&materialization.agent_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none()
+    {
+        return Err(StoreError::InvalidData(format!(
+            "PR Agent {} has no active worktree",
+            materialization.agent_id
+        )));
+    }
     let session_id = Uuid::now_v7().to_string();
     transaction.execute(
         "INSERT INTO provider_sessions(
@@ -3476,7 +3653,7 @@ fn complete_issue_assignment(
     Ok(())
 }
 
-fn fail_issue_assignment(
+fn fail_agent_assignment(
     database: &Path,
     assignment_id: &str,
     error: &str,
@@ -3495,6 +3672,12 @@ fn fail_issue_assignment(
         "UPDATE agent_instances SET lifecycle='blocked',context_error=?2
          WHERE assignment_id=?1 AND lifecycle='materializing'",
         params![assignment_id, error],
+    )?;
+    transaction.execute(
+        "UPDATE worktrees SET lifecycle='blocked',observed_at=?2
+         WHERE agent_id IN (SELECT agent_id FROM agent_instances WHERE assignment_id=?1)
+           AND lifecycle='active'",
+        params![assignment_id, now],
     )?;
     transaction.commit()?;
     Ok(())
@@ -3936,8 +4119,13 @@ fn remove_turn_rocket(
     Ok(())
 }
 
-fn claim_runnable_turn(database: &Path) -> Result<Option<TurnClaim>, StoreError> {
+fn claim_runnable_turn(
+    database: &Path,
+    work_item_kind: &str,
+    profile_id: &str,
+) -> Result<Option<TurnClaim>, StoreError> {
     require_current_schema(database)?;
+    validate_work_item_kind(work_item_kind)?;
     let now = now_rfc3339();
     let mut connection = open_read_write(database)?;
     configure_connection(&connection)?;
@@ -3945,8 +4133,8 @@ fn claim_runnable_turn(database: &Path) -> Result<Option<TurnClaim>, StoreError>
     let selected = transaction
         .query_row(
             "SELECT b.batch_id,ps.session_id,ps.provider_session_id,
-                    r.name_with_owner,w.number,COALESCE(w.context_revision,ps.context_revision),
-                    ai.profile_id,a.lifecycle
+                    r.name_with_owner,w.kind,w.number,
+                    COALESCE(w.context_revision,ps.context_revision),ai.profile_id,a.lifecycle
              FROM wake_batches b
              JOIN work_items w ON w.node_id=b.work_item_node_id
              JOIN repositories r ON r.node_id=w.repository_node_id
@@ -3956,19 +4144,20 @@ fn claim_runnable_turn(database: &Path) -> Result<Option<TurnClaim>, StoreError>
                AND ((a.lifecycle='active' AND ai.lifecycle='idle')
                     OR (a.lifecycle='finalizing' AND ai.lifecycle='finalizing'))
              JOIN provider_sessions ps ON ps.agent_id=ai.agent_id AND ps.lifecycle='idle'
-             WHERE b.lifecycle='runnable' AND w.kind='issue'
+             WHERE b.lifecycle='runnable' AND w.kind=?1 AND ai.profile_id=?2
              ORDER BY b.created_at,b.batch_id LIMIT 1",
-            [],
+            params![work_item_kind, profile_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    sqlite_i64_to_u64(row.get(4)?, "turn Issue number")?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(4)?,
+                    sqlite_i64_to_u64(row.get(5)?, "turn Work Item number")?,
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             },
         )
@@ -3978,6 +4167,7 @@ fn claim_runnable_turn(database: &Path) -> Result<Option<TurnClaim>, StoreError>
         session_id,
         provider_session_id,
         repository,
+        selected_work_item_kind,
         number,
         context_revision,
         profile_id,
@@ -4018,6 +4208,7 @@ fn claim_runnable_turn(database: &Path) -> Result<Option<TurnClaim>, StoreError>
         batch_id,
         provider_session_id,
         repository,
+        work_item_kind: selected_work_item_kind,
         number,
         context_revision,
         profile_id,
@@ -4129,8 +4320,8 @@ fn claim_urgent_steer(database: &Path, turn_id: &str) -> Result<Option<TurnClaim
     let selected = connection
         .query_row(
             "SELECT b.batch_id,ps.provider_session_id,
-                    r.name_with_owner,w.number,COALESCE(w.context_revision,ps.context_revision),
-                    ai.profile_id
+                    r.name_with_owner,w.kind,w.number,
+                    COALESCE(w.context_revision,ps.context_revision),ai.profile_id
              FROM turns t
              JOIN provider_sessions ps ON ps.session_id=t.session_id
              JOIN agent_instances ai ON ai.agent_id=ps.agent_id
@@ -4147,15 +4338,23 @@ fn claim_urgent_steer(database: &Path, turn_id: &str) -> Result<Option<TurnClaim
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    sqlite_i64_to_u64(row.get(3)?, "steer Issue number")?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(3)?,
+                    sqlite_i64_to_u64(row.get(4)?, "steer Work Item number")?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((batch_id, provider_session_id, repository, number, context_revision, profile_id)) =
-        selected
+    let Some((
+        batch_id,
+        provider_session_id,
+        repository,
+        work_item_kind,
+        number,
+        context_revision,
+        profile_id,
+    )) = selected
     else {
         return Ok(None);
     };
@@ -4165,6 +4364,7 @@ fn claim_urgent_steer(database: &Path, turn_id: &str) -> Result<Option<TurnClaim
         batch_id,
         provider_session_id,
         repository,
+        work_item_kind,
         number,
         context_revision,
         profile_id,
@@ -4452,6 +4652,22 @@ fn enqueue_rocket_removal(
 fn scalar_u64(connection: &Connection, query: &str) -> Result<u64, StoreError> {
     let value = connection.query_row(query, [], |row| row.get::<_, i64>(0))?;
     Ok(sqlite_i64_to_u64(value, "SQLite count")?)
+}
+
+fn validate_work_item_kind(kind: &str) -> Result<(), StoreError> {
+    if matches!(kind, "issue" | "pr") {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidData(format!("unknown Work Item kind {kind}")))
+    }
+}
+
+fn agent_role_for_kind(kind: &str) -> Result<&'static str, StoreError> {
+    match kind {
+        "issue" => Ok("issue_agent"),
+        "pr" => Ok("pr_implementation_agent"),
+        other => Err(StoreError::InvalidData(format!("unknown Work Item kind {other}"))),
+    }
 }
 
 fn sqlite_u64(value: u64, name: &str) -> Result<i64, StoreError> {
