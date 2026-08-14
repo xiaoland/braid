@@ -58,6 +58,14 @@ Versioning once release artifacts are published.
   normal/soft/hard/unavailable Context pressure. Braid reconnects a lost
   app-server, resumes the same compatible physical thread, and keeps transport
   loss distinct from provider protocol failure.
+- Forward-only schema version 8 adds public `braid gh` write receipts,
+  concurrency claims, and comment-ID-keyed Implementation Request progress.
+  The first write vertical mechanically attributes App-authored comments and
+  converges concurrent `pr ensure` calls through a deterministic same-tree
+  bootstrap branch, Draft PR, and native Issue association.
+- `scripts/tests/50_issue_to_pr.sh` exercises that bounded first Slice 5
+  vertical against real GitHub objects while leaving PR Agent/worktree/review
+  behavior explicitly unproven.
 - The expanded Slice 4 public campaign now proves in-place provider resume plus
   a subsequent debounced Wake, complete soft-pressure Context delivery with one
   Operational Status Comment, and hard-pressure refusal with no provider

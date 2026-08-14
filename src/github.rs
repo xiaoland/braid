@@ -35,16 +35,22 @@ pub enum GitHubError {
     GraphQl(String),
     #[error("GitHub GraphQL returned no data")]
     MissingData,
+    #[error("GitHub state has not converged yet: {0}")]
+    ConvergencePending(String),
     #[error("credential resolved App {actual}, expected {expected}")]
     WrongApp { actual: u64, expected: u64 },
-    #[error("GitHub App installation lacks required read permissions: {0}")]
+    #[error("GitHub App installation lacks required permissions: {0}")]
     InsufficientPermissions(String),
 }
 
 impl GitHubError {
     pub fn is_unavailable(&self) -> bool {
-        matches!(self, Self::Transport(_))
+        matches!(self, Self::Transport(_) | Self::ConvergencePending(_))
             || matches!(self, Self::Http { status, .. } if status.is_server_error())
+    }
+
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Self::Http { status, .. } if *status == StatusCode::UNPROCESSABLE_ENTITY || *status == StatusCode::CONFLICT)
     }
 }
 
@@ -318,6 +324,40 @@ impl GitHubClient {
         .await
     }
 
+    pub async fn issue_comments(
+        &self,
+        issue_number: u64,
+    ) -> Result<Vec<IssueComment>, GitHubError> {
+        let mut comments = Vec::new();
+        for page in 1_u16..=100 {
+            let query = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("per_page", "100")
+                .append_pair("page", &page.to_string())
+                .finish();
+            let response = self
+                .http
+                .get(format!(
+                    "{API_ROOT}/repos/{}/issues/{issue_number}/comments?{query}",
+                    self.identity.repository
+                ))
+                .bearer_auth(&self.installation_token)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", &self.api_version)
+                .send()
+                .await
+                .map_err(GitHubError::Transport)?;
+            let page_comments = rest_response::<Vec<IssueComment>>(response).await?;
+            let complete = page_comments.len() < 100;
+            comments.extend(page_comments);
+            if complete {
+                return Ok(comments);
+            }
+        }
+        Err(GitHubError::GraphQl(
+            "Issue comments exceed the bounded 10,000-comment write-recovery scan".into(),
+        ))
+    }
+
     pub async fn update_issue_comment(
         &self,
         comment_id: &str,
@@ -331,6 +371,231 @@ impl GitHubClient {
             &IssueCommentRequest { body },
         )
         .await
+    }
+
+    pub fn require_write_permissions(&self, permissions: &[&str]) -> Result<(), GitHubError> {
+        let missing = permissions
+            .iter()
+            .filter(|name| {
+                self.identity.permissions.get(**name).map(String::as_str) != Some("write")
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(GitHubError::InsufficientPermissions(
+                missing
+                    .into_iter()
+                    .map(|name| format!("{name}:write"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ))
+        }
+    }
+
+    pub async fn issue_comment(&self, comment_id: u64) -> Result<IssueComment, GitHubError> {
+        rest_get(
+            &self.http,
+            &format!("/repos/{}/issues/comments/{comment_id}", self.identity.repository),
+            &self.installation_token,
+            &self.api_version,
+        )
+        .await
+    }
+
+    pub async fn issue_or_pull_request(
+        &self,
+        number: u64,
+    ) -> Result<IssueOrPullRequest, GitHubError> {
+        rest_get(
+            &self.http,
+            &format!("/repos/{}/issues/{number}", self.identity.repository),
+            &self.installation_token,
+            &self.api_version,
+        )
+        .await
+    }
+
+    pub async fn repository_details(&self) -> Result<RepositoryDetails, GitHubError> {
+        rest_get(
+            &self.http,
+            &format!("/repos/{}", self.identity.repository),
+            &self.installation_token,
+            &self.api_version,
+        )
+        .await
+    }
+
+    pub async fn git_reference(&self, name: &str) -> Result<Option<GitReference>, GitHubError> {
+        let encoded = encode_path(name);
+        rest_get_optional(
+            &self.http,
+            &format!("/repos/{}/git/ref/heads/{encoded}", self.identity.repository),
+            &self.installation_token,
+            &self.api_version,
+        )
+        .await
+    }
+
+    pub async fn git_commit(&self, sha: &str) -> Result<GitCommit, GitHubError> {
+        rest_get(
+            &self.http,
+            &format!("/repos/{}/git/commits/{sha}", self.identity.repository),
+            &self.installation_token,
+            &self.api_version,
+        )
+        .await
+    }
+
+    pub async fn create_git_commit(
+        &self,
+        message: &str,
+        tree: &str,
+        parent: &str,
+        authored_at: &str,
+    ) -> Result<GitCommit, GitHubError> {
+        let actor = format!("{}[bot]", self.identity.app_slug);
+        let email = format!("{}+{}@users.noreply.github.com", self.identity.app_id, actor);
+        rest_post(
+            &self.http,
+            &format!("/repos/{}/git/commits", self.identity.repository),
+            &self.installation_token,
+            &self.api_version,
+            &CreateGitCommit {
+                message,
+                tree,
+                parents: [parent],
+                author: GitSignature { name: &actor, email: &email, date: authored_at },
+                committer: GitSignature { name: &actor, email: &email, date: authored_at },
+            },
+        )
+        .await
+    }
+
+    pub async fn create_git_reference(
+        &self,
+        name: &str,
+        sha: &str,
+    ) -> Result<GitReference, GitHubError> {
+        let reference = format!("refs/heads/{name}");
+        rest_post(
+            &self.http,
+            &format!("/repos/{}/git/refs", self.identity.repository),
+            &self.installation_token,
+            &self.api_version,
+            &CreateGitReference { reference: &reference, sha },
+        )
+        .await
+    }
+
+    pub async fn update_git_reference(
+        &self,
+        name: &str,
+        sha: &str,
+    ) -> Result<GitReference, GitHubError> {
+        let encoded = encode_path(name);
+        rest_patch(
+            &self.http,
+            &format!("/repos/{}/git/refs/heads/{encoded}", self.identity.repository),
+            &self.installation_token,
+            &self.api_version,
+            &UpdateGitReference { sha, force: false },
+        )
+        .await
+    }
+
+    pub async fn open_pull_requests_for_head(
+        &self,
+        head: &str,
+        base: &str,
+    ) -> Result<Vec<PullRequest>, GitHubError> {
+        let head = format!(
+            "{}:{head}",
+            self.identity.repository.split_once('/').map_or("", |(owner, _)| owner)
+        );
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("state", "open")
+            .append_pair("head", &head)
+            .append_pair("base", base)
+            .append_pair("per_page", "100")
+            .finish();
+        let response = self
+            .http
+            .get(format!("{API_ROOT}/repos/{}/pulls?{query}", self.identity.repository))
+            .bearer_auth(&self.installation_token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", &self.api_version)
+            .send()
+            .await
+            .map_err(GitHubError::Transport)?;
+        rest_response(response).await
+    }
+
+    pub async fn create_draft_pull_request(
+        &self,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<PullRequest, GitHubError> {
+        rest_post(
+            &self.http,
+            &format!("/repos/{}/pulls", self.identity.repository),
+            &self.installation_token,
+            &self.api_version,
+            &CreatePullRequest { title, body, head, base, draft: true },
+        )
+        .await
+    }
+
+    pub async fn pull_request_closing_issues(
+        &self,
+        number: u64,
+    ) -> Result<Vec<AssociatedIssue>, GitHubError> {
+        let repository = self
+            .identity
+            .repository
+            .split_once('/')
+            .ok_or_else(|| GitHubError::InvalidRepository(self.identity.repository.clone()))?;
+        let mut cursor: Option<String> = None;
+        let mut issues = Vec::new();
+        for _ in 0..100 {
+            let data: ClosingIssuesData = self
+                .graphql(
+                    "query($owner:String!,$name:String!,$number:Int!,$after:String){\
+                       repository(owner:$owner,name:$name){pullRequest(number:$number){\
+                         closingIssuesReferences(first:100,after:$after){\
+                           nodes{number repository{nameWithOwner}}\
+                           pageInfo{hasNextPage endCursor}}}}}",
+                    &serde_json::json!({
+                        "owner": repository.0,
+                        "name": repository.1,
+                        "number": number,
+                        "after": cursor,
+                    }),
+                )
+                .await?;
+            let connection = data
+                .repository
+                .and_then(|repository| repository.pull_request)
+                .map(|pull_request| pull_request.closing_issues)
+                .ok_or(GitHubError::MissingData)?;
+            issues.extend(connection.nodes.into_iter().map(|issue| AssociatedIssue {
+                repository: issue.repository.name_with_owner,
+                number: issue.number,
+            }));
+            if !connection.page_info.has_next_page {
+                return Ok(issues);
+            }
+            cursor = connection.page_info.end_cursor;
+            if cursor.is_none() {
+                return Err(GitHubError::GraphQl(
+                    "closingIssuesReferences hasNextPage without endCursor".into(),
+                ));
+            }
+        }
+        Err(GitHubError::GraphQl("closingIssuesReferences exceeded 10,000 entries".into()))
     }
 
     pub async fn app_webhook_config(&self) -> Result<AppWebhookConfig, GitHubError> {
@@ -413,6 +678,31 @@ async fn rest_get<T: DeserializeOwned>(
             .map_err(GitHubError::Transport)?,
     )
     .await
+}
+
+async fn rest_get_optional<T: DeserializeOwned>(
+    client: &Client,
+    path: &str,
+    token: &str,
+    api_version: &str,
+) -> Result<Option<T>, GitHubError> {
+    let response = client
+        .get(format!("{API_ROOT}{path}"))
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", api_version)
+        .send()
+        .await
+        .map_err(GitHubError::Transport)?;
+    if response.status() == StatusCode::NOT_FOUND {
+        Ok(None)
+    } else {
+        rest_response(response).await.map(Some)
+    }
+}
+
+fn encode_path(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
 async fn rest_post_empty<T: DeserializeOwned>(
@@ -591,9 +881,184 @@ pub struct CreatedIssueComment {
     pub node_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IssueComment {
+    pub id: u64,
+    pub node_id: String,
+    pub html_url: String,
+    pub issue_url: String,
+    pub body: Option<String>,
+    pub created_at: String,
+    pub user: Option<GitHubActor>,
+}
+
+impl IssueComment {
+    pub fn issue_number(&self) -> Result<u64, GitHubError> {
+        self.issue_url
+            .rsplit_once('/')
+            .and_then(|(_, number)| number.parse::<u64>().ok())
+            .filter(|number| *number > 0)
+            .ok_or_else(|| GitHubError::GraphQl("Issue comment has an invalid issue_url".into()))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GitHubActor {
+    pub login: String,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IssueOrPullRequest {
+    pub id: u64,
+    pub node_id: String,
+    pub number: u64,
+    pub title: String,
+    pub html_url: String,
+    pub state: String,
+    pub pull_request: Option<serde_json::Value>,
+}
+
+impl IssueOrPullRequest {
+    pub fn kind(&self) -> &'static str {
+        if self.pull_request.is_some() { "pr" } else { "issue" }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RepositoryDetails {
+    pub default_branch: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GitReference {
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub object: GitObject,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GitObject {
+    pub sha: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GitCommit {
+    pub sha: String,
+    pub tree: GitObject,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PullRequest {
+    pub id: u64,
+    pub node_id: String,
+    pub number: u64,
+    pub html_url: String,
+    pub draft: bool,
+    pub state: String,
+    pub body: Option<String>,
+    pub head: PullRequestRef,
+    pub base: PullRequestRef,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PullRequestRef {
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub sha: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AssociatedIssue {
+    pub repository: String,
+    pub number: u64,
+}
+
+#[derive(Deserialize)]
+struct ClosingIssuesData {
+    repository: Option<ClosingIssuesRepository>,
+}
+
+#[derive(Deserialize)]
+struct ClosingIssuesRepository {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<ClosingIssuesPullRequest>,
+}
+
+#[derive(Deserialize)]
+struct ClosingIssuesPullRequest {
+    #[serde(rename = "closingIssuesReferences")]
+    closing_issues: ClosingIssuesConnection,
+}
+
+#[derive(Deserialize)]
+struct ClosingIssuesConnection {
+    nodes: Vec<ClosingIssueNode>,
+    #[serde(rename = "pageInfo")]
+    page_info: ClosingIssuesPageInfo,
+}
+
+#[derive(Deserialize)]
+struct ClosingIssueNode {
+    number: u64,
+    repository: ClosingIssueRepository,
+}
+
+#[derive(Deserialize)]
+struct ClosingIssueRepository {
+    #[serde(rename = "nameWithOwner")]
+    name_with_owner: String,
+}
+
+#[derive(Deserialize)]
+struct ClosingIssuesPageInfo {
+    #[serde(rename = "hasNextPage")]
+    has_next_page: bool,
+    #[serde(rename = "endCursor")]
+    end_cursor: Option<String>,
+}
+
 #[derive(Serialize)]
 struct IssueCommentRequest<'a> {
     body: &'a str,
+}
+
+#[derive(Serialize)]
+struct CreateGitCommit<'a> {
+    message: &'a str,
+    tree: &'a str,
+    parents: [&'a str; 1],
+    author: GitSignature<'a>,
+    committer: GitSignature<'a>,
+}
+
+#[derive(Serialize)]
+struct GitSignature<'a> {
+    name: &'a str,
+    email: &'a str,
+    date: &'a str,
+}
+
+#[derive(Serialize)]
+struct CreateGitReference<'a> {
+    #[serde(rename = "ref")]
+    reference: &'a str,
+    sha: &'a str,
+}
+
+#[derive(Serialize)]
+struct UpdateGitReference<'a> {
+    sha: &'a str,
+    force: bool,
+}
+
+#[derive(Serialize)]
+struct CreatePullRequest<'a> {
+    title: &'a str,
+    body: &'a str,
+    head: &'a str,
+    base: &'a str,
+    draft: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -10,6 +10,7 @@ mod store;
 mod telemetry;
 mod tunnel;
 mod webhook;
+mod writer;
 
 #[tokio::main]
 async fn main() {

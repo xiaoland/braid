@@ -15,7 +15,18 @@ use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 7;
+mod gh_writes;
+
+pub use gh_writes::{
+    GhWriteReceipt, ImplementationProgress, ImplementationRequestReceipt, NewGhWriteIntent,
+    NewImplementationRequest,
+};
+use gh_writes::{
+    claim_gh_write, finish_gh_write, gh_write_receipt, implementation_request_receipt,
+    prepare_gh_write, prepare_implementation_request, record_implementation_progress,
+};
+
+pub const DATABASE_SCHEMA_VERSION: u32 = 8;
 
 const INITIAL_SQL: &str = include_str!("../migrations/0001_initial.sql");
 const CONTEXT_LEDGER_SQL: &str = include_str!("../migrations/0002_context_ledger.sql");
@@ -25,6 +36,7 @@ const OPERATIONAL_STATUS_SQL: &str = include_str!("../migrations/0005_operationa
 const CONTEXT_RESETS_SQL: &str = include_str!("../migrations/0006_context_resets.sql");
 const OPERATIONAL_CONVERGENCE_SQL: &str =
     include_str!("../migrations/0007_operational_convergence.sql");
+const BRAID_GH_SQL: &str = include_str!("../migrations/0008_braid_gh.sql");
 const MIGRATIONS: &[Migration] = &[
     Migration { version: 1, name: "initial", sql: INITIAL_SQL },
     Migration { version: 2, name: "context-ledger", sql: CONTEXT_LEDGER_SQL },
@@ -33,6 +45,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration { version: 5, name: "operational-status", sql: OPERATIONAL_STATUS_SQL },
     Migration { version: 6, name: "context-resets", sql: CONTEXT_RESETS_SQL },
     Migration { version: 7, name: "operational-convergence", sql: OPERATIONAL_CONVERGENCE_SQL },
+    Migration { version: 8, name: "braid-gh", sql: BRAID_GH_SQL },
 ];
 
 #[derive(Debug, Error)]
@@ -601,6 +614,91 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
+    pub fn prepare_gh_write(&self, write: NewGhWriteIntent) -> Result<GhWriteReceipt, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::PrepareGhWrite(write, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn prepare_implementation_request(
+        &self,
+        request: NewImplementationRequest,
+    ) -> Result<ImplementationRequestReceipt, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::PrepareImplementationRequest(request, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn gh_write_receipt(
+        &self,
+        intent_id: String,
+    ) -> Result<Option<GhWriteReceipt>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::GhWriteReceipt(intent_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn implementation_request_receipt(
+        &self,
+        intent_id: String,
+    ) -> Result<Option<ImplementationRequestReceipt>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::ImplementationRequestReceipt(intent_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn claim_gh_write(&self, intent_id: String) -> Result<bool, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::ClaimGhWrite(intent_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn record_implementation_progress(
+        &self,
+        intent_id: String,
+        progress: ImplementationProgress,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::RecordImplementationProgress(intent_id, progress, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn finish_gh_write(
+        &self,
+        intent_id: String,
+        lifecycle: &'static str,
+        remote_database_id: Option<String>,
+        remote_node_id: Option<String>,
+        remote_url: Option<String>,
+        error: Option<String>,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::FinishGhWrite(
+                intent_id,
+                lifecycle,
+                remote_database_id,
+                remote_node_id,
+                remote_url,
+                error,
+                reply,
+            ))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
     pub fn tracked_work_items(&self) -> Result<Vec<TrackedWorkItem>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
@@ -1045,6 +1143,27 @@ enum Command {
         Option<String>,
         Sender<Result<(), StoreError>>,
     ),
+    PrepareGhWrite(NewGhWriteIntent, Sender<Result<GhWriteReceipt, StoreError>>),
+    PrepareImplementationRequest(
+        NewImplementationRequest,
+        Sender<Result<ImplementationRequestReceipt, StoreError>>,
+    ),
+    GhWriteReceipt(String, Sender<Result<Option<GhWriteReceipt>, StoreError>>),
+    ImplementationRequestReceipt(
+        String,
+        Sender<Result<Option<ImplementationRequestReceipt>, StoreError>>,
+    ),
+    ClaimGhWrite(String, Sender<Result<bool, StoreError>>),
+    RecordImplementationProgress(String, ImplementationProgress, Sender<Result<(), StoreError>>),
+    FinishGhWrite(
+        String,
+        &'static str,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Sender<Result<(), StoreError>>,
+    ),
     TrackedWorkItems(Sender<Result<Vec<TrackedWorkItem>, StoreError>>),
     CanonicalObjects(String, Sender<Result<Vec<CanonicalObjectState>, StoreError>>),
     BeginReconciliation(String, Sender<Result<ReconciliationRun, StoreError>>),
@@ -1196,6 +1315,43 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
                     lifecycle,
                     remote_database_id.as_deref(),
                     remote_node_id.as_deref(),
+                    error.as_deref(),
+                ));
+            }
+            Command::PrepareGhWrite(write, reply) => {
+                let _ = reply.send(prepare_gh_write(database, &write));
+            }
+            Command::PrepareImplementationRequest(request, reply) => {
+                let _ = reply.send(prepare_implementation_request(database, &request));
+            }
+            Command::GhWriteReceipt(intent_id, reply) => {
+                let _ = reply.send(gh_write_receipt(database, &intent_id));
+            }
+            Command::ImplementationRequestReceipt(intent_id, reply) => {
+                let _ = reply.send(implementation_request_receipt(database, &intent_id));
+            }
+            Command::ClaimGhWrite(intent_id, reply) => {
+                let _ = reply.send(claim_gh_write(database, &intent_id));
+            }
+            Command::RecordImplementationProgress(intent_id, progress, reply) => {
+                let _ = reply.send(record_implementation_progress(database, &intent_id, &progress));
+            }
+            Command::FinishGhWrite(
+                intent_id,
+                lifecycle,
+                remote_database_id,
+                remote_node_id,
+                remote_url,
+                error,
+                reply,
+            ) => {
+                let _ = reply.send(finish_gh_write(
+                    database,
+                    &intent_id,
+                    lifecycle,
+                    remote_database_id.as_deref(),
+                    remote_node_id.as_deref(),
+                    remote_url.as_deref(),
                     error.as_deref(),
                 ));
             }

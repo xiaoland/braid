@@ -1,4 +1,5 @@
 use std::{
+    fs,
     io::{self, Write as _},
     path::{Path, PathBuf},
 };
@@ -14,6 +15,7 @@ use crate::{
     github::{GitHubClient, RepositoryName, WorkItemLocator},
     store::{MigrationPlan, MigrationResult, StoreActor, StoreStatus},
     telemetry,
+    writer::{self, CommentCreateRequest, PullRequestEnsureRequest},
 };
 
 #[derive(Debug, Parser)]
@@ -46,6 +48,10 @@ enum Command {
     Github {
         #[command(subcommand)]
         command: GitHubCommand,
+    },
+    Gh {
+        #[command(subcommand)]
+        command: GhCommand,
     },
     Telemetry {
         #[command(subcommand)]
@@ -96,6 +102,29 @@ enum GitHubCommand {
     Webhook(ConfigPath),
     Deliveries(ConfigPath),
     Redeliver(GitHubRedeliver),
+}
+
+#[derive(Debug, Subcommand)]
+enum GhCommand {
+    Comment {
+        #[command(subcommand)]
+        command: GhCommentCommand,
+    },
+    Pr {
+        #[command(subcommand)]
+        command: GhPrCommand,
+    },
+    Receipt(GhReceiptArguments),
+}
+
+#[derive(Debug, Subcommand)]
+enum GhCommentCommand {
+    Create(GhCommentCreate),
+}
+
+#[derive(Debug, Subcommand)]
+enum GhPrCommand {
+    Ensure(GhPrEnsure),
 }
 
 #[derive(Debug, Args)]
@@ -173,6 +202,46 @@ struct GitHubRedeliver {
 }
 
 #[derive(Debug, Args)]
+struct GhCommentCreate {
+    #[arg(value_name = "OWNER/REPOSITORY#NUMBER")]
+    target: String,
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long)]
+    profile: String,
+    #[arg(long, conflicts_with = "body_file")]
+    body: Option<String>,
+    #[arg(long, value_name = "PATH", conflicts_with = "body")]
+    body_file: Option<PathBuf>,
+    #[arg(long, value_name = "TOKEN")]
+    request_id: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct GhPrEnsure {
+    #[arg(long, value_name = "ISSUE_COMMENT_ID")]
+    comment: u64,
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long, value_name = "BRANCH")]
+    head: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct GhReceiptArguments {
+    #[arg(value_name = "RECEIPT_ID")]
+    receipt_id: String,
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct ServeArguments {
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
@@ -224,6 +293,7 @@ pub async fn run() -> Result<()> {
         }
         Command::Context { command } => Box::pin(context(command)).await?,
         Command::Github { command } => github(command).await?,
+        Command::Gh { command } => Box::pin(gh(command)).await?,
         Command::Telemetry { command: TelemetryCommand::Probe(arguments) } => {
             telemetry_probe(arguments).await?;
         }
@@ -233,6 +303,87 @@ pub async fn run() -> Result<()> {
         Command::Serve(arguments) => {
             let config = load(&arguments.config)?;
             crate::runtime::serve(config, arguments.tunnel, !arguments.transport_only).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn gh(command: GhCommand) -> Result<()> {
+    match command {
+        GhCommand::Comment { command: GhCommentCommand::Create(arguments) } => {
+            let config = load(&arguments.config)?;
+            let target = arguments.target.parse::<WorkItemLocator>()?;
+            let body = match (arguments.body, arguments.body_file) {
+                (Some(body), None) => body,
+                (None, Some(path)) => fs::read_to_string(&path).with_context(|| {
+                    format!("cannot read Agent comment body {}", path.display())
+                })?,
+                (None, None) => bail!("comment create requires --body or --body-file"),
+                (Some(_), Some(_)) => unreachable!("clap enforces body argument conflicts"),
+            };
+            let actor = store(&config)?;
+            let receipt = writer::create_comment(
+                &config,
+                &actor,
+                CommentCreateRequest {
+                    target,
+                    profile_id: arguments.profile,
+                    body,
+                    request_id: arguments.request_id,
+                },
+            )
+            .await?;
+            print_gh_receipt(&receipt, arguments.json)
+        }
+        GhCommand::Pr { command: GhPrCommand::Ensure(arguments) } => {
+            let config = load(&arguments.config)?;
+            let actor = store(&config)?;
+            let receipt = writer::ensure_pull_request(
+                &config,
+                &actor,
+                PullRequestEnsureRequest { comment_id: arguments.comment, head: arguments.head },
+            )
+            .await?;
+            if arguments.json {
+                print_json(&receipt)?;
+            } else {
+                println!("receipt: {}", receipt.write.intent_id);
+                println!("state: {} / {}", receipt.write.lifecycle, receipt.stage);
+                println!("Implementation Request: {}", receipt.write.target);
+                println!("head: {}", receipt.head_ref);
+                if let Some(url) = &receipt.write.remote_url {
+                    println!("PR: {url}");
+                }
+                if let Some(sha) = &receipt.bootstrap_commit_sha {
+                    println!("bootstrap commit: {sha}");
+                }
+                println!("PR Profile: {}", receipt.pr_profile_id);
+            }
+            Ok(())
+        }
+        GhCommand::Receipt(arguments) => {
+            let config = load(&arguments.config)?;
+            let actor = store(&config)?;
+            let receipt = writer::receipt(&actor, &arguments.receipt_id)?;
+            print_gh_receipt(&receipt, arguments.json)
+        }
+    }
+}
+
+fn print_gh_receipt(receipt: &crate::store::GhWriteReceipt, json: bool) -> Result<()> {
+    if json {
+        print_json(receipt)?;
+    } else {
+        println!("receipt: {}", receipt.intent_id);
+        println!("operation: {}", receipt.operation);
+        println!("state: {}", receipt.lifecycle);
+        println!("target: {}", receipt.target);
+        println!("Profile: {} ({})", receipt.profile_id, receipt.role);
+        if let Some(url) = &receipt.remote_url {
+            println!("GitHub: {url}");
+        }
+        if let Some(error) = &receipt.last_error {
+            println!("error: {error}");
         }
     }
     Ok(())

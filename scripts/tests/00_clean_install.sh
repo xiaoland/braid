@@ -125,7 +125,7 @@ fi
 /usr/bin/grep -q 'Codex app-server' "$temporary_root/doctor.json"
 
 schema=$(run_clean "$braid" status --config "$config" --json | /usr/bin/sed -n 's/.*"schema_version": \([0-9][0-9]*\).*/\1/p')
-test "$schema" = "7"
+test "$schema" = "8"
 
 v1="$runtime/state/v1.sqlite3"
 /usr/bin/sqlite3 "$v1" < "$repository_root/migrations/0001_initial.sql"
@@ -138,17 +138,17 @@ run_clean "$braid" migrate apply --config "$v1_config"
 backup_count_after=$(find "$runtime/state/backups" -type f -name '*.sqlite3' | wc -l | tr -d ' ')
 test "$backup_count_after" = "$((backup_count_before + 1))"
 v1_schema=$(run_clean "$braid" status --config "$v1_config" --json | /usr/bin/sed -n 's/.*"schema_version": \([0-9][0-9]*\).*/\1/p')
-test "$v1_schema" = "7"
+test "$v1_schema" = "8"
 
 newer="$runtime/state/newer.sqlite3"
-/usr/bin/sqlite3 "$newer" 'CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (8,"future","0000000000000000000000000000000000000000000000000000000000000000","future");'
+/usr/bin/sqlite3 "$newer" 'CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (9,"future","0000000000000000000000000000000000000000000000000000000000000000","future");'
 newer_config="$temporary_root/newer.toml"
 write_config "$newer_config" "$newer" 1.0 43189
 if run_clean "$braid" migrate plan --config "$newer_config" > "$temporary_root/newer.out" 2>&1; then
     echo "schema-newer fixture was accepted unexpectedly" >&2
     exit 1
 fi
-/usr/bin/grep -q 'schema 8 is newer' "$temporary_root/newer.out"
+/usr/bin/grep -q 'schema 9 is newer' "$temporary_root/newer.out"
 
 foreign="$runtime/state/foreign.sqlite3"
 /usr/bin/sqlite3 "$foreign" 'CREATE TABLE prototype_state(id INTEGER PRIMARY KEY);'

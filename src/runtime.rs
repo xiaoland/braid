@@ -68,7 +68,7 @@ struct IngressState {
     app_actor_node_id: String,
     app_actor_login: String,
     agent_actor_node_ids: Vec<String>,
-    agent_profile_ids: Vec<String>,
+    agent_attributions: Vec<String>,
     webhook_secret: Arc<Vec<u8>>,
 }
 
@@ -165,7 +165,7 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
             .iter()
             .filter_map(|profile| profile.github_actor_node_id.clone())
             .collect(),
-        agent_profile_ids: config.profiles.iter().map(|profile| profile.id.clone()).collect(),
+        agent_attributions: agent_attributions(&config),
         webhook_secret: Arc::new(secret.into_bytes()),
     });
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
@@ -359,7 +359,7 @@ async fn webhook_handler(
             app_node_id: &state.app_actor_node_id,
             app_login: &state.app_actor_login,
             agent_node_ids: &state.agent_actor_node_ids,
-            profile_ids: &state.agent_profile_ids,
+            agent_attributions: &state.agent_attributions,
         },
     );
     let event = match parsed {
@@ -715,7 +715,7 @@ fn reconcile_observations(
         quiet_seconds: config.scheduler.quiet_seconds,
         event_threshold: config.scheduler.event_threshold,
     };
-    let profile_ids = config.profiles.iter().map(|profile| profile.id.clone()).collect::<Vec<_>>();
+    let attributions = agent_attributions(config);
     let mut changes = 0;
     for observation in current {
         let previous = prior.get(&observation.object_node_id);
@@ -750,7 +750,7 @@ fn reconcile_observations(
             && !observation
                 .body
                 .as_deref()
-                .is_some_and(|body| webhook::has_agent_attribution(body, &profile_ids));
+                .is_some_and(|body| webhook::has_agent_attribution(body, &attributions));
         let event = reconciled_event(observation, action, classification, external, config);
         if store.ingest_event(event, policy)?.event_id.is_some() {
             changes += 1;
@@ -1865,17 +1865,35 @@ fn issue_system_prompt(config: &Config, profile: &Profile, issue_number: u64) ->
          Discuss product and technical design; keep the Issue description current as accepted design evolves.\n\
          Before acting on an Event Reference, use {} to read canonical GitHub state.\n\
          Braid never mirrors your turn. Publish only concise Human-relevant comments yourself.\n\
-         Begin each Agent comment with this quote block:\n\
-         > **Braid Agent · {} · `{}`**\n\
+         Prefer `braid gh` for Braid-App-authored writes; it reads BRAID_CONFIG and creates a durable receipt.\n\
+         If you publish directly, begin each Agent comment with this public quote block:\n\
+         > **Braid Agent · {}**\n\
+         > Issue Agent\n\
          Never publish raw chain of thought. Treat folded or deleted bodies as absent.\n\n\
          --- Profile User Instructions ---\n{}",
         config.github.repository,
         issue_number,
         config.tools.gh.display(),
         profile.display_name,
-        profile.id,
         profile.user_instructions,
     )
+}
+
+fn agent_attributions(config: &Config) -> Vec<String> {
+    let mut attributions = Vec::new();
+    for profile in &config.profiles {
+        if profile.has_tag("issue") {
+            attributions
+                .push(format!("> **Braid Agent · {}**\n> Issue Agent", profile.display_name));
+        }
+        if profile.has_tag("pr") {
+            attributions.push(format!(
+                "> **Braid Agent · {}**\n> PR Implementation Agent",
+                profile.display_name
+            ));
+        }
+    }
+    attributions
 }
 
 fn render_event_references(claim: &TurnClaim) -> String {

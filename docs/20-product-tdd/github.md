@@ -165,6 +165,30 @@ MVP write subset under the Braid App identity:
 The current Work Item is only a default target. Missing verbs are implementation
 backlog, not a permission policy, and ordinary `gh` remains available.
 
+The first shipped write vertical is intentionally small and recoverable:
+
+```shell
+braid gh comment create owner/repository#123 \
+  --config /absolute/path/to/braid.toml \
+  --profile issue-codex \
+  --request-id stable-agent-message-key \
+  --body 'Concise public update'
+
+braid gh pr ensure --comment 123456789 \
+  --config /absolute/path/to/braid.toml
+
+braid gh receipt 019... --config /absolute/path/to/braid.toml
+```
+
+`comment create` derives the public role from the canonical Issue/PR target and
+the Profile tags; callers cannot provide the attribution block. `--request-id`
+is optional and defaults to the attributed body digest, while supplying it
+allows the Agent to make its retry identity explicit. Receipts expose bounded
+operation/target/Profile/lifecycle/remote-reference evidence and do not echo
+the comment payload. `pr ensure` accepts an optional explicit `--head`, then the
+sole same-repository Development branch, then its deterministic
+request-comment-derived branch.
+
 `pr ensure` first selects an explicit requested head, the sole unambiguous
 Development linked branch, or a deterministic request-comment-derived ref. It
 compares that head to the intended base. When GitHub has no differing commit,

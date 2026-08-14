@@ -38,7 +38,7 @@ pub struct ActorPolicy<'a> {
     pub app_node_id: &'a str,
     pub app_login: &'a str,
     pub agent_node_ids: &'a [String],
-    pub profile_ids: &'a [String],
+    pub agent_attributions: &'a [String],
 }
 
 pub fn parse_verified(
@@ -72,7 +72,7 @@ pub fn parse_verified(
     let agent_origin = actor_node_id.as_deref() == Some(actors.app_node_id)
         || actor_login.as_deref() == Some(actors.app_login)
         || actor_node_id.as_ref().is_some_and(|node_id| actors.agent_node_ids.contains(node_id))
-        || body_text.is_some_and(|body| has_agent_attribution(body, actors.profile_ids));
+        || body_text.is_some_and(|body| has_agent_attribution(body, actors.agent_attributions));
     let target = target(event_name, &payload, action.as_deref());
     let known = is_known_event(event_name);
     let classification =
@@ -325,12 +325,13 @@ pub fn has_visible_mention(markdown: &str, handle: &str) -> bool {
     false
 }
 
-pub fn has_agent_attribution(markdown: &str, profile_ids: &[String]) -> bool {
-    let Some(first_line) = markdown.lines().next() else { return false };
-    first_line.starts_with("> **Braid Agent · ")
-        && profile_ids
-            .iter()
-            .any(|profile_id| first_line.ends_with(&format!(" · `{profile_id}`**")))
+pub fn has_agent_attribution(markdown: &str, attributions: &[String]) -> bool {
+    attributions.iter().any(|attribution| {
+        markdown == attribution
+            || markdown
+                .strip_prefix(attribution)
+                .is_some_and(|remaining| remaining.starts_with("\n\n"))
+    })
 }
 
 fn contains_exact_mention(text: &str, mention: &str) -> bool {

@@ -32,6 +32,8 @@ cargo run --locked -- config check --config /absolute/path/to/braid.toml
 cargo run --locked -- migrate plan --config /absolute/path/to/braid.toml
 cargo run --locked -- github probe --config /absolute/path/to/braid.toml --repository owner/repository
 cargo run --locked -- context issue owner/repository#123 --config /absolute/path/to/braid.toml
+cargo run --locked -- gh comment create owner/repository#123 --config /absolute/path/to/braid.toml --profile issue-codex --body 'Concise update'
+cargo run --locked -- gh pr ensure --comment 123456789 --config /absolute/path/to/braid.toml
 cargo run --locked -- serve --config /absolute/path/to/braid.toml --tunnel
 cargo run --locked -- serve --config /absolute/path/to/braid.toml --transport-only
 cargo run --locked -- status --config /absolute/path/to/braid.toml --json
@@ -46,6 +48,10 @@ helpers may lower it to force pagination while requiring byte-identical Context.
 `--transport-only` deliberately stops at verified webhook ingress, canonical
 reconciliation, reactions, and runnable debounce batches. `--tunnel` adds the
 free supervised Quick Tunnel to either mode.
+`braid gh` is the Braid-App-authored write surface. Comment creation prepends
+the configured public Profile/role attribution and returns a durable receipt;
+`pr ensure` uses the triggering Issue comment ID as its concurrency-safe
+Implementation Request key.
 
 Copy [`config.example.toml`](config.example.toml) outside the checkout and
 replace every placeholder path before running diagnostics. A packaged release

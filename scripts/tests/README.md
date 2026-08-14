@@ -13,7 +13,7 @@ through real GitHub Work Items and a clean packaged installation.
 
 `00_clean_install.sh` is the Rust foundation gate. It unpacks the release
 artifact, scrubs Python/PDM/Cargo from the binary's `PATH`, exercises only the
-public CLI, verifies schema 0→7, schema 1→7 with a pre-v7 backup, and
+public CLI, verifies schema 0→8, schema 1→8 with a pre-v8 backup, and
 schema-newer refusal, and uses the adjacent
 bounded OTLP/HTTP capture helper to observe sampling. Its direct SQLite write is
 limited to constructing declared migration-compatibility fixtures; it does not
@@ -93,7 +93,8 @@ Context invalidation/replacement, restart/resume, PR Agents, or the full release
 campaign.
 
 `40_context_lifecycle.sh` is the Slice 4 lifecycle gate at the public boundary.
-It requires schema 7 and a real App/Codex/Quick Tunnel fixture. A
+
+It requires the current schema and a real App/Codex/Quick Tunnel fixture. A
 plain external Issue-description edit while the Agent is idle must create a new
 physical provider session without starting a turn. The same edit during an
 accepted turn must fence and interrupt that turn, remove its `rocket` without
@@ -127,3 +128,25 @@ provider session or turn, and never truncates or summarizes the Context.
 
 This Slice 4 helper does not yet claim native unassignment, active-turn
 app-server loss, Context-unavailable recovery, or PR Agent coverage.
+
+`50_issue_to_pr.sh` begins the Slice 5 public gate without claiming the full
+Issue-to-implementation journey. It creates a disposable real Issue, publishes
+one App-authored attributed Agent comment through `braid gh`, verifies its
+durable receipt, invokes `braid gh pr ensure` twice concurrently, and requires
+one deterministic branch, one same-tree bootstrap commit, one Draft PR, and one
+native Issue association. Cleanup closes the PR/Issue and deletes the fixture
+branch. Set `BRAID_TEST_KEEP_FIXTURES=1` to retain evidence intentionally.
+
+The helper requires the installed Braid App to expose `Issues: write`, `Pull
+requests: write`, and `Contents: write` and a schema-current config/private key:
+
+```shell
+BRAID_CONFIG=/absolute/path/to/braid.toml \
+BRAID_BIN=/absolute/path/to/braid \
+scripts/tests/50_issue_to_pr.sh
+```
+
+Its PASS is deliberately bounded: PR Agent Group materialization, isolated
+worktree, implementation diff, review, cross-surface invalidation, and PR
+lifecycle remain unproven until this same helper is expanded in later Slice 5
+increments.
