@@ -1641,7 +1641,10 @@ fn ingest_event(
                work_item_node_id=excluded.work_item_node_id,
                object_kind=excluded.object_kind,
                version=excluded.version,
-               digest=excluded.digest,
+               digest=CASE
+                 WHEN excluded.object_kind IN ('issue','pr') THEN canonical_objects.digest
+                 ELSE excluded.digest
+               END,
                lifecycle=excluded.lifecycle,
                observed_at=excluded.observed_at",
             params![node_id, work_item_node_id, object_kind, version, digest, lifecycle, now],

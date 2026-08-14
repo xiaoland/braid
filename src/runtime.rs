@@ -715,11 +715,7 @@ fn reconcile_observations(
     let mut changes = 0;
     for observation in current {
         let previous = prior.get(&observation.object_node_id);
-        if previous.is_some_and(|previous| {
-            previous.version == observation.version
-                && previous.digest == observation.digest
-                && previous.lifecycle == observation.lifecycle
-        }) {
+        if previous.is_some_and(|previous| observation_unchanged(previous, observation)) {
             continue;
         }
         let (action, classification) = reconciled_change(previous, observation);
@@ -770,6 +766,20 @@ fn reconcile_observations(
         }
     }
     Ok(changes)
+}
+
+fn observation_unchanged(
+    previous: &CanonicalObjectState,
+    observation: &CanonicalObservation,
+) -> bool {
+    if previous.lifecycle != observation.lifecycle {
+        return false;
+    }
+    if matches!(observation.object_kind, "issue" | "pr") {
+        previous.version == observation.version || previous.digest == observation.digest
+    } else {
+        previous.version == observation.version && previous.digest == observation.digest
+    }
 }
 
 fn reconciled_change(

@@ -156,6 +156,24 @@ for _ in $(seq 1 3); do
 done
 [[ "$public_probe_ready" -eq 1 ]] || fail "public signed webhook probe failed"
 
+readonly baseline_marker="BRAID_RESET_BASELINE_$(date -u +%s)"
+readonly idle_marker="BRAID_IDLE_CONTEXT_$(date -u +%s)"
+readonly active_marker="BRAID_ACTIVE_CONTEXT_$(date -u +%s)"
+readonly restored_marker="BRAID_RESTORED_COMMENT_$(date -u +%s)"
+readonly deleted_marker="BRAID_DELETED_COMMENT_$(date -u +%s)"
+fixture_issue="$(gh api --method POST "repos/$repository/issues" \
+    -f title="Braid Slice 4: Context lifecycle $(date -u +%Y%m%dT%H%M%SZ)" \
+    -f body="Baseline design: $baseline_marker" --jq '.number')"
+restored_comment_json="$(gh api --method POST "repos/$repository/issues/$fixture_issue/comments" \
+    -f body="Lifecycle fixture $restored_marker. Only when Braid reports that this comment was unminimized, publish one concise attributed comment containing $restored_marker.")"
+restored_comment_node_id="$(jq -er '.node_id' <<<"$restored_comment_json")"
+deleted_comment_json="$(gh api --method POST "repos/$repository/issues/$fixture_issue/comments" \
+    -f body="Lifecycle deletion fixture: $deleted_marker")"
+deleted_comment_id="$(jq -er '.id' <<<"$deleted_comment_json")"
+
+# Register transport only after the baseline lifecycle comments exist. They
+# enter the initial canonical Context without manufacturing pre-activation
+# Wake batches.
 repository_hook_id="$(gh api --method POST "repos/$repository/hooks" \
     -f name=web \
     -F active=true \
@@ -165,13 +183,6 @@ repository_hook_id="$(gh api --method POST "repos/$repository/hooks" \
     -f 'config[content_type]=json' \
     -f "config[secret]=$BRAID_WEBHOOK_SECRET" \
     --jq '.id')"
-
-readonly baseline_marker="BRAID_RESET_BASELINE_$(date -u +%s)"
-readonly idle_marker="BRAID_IDLE_CONTEXT_$(date -u +%s)"
-readonly active_marker="BRAID_ACTIVE_CONTEXT_$(date -u +%s)"
-fixture_issue="$(gh api --method POST "repos/$repository/issues" \
-    -f title="Braid Slice 4: Context lifecycle $(date -u +%Y%m%dT%H%M%SZ)" \
-    -f body="Baseline design: $baseline_marker" --jq '.number')"
 
 has_reaction() {
     local comment_id=$1
@@ -255,7 +266,7 @@ current_agent_comments="$(gh api "repos/$repository/issues/$fixture_issue/commen
 
 note "editing Issue Context during a turn: fence, interrupt, replace, continue"
 active_comment="$(gh api --method POST "repos/$repository/issues/$fixture_issue/comments" \
-    -f body="@braid Run a shell sleep for 60 seconds before any other action. If Braid replaces stale Context, reread the Issue description and publish one concise attributed comment containing its current marker." --jq '.id')"
+    -f body="@braid Please review whether the current Issue description is internally coherent and publish one concise attributed assessment that names its current BRAID_* design marker." --jq '.id')"
 for _ in $(seq 1 90); do
     has_reaction "$active_comment" rocket && break
     sleep 1
@@ -313,6 +324,121 @@ distinct_sessions="$(jq --argjson number "$fixture_issue" '
 ' <<<"$status_payload")"
 [[ "$distinct_sessions" -eq 3 ]] || fail "expected exactly three physical sessions, got $distinct_sessions"
 
+note "minimizing a visible comment: reconcile, replace idle Context, start no turn"
+comments_before_minimize="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
+    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+gh api graphql \
+    -f query='mutation($id:ID!){minimizeComment(input:{subjectId:$id,classifier:OUTDATED}){minimizedComment{isMinimized minimizedReason}}}' \
+    -f id="$restored_comment_node_id" | jq -e '.data.minimizeComment.minimizedComment.isMinimized == true' >/dev/null
+for _ in $(seq 1 180); do
+    status_payload="$($binary status --config "$test_config" --json)"
+    if jq -e --argjson number "$fixture_issue" --arg old "$active_session" '
+        any(.transport.context_resets[];
+          .work_item_number == $number and .old_provider_session_id == $old and
+          .lifecycle == "applied" and .continuation == false and
+          .context_revision_before != .context_revision_after)
+    ' >/dev/null <<<"$status_payload"; then
+        break
+    fi
+    sleep 1
+done
+jq -e --argjson number "$fixture_issue" --arg old "$active_session" '
+    any(.transport.context_resets[];
+      .work_item_number == $number and .old_provider_session_id == $old and
+      .lifecycle == "applied" and .continuation == false and
+      .context_revision_before != .context_revision_after)
+' >/dev/null <<<"$status_payload" || fail "minimized comment did not replace idle Context"
+minimized_session="$(jq -er --argjson number "$fixture_issue" '
+    [.transport.agent_groups[] | select(
+      .work_item_kind == "issue" and .work_item_number == $number and
+      .session_lifecycle == "idle")][-1].provider_session_id
+' <<<"$status_payload")"
+[[ "$minimized_session" != "$active_session" ]] || fail "minimized comment reused stale Context"
+minimized_context="$($binary context issue "$repository#$fixture_issue" --config "$test_config")"
+grep -q 'State: minimized (outdated)' <<<"$minimized_context" || \
+    fail "minimized comment metadata is absent from current Context"
+grep -q "$restored_marker" <<<"$minimized_context" && \
+    fail "minimized comment body remained in current Context"
+sleep 5
+comments_after_minimize="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
+    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+[[ "$comments_after_minimize" -eq "$comments_before_minimize" ]] || \
+    fail "minimize Hard Invalidation fabricated a turn"
+
+note "unminimizing the comment: restore body and release one ordinary Wake"
+gh api graphql \
+    -f query='mutation($id:ID!){unminimizeComment(input:{subjectId:$id}){unminimizedComment{isMinimized}}}' \
+    -f id="$restored_comment_node_id" | jq -e '.data.unminimizeComment.unminimizedComment.isMinimized == false' >/dev/null
+for _ in $(seq 1 240); do
+    status_payload="$($binary status --config "$test_config" --json)"
+    if [[ "$(agent_marker_count "$restored_marker")" -eq 1 ]] && \
+        jq -e --argjson number "$fixture_issue" '
+          any(.transport.agent_groups[];
+            .work_item_number == $number and .session_lifecycle == "idle" and
+            .active_turn_id == null)
+        ' >/dev/null <<<"$status_payload"; then
+        break
+    fi
+    sleep 1
+done
+[[ "$(agent_marker_count "$restored_marker")" -eq 1 ]] || \
+    fail "unminimize Wake did not expose the restored comment body to the Agent"
+restored_session="$(jq -er --argjson number "$fixture_issue" '
+    [.transport.agent_groups[] | select(
+      .work_item_kind == "issue" and .work_item_number == $number and
+      .session_lifecycle == "idle")][-1].provider_session_id
+' <<<"$status_payload")"
+[[ "$restored_session" == "$minimized_session" ]] || \
+    fail "unminimize Wake unexpectedly replaced the valid provider session"
+restored_context="$($binary context issue "$repository#$fixture_issue" --config "$test_config")"
+grep -q "$restored_marker" <<<"$restored_context" || \
+    fail "unminimized body is absent from current Context"
+
+note "deleting another visible comment: retain tombstone, replace idle Context"
+comments_before_delete="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
+    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+gh api --method DELETE "repos/$repository/issues/comments/$deleted_comment_id" >/dev/null
+for _ in $(seq 1 150); do
+    status_payload="$($binary status --config "$test_config" --json)"
+    if jq -e --argjson number "$fixture_issue" --arg old "$restored_session" '
+        any(.transport.context_resets[];
+          .work_item_number == $number and .old_provider_session_id == $old and
+          .lifecycle == "applied" and .continuation == false and
+          .context_revision_before != .context_revision_after)
+    ' >/dev/null <<<"$status_payload"; then
+        break
+    fi
+    sleep 1
+done
+jq -e --argjson number "$fixture_issue" --arg old "$restored_session" '
+    any(.transport.context_resets[];
+      .work_item_number == $number and .old_provider_session_id == $old and
+      .lifecycle == "applied" and .continuation == false and
+      .context_revision_before != .context_revision_after)
+' >/dev/null <<<"$status_payload" || fail "deleted comment did not replace idle Context"
+deleted_session="$(jq -er --argjson number "$fixture_issue" '
+    [.transport.agent_groups[] | select(
+      .work_item_kind == "issue" and .work_item_number == $number and
+      .session_lifecycle == "idle")][-1].provider_session_id
+' <<<"$status_payload")"
+[[ "$deleted_session" != "$restored_session" ]] || fail "deleted comment reused stale Context"
+deleted_context="$($binary context issue "$repository#$fixture_issue" --config "$test_config")"
+grep -q 'State: deleted' <<<"$deleted_context" || \
+    fail "deleted comment tombstone is absent from current Context"
+grep -q "$deleted_marker" <<<"$deleted_context" && \
+    fail "deleted comment body remained in current Context"
+sleep 5
+comments_after_delete="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
+    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+[[ "$comments_after_delete" -eq "$comments_before_delete" ]] || \
+    fail "delete Hard Invalidation fabricated a turn"
+
+distinct_sessions="$(jq --argjson number "$fixture_issue" '
+    [.transport.agent_groups[] | select(.work_item_number == $number) | .provider_session_id] |
+    unique | length
+' <<<"$status_payload")"
+[[ "$distinct_sessions" -eq 5 ]] || fail "expected five physical sessions, got $distinct_sessions"
+
 app_comments="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
     jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor)] | length')"
 [[ "$app_comments" -eq 0 ]] || fail "Braid published turn activity during Context replacement"
@@ -331,6 +457,8 @@ jq -n \
     --arg baseline_session "$baseline_session" \
     --arg idle_session "$idle_session" \
     --arg active_session "$active_session" \
+    --arg minimized_session "$minimized_session" \
+    --arg deleted_session "$deleted_session" \
     --argjson issue "$fixture_issue" \
     '{
       verdict:"PASS",
@@ -339,6 +467,20 @@ jq -n \
       candidate:$candidate,
       candidate_sha256:$candidate_sha256,
       fixture_issue:$issue,
-      sessions:{baseline:$baseline_session,idle_replacement:$idle_session,active_replacement:$active_session},
-      journeys:["idle-hard-invalidation","active-hard-invalidation","stale-turn-reaction-fence","continuation-current-context"]
+      sessions:{
+        baseline:$baseline_session,
+        idle_replacement:$idle_session,
+        active_replacement:$active_session,
+        minimized_replacement:$minimized_session,
+        deleted_replacement:$deleted_session
+      },
+      journeys:[
+        "idle-hard-invalidation",
+        "active-hard-invalidation",
+        "stale-turn-reaction-fence",
+        "continuation-current-context",
+        "minimize-reconciliation-reset",
+        "unminimize-wake",
+        "delete-tombstone-reset"
+      ]
     }'

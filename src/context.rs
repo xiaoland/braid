@@ -297,6 +297,7 @@ pub fn reconcile_local_state(
     match context {
         CanonicalContext::Issue(issue) => reconcile_issue_comments(issue, store),
         CanonicalContext::PullRequest(pull_request) => {
+            let work_item_digest = pull_request_root_digest(pull_request);
             for issue in &mut pull_request.associated_issues {
                 reconcile_issue_comments(issue, store)?;
             }
@@ -310,6 +311,7 @@ pub fn reconcile_local_state(
                 pull_request.number,
                 &pull_request.state,
                 &pull_request.updated_at,
+                &work_item_digest,
                 "pr_comment",
                 &pull_request.conversation,
             ))?;
@@ -350,6 +352,7 @@ pub fn reconcile_local_state(
                 pull_request.number,
                 &pull_request.state,
                 &pull_request.updated_at,
+                &work_item_digest,
                 "review_comment",
                 &review_comments,
             ))?;
@@ -445,7 +448,7 @@ fn issue_observation(issue: &IssueSnapshot) -> CanonicalObservation {
         database_id: issue.database_id.clone(),
         object_kind: "issue",
         version: issue.updated_at.clone(),
-        digest: root_digest(&issue.node_id, &issue.state, &issue.updated_at),
+        digest: issue_root_digest(issue),
         lifecycle: "active",
         author_node_id: issue.author.as_ref().map(|author| author.node_id.clone()),
         author_login: issue.author.as_ref().map(|author| author.login.clone()),
@@ -465,7 +468,7 @@ fn pull_request_observation(pull_request: &PullRequestSnapshot) -> CanonicalObse
         database_id: pull_request.database_id.clone(),
         object_kind: "pr",
         version: pull_request.updated_at.clone(),
-        digest: root_digest(&pull_request.node_id, &pull_request.state, &pull_request.updated_at),
+        digest: pull_request_root_digest(pull_request),
         lifecycle: "active",
         author_node_id: pull_request.author.as_ref().map(|author| author.node_id.clone()),
         author_login: pull_request.author.as_ref().map(|author| author.login.clone()),
@@ -615,6 +618,7 @@ fn reconcile_issue_comments(
     issue: &mut IssueSnapshot,
     store: &StoreActor,
 ) -> Result<(), ContextError> {
+    let work_item_digest = issue_root_digest(issue);
     let excluded = store.operational_status_comment_ids(issue.node_id.clone())?;
     issue.comments.retain(|comment| !excluded.contains(&comment.node_id));
     let mut tombstones = store.reconcile_comments(comment_set(
@@ -625,6 +629,7 @@ fn reconcile_issue_comments(
         issue.number,
         &issue.state,
         &issue.updated_at,
+        &work_item_digest,
         "issue_comment",
         &issue.comments,
     ))?;
@@ -659,6 +664,7 @@ fn comment_set(
     work_item_number: u64,
     work_item_state: &str,
     work_item_version: &str,
+    work_item_digest: &str,
     object_kind: &'static str,
     comments: &[CommentSnapshot],
 ) -> CanonicalCommentSet {
@@ -670,7 +676,7 @@ fn comment_set(
         work_item_number,
         work_item_state: work_item_state.to_owned(),
         work_item_version: work_item_version.to_owned(),
-        work_item_digest: root_digest(work_item_node_id, work_item_state, work_item_version),
+        work_item_digest: work_item_digest.to_owned(),
         object_kind,
         comments: comments
             .iter()
@@ -695,14 +701,32 @@ fn comment_set(
     }
 }
 
-fn root_digest(node_id: &str, state: &str, version: &str) -> String {
+fn root_projection_digest(node_id: &str, projection: &str) -> String {
     let mut digest = Sha256::new();
+    digest.update(b"braid-root-projection-v1\0");
     digest.update(node_id.as_bytes());
     digest.update(b"\0");
-    digest.update(state.as_bytes());
-    digest.update(b"\0");
-    digest.update(version.as_bytes());
+    digest.update(projection.as_bytes());
     hex::encode(digest.finalize())
+}
+
+fn issue_root_digest(issue: &IssueSnapshot) -> String {
+    let mut root = issue.clone();
+    root.comments.clear();
+    let mut projection = String::new();
+    render_issue(&mut projection, &root, true);
+    root_projection_digest(&root.node_id, &projection)
+}
+
+fn pull_request_root_digest(pull_request: &PullRequestSnapshot) -> String {
+    let mut root = pull_request.clone();
+    root.associated_issues.clear();
+    root.conversation.clear();
+    root.reviews.clear();
+    root.review_threads.clear();
+    let mut projection = String::new();
+    render_pull_request(&mut projection, &root);
+    root_projection_digest(&root.node_id, &projection)
 }
 
 fn extend_tombstones(

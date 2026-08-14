@@ -99,11 +99,16 @@ physical provider session without starting a turn. The same edit during an
 accepted turn must fence and interrupt that turn, remove its `rocket` without
 claiming success/failure, inject the complete current Issue Context into a third
 session, and run one continuation that demonstrates the edited description was
-seen. The helper observes only GitHub, loopback health, and `braid status`; the
-status command exposes durable reset/session/revision evidence rather than
-requiring SQLite inspection.
+seen. The helper then folds a visible comment and proves reconciliation replaces
+the idle session while retaining only folded metadata; restores it and proves
+one ordinary Wake uses the same valid session and sees the restored body; then
+deletes another comment and proves a body-less tombstone plus a fifth physical
+session. The fixture uses a real design-review message to create the active turn,
+not a shell/sleep command. The helper observes only GitHub, loopback health,
+`braid context`, and `braid status`; the status command exposes durable
+reset/session/revision evidence rather than requiring SQLite inspection.
 
-This first Slice 4 helper does not yet claim minimize/unminimize/delete,
-unassignment, close/reopen/finalization, provider restart, or context-pressure
-coverage. Those journeys extend the same script only after their public runtime
-seams exist.
+This Slice 4 helper does not yet claim unassignment,
+close/reopen/finalization, provider restart, or context-pressure coverage.
+Those journeys extend the same script only after their public runtime seams
+exist.

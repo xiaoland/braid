@@ -44,7 +44,10 @@ Versioning once release artifacts are published.
   operator status.
 - The public `scripts/tests/40_context_lifecycle.sh` real GitHub/Quick
   Tunnel/Codex gate for idle and active Issue-description Hard Invalidation,
-  including stale-turn reaction fencing and current-Context continuation.
+  stale-turn reaction fencing, current-Context continuation, minimized-comment
+  reconciliation, unminimize Wake, and deletion tombstones. Root reconciliation
+  now compares the human-visible Issue/PR projection so ordinary comment
+  activity cannot masquerade as a description edit through GitHub `updatedAt`.
 - Desired-state trusted-mention reactions, including removal of stale active
   reactions after terminal convergence, and Agent-origin echo suppression by
   stable actor identity or public Profile attribution.
