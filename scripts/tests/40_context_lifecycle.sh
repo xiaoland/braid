@@ -161,6 +161,8 @@ readonly idle_marker="BRAID_IDLE_CONTEXT_$(date -u +%s)"
 readonly active_marker="BRAID_ACTIVE_CONTEXT_$(date -u +%s)"
 readonly restored_marker="BRAID_RESTORED_COMMENT_$(date -u +%s)"
 readonly deleted_marker="BRAID_DELETED_COMMENT_$(date -u +%s)"
+readonly preclose_marker="BRAID_PRECLOSE_REVIEW_$(date -u +%s)"
+readonly reopened_marker="BRAID_REOPENED_CONTEXT_$(date -u +%s)"
 fixture_issue="$(gh api --method POST "repos/$repository/issues" \
     -f title="Braid Slice 4: Context lifecycle $(date -u +%Y%m%dT%H%M%SZ)" \
     -f body="Baseline design: $baseline_marker" --jq '.number')"
@@ -439,6 +441,99 @@ distinct_sessions="$(jq --argjson number "$fixture_issue" '
 ' <<<"$status_payload")"
 [[ "$distinct_sessions" -eq 5 ]] || fail "expected five physical sessions, got $distinct_sessions"
 
+note "closing during an active turn: finish current turn, run one finalization, then sleep"
+preclose_comment="$(gh api --method POST "repos/$repository/issues/$fixture_issue/comments" \
+    -f body="@braid Conduct a careful final design audit before closure and publish one concise attributed comment containing $preclose_marker." --jq '.id')"
+for _ in $(seq 1 90); do
+    status_payload="$($binary status --config "$test_config" --json)"
+    if has_reaction "$preclose_comment" rocket && \
+        jq -e --argjson number "$fixture_issue" '
+          any(.transport.agent_groups[];
+            .work_item_number == $number and .session_lifecycle == "running" and
+            .active_turn_id != null)
+        ' >/dev/null <<<"$status_payload"; then
+        break
+    fi
+    sleep 1
+done
+has_reaction "$preclose_comment" rocket || fail "pre-close turn was not accepted"
+jq -e --argjson number "$fixture_issue" '
+    any(.transport.agent_groups[];
+      .work_item_number == $number and .session_lifecycle == "running" and
+      .active_turn_id != null)
+' >/dev/null <<<"$status_payload" || fail "Issue was not active before close"
+gh issue close "$fixture_issue" --repo "$repository" >/dev/null
+
+for _ in $(seq 1 240); do
+    status_payload="$($binary status --config "$test_config" --json)"
+    if jq -e --argjson number "$fixture_issue" '
+        any(.transport.agent_groups[];
+          .work_item_number == $number and .assignment_lifecycle == "sleeping" and
+          .session_lifecycle == "sleeping" and .active_turn_id == null and
+          .finalization_turns == 1 and .last_finalization_lifecycle == "completed")
+    ' >/dev/null <<<"$status_payload"; then
+        break
+    fi
+    sleep 2
+done
+jq -e --argjson number "$fixture_issue" '
+    any(.transport.agent_groups[];
+      .work_item_number == $number and .assignment_lifecycle == "sleeping" and
+      .session_lifecycle == "sleeping" and .active_turn_id == null and
+      .finalization_turns == 1 and .last_finalization_lifecycle == "completed")
+' >/dev/null <<<"$status_payload" || fail "close did not converge through one finalization to sleeping"
+has_reaction "$preclose_comment" +1 || fail "close interrupted the already-running turn"
+has_reaction "$preclose_comment" confused && fail "close reported the already-running turn failed"
+[[ "$(agent_marker_count "$preclose_marker")" -eq 1 ]] || \
+    fail "pre-close turn did not publish its expected assessment"
+
+note "adding work while closed: retain it in GitHub Context without granting another turn"
+closed_comment="$(gh api --method POST "repos/$repository/issues/$fixture_issue/comments" \
+    -f body="When this Issue reopens, read the complete current Context and publish one concise attributed comment containing $reopened_marker." --jq '.id')"
+for _ in $(seq 1 90); do
+    has_reaction "$closed_comment" eyes && break
+    sleep 1
+done
+has_reaction "$closed_comment" eyes || fail "closed-Issue comment was not durably acknowledged"
+sleep 35
+status_payload="$($binary status --config "$test_config" --json)"
+jq -e --argjson number "$fixture_issue" '
+    any(.transport.agent_groups[];
+      .work_item_number == $number and .assignment_lifecycle == "sleeping" and
+      .finalization_turns == 1)
+' >/dev/null <<<"$status_payload" || fail "closed-Issue activity woke the sleeping Agent Group"
+[[ "$(agent_marker_count "$reopened_marker")" -eq 0 ]] || \
+    fail "closed-Issue activity started a second turn"
+
+note "reopening: rebuild current Context in a fresh session and release one debounced Wake"
+gh issue reopen "$fixture_issue" --repo "$repository" >/dev/null
+for _ in $(seq 1 300); do
+    status_payload="$($binary status --config "$test_config" --json)"
+    if [[ "$(agent_marker_count "$reopened_marker")" -eq 1 ]] && \
+        jq -e --argjson number "$fixture_issue" '
+          any(.transport.agent_groups[];
+            .work_item_number == $number and .assignment_lifecycle == "active" and
+            .session_lifecycle == "idle" and .active_turn_id == null and
+            .finalization_turns == 1)
+        ' >/dev/null <<<"$status_payload"; then
+        break
+    fi
+    sleep 1
+done
+[[ "$(agent_marker_count "$reopened_marker")" -eq 1 ]] || \
+    fail "reopen Wake did not use the current GitHub Context"
+reopened_session="$(jq -er --argjson number "$fixture_issue" '
+    [.transport.agent_groups[] | select(
+      .work_item_kind == "issue" and .work_item_number == $number and
+      .session_lifecycle == "idle")][-1].provider_session_id
+' <<<"$status_payload")"
+[[ "$reopened_session" != "$deleted_session" ]] || fail "reopen reused the sleeping provider session"
+distinct_sessions="$(jq --argjson number "$fixture_issue" '
+    [.transport.agent_groups[] | select(.work_item_number == $number) | .provider_session_id] |
+    unique | length
+' <<<"$status_payload")"
+[[ "$distinct_sessions" -eq 6 ]] || fail "expected six physical sessions after reopen, got $distinct_sessions"
+
 app_comments="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
     jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor)] | length')"
 [[ "$app_comments" -eq 0 ]] || fail "Braid published turn activity during Context replacement"
@@ -459,6 +554,7 @@ jq -n \
     --arg active_session "$active_session" \
     --arg minimized_session "$minimized_session" \
     --arg deleted_session "$deleted_session" \
+    --arg reopened_session "$reopened_session" \
     --argjson issue "$fixture_issue" \
     '{
       verdict:"PASS",
@@ -472,7 +568,8 @@ jq -n \
         idle_replacement:$idle_session,
         active_replacement:$active_session,
         minimized_replacement:$minimized_session,
-        deleted_replacement:$deleted_session
+        deleted_replacement:$deleted_session,
+        reopened:$reopened_session
       },
       journeys:[
         "idle-hard-invalidation",
@@ -481,6 +578,9 @@ jq -n \
         "continuation-current-context",
         "minimize-reconciliation-reset",
         "unminimize-wake",
-        "delete-tombstone-reset"
+        "delete-tombstone-reset",
+        "active-close-finalization-sleep",
+        "closed-activity-no-wake",
+        "reopen-fresh-context-debounced-wake"
       ]
     }'

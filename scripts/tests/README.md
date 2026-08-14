@@ -108,7 +108,15 @@ not a shell/sleep command. The helper observes only GitHub, loopback health,
 `braid context`, and `braid status`; the status command exposes durable
 reset/session/revision evidence rather than requiring SQLite inspection.
 
-This Slice 4 helper does not yet claim unassignment,
-close/reopen/finalization, provider restart, or context-pressure coverage.
-Those journeys extend the same script only after their public runtime seams
-exist.
+The same fixture now closes the Issue only after public status proves a turn
+is running. That turn reaches its ordinary terminal without interruption; one
+and only one Finalization Turn follows, then the Agent Group and provider
+session become `sleeping`. A comment created while closed receives durable
+`eyes` but grants no second turn. Reopen creates a fresh physical session from
+the complete current GitHub Context and releases exactly one ordinary Wake
+after the normal debounce window. Public status exposes the bounded
+finalization count and terminal lifecycle so the helper never reads SQLite.
+
+This Slice 4 helper does not yet claim native unassignment, provider restart,
+or context-pressure coverage. Those journeys extend the same script only after
+their public runtime seams exist.

@@ -245,6 +245,14 @@ pub struct AssignmentCandidate {
 }
 
 #[derive(Debug, Clone)]
+pub struct IssueLifecycleCandidate {
+    pub event_id: String,
+    pub action: String,
+    pub repository: String,
+    pub number: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct AgentMaterialization {
     pub assignment_id: String,
     pub agent_id: String,
@@ -265,6 +273,7 @@ pub struct TurnClaim {
     pub profile_id: String,
     pub references: Vec<String>,
     pub trusted_mention: bool,
+    pub trigger_kind: String,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +300,8 @@ pub struct AgentGroupSummary {
     pub session_lifecycle: Option<String>,
     pub active_turn_id: Option<String>,
     pub turn_lifecycle: Option<String>,
+    pub finalization_turns: u64,
+    pub last_finalization_lifecycle: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -638,6 +649,92 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
+    pub fn issue_lifecycle_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<IssueLifecycleCandidate>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::IssueLifecycleCandidates(limit, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn prepare_issue_finalization(&self, event_id: String) -> Result<bool, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::PrepareIssueFinalization(event_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn begin_issue_reactivation(
+        &self,
+        event_id: String,
+    ) -> Result<Option<AgentMaterialization>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::BeginIssueReactivation(event_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_issue_reactivation(
+        &self,
+        event_id: String,
+        materialization: AgentMaterialization,
+        provider_session_id: String,
+        context_revision: String,
+        instruction_revision: String,
+        policy: SchedulerPolicy,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::CompleteIssueReactivation(
+                event_id,
+                materialization,
+                provider_session_id,
+                context_revision,
+                instruction_revision,
+                policy,
+                reply,
+            ))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn fail_issue_reactivation(
+        &self,
+        event_id: String,
+        assignment_id: String,
+        error: String,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::FailIssueReactivation(event_id, assignment_id, error, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn has_lifecycle_observation(
+        &self,
+        work_item_node_id: String,
+        action: String,
+        object_version: String,
+    ) -> Result<bool, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::HasLifecycleObservation(
+                work_item_node_id,
+                action,
+                object_version,
+                reply,
+            ))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
     pub fn begin_issue_assignment(
         &self,
         event_id: String,
@@ -875,6 +972,20 @@ enum Command {
     ),
     RegisterProfile(ProfileRecord, Sender<Result<(), StoreError>>),
     AssignmentCandidates(usize, Sender<Result<Vec<AssignmentCandidate>, StoreError>>),
+    IssueLifecycleCandidates(usize, Sender<Result<Vec<IssueLifecycleCandidate>, StoreError>>),
+    PrepareIssueFinalization(String, Sender<Result<bool, StoreError>>),
+    BeginIssueReactivation(String, Sender<Result<Option<AgentMaterialization>, StoreError>>),
+    CompleteIssueReactivation(
+        String,
+        AgentMaterialization,
+        String,
+        String,
+        String,
+        SchedulerPolicy,
+        Sender<Result<(), StoreError>>,
+    ),
+    FailIssueReactivation(String, String, String, Sender<Result<(), StoreError>>),
+    HasLifecycleObservation(String, String, String, Sender<Result<bool, StoreError>>),
     BeginIssueAssignment(
         String,
         ProfileRecord,
@@ -1022,6 +1133,50 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             }
             Command::AssignmentCandidates(limit, reply) => {
                 let _ = reply.send(assignment_candidates(database, limit));
+            }
+            Command::IssueLifecycleCandidates(limit, reply) => {
+                let _ = reply.send(issue_lifecycle_candidates(database, limit));
+            }
+            Command::PrepareIssueFinalization(event_id, reply) => {
+                let _ = reply.send(prepare_issue_finalization(database, &event_id));
+            }
+            Command::BeginIssueReactivation(event_id, reply) => {
+                let _ = reply.send(begin_issue_reactivation(database, &event_id));
+            }
+            Command::CompleteIssueReactivation(
+                event_id,
+                materialization,
+                provider_session_id,
+                context_revision,
+                instruction_revision,
+                policy,
+                reply,
+            ) => {
+                let _ = reply.send(complete_issue_reactivation(
+                    database,
+                    &event_id,
+                    &materialization,
+                    &provider_session_id,
+                    &context_revision,
+                    &instruction_revision,
+                    policy,
+                ));
+            }
+            Command::FailIssueReactivation(event_id, assignment_id, error, reply) => {
+                let _ = reply.send(fail_issue_reactivation(
+                    database,
+                    &event_id,
+                    &assignment_id,
+                    &error,
+                ));
+            }
+            Command::HasLifecycleObservation(work_item_node_id, action, object_version, reply) => {
+                let _ = reply.send(has_lifecycle_observation(
+                    database,
+                    &work_item_node_id,
+                    &action,
+                    &object_version,
+                ));
             }
             Command::BeginIssueAssignment(
                 event_id,
@@ -1642,12 +1797,22 @@ fn ingest_event(
                object_kind=excluded.object_kind,
                version=excluded.version,
                digest=CASE
-                 WHEN excluded.object_kind IN ('issue','pr') THEN canonical_objects.digest
+                 WHEN excluded.object_kind IN ('issue','pr') AND ?8=0
+                   THEN canonical_objects.digest
                  ELSE excluded.digest
                END,
                lifecycle=excluded.lifecycle,
                observed_at=excluded.observed_at",
-            params![node_id, work_item_node_id, object_kind, version, digest, lifecycle, now],
+            params![
+                node_id,
+                work_item_node_id,
+                object_kind,
+                version,
+                digest,
+                lifecycle,
+                now,
+                i64::from(event.delivery_guid.starts_with("reconcile-")),
+            ],
         )?;
     }
 
@@ -1956,7 +2121,14 @@ fn load_agent_groups(
 ) -> Result<Vec<AgentGroupSummary>, StoreError> {
     let mut statement = connection.prepare(
         "SELECT w.kind,w.number,ai.profile_id,a.generation,a.lifecycle,
-                ps.provider_session_id,ps.lifecycle,t.provider_turn_id,t.lifecycle
+                ps.provider_session_id,ps.lifecycle,t.provider_turn_id,t.lifecycle,
+                (SELECT COUNT(*) FROM turns ft
+                 JOIN provider_sessions fps ON fps.session_id=ft.session_id
+                 WHERE fps.agent_id=ai.agent_id AND ft.trigger_kind='finalization'),
+                (SELECT ft.lifecycle FROM turns ft
+                 JOIN provider_sessions fps ON fps.session_id=ft.session_id
+                 WHERE fps.agent_id=ai.agent_id AND ft.trigger_kind='finalization'
+                 ORDER BY ft.rowid DESC LIMIT 1)
          FROM assignments a
          JOIN work_items w ON w.node_id=a.work_item_node_id
          JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
@@ -1976,6 +2148,8 @@ fn load_agent_groups(
             session_lifecycle: row.get(6)?,
             active_turn_id: row.get(7)?,
             turn_lifecycle: row.get(8)?,
+            finalization_turns: sqlite_i64_to_u64(row.get(9)?, "finalization turn count")?,
+            last_finalization_lifecycle: row.get(10)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -2390,6 +2564,370 @@ fn assignment_candidates(
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+}
+
+fn issue_lifecycle_candidates(
+    database: &Path,
+    limit: usize,
+) -> Result<Vec<IssueLifecycleCandidate>, StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_only(database)?;
+    let limit = i64::try_from(limit)
+        .map_err(|_| StoreError::InvalidData("Issue lifecycle limit exceeds i64".into()))?;
+    let mut statement = connection.prepare(
+        "SELECT e.event_id,d.action,r.name_with_owner,w.number
+         FROM events e
+         JOIN deliveries d ON d.delivery_guid=e.delivery_guid
+         JOIN work_items w ON w.node_id=e.work_item_node_id
+         JOIN repositories r ON r.node_id=w.repository_node_id
+         WHERE e.lifecycle='pending' AND e.classification='lifecycle'
+           AND d.event_name='issues' AND d.action IN ('closed','reopened')
+         ORDER BY e.observed_at,e.event_id LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit], |row| {
+        Ok(IssueLifecycleCandidate {
+            event_id: row.get(0)?,
+            action: row.get(1)?,
+            repository: row.get(2)?,
+            number: sqlite_i64_to_u64(row.get(3)?, "lifecycle Issue number")?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+}
+
+fn prepare_issue_finalization(database: &Path, event_id: &str) -> Result<bool, StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let candidate = transaction
+        .query_row(
+            "SELECT e.work_item_node_id,w.state,d.action
+             FROM events e
+             JOIN work_items w ON w.node_id=e.work_item_node_id
+             JOIN deliveries d ON d.delivery_guid=e.delivery_guid
+             WHERE e.event_id=?1 AND e.lifecycle='pending' AND w.kind='issue'",
+            [event_id],
+            |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            },
+        )
+        .optional()?;
+    let Some((work_item_node_id, state, action)) = candidate else {
+        transaction.commit()?;
+        return Ok(false);
+    };
+    if action != "closed" || !state.eq_ignore_ascii_case("closed") {
+        transaction.execute(
+            "UPDATE events SET lifecycle='superseded' WHERE event_id=?1 AND lifecycle='pending'",
+            [event_id],
+        )?;
+        transaction.commit()?;
+        return Ok(false);
+    }
+    let selected = transaction
+        .query_row(
+            "SELECT a.assignment_id,ai.agent_id,ps.session_id
+             FROM assignments a
+             JOIN agent_instances ai ON ai.assignment_id=a.assignment_id AND ai.lifecycle='idle'
+             JOIN provider_sessions ps ON ps.agent_id=ai.agent_id AND ps.lifecycle='idle'
+             WHERE a.work_item_node_id=?1 AND a.lifecycle='active'
+             ORDER BY ps.started_at DESC LIMIT 1",
+            [&work_item_node_id],
+            |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            },
+        )
+        .optional()?;
+    let Some((assignment_id, agent_id, _session_id)) = selected else {
+        let has_group = transaction
+            .query_row(
+                "SELECT 1 FROM assignments
+                 WHERE work_item_node_id=?1
+                   AND lifecycle IN ('materializing','active','finalizing','sleeping') LIMIT 1",
+                [&work_item_node_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !has_group {
+            transaction.execute(
+                "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
+                [event_id],
+            )?;
+        }
+        transaction.commit()?;
+        return Ok(false);
+    };
+    transaction.execute(
+        "UPDATE wake_batches SET lifecycle='consumed',updated_at=?2
+         WHERE work_item_node_id=?1 AND lifecycle IN ('pending','runnable')",
+        params![work_item_node_id, now],
+    )?;
+    schedule_event(
+        &transaction,
+        &work_item_node_id,
+        event_id,
+        SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 },
+        false,
+        &now,
+    )?;
+    let assignment = transaction.execute(
+        "UPDATE assignments SET lifecycle='finalizing'
+         WHERE assignment_id=?1 AND lifecycle='active'",
+        [&assignment_id],
+    )?;
+    let agent = transaction.execute(
+        "UPDATE agent_instances SET lifecycle='finalizing'
+         WHERE agent_id=?1 AND lifecycle='idle'",
+        [&agent_id],
+    )?;
+    if assignment != 1 || agent != 1 {
+        return Err(StoreError::InvalidData(format!(
+            "Issue lifecycle event {event_id} lost its idle Agent Group"
+        )));
+    }
+    transaction.commit()?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn begin_issue_reactivation(
+    database: &Path,
+    event_id: &str,
+) -> Result<Option<AgentMaterialization>, StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let candidate = transaction
+        .query_row(
+            "SELECT e.work_item_node_id,w.state,d.action
+             FROM events e
+             JOIN work_items w ON w.node_id=e.work_item_node_id
+             JOIN deliveries d ON d.delivery_guid=e.delivery_guid
+             WHERE e.event_id=?1 AND e.lifecycle='pending' AND w.kind='issue'",
+            [event_id],
+            |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            },
+        )
+        .optional()?;
+    let Some((work_item_node_id, state, action)) = candidate else {
+        transaction.commit()?;
+        return Ok(None);
+    };
+    if action != "reopened" || !state.eq_ignore_ascii_case("open") {
+        transaction.execute(
+            "UPDATE events SET lifecycle='superseded' WHERE event_id=?1 AND lifecycle='pending'",
+            [event_id],
+        )?;
+        transaction.commit()?;
+        return Ok(None);
+    }
+    let selected = transaction
+        .query_row(
+            "SELECT a.assignment_id,ai.agent_id,a.generation,ai.profile_id,ai.profile_revision
+             FROM assignments a
+             JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
+             WHERE a.work_item_node_id=?1 AND a.lifecycle='sleeping' AND ai.lifecycle='sleeping'
+             ORDER BY a.generation DESC LIMIT 1",
+            [&work_item_node_id],
+            |row| {
+                Ok(AgentMaterialization {
+                    assignment_id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    work_item_node_id: work_item_node_id.clone(),
+                    generation: sqlite_i64_to_u64(row.get(2)?, "reactivation generation")?,
+                    profile_id: row.get(3)?,
+                    profile_revision: sqlite_i64_to_u64(
+                        row.get(4)?,
+                        "reactivation Profile revision",
+                    )?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(materialization) = selected else {
+        let has_group = transaction
+            .query_row(
+                "SELECT 1 FROM assignments WHERE work_item_node_id=?1 LIMIT 1",
+                [&work_item_node_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !has_group
+            || transaction
+                .query_row(
+                    "SELECT 1 FROM assignments
+                     WHERE work_item_node_id=?1 AND lifecycle='active' LIMIT 1",
+                    [&work_item_node_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+        {
+            transaction.execute(
+                "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
+                [event_id],
+            )?;
+        }
+        transaction.commit()?;
+        return Ok(None);
+    };
+    transaction.execute(
+        "UPDATE wake_batches SET lifecycle='consumed',updated_at=?2
+         WHERE work_item_node_id=?1 AND lifecycle IN ('pending','runnable')",
+        params![work_item_node_id, now],
+    )?;
+    transaction.execute(
+        "UPDATE events SET lifecycle='consumed'
+         WHERE work_item_node_id=?1 AND lifecycle='pending'
+           AND classification='hard_invalidation' AND origin!='agent'",
+        [&work_item_node_id],
+    )?;
+    transaction.execute(
+        "UPDATE events SET lifecycle='materializing' WHERE event_id=?1 AND lifecycle='pending'",
+        [event_id],
+    )?;
+    transaction.execute(
+        "UPDATE assignments SET lifecycle='materializing' WHERE assignment_id=?1",
+        [&materialization.assignment_id],
+    )?;
+    transaction.execute(
+        "UPDATE agent_instances SET lifecycle='materializing' WHERE agent_id=?1",
+        [&materialization.agent_id],
+    )?;
+    transaction.commit()?;
+    Ok(Some(materialization))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_issue_reactivation(
+    database: &Path,
+    event_id: &str,
+    materialization: &AgentMaterialization,
+    provider_session_id: &str,
+    context_revision: &str,
+    instruction_revision: &str,
+    policy: SchedulerPolicy,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let event_state = transaction
+        .query_row("SELECT lifecycle FROM events WHERE event_id=?1", [event_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?;
+    if event_state.as_deref() != Some("materializing") {
+        return Err(StoreError::InvalidData(format!(
+            "Issue reopen event {event_id} is not materializing"
+        )));
+    }
+    let session_id = Uuid::now_v7().to_string();
+    transaction.execute(
+        "UPDATE provider_sessions SET lifecycle='replaced'
+         WHERE agent_id=?1 AND lifecycle='sleeping'",
+        [&materialization.agent_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO provider_sessions(
+           session_id,agent_id,provider_kind,provider_session_id,context_revision,
+           instruction_revision,lifecycle,started_at
+         ) VALUES (?1,?2,'codex',?3,?4,?5,'idle',?6)",
+        params![
+            session_id,
+            materialization.agent_id,
+            provider_session_id,
+            context_revision,
+            instruction_revision,
+            now,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE assignments SET lifecycle='active',retired_at=NULL
+         WHERE assignment_id=?1 AND lifecycle='materializing'",
+        [&materialization.assignment_id],
+    )?;
+    transaction.execute(
+        "UPDATE agent_instances SET lifecycle='idle'
+         WHERE agent_id=?1 AND lifecycle='materializing'",
+        [&materialization.agent_id],
+    )?;
+    transaction.execute(
+        "UPDATE work_items SET context_revision=?2,observed_at=?3 WHERE node_id=?1",
+        params![materialization.work_item_node_id, context_revision, now],
+    )?;
+    transaction.execute(
+        "UPDATE events SET lifecycle='pending' WHERE event_id=?1 AND lifecycle='materializing'",
+        [event_id],
+    )?;
+    schedule_event(
+        &transaction,
+        &materialization.work_item_node_id,
+        event_id,
+        policy,
+        false,
+        &now,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn fail_issue_reactivation(
+    database: &Path,
+    event_id: &str,
+    assignment_id: &str,
+    _error: &str,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "UPDATE events SET lifecycle='blocked' WHERE event_id=?1 AND lifecycle='materializing'",
+        [event_id],
+    )?;
+    transaction.execute(
+        "UPDATE assignments SET lifecycle='blocked',retired_at=?2
+         WHERE assignment_id=?1 AND lifecycle='materializing'",
+        params![assignment_id, now],
+    )?;
+    transaction.execute(
+        "UPDATE agent_instances SET lifecycle='blocked'
+         WHERE assignment_id=?1 AND lifecycle='materializing'",
+        [assignment_id],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn has_lifecycle_observation(
+    database: &Path,
+    work_item_node_id: &str,
+    action: &str,
+    object_version: &str,
+) -> Result<bool, StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_only(database)?;
+    Ok(connection
+        .query_row(
+            "SELECT 1
+             FROM events e JOIN deliveries d ON d.delivery_guid=e.delivery_guid
+             WHERE e.work_item_node_id=?1 AND e.object_version=?2
+               AND e.classification='lifecycle' AND d.action=?3 LIMIT 1",
+            params![work_item_node_id, object_version, action],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn begin_issue_assignment(
@@ -2992,12 +3530,15 @@ fn claim_runnable_turn(database: &Path) -> Result<Option<TurnClaim>, StoreError>
         .query_row(
             "SELECT b.batch_id,ps.session_id,ps.provider_session_id,
                     r.name_with_owner,w.number,COALESCE(w.context_revision,ps.context_revision),
-                    ai.profile_id
+                    ai.profile_id,a.lifecycle
              FROM wake_batches b
              JOIN work_items w ON w.node_id=b.work_item_node_id
              JOIN repositories r ON r.node_id=w.repository_node_id
-             JOIN assignments a ON a.work_item_node_id=w.node_id AND a.lifecycle='active'
-             JOIN agent_instances ai ON ai.assignment_id=a.assignment_id AND ai.lifecycle='idle'
+             JOIN assignments a ON a.work_item_node_id=w.node_id
+               AND a.lifecycle IN ('active','finalizing')
+             JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
+               AND ((a.lifecycle='active' AND ai.lifecycle='idle')
+                    OR (a.lifecycle='finalizing' AND ai.lifecycle='finalizing'))
              JOIN provider_sessions ps ON ps.agent_id=ai.agent_id AND ps.lifecycle='idle'
              WHERE b.lifecycle='runnable' AND w.kind='issue'
              ORDER BY b.created_at,b.batch_id LIMIT 1",
@@ -3011,6 +3552,7 @@ fn claim_runnable_turn(database: &Path) -> Result<Option<TurnClaim>, StoreError>
                     sqlite_i64_to_u64(row.get(4)?, "turn Issue number")?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             },
         )
@@ -3023,12 +3565,20 @@ fn claim_runnable_turn(database: &Path) -> Result<Option<TurnClaim>, StoreError>
         number,
         context_revision,
         profile_id,
+        assignment_lifecycle,
     )) = selected
     else {
         transaction.commit()?;
         return Ok(None);
     };
     let (references, trusted_mention) = batch_references(&transaction, &batch_id)?;
+    let trigger_kind = if assignment_lifecycle == "finalizing" {
+        "finalization"
+    } else if trusted_mention {
+        "trusted_mention"
+    } else {
+        "wake_batch"
+    };
     let turn_id = Uuid::now_v7().to_string();
     transaction.execute(
         "UPDATE wake_batches SET lifecycle='consumed',updated_at=?2
@@ -3044,13 +3594,7 @@ fn claim_runnable_turn(database: &Path) -> Result<Option<TurnClaim>, StoreError>
         "INSERT INTO turns(
            turn_id,session_id,context_revision,trigger_kind,lifecycle,batch_id
          ) VALUES (?1,?2,?3,?4,'starting',?5)",
-        params![
-            turn_id,
-            session_id,
-            context_revision,
-            if trusted_mention { "trusted_mention" } else { "wake_batch" },
-            batch_id,
-        ],
+        params![turn_id, session_id, context_revision, trigger_kind, batch_id,],
     )?;
     transaction.commit()?;
     Ok(Some(TurnClaim {
@@ -3063,6 +3607,7 @@ fn claim_runnable_turn(database: &Path) -> Result<Option<TurnClaim>, StoreError>
         profile_id,
         references,
         trusted_mention,
+        trigger_kind: trigger_kind.into(),
     }))
 }
 
@@ -3095,12 +3640,24 @@ fn mark_turn_terminal(database: &Path, turn_id: &str, lifecycle: &str) -> Result
     let mut connection = open_read_write(database)?;
     configure_connection(&connection)?;
     let transaction = connection.transaction()?;
-    let session_id = transaction
+    let (session_id, trigger_kind, agent_id, assignment_id, work_item_node_id) = transaction
         .query_row(
-            "SELECT session_id FROM turns
-             WHERE turn_id=?1 AND lifecycle IN ('starting','running')",
+            "SELECT t.session_id,t.trigger_kind,ps.agent_id,ai.assignment_id,a.work_item_node_id
+             FROM turns t
+             JOIN provider_sessions ps ON ps.session_id=t.session_id
+             JOIN agent_instances ai ON ai.agent_id=ps.agent_id
+             JOIN assignments a ON a.assignment_id=ai.assignment_id
+             WHERE t.turn_id=?1 AND t.lifecycle IN ('starting','running')",
             [turn_id],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
         )
         .optional()?
         .ok_or_else(|| StoreError::InvalidData(format!("turn {turn_id} is not active")))?;
@@ -3108,10 +3665,44 @@ fn mark_turn_terminal(database: &Path, turn_id: &str, lifecycle: &str) -> Result
         "UPDATE turns SET lifecycle=?2,ended_at=?3 WHERE turn_id=?1",
         params![turn_id, lifecycle, now],
     )?;
+    let finalization = trigger_kind == "finalization";
+    let session_lifecycle = if lifecycle == "unknown" {
+        "unknown"
+    } else if finalization {
+        "sleeping"
+    } else {
+        "idle"
+    };
     transaction.execute(
         "UPDATE provider_sessions SET lifecycle=?2 WHERE session_id=?1",
-        params![session_id, if lifecycle == "unknown" { "unknown" } else { "idle" }],
+        params![session_id, session_lifecycle],
     )?;
+    if finalization && lifecycle != "unknown" {
+        transaction.execute(
+            "UPDATE assignments SET lifecycle='sleeping'
+             WHERE assignment_id=?1 AND lifecycle='finalizing'",
+            [&assignment_id],
+        )?;
+        transaction.execute(
+            "UPDATE agent_instances SET lifecycle='sleeping'
+             WHERE agent_id=?1 AND lifecycle='finalizing'",
+            [&agent_id],
+        )?;
+        transaction.execute(
+            "UPDATE events SET lifecycle='consumed'
+             WHERE event_id IN (
+               SELECT be.event_id FROM turns t
+               JOIN wake_batch_events be ON be.batch_id=t.batch_id
+               WHERE t.turn_id=?1
+             ) AND lifecycle='pending'",
+            [turn_id],
+        )?;
+        transaction.execute(
+            "UPDATE wake_batches SET lifecycle='consumed',updated_at=?2
+             WHERE work_item_node_id=?1 AND lifecycle IN ('pending','runnable')",
+            params![work_item_node_id, now],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -3163,6 +3754,7 @@ fn claim_urgent_steer(database: &Path, turn_id: &str) -> Result<Option<TurnClaim
         profile_id,
         references,
         trusted_mention,
+        trigger_kind: "urgent_steer".into(),
     }))
 }
 

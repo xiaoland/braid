@@ -48,6 +48,11 @@ Versioning once release artifacts are published.
   reconciliation, unminimize Wake, and deletion tombstones. Root reconciliation
   now compares the human-visible Issue/PR projection so ordinary comment
   activity cannot masquerade as a description edit through GitHub `updatedAt`.
+- Issue close now preserves an already-running turn, grants exactly one
+  reaction-free Finalization Turn, and atomically sleeps the Agent Group.
+  Closed activity cannot grant another turn; reopen rebuilds complete current
+  GitHub Context in a fresh provider session and releases one ordinary
+  debounced Wake. Public status reports bounded finalization evidence.
 - Desired-state trusted-mention reactions, including removal of stale active
   reactions after terminal convergence, and Agent-origin echo suppression by
   stable actor identity or public Profile attribution.
