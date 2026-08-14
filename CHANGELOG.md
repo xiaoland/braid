@@ -66,6 +66,10 @@ Versioning once release artifacts are published.
 - `scripts/tests/50_issue_to_pr.sh` exercises that bounded first Slice 5
   vertical against real GitHub objects while leaving PR Agent/worktree/review
   behavior explicitly unproven.
+- The first real Slice 5 campaign converged two concurrent ensure processes from
+  Issue #33 and App comment `5294048165` to one durable receipt, one same-tree
+  bootstrap branch, and Draft PR #34 with its native Issue association. Cleanup
+  closed both Work Items and deleted the temporary branch.
 - The expanded Slice 4 public campaign now proves in-place provider resume plus
   a subsequent debounced Wake, complete soft-pressure Context delivery with one
   Operational Status Comment, and hard-pressure refusal with no provider

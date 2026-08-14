@@ -29,7 +29,7 @@ cleanup() {
         gh api --method DELETE "repos/$repository/git/refs/heads/$head_ref" >/dev/null 2>&1 || true
     fi
     if [ -n "$issue_number" ]; then
-        gh issue close "$issue_number" --repo "$repository" --reason not-planned >/dev/null 2>&1 || true
+        gh issue close "$issue_number" --repo "$repository" --reason "not planned" >/dev/null 2>&1 || true
     fi
     rm -rf "$temporary_root"
 }
