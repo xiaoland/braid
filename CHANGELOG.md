@@ -80,6 +80,23 @@ Versioning once release artifacts are published.
   PR comment; no turn mirror appeared. The campaign closed both Work Items,
   removed all five attempted fixture branches, and left review, cross-surface
   invalidation, direct-identity variants, and PR lifecycle as explicit gaps.
+- Forward-only schema version 10 records visible content digests and one
+  Issue-description cursor per native association. PR review-thread lifecycle
+  can now replace stale PR Context in the existing worktree, while open
+  Associated-Issue description edits create a PR-scoped invalidation only after
+  the ordinary debounce/count boundary.
+- The Slice 5 campaign now provisions a temporary free Quick Tunnel and
+  repository webhook, exercises a real review comment/thread, and checks an
+  active cross-surface replacement without restoring Braid turn mirroring.
+  Candidate `b5f72255e79935526fcbed6bf27c402a1ff74d5936842509579122d69aefa612`
+  passed that expanded gate against closed Issue #57 and PR #58 with one
+  continuation, a preserved worktree, and no operator correction.
+- `braid gh comment create` now normalizes an accidentally repeated generated
+  attribution prefix to one quote block, and Agent system prompts state that
+  callers pass only the message body to that command.
+- Reconciliation now treats the first observation of a review thread as
+  canonical state rather than a second Wake; only a known resolved thread
+  becoming unresolved owns the thread-level Wake.
 - The expanded Slice 4 public campaign now proves in-place provider resume plus
   a subsequent debounced Wake, complete soft-pressure Context delivery with one
   Operational Status Comment, and hard-pressure refusal with no provider

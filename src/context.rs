@@ -149,6 +149,7 @@ pub struct ReviewThreadSnapshot {
     pub line: Option<u64>,
     pub start_line: Option<u64>,
     pub resolved: bool,
+    pub resolved_by: Option<Actor>,
     pub collapsed: bool,
     pub outdated: bool,
     pub comments: Vec<CommentSnapshot>,
@@ -221,6 +222,7 @@ pub struct CanonicalObservation {
     pub author_node_id: Option<String>,
     pub author_login: Option<String>,
     pub body: Option<String>,
+    pub content_digest: Option<String>,
 }
 
 pub async fn materialize_issue(
@@ -339,6 +341,7 @@ pub fn reconcile_local_state(
                 anchor_node_id: pull_request.node_id.clone(),
                 anchor_kind: "pr",
                 observed_version: pull_request.updated_at.clone(),
+                anchor_content_digest: None,
                 related: pull_request
                     .associated_issues
                     .iter()
@@ -349,6 +352,7 @@ pub fn reconcile_local_state(
                         kind: "issue",
                         number: issue.number,
                         state: issue.state.clone(),
+                        content_digest: Some(visible_content_digest(&issue.body)),
                     })
                     .collect(),
             })?;
@@ -376,6 +380,7 @@ pub fn reconcile_local_state(
                     line: None,
                     start_line: None,
                     resolved: false,
+                    resolved_by: None,
                     collapsed: false,
                     outdated: false,
                     comments: tombstones
@@ -466,6 +471,7 @@ fn issue_observation(issue: &IssueSnapshot) -> CanonicalObservation {
         author_node_id: issue.author.as_ref().map(|author| author.node_id.clone()),
         author_login: issue.author.as_ref().map(|author| author.login.clone()),
         body: Some(issue.body.clone()),
+        content_digest: Some(visible_content_digest(&issue.body)),
     }
 }
 
@@ -486,6 +492,7 @@ fn pull_request_observation(pull_request: &PullRequestSnapshot) -> CanonicalObse
         author_node_id: pull_request.author.as_ref().map(|author| author.node_id.clone()),
         author_login: pull_request.author.as_ref().map(|author| author.login.clone()),
         body: Some(pull_request.body.clone()),
+        content_digest: Some(visible_content_digest(&pull_request.body)),
     }
 }
 
@@ -517,6 +524,7 @@ fn review_observation(
         author_node_id: review.author.as_ref().map(|author| author.node_id.clone()),
         author_login: review.author.as_ref().map(|author| author.login.clone()),
         body: Some(review.body.clone()),
+        content_digest: Some(visible_content_digest(&review.body)),
     }
 }
 
@@ -547,9 +555,10 @@ fn review_thread_observation(
         digest: object_digest(&thread.node_id, &version, None),
         version,
         lifecycle,
-        author_node_id: None,
-        author_login: None,
+        author_node_id: thread.resolved_by.as_ref().map(|author| author.node_id.clone()),
+        author_login: thread.resolved_by.as_ref().map(|author| author.login.clone()),
         body: None,
+        content_digest: None,
     }
 }
 
@@ -575,6 +584,7 @@ fn observation(
         author_node_id: comment.author.as_ref().map(|author| author.node_id.clone()),
         author_login: comment.author.as_ref().map(|author| author.login.clone()),
         body: comment.body.clone(),
+        content_digest: comment.body.as_deref().map(visible_content_digest),
     }
 }
 
@@ -600,6 +610,7 @@ fn pr_observation(
         author_node_id: comment.author.as_ref().map(|author| author.node_id.clone()),
         author_login: comment.author.as_ref().map(|author| author.login.clone()),
         body: comment.body.clone(),
+        content_digest: comment.body.as_deref().map(visible_content_digest),
     }
 }
 
@@ -652,6 +663,7 @@ fn reconcile_issue_comments(
         anchor_node_id: issue.node_id.clone(),
         anchor_kind: "issue",
         observed_version: issue.updated_at.clone(),
+        anchor_content_digest: Some(visible_content_digest(&issue.body)),
         related: issue
             .associated_prs
             .iter()
@@ -662,6 +674,7 @@ fn reconcile_issue_comments(
                 kind: "pr",
                 number: pull_request.number,
                 state: pull_request.state.clone(),
+                content_digest: None,
             })
             .collect(),
     })?;
@@ -897,6 +910,9 @@ fn render_pull_request(output: &mut String, pull_request: &PullRequestSnapshot) 
                 states.push("open");
             }
             push_line(output, &format!("State: {}", states.join(", ")));
+            if thread.resolved {
+                push_actor(output, "Resolved by", thread.resolved_by.as_ref());
+            }
             if thread.resolved || thread.collapsed {
                 render_thread_metadata(output, &thread.comments);
             } else {
@@ -1093,6 +1109,10 @@ pub fn filter_html_comments(markdown: &str) -> String {
     }
     visible.push_str(&markdown[cursor..]);
     visible
+}
+
+pub fn visible_content_digest(markdown: &str) -> String {
+    hex::encode(Sha256::digest(filter_html_comments(markdown).as_bytes()))
 }
 
 fn line_offsets(markdown: &str) -> Vec<usize> {
@@ -1523,6 +1543,7 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
   repository(owner:$owner,name:$name){pullRequest(number:$number){
     items:reviewThreads(first:$pageSize,after:$cursor){nodes{
       id path line startLine isResolved isCollapsed isOutdated
+      resolvedBy{id login}
     } pageInfo{hasNextPage endCursor}}
   }}
 }"#;
@@ -1731,6 +1752,8 @@ struct ReviewThreadRaw {
     start_line: Option<u64>,
     #[serde(rename = "isResolved")]
     is_resolved: bool,
+    #[serde(rename = "resolvedBy")]
+    resolved_by: Option<ActorRaw>,
     #[serde(rename = "isCollapsed")]
     is_collapsed: bool,
     #[serde(rename = "isOutdated")]
@@ -2291,6 +2314,7 @@ async fn read_pr_snapshot(
             line: thread.line,
             start_line: thread.start_line,
             resolved: thread.is_resolved,
+            resolved_by: thread.resolved_by.map(Into::into),
             collapsed: thread.is_collapsed,
             outdated: thread.is_outdated,
             comments: thread_comments,

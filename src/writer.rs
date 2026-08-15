@@ -232,11 +232,15 @@ fn role_for_target(profile: &Profile, kind: &str) -> Result<&'static str> {
 }
 
 fn render_agent_comment(profile: &Profile, role: &str, body: &str) -> Result<String> {
-    let body = body.trim();
+    let attribution = format!("> **Braid Agent · {}**\n> {}", profile.display_name, role);
+    let mut body = body.trim();
+    while let Some(remainder) = body.strip_prefix(&attribution) {
+        body = remainder.trim_start();
+    }
     if body.is_empty() {
         bail!("Agent comment body must not be empty");
     }
-    let rendered = format!("> **Braid Agent · {}**\n> {}\n\n{}", profile.display_name, role, body);
+    let rendered = format!("{attribution}\n\n{body}");
     if rendered.len() > COMMENT_BODY_LIMIT {
         bail!(
             "Agent comment is {} bytes; Braid's safe limit is {COMMENT_BODY_LIMIT}",
@@ -386,9 +390,11 @@ fn record_pr_activation(
                 object_node_id: None,
                 object_version: Some(receipt.write.request_digest.clone()),
                 object_digest: None,
+                content_digest: None,
                 actor_node_id: Some(github.identity().actor_node_id.clone()),
                 actor_login: Some(github.identity().actor_login.clone()),
                 classification: "wake",
+                cross_surface_invalidation: false,
                 origin: "braid",
                 reference,
                 mention_candidate: false,

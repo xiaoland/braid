@@ -77,7 +77,8 @@ The PR portion then appears in this order:
 Visible reviews and review comments use the same identity/author/time/body
 shape as Issue comments. A resolved, collapsed, or minimized review thread
 keeps thread ID, path/line when present, authors, timestamps, resolution and
-outdated state, but omits all comment bodies. An unresolved visible thread
+outdated state, plus the resolver when GitHub exposes one, but omits all
+comment bodies. An unresolved visible thread
 includes its visible comment bodies. Dismissed reviews retain their canonical
 state and visible body unless separately minimized.
 

@@ -151,6 +151,19 @@ stable ID, last known author/time metadata, and `deleted`. Local state never
 retains a deleted body as Context. Older webhook payloads are stored as evidence
 but cannot replace a newer canonical digest/version.
 
+Cross-surface description detection is edge-scoped rather than inferred from
+the generic root `updatedAt`: every active native Issue↔PR association stores
+the last observed digest of the Issue description after HTML-comment removal.
+Webhook `issues.edited` uses the exact `changes.body` signal; reconciliation
+compares the current visible digest with the edge cursor. The cursor and any
+derived PR event are committed together, so repeated delivery, a metadata-only
+edit, or another Context read cannot manufacture a second invalidation.
+
+Reconciliation records a previously unseen review thread without creating a
+second Wake: the thread's first visible comment/review delivery already owns
+that Wake. Only a known thread changing from resolved to unresolved creates the
+thread-level Wake; resolved remains a Hard Invalidation.
+
 ## `braid gh` and Outbox
 
 `braid gh` follows familiar GitHub target/flag conventions and implements the
@@ -181,7 +194,9 @@ braid gh receipt 019... --config /absolute/path/to/braid.toml
 ```
 
 `comment create` derives the public role from the canonical Issue/PR target and
-the Profile tags; callers cannot provide the attribution block. `--request-id`
+the Profile tags. The writer prepends one attribution block and removes exact
+repetitions of that generated block from the start of the supplied body, so a
+caller retry or model mistake cannot duplicate it. `--request-id`
 is optional and defaults to the attributed body digest, while supplying it
 allows the Agent to make its retry identity explicit. Receipts expose bounded
 operation/target/Profile/lifecycle/remote-reference evidence and do not echo

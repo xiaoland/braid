@@ -26,7 +26,7 @@ use gh_writes::{
     prepare_gh_write, prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 9;
+pub const DATABASE_SCHEMA_VERSION: u32 = 10;
 
 const INITIAL_SQL: &str = include_str!("../migrations/0001_initial.sql");
 const CONTEXT_LEDGER_SQL: &str = include_str!("../migrations/0002_context_ledger.sql");
@@ -38,6 +38,8 @@ const OPERATIONAL_CONVERGENCE_SQL: &str =
     include_str!("../migrations/0007_operational_convergence.sql");
 const BRAID_GH_SQL: &str = include_str!("../migrations/0008_braid_gh.sql");
 const PR_AGENT_WORKTREE_SQL: &str = include_str!("../migrations/0009_pr_agent_worktree.sql");
+const CROSS_SURFACE_CONTEXT_SQL: &str =
+    include_str!("../migrations/0010_cross_surface_context.sql");
 const MIGRATIONS: &[Migration] = &[
     Migration { version: 1, name: "initial", sql: INITIAL_SQL },
     Migration { version: 2, name: "context-ledger", sql: CONTEXT_LEDGER_SQL },
@@ -48,6 +50,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration { version: 7, name: "operational-convergence", sql: OPERATIONAL_CONVERGENCE_SQL },
     Migration { version: 8, name: "braid-gh", sql: BRAID_GH_SQL },
     Migration { version: 9, name: "pr-agent-worktree", sql: PR_AGENT_WORKTREE_SQL },
+    Migration { version: 10, name: "cross-surface-context", sql: CROSS_SURFACE_CONTEXT_SQL },
 ];
 
 #[derive(Debug, Error)]
@@ -130,9 +133,11 @@ pub struct IngressEvent {
     pub object_node_id: Option<String>,
     pub object_version: Option<String>,
     pub object_digest: Option<String>,
+    pub content_digest: Option<String>,
     pub actor_node_id: Option<String>,
     pub actor_login: Option<String>,
     pub classification: &'static str,
+    pub cross_surface_invalidation: bool,
     pub origin: &'static str,
     pub reference: String,
     pub mention_candidate: bool,
@@ -243,6 +248,7 @@ pub struct CanonicalObjectState {
     pub lifecycle: String,
     pub author_node_id: Option<String>,
     pub author_login: Option<String>,
+    pub content_digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +307,7 @@ pub struct ContextResetClaim {
     pub reset_id: String,
     pub assignment_id: String,
     pub repository: String,
+    pub work_item_kind: String,
     pub number: u64,
     pub profile_id: String,
     pub old_provider_session_id: String,
@@ -308,6 +315,8 @@ pub struct ContextResetClaim {
     pub provider_turn_id: Option<String>,
     pub references: Vec<String>,
     pub continuation: bool,
+    pub worktree_path: Option<PathBuf>,
+    pub worktree_head_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -408,6 +417,7 @@ pub struct AssociatedWorkItem {
     pub kind: &'static str,
     pub number: u64,
     pub state: String,
+    pub content_digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +425,7 @@ pub struct AssociationSet {
     pub anchor_node_id: String,
     pub anchor_kind: &'static str,
     pub observed_version: String,
+    pub anchor_content_digest: Option<String>,
     pub related: Vec<AssociatedWorkItem>,
 }
 
@@ -1091,18 +1102,24 @@ impl StoreActor {
     pub fn begin_context_reset(
         &self,
         active_turn_id: Option<String>,
+        work_item_kind: String,
+        profile_id: String,
     ) -> Result<Option<ContextResetClaim>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::BeginContextReset(active_turn_id, reply))
+            .send(Command::BeginContextReset(active_turn_id, work_item_kind, profile_id, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub fn ready_context_reset(&self) -> Result<Option<ContextResetClaim>, StoreError> {
+    pub fn ready_context_reset(
+        &self,
+        work_item_kind: String,
+        profile_id: String,
+    ) -> Result<Option<ContextResetClaim>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::ReadyContextReset(reply))
+            .send(Command::ReadyContextReset(work_item_kind, profile_id, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1279,8 +1296,13 @@ enum Command {
     ConsumeSteerBatch(String, Sender<Result<(), StoreError>>),
     EnqueueTurnReaction(String, String, Sender<Result<(), StoreError>>),
     EnqueueOperationalStatus(String, String, Sender<Result<(), StoreError>>),
-    BeginContextReset(Option<String>, Sender<Result<Option<ContextResetClaim>, StoreError>>),
-    ReadyContextReset(Sender<Result<Option<ContextResetClaim>, StoreError>>),
+    BeginContextReset(
+        Option<String>,
+        String,
+        String,
+        Sender<Result<Option<ContextResetClaim>, StoreError>>,
+    ),
+    ReadyContextReset(String, String, Sender<Result<Option<ContextResetClaim>, StoreError>>),
     MarkContextResetTurnTerminal(String, String, String, Sender<Result<(), StoreError>>),
     CompleteContextReset(String, String, String, String, Sender<Result<(), StoreError>>),
     FailContextReset(String, String, Sender<Result<(), StoreError>>),
@@ -1587,11 +1609,16 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::EnqueueOperationalStatus(turn_id, body, reply) => {
                 let _ = reply.send(enqueue_operational_status(database, &turn_id, &body));
             }
-            Command::BeginContextReset(active_turn_id, reply) => {
-                let _ = reply.send(begin_context_reset(database, active_turn_id.as_deref()));
+            Command::BeginContextReset(active_turn_id, work_item_kind, profile_id, reply) => {
+                let _ = reply.send(begin_context_reset(
+                    database,
+                    active_turn_id.as_deref(),
+                    &work_item_kind,
+                    &profile_id,
+                ));
             }
-            Command::ReadyContextReset(reply) => {
-                let _ = reply.send(ready_context_reset(database));
+            Command::ReadyContextReset(work_item_kind, profile_id, reply) => {
+                let _ = reply.send(ready_context_reset(database, &work_item_kind, &profile_id));
             }
             Command::MarkContextResetTurnTerminal(reset_id, turn_id, lifecycle, reply) => {
                 let _ = reply.send(mark_context_reset_turn_terminal(
@@ -1944,14 +1971,25 @@ fn reconcile_associations(database: &Path, update: &AssociationSet) -> Result<()
             (related.node_id.as_str(), update.anchor_node_id.as_str())
         };
         active_pairs.insert((issue_node_id.to_owned(), pr_node_id.to_owned()));
+        let issue_content_digest = if update.anchor_kind == "issue" {
+            update.anchor_content_digest.as_deref()
+        } else {
+            related.content_digest.as_deref()
+        };
         transaction.execute(
-            "INSERT INTO associations(issue_node_id, pr_node_id, source, observed_version, active)
-             VALUES (?1,?2,'native',?3,1)
+            "INSERT INTO associations(
+               issue_node_id,pr_node_id,source,observed_version,active,issue_content_digest
+             ) VALUES (?1,?2,'native',?3,1,?4)
              ON CONFLICT(issue_node_id,pr_node_id) DO UPDATE SET
                source='native',
                observed_version=excluded.observed_version,
+               issue_content_digest=CASE
+                 WHEN associations.active=0 THEN excluded.issue_content_digest
+                 ELSE COALESCE(associations.issue_content_digest,
+                               excluded.issue_content_digest)
+               END,
                active=1",
-            params![issue_node_id, pr_node_id, update.observed_version],
+            params![issue_node_id, pr_node_id, update.observed_version, issue_content_digest],
         )?;
     }
     let anchor_column = if update.anchor_kind == "issue" { "issue_node_id" } else { "pr_node_id" };
@@ -2142,8 +2180,9 @@ fn ingest_event(
         };
         transaction.execute(
             "INSERT INTO canonical_objects(
-               node_id,work_item_node_id,object_kind,version,digest,lifecycle,observed_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7)
+               node_id,work_item_node_id,object_kind,version,digest,lifecycle,observed_at,
+               content_digest
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?9)
              ON CONFLICT(node_id) DO UPDATE SET
                work_item_node_id=excluded.work_item_node_id,
                object_kind=excluded.object_kind,
@@ -2154,7 +2193,8 @@ fn ingest_event(
                  ELSE excluded.digest
                END,
                lifecycle=excluded.lifecycle,
-               observed_at=excluded.observed_at",
+               observed_at=excluded.observed_at,
+               content_digest=COALESCE(excluded.content_digest,canonical_objects.content_digest)",
             params![
                 node_id,
                 work_item_node_id,
@@ -2164,6 +2204,7 @@ fn ingest_event(
                 lifecycle,
                 now,
                 i64::from(event.delivery_guid.starts_with("reconcile-")),
+                event.content_digest,
             ],
         )?;
     }
@@ -2189,6 +2230,9 @@ fn ingest_event(
     {
         enqueue_reaction(&transaction, event, &event_id, target, &now)?;
     }
+    if lifecycle == "pending" && event.cross_surface_invalidation && event.origin != "agent" {
+        schedule_cross_surface_invalidations(&transaction, event, &event_id, policy, &now)?;
+    }
     transaction.commit()?;
     Ok(IngestResult {
         duplicate: false,
@@ -2198,6 +2242,87 @@ fn ingest_event(
         batch_id: batch.as_ref().map(|value| value.0.clone()),
         batch_lifecycle: batch.map(|value| value.1),
     })
+}
+
+fn schedule_cross_surface_invalidations(
+    transaction: &rusqlite::Transaction<'_>,
+    source: &IngressEvent,
+    source_event_id: &str,
+    policy: SchedulerPolicy,
+    now: &str,
+) -> Result<(), StoreError> {
+    if source.event_name != "issues"
+        || source.action.as_deref() != Some("edited")
+        || source.work_item_kind != Some("issue")
+        || !source
+            .work_item_state
+            .as_deref()
+            .is_some_and(|state| state.eq_ignore_ascii_case("open"))
+    {
+        return Ok(());
+    }
+    let Some(issue_node_id) = source.work_item_node_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(content_digest) = source.content_digest.as_deref() else {
+        return Ok(());
+    };
+    let targets = {
+        let mut statement = transaction.prepare(
+            "SELECT pr.node_id,r.name_with_owner,pr.number
+             FROM associations edge
+             JOIN work_items pr ON pr.node_id=edge.pr_node_id AND pr.kind='pr'
+             JOIN repositories r ON r.node_id=pr.repository_node_id
+             JOIN assignments a ON a.work_item_node_id=pr.node_id AND a.lifecycle='active'
+             WHERE edge.issue_node_id=?1 AND edge.active=1 AND lower(pr.state)='open'
+               AND edge.issue_content_digest IS NOT NULL
+               AND edge.issue_content_digest<>?2
+             ORDER BY r.name_with_owner,pr.number",
+        )?;
+        statement
+            .query_map(params![issue_node_id, content_digest], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (pr_node_id, repository, number) in targets {
+        let event_id = Uuid::now_v7().to_string();
+        let dedupe_key = hex::encode(Sha256::digest(
+            format!("braid-cross-surface-v1\0{source_event_id}\0{pr_node_id}").as_bytes(),
+        ));
+        let reference = format!(
+            "Associated Issue description changed for GitHub PR {repository}#{number}: {}",
+            source.reference
+        );
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO events(
+               event_id,delivery_guid,work_item_node_id,object_node_id,object_version,
+               classification,origin,reference,lifecycle,observed_at,dedupe_key,
+               mention_candidate,trusted_mention,body_digest
+             ) VALUES (?1,?2,?3,?4,?5,'cross_surface_invalidation',?6,?7,'pending',?8,?9,0,0,?10)",
+            params![
+                event_id,
+                source.delivery_guid,
+                pr_node_id,
+                source.object_node_id,
+                source.object_version,
+                source.origin,
+                reference,
+                now,
+                dedupe_key,
+                source.object_digest,
+            ],
+        )?;
+        if inserted == 1 {
+            schedule_event(transaction, &pr_node_id, &event_id, policy, false, now)?;
+        }
+    }
+    transaction.execute(
+        "UPDATE associations SET issue_content_digest=?2
+         WHERE issue_node_id=?1 AND active=1",
+        params![issue_node_id, content_digest],
+    )?;
+    Ok(())
 }
 
 fn event_object_kind(event: &IngressEvent) -> Option<&'static str> {
@@ -2807,7 +2932,7 @@ fn canonical_objects(
     let connection = open_read_only(database)?;
     let mut statement = connection.prepare(
         "SELECT node_id,database_id,object_kind,version,digest,lifecycle,
-                author_node_id,author_login
+                author_node_id,author_login,content_digest
          FROM canonical_objects WHERE work_item_node_id=?1
          ORDER BY object_kind,node_id",
     )?;
@@ -2821,6 +2946,7 @@ fn canonical_objects(
             lifecycle: row.get(5)?,
             author_node_id: row.get(6)?,
             author_login: row.get(7)?,
+            content_digest: row.get(8)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -3712,13 +3838,17 @@ fn set_assignment_context_pressure(
 fn begin_context_reset(
     database: &Path,
     active_turn_id: Option<&str>,
+    work_item_kind: &str,
+    profile_id: &str,
 ) -> Result<Option<ContextResetClaim>, StoreError> {
     require_current_schema(database)?;
+    validate_work_item_kind(work_item_kind)?;
     let now = now_rfc3339();
     let mut connection = open_read_write(database)?;
     configure_connection(&connection)?;
     let transaction = connection.transaction()?;
-    let work_item_node_id = context_reset_work_item(&transaction, active_turn_id)?;
+    let work_item_node_id =
+        context_reset_work_item(&transaction, active_turn_id, work_item_kind, profile_id)?;
     let Some(work_item_node_id) = work_item_node_id else {
         transaction.commit()?;
         return Ok(None);
@@ -3729,10 +3859,10 @@ fn begin_context_reset(
          JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
          JOIN provider_sessions ps ON ps.agent_id=ai.agent_id
          LEFT JOIN turns t ON t.session_id=ps.session_id AND t.lifecycle='running'
-         WHERE a.work_item_node_id=?1 AND a.lifecycle='active'
+         WHERE a.work_item_node_id=?1 AND a.lifecycle='active' AND ai.profile_id=?2
            AND ps.lifecycle IN ('idle','running')
          ORDER BY ps.started_at DESC LIMIT 1",
-        [&work_item_node_id],
+        params![work_item_node_id, profile_id],
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -3797,6 +3927,8 @@ fn begin_context_reset(
 fn context_reset_work_item(
     transaction: &rusqlite::Transaction<'_>,
     active_turn_id: Option<&str>,
+    work_item_kind: &str,
+    profile_id: &str,
 ) -> Result<Option<String>, StoreError> {
     if let Some(turn_id) = active_turn_id {
         return transaction
@@ -3808,7 +3940,7 @@ fn context_reset_work_item(
                  JOIN assignments a ON a.assignment_id=ai.assignment_id
                  JOIN work_items w ON w.node_id=a.work_item_node_id
                  WHERE t.turn_id=?1 AND t.lifecycle='running' AND ps.lifecycle='running'
-                   AND a.lifecycle='active' AND w.kind='issue'
+                   AND a.lifecycle='active' AND w.kind=?2 AND ai.profile_id=?3
                    AND NOT EXISTS (
                      SELECT 1 FROM context_resets cr
                      WHERE cr.agent_id=ai.agent_id
@@ -3817,10 +3949,18 @@ fn context_reset_work_item(
                    AND EXISTS (
                      SELECT 1 FROM events e
                      WHERE e.work_item_node_id=w.node_id AND e.lifecycle='pending'
-                       AND e.classification='hard_invalidation' AND e.origin!='agent'
+                       AND e.origin!='agent'
                        AND (e.mention_candidate=0 OR e.trusted_mention=0)
+                       AND (
+                         e.classification='hard_invalidation'
+                         OR (e.classification='cross_surface_invalidation' AND EXISTS (
+                           SELECT 1 FROM wake_batches wb
+                           JOIN wake_batch_events be ON be.batch_id=wb.batch_id
+                           WHERE be.event_id=e.event_id AND wb.lifecycle='runnable'
+                         ))
+                       )
                    )",
-                [turn_id],
+                params![turn_id, work_item_kind, profile_id],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -3834,16 +3974,24 @@ fn context_reset_work_item(
              JOIN assignments a ON a.work_item_node_id=w.node_id AND a.lifecycle='active'
              JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
              JOIN provider_sessions ps ON ps.agent_id=ai.agent_id AND ps.lifecycle='idle'
-             WHERE e.lifecycle='pending' AND e.classification='hard_invalidation'
-               AND e.origin!='agent' AND w.kind='issue'
+             WHERE e.lifecycle='pending' AND e.origin!='agent'
+               AND w.kind=?1 AND ai.profile_id=?2
                AND (e.mention_candidate=0 OR e.trusted_mention=0)
+               AND (
+                 e.classification='hard_invalidation'
+                 OR (e.classification='cross_surface_invalidation' AND EXISTS (
+                   SELECT 1 FROM wake_batches wb
+                   JOIN wake_batch_events be ON be.batch_id=wb.batch_id
+                   WHERE be.event_id=e.event_id AND wb.lifecycle='runnable'
+                 ))
+               )
                AND NOT EXISTS (
                  SELECT 1 FROM context_resets cr
                  WHERE cr.agent_id=ai.agent_id
                    AND cr.lifecycle IN ('interrupting','materializing')
                )
              ORDER BY e.observed_at,e.event_id LIMIT 1",
-            [],
+            params![work_item_kind, profile_id],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -3856,23 +4004,39 @@ fn context_reset_events(
 ) -> Result<Vec<String>, StoreError> {
     let mut statement = transaction.prepare(
         "SELECT event_id FROM events
-         WHERE work_item_node_id=?1 AND lifecycle='pending'
-           AND classification='hard_invalidation' AND origin!='agent'
+         WHERE work_item_node_id=?1 AND lifecycle='pending' AND origin!='agent'
            AND (mention_candidate=0 OR trusted_mention=0)
+           AND (
+             classification='hard_invalidation'
+             OR (classification='cross_surface_invalidation' AND EXISTS (
+               SELECT 1 FROM wake_batches wb
+               JOIN wake_batch_events be ON be.batch_id=wb.batch_id
+               WHERE be.event_id=events.event_id AND wb.lifecycle='runnable'
+             ))
+           )
          ORDER BY observed_at,event_id",
     )?;
     let rows = statement.query_map([work_item_node_id], |row| row.get::<_, String>(0))?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
 }
 
-fn ready_context_reset(database: &Path) -> Result<Option<ContextResetClaim>, StoreError> {
+fn ready_context_reset(
+    database: &Path,
+    work_item_kind: &str,
+    profile_id: &str,
+) -> Result<Option<ContextResetClaim>, StoreError> {
     require_current_schema(database)?;
+    validate_work_item_kind(work_item_kind)?;
     let connection = open_read_only(database)?;
     let reset_id = connection
         .query_row(
-            "SELECT reset_id FROM context_resets
-             WHERE lifecycle='materializing' ORDER BY created_at,reset_id LIMIT 1",
-            [],
+            "SELECT cr.reset_id FROM context_resets cr
+             JOIN agent_instances ai ON ai.agent_id=cr.agent_id
+             JOIN assignments a ON a.assignment_id=ai.assignment_id
+             JOIN work_items w ON w.node_id=a.work_item_node_id
+             WHERE cr.lifecycle='materializing' AND w.kind=?1 AND ai.profile_id=?2
+             ORDER BY cr.created_at,cr.reset_id LIMIT 1",
+            params![work_item_kind, profile_id],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
@@ -3884,14 +4048,16 @@ fn load_context_reset_claim(
     reset_id: &str,
 ) -> Result<ContextResetClaim, StoreError> {
     let mut claim = connection.query_row(
-        "SELECT cr.reset_id,a.assignment_id,r.name_with_owner,w.number,ai.profile_id,
-                ps.provider_session_id,cr.active_turn_id,t.provider_turn_id,cr.continuation
+        "SELECT cr.reset_id,a.assignment_id,r.name_with_owner,w.kind,w.number,ai.profile_id,
+                ps.provider_session_id,cr.active_turn_id,t.provider_turn_id,cr.continuation,
+                wt.path,wt.head_ref
          FROM context_resets cr
          JOIN agent_instances ai ON ai.agent_id=cr.agent_id
          JOIN assignments a ON a.assignment_id=ai.assignment_id
          JOIN work_items w ON w.node_id=a.work_item_node_id
          JOIN repositories r ON r.node_id=w.repository_node_id
          JOIN provider_sessions ps ON ps.session_id=cr.old_session_id
+         LEFT JOIN worktrees wt ON wt.agent_id=ai.agent_id AND wt.lifecycle='active'
          LEFT JOIN turns t ON t.turn_id=cr.active_turn_id
          WHERE cr.reset_id=?1",
         [reset_id],
@@ -3900,13 +4066,16 @@ fn load_context_reset_claim(
                 reset_id: row.get(0)?,
                 assignment_id: row.get(1)?,
                 repository: row.get(2)?,
-                number: sqlite_i64_to_u64(row.get(3)?, "context reset Issue number")?,
-                profile_id: row.get(4)?,
-                old_provider_session_id: row.get(5)?,
-                active_turn_id: row.get(6)?,
-                provider_turn_id: row.get(7)?,
+                work_item_kind: row.get(3)?,
+                number: sqlite_i64_to_u64(row.get(4)?, "context reset Work Item number")?,
+                profile_id: row.get(5)?,
+                old_provider_session_id: row.get(6)?,
+                active_turn_id: row.get(7)?,
+                provider_turn_id: row.get(8)?,
                 references: Vec::new(),
-                continuation: row.get::<_, i64>(8)? != 0,
+                continuation: row.get::<_, i64>(9)? != 0,
+                worktree_path: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
+                worktree_head_ref: row.get(11)?,
             })
         },
     )?;
@@ -4043,6 +4212,22 @@ fn complete_context_reset(
         for event_id in &event_ids {
             schedule_event(&transaction, &work_item_node_id, event_id, policy, true, &now)?;
         }
+    } else {
+        transaction.execute(
+            "UPDATE wake_batches SET lifecycle='consumed',updated_at=?2
+             WHERE lifecycle IN ('pending','runnable')
+               AND EXISTS (
+                 SELECT 1 FROM wake_batch_events be
+                 JOIN context_reset_events cre ON cre.event_id=be.event_id
+                 WHERE be.batch_id=wake_batches.batch_id AND cre.reset_id=?1
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM wake_batch_events be
+                 JOIN events e ON e.event_id=be.event_id
+                 WHERE be.batch_id=wake_batches.batch_id AND e.lifecycle='pending'
+               )",
+            params![reset_id, now],
+        )?;
     }
     for event_id in event_ids {
         transaction.execute(

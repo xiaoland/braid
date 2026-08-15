@@ -13,7 +13,7 @@ through real GitHub Work Items and a clean packaged installation.
 
 `00_clean_install.sh` is the Rust foundation gate. It unpacks the release
 artifact, scrubs Python/PDM/Cargo from the binary's `PATH`, exercises only the
-public CLI, verifies schema 0→9, schema 1→9 with a pre-v9 backup, and
+public CLI, verifies schema 0→10, schema 1→10 with a pre-v10 backup, and
 schema-newer refusal, and uses the adjacent
 bounded OTLP/HTTP capture helper to observe sampling. Its direct SQLite write is
 limited to constructing declared migration-compatibility fixtures; it does not
@@ -137,8 +137,15 @@ requires one deterministic branch, one same-tree bootstrap commit, one Draft PR,
 one native Issue association, one PR Profile/session, and one generation-scoped
 worktree provisioned from a fresh source clone. The real Codex Implementation
 Agent must then push one exact requested file and publish one concise attributed
-PR comment; the PR must contain no Braid turn mirror. Cleanup closes the PR and
-Issue, deletes the fixture branch, and removes the isolated runtime/source.
+PR comment. It then uses a real inline review comment and review-thread
+resolution to prove PR Event References plus an idle PR Context replacement,
+starts a second real PR turn, and edits the directly Associated Issue
+description to prove debounced active-turn fencing, one continuation, and
+preservation of the same dedicated worktree. A temporary free Quick Tunnel and
+repository webhook provide the low-latency ingress; reconciliation remains the
+60-second repair path. The PR must contain no Braid turn mirror. Cleanup deletes
+the webhook, closes the PR and Issue, deletes the fixture branch, and removes
+the isolated runtime/source.
 Set `BRAID_TEST_KEEP_FIXTURES=1` to retain evidence intentionally.
 
 The helper requires the installed Braid App to expose `Issues: write`, `Pull
@@ -147,12 +154,11 @@ requests: write`, and `Contents: write` and a schema-current config/private key:
 ```shell
 BRAID_CONFIG=/absolute/path/to/braid.toml \
 BRAID_BIN=/absolute/path/to/braid \
+BRAID_TEST_WRANGLER=/absolute/path/to/wrangler \
+BRAID_WEBHOOK_SECRET='temporary-repository-hook-secret' \
 scripts/tests/50_issue_to_pr.sh
 ```
 
-Its PASS is deliberately bounded. It now proves PR Agent Group materialization,
-isolated worktree execution, a real pushed diff, Agent-authored PR prose, and
-absence of Braid turn mirroring. Review/review-thread routing, cross-surface
-invalidation, configured and unconfigured direct-`gh` origins, PR
-finalization/reopen/merge, and restart recovery remain unproven until later
-Slice 5/6 increments.
+Its PASS is deliberately bounded. Configured and unconfigured direct-`gh`
+origins, PR finalization/reopen/merge, and restart recovery remain unproven
+until later Slice 5/6 increments.

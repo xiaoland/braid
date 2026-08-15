@@ -4,7 +4,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::store::{IngressEvent, ReactionTarget};
+use crate::{
+    context,
+    store::{IngressEvent, ReactionTarget},
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -62,6 +65,9 @@ pub fn parse_verified(
     }
 
     let action = payload.action.clone();
+    let cross_surface_invalidation = event_name == "issues"
+        && action.as_deref() == Some("edited")
+        && payload.changes.as_ref().is_some_and(|changes| changes.body.is_some());
     let actor_node_id = payload.sender.as_ref().and_then(|actor| actor.node_id.clone());
     let actor_login = payload.sender.as_ref().map(|actor| actor.login.clone());
     let body_text = payload
@@ -105,6 +111,7 @@ pub fn parse_verified(
         (Some(node_id), Some(version), body) => Some(object_digest(node_id, version, body)),
         _ => None,
     };
+    let content_digest = target.object_body.as_deref().map(context::visible_content_digest);
     Ok(IngressEvent {
         delivery_guid: delivery.into(),
         event_name: event_name.into(),
@@ -118,9 +125,11 @@ pub fn parse_verified(
         object_node_id: target.object_node_id,
         object_version: target.object_version,
         object_digest,
+        content_digest,
         actor_node_id,
         actor_login,
         classification,
+        cross_surface_invalidation,
         origin: if agent_origin { "agent" } else { "external" },
         reference: target.reference,
         mention_candidate,
@@ -357,6 +366,12 @@ struct Payload {
     comment: Option<Comment>,
     review: Option<Review>,
     thread: Option<ReviewThread>,
+    changes: Option<Changes>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Changes {
+    body: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

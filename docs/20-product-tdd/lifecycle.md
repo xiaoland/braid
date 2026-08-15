@@ -91,6 +91,16 @@ not allowed to drive Braid-owned GitHub writes. Local code changes are not
 rolled back; a replacement PR Agent inspects its dedicated worktree before
 continuing.
 
+Each active native Issue↔PR edge retains the last completely observed
+Human-visible Issue-description digest. An exact webhook body edit, or a
+reconciliation root edit whose current digest differs from that edge cursor,
+creates one PR-scoped Cross-surface Hard Invalidation reference and advances
+the cursor atomically. Title/label/project changes with the same visible body,
+HTML-comment-only edits, closed Issues, inactive edges, and inactive PR Agent
+Groups do not create this invalidation. The derived reference enters the PR's
+ordinary Quiet Window/count batch; the Wrapper never infers semantic urgency
+from the edited prose.
+
 ## Assignment and Terminal Lifecycle
 
 - In native Agent App assignment mode, Issue unassignment starts/resets the
