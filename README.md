@@ -4,86 +4,60 @@
 
 # Braid
 
-**Braid** keeps a GitHub Issue and one local Coding Agent thread in a durable
-collaboration loop. This independent prototype has its own SVC markers, task
-packets, Python package, dependency lock, and test commands.
+Braid turns GitHub Issues and pull requests into durable working memory for
+local Coding Agents. GitHub holds the current design, implementation state,
+metadata, relationships, and discussion; Braid rebuilds a provider session from
+that state whenever prior context becomes stale.
 
-## Local Setup
+Braid is implemented as one Rust package and one portable `braid` binary. The
+active product and implementation contracts are:
 
-Python 3.12 and PDM 2.28 or later are required.
+- [Product Truth](docs/10-prd/README.md)
+- [Real end-to-end acceptance](docs/10-prd/acceptance.md)
+- [Rust Product TDD](docs/20-product-tdd/README.md)
+- [GitHub Context](docs/20-product-tdd/context.md)
+- [Event/session lifecycle](docs/20-product-tdd/lifecycle.md)
+- [Codex provider contract](docs/20-product-tdd/app-server.md)
+- [GitHub boundary](docs/20-product-tdd/github.md)
+- [Deployment and observability](docs/40-deployment/README.md)
+- [Glossary](glossary.md)
 
-```shell
-pdm install -G test
-pdm run test
-```
-
-Run the real, read-only provider contract probe with explicit absolute paths:
-
-```shell
-pdm run braid probe-app-server \
-  --codex /absolute/path/to/codex \
-  --workspace /absolute/path/to/a/read-only-probe-directory
-```
-
-Copy `config.example.json` to the ignored `config.local.json`, replace every
-placeholder, create the state database's parent directory, and validate it:
+The first supported delivery target is a packaged macOS arm64 binary; Linux
+x86_64 follows. Build and inspect the public operator surface with:
 
 ```shell
-pdm run braid config-check --config /absolute/path/to/config.local.json
+cargo build --locked
+cargo run --locked -- --version
+cargo run --locked -- config check --config /absolute/path/to/braid.toml
+cargo run --locked -- migrate plan --config /absolute/path/to/braid.toml
+cargo run --locked -- github probe --config /absolute/path/to/braid.toml --repository owner/repository
+cargo run --locked -- context issue owner/repository#123 --config /absolute/path/to/braid.toml
+cargo run --locked -- gh comment create owner/repository#123 --config /absolute/path/to/braid.toml --profile issue-codex --body 'Concise update'
+cargo run --locked -- gh pr ensure --comment 123456789 --config /absolute/path/to/braid.toml
+cargo run --locked -- serve --config /absolute/path/to/braid.toml --tunnel
+cargo run --locked -- serve --config /absolute/path/to/braid.toml --transport-only
+cargo run --locked -- status --config /absolute/path/to/braid.toml --json
 ```
 
-Start loopback ingress plus periodic canonical reconciliation without changing
-the GitHub App webhook URL:
+Apply all pending migrations before `context`; the local canonical ledger keeps
+only mechanical versions, associations, and deleted-comment tombstones while
+GitHub remains the content authority.
+The diagnostic `--page-size` defaults to GitHub's maximum of 100; real campaign
+helpers may lower it to force pagination while requiring byte-identical Context.
+`serve` owns the configured Codex app-server and Issue Agent turns;
+`--transport-only` deliberately stops at verified webhook ingress, canonical
+reconciliation, reactions, and runnable debounce batches. `--tunnel` adds the
+free supervised Quick Tunnel to either mode.
+`braid gh` is the Braid-App-authored write surface. Comment creation prepends
+the configured public Profile/role attribution and returns a durable receipt;
+`pr ensure` uses the triggering Issue comment ID as its concurrency-safe
+Implementation Request key.
 
-```shell
-pdm run braid serve \
-  --config /absolute/path/to/config.local.json \
-  --repository owner/repository \
-  --issue-number 123
-```
+Copy [`config.example.toml`](config.example.toml) outside the checkout and
+replace every placeholder path before running diagnostics. A packaged release
+does not require Python, PDM, Cargo, or a source checkout.
 
-For a dedicated test GitHub App, add the free Wrangler Quick Tunnel. The
-runtime reports the temporary public URL, updates the App webhook while it is
-running, and restores the previous URL on a graceful stop:
-
-```shell
-pdm run braid serve \
-  --config /absolute/path/to/config.local.json \
-  --repository owner/repository \
-  --issue-number 123 \
-  --wrangler /absolute/path/to/wrangler
-```
-
-The Quick Tunnel exposes only the webhook app. Bounded runtime health remains
-loopback-only at `http://127.0.0.1:<health_port>/healthz`.
-
-`serve` fails closed when the installed Codex version or either generated
-schema digest differs from the configured protocol pin. The collaboration
-instructions path is only an integrity pin: the persistent workflow lives in
-this project's `AGENTS.md`, where Codex loads it only for this project. The provider cwd
-must be a pre-provisioned, dedicated Issue worktree; the Wrapper launches there
-but never creates, selects, or manages its branch, worktree, or PR.
-The proposed bounded section is documented in
-[`docs/project-scope-collaboration.md`](docs/project-scope-collaboration.md) and
-installed in this project's `AGENTS.md`; ordinary chat outside this project is
-unaffected.
-
-Each Agent turn is one visible GitHub comment: assistant messages and
-provider-labelled reasoning summaries remain readable, while every supported
-tool call uses a compact `<summary>` with bounded call/result evidence folded
-inside `<details>`. The final assistant response is promoted to the top of the
-same comment. Braid never places debug JSON, protocol IDs, raw chain-of-thought,
-or an ownership marker in the GitHub body.
-
-The local runtime and Quick Tunnel supervisor remain building blocks, not full
-product acceptance. The bounded historical smokes and their findings are
-recorded in [`tasks/minimal-mirror-smoke.md`](tasks/minimal-mirror-smoke.md) and
-[`tasks/human-readable-turn-mirror.md`](tasks/human-readable-turn-mirror.md).
-Their disposable GitHub objects were removed during project extraction; the
-task packets preserve the evidence and diagnosed failure modes. The full
-Issue-to-Draft-PR black-box campaign remains separate.
-
-See [the protocol contract](docs/app-server-protocol.md), the
-[projection reducer contract](tasks/projection-reducer-contract.md), and the
-[implementation packet](tasks/bootstrap-implementation.md). External setup and
-exclusive handoff are specified in the [operator runbook](docs/operator-runbook.md).
+Braid deliberately avoids a large internal fake/unit-test surface while the
+workflow is being established. Diagnostic and real black-box campaign helpers
+belong under [`scripts/tests/`](scripts/tests/), but retained GitHub/provider/
+OTel evidence and Human verdicts remain the acceptance oracle.
