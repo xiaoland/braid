@@ -111,7 +111,7 @@ pub fn parse_verified(
         (Some(node_id), Some(version), body) => Some(object_digest(node_id, version, body)),
         _ => None,
     };
-    let content_digest = target.object_body.as_deref().map(context::visible_content_digest);
+    let visible_body = target.object_body.as_deref().map(context::filter_html_comments);
     Ok(IngressEvent {
         delivery_guid: delivery.into(),
         event_name: event_name.into(),
@@ -125,7 +125,7 @@ pub fn parse_verified(
         object_node_id: target.object_node_id,
         object_version: target.object_version,
         object_digest,
-        content_digest,
+        visible_body,
         actor_node_id,
         actor_login,
         classification,
@@ -220,12 +220,13 @@ fn target(event_name: &str, payload: &Payload, action: Option<&str>) -> Target {
                 let lifecycle = if action == Some("deleted") { "deleted" } else { "active" };
                 format!("{timestamp}:{lifecycle}:")
             });
-            (comment.node_id.clone(), version, comment.body.clone())
+            (comment.node_id.clone(), Some(comment.id.to_string()), version, comment.body.clone())
         })
         .or_else(|| {
             payload.review.as_ref().map(|review| {
                 (
                     review.node_id.clone(),
+                    review.id.map(|id| id.to_string()),
                     review.updated_at.clone().or_else(|| review.submitted_at.clone()),
                     review.body.clone(),
                 )
@@ -235,53 +236,94 @@ fn target(event_name: &str, payload: &Payload, action: Option<&str>) -> Target {
             payload
                 .thread
                 .as_ref()
-                .map(|thread| (thread.node_id.clone(), thread.updated_at.clone(), None))
+                .map(|thread| (thread.node_id.clone(), None, thread.updated_at.clone(), None))
         })
         .or_else(|| {
             payload.pull_request.as_ref().map(|pull_request| {
                 (
                     pull_request.node_id.clone(),
+                    Some(pull_request.number.to_string()),
                     pull_request.updated_at.clone(),
                     pull_request.body.clone(),
                 )
             })
         })
         .or_else(|| {
-            payload
-                .issue
-                .as_ref()
-                .map(|issue| (issue.node_id.clone(), issue.updated_at.clone(), issue.body.clone()))
+            payload.issue.as_ref().map(|issue| {
+                (
+                    issue.node_id.clone(),
+                    Some(issue.number.to_string()),
+                    issue.updated_at.clone(),
+                    issue.body.clone(),
+                )
+            })
         });
-    let reference = match (&work_item, &object) {
-        (Some((_, kind, number, _)), Some((node_id, version, _))) => format!(
-            "GitHub {kind} {}#{} object {} at {}",
-            payload
-                .repository
-                .as_ref()
-                .map_or("unknown", |repository| repository.full_name.as_str()),
-            number,
-            node_id,
-            version.as_deref().unwrap_or("unknown version")
-        ),
-        (Some((_, kind, number, _)), None) => format!(
-            "GitHub {kind} {}#{}",
-            payload
-                .repository
-                .as_ref()
-                .map_or("unknown", |repository| repository.full_name.as_str()),
-            number
-        ),
-        _ => format!("GitHub webhook {event_name}"),
-    };
+    let repository =
+        payload.repository.as_ref().map_or("unknown", |repository| repository.full_name.as_str());
+    let reference = event_reference(
+        event_name,
+        action,
+        repository,
+        work_item.as_ref().map(|value| value.1),
+        work_item.as_ref().map(|value| value.2),
+        object.as_ref().and_then(|value| value.1.as_deref()),
+        payload.sender.as_ref().map(|actor| actor.login.as_str()),
+    );
     Target {
         work_item_node_id: work_item.as_ref().map(|value| value.0.clone()),
         work_item_kind: work_item.as_ref().map(|value| value.1),
         work_item_number: work_item.as_ref().map(|value| value.2),
         work_item_state: work_item.map(|value| value.3),
         object_node_id: object.as_ref().map(|value| value.0.clone()),
-        object_version: object.as_ref().and_then(|value| value.1.clone()),
-        object_body: object.and_then(|value| value.2),
+        object_version: object.as_ref().and_then(|value| value.2.clone()),
+        object_body: object.and_then(|value| value.3),
         reference,
+    }
+}
+
+pub(crate) fn event_reference(
+    event_name: &str,
+    action: Option<&str>,
+    repository: &str,
+    work_item_kind: Option<&str>,
+    work_item_number: Option<u64>,
+    object_database_id: Option<&str>,
+    actor_login: Option<&str>,
+) -> String {
+    let surface = match (work_item_kind, work_item_number) {
+        (Some("pr"), Some(number)) => format!("GitHub PR {repository}#{number}"),
+        (Some("issue"), Some(number)) => format!("GitHub Issue {repository}#{number}"),
+        _ => format!("GitHub repository {repository}"),
+    };
+    let action = action.unwrap_or("changed").replace('_', " ");
+    let actor = actor_login.map_or_else(String::new, |login| format!(" by @{login}"));
+    match event_name {
+        "issue_comment" => object_database_id.map_or_else(
+            || format!("A comment on {surface} was {action}{actor}."),
+            |id| format!("GitHub comment {repository}#issuecomment-{id} was {action}{actor}."),
+        ),
+        "pull_request_review_comment" => object_database_id.map_or_else(
+            || format!("A review comment on {surface} was {action}{actor}."),
+            |id| {
+                format!(
+                    "GitHub review comment {repository}#pullrequestreviewcomment-{id} was {action}{actor}."
+                )
+            },
+        ),
+        "pull_request_review" => object_database_id.map_or_else(
+            || format!("A review on {surface} was {action}{actor}."),
+            |id| format!("GitHub review {id} on {surface} was {action}{actor}."),
+        ),
+        "pull_request_review_thread" => {
+            format!("A review thread on {surface} was {action}{actor}.")
+        }
+        "pull_request" if action == "synchronize" => {
+            format!("{surface} received new commits{actor}.")
+        }
+        "issues" | "pull_request" | "issue_dependencies" => {
+            format!("{surface} was {action}{actor}.")
+        }
+        _ => format!("{surface} received a {event_name} event{actor}."),
     }
 }
 
@@ -416,6 +458,7 @@ struct Comment {
 
 #[derive(Debug, Deserialize)]
 struct Review {
+    id: Option<u64>,
     node_id: String,
     body: Option<String>,
     submitted_at: Option<String>,

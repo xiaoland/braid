@@ -232,8 +232,7 @@ comment_json=$("$braid" gh comment create "$repository#$issue_number" \
     --request-id "slice5-$stamp-implementation-request" \
     --body "Implementation Request: implement the exact bounded file change in this Issue description, verify it, push it, and report concisely on the Draft PR." \
     --json)
-comment_id=$(printf '%s' "$comment_json" | jq -r '.remote_database_id')
-receipt_id=$(printf '%s' "$comment_json" | jq -r '.intent_id')
+comment_id=$(printf '%s' "$comment_json" | jq -r '.comment | split("#issuecomment-")[1]')
 profile_display=$("$braid" profile inspect --config "$config" --profile "$issue_profile" --json | jq -r .display_name)
 [ -n "$comment_id" ] && [ "$comment_id" != null ] || fail "comment receipt omitted remote comment ID"
 body=$(gh api "repos/$repository/issues/comments/$comment_id" --jq .body)
@@ -241,9 +240,17 @@ first=$(printf '%s\n' "$body" | sed -n '1p')
 second=$(printf '%s\n' "$body" | sed -n '2p')
 [ "$first" = "> **Braid Agent · $profile_display**" ] || fail "Braid attribution display name drifted"
 [ "$second" = '> Issue Agent' ] || fail "Braid attribution role drifted"
-"$braid" gh receipt "$receipt_id" --config "$config" --json | jq -e \
-    '.lifecycle == "applied" and .operation == "comment_create" and .remote_database_id != null' \
-    >/dev/null || fail "comment receipt did not converge"
+comment_retry_json=$("$braid" gh comment create "$repository#$issue_number" \
+    --config "$config" \
+    --profile "$issue_profile" \
+    --request-id "slice5-$stamp-implementation-request" \
+    --body "Implementation Request: implement the exact bounded file change in this Issue description, verify it, push it, and report concisely on the Draft PR." \
+    --json)
+retry_comment_id=$(printf '%s' "$comment_retry_json" | jq -r '.comment | split("#issuecomment-")[1]')
+[ "$retry_comment_id" = "$comment_id" ] || fail "idempotent comment retry created a different comment"
+printf '%s' "$comment_retry_json" | jq -e \
+    '(has("intent_id") | not) and (has("request_digest") | not) and (has("remote_node_id") | not) and (has("write") | not)' \
+    >/dev/null || fail "comment result leaked internal identifiers"
 
 head_ref="braid/implementation-request-$comment_id"
 "$braid" gh pr ensure --comment "$comment_id" --config "$config" --json \
@@ -261,14 +268,14 @@ wait "$second_pid" || {
     fail "second concurrent pr ensure failed"
 }
 
-first_pr=$(jq -r '.pull_request_number' "$temporary_root/ensure-a.json")
-second_pr=$(jq -r '.pull_request_number' "$temporary_root/ensure-b.json")
+first_pr=$(jq -r '.pull_request | split("#")[1]' "$temporary_root/ensure-a.json")
+second_pr=$(jq -r '.pull_request | split("#")[1]' "$temporary_root/ensure-b.json")
 [ "$first_pr" = "$second_pr" ] || fail "concurrent pr ensure calls returned different PRs"
 pull_number=$first_pr
 [ "$pull_number" != null ] || fail "pr ensure receipt omitted PR number"
-first_receipt=$(jq -r '.write.intent_id' "$temporary_root/ensure-a.json")
-second_receipt=$(jq -r '.write.intent_id' "$temporary_root/ensure-b.json")
-[ "$first_receipt" = "$second_receipt" ] || fail "concurrent pr ensure calls returned different receipts"
+jq -e \
+    '(has("write") | not) and (has("intent_id") | not) and (has("request_digest") | not) and (has("pull_request_node_id") | not)' \
+    "$temporary_root/ensure-a.json" >/dev/null || fail "PR result leaked internal identifiers"
 
 pr=$(gh pr view "$pull_number" --repo "$repository" --json isDraft,state,headRefName,baseRefName,url)
 printf '%s' "$pr" | jq -e \

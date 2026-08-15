@@ -97,6 +97,12 @@ Versioning once release artifacts are published.
 - Reconciliation now treats the first observation of a review thread as
   canonical state rather than a second Wake; only a known resolved thread
   becoming unresolved owns the thread-level Wake.
+- Forward-only schema version 11 replaces per-association Issue-description
+  digests with one Issue-owned visible-description comparison state. Agent
+  Context, Event References, public Context diagnostics, and `braid gh` results
+  no longer expose Context fingerprints, GraphQL node IDs, local receipt IDs,
+  provider IDs, or other internal correlation values; `braid gh receipt` is
+  removed in favor of retrying the semantic write operation itself.
 - The expanded Slice 4 public campaign now proves in-place provider resume plus
   a subsequent debounced Wake, complete soft-pressure Context delivery with one
   Operational Status Comment, and hard-pressure refusal with no provider

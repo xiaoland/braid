@@ -72,11 +72,11 @@ The PR portion then appears in this order:
 5. `## Description` with current PR body;
 6. `## Conversation` with PR Issue comments;
 7. `## Reviews` in submission order;
-8. `## Review Threads` ordered by creation evidence and stable thread ID.
+8. `## Review Threads` ordered by creation evidence and canonical location.
 
 Visible reviews and review comments use the same identity/author/time/body
 shape as Issue comments. A resolved, collapsed, or minimized review thread
-keeps thread ID, path/line when present, authors, timestamps, resolution and
+keeps path/line when present, authors, timestamps, resolution and
 outdated state, plus the resolver when GitHub exposes one, but omits all
 comment bodies. An unresolved visible thread
 includes its visible comment bodies. Dismissed reviews retain their canonical
@@ -107,11 +107,13 @@ the latest observed lifecycle event. A webhook that arrives after a newer
 canonical reread can be recorded as delivery evidence but cannot regress the
 snapshot.
 
-`Context Revision` is
-`sha256("braid-context-v1\0" || rendered_utf8_bytes)`. It is a content address
-for fencing, idempotency, and telemetry correlation, not authentication. The
-rendered bytes are therefore the only revision authority; JSON map ordering can
-never change it.
+`Context Revision` is an internal exact-content fingerprint used only to fence
+stale provider output and determine session compatibility. This is one of the
+few places where a digest is necessary: GitHub exposes a graph of independently
+versioned fields but no atomic version for the complete rendered Context. The
+fingerprint is not a product identity and never appears in Agent Context, Event
+References, `braid gh` output, or public Context diagnostics. Rendered bytes are
+the revision authority; JSON map ordering cannot change it.
 
 ## Event References
 
@@ -123,9 +125,10 @@ GitHub PR owner/repo#45 received new commits.
 Review thread on GitHub PR owner/repo#45 was resolved.
 ```
 
-It contains no body, webhook envelope, GraphQL node ID, digest, internal
-generation, or debug JSON. A coalesced turn sorts references by Braid receipt
-sequence and removes superseded versions of the same object.
+It contains no body, webhook envelope, GraphQL node ID, UUID, digest, internal
+generation/revision, provider identifier, or debug JSON. A coalesced turn sorts
+references by Braid receipt sequence and removes superseded versions of the
+same object.
 
 ## Completeness and Pressure
 

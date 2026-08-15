@@ -138,11 +138,11 @@ synchronous durability. One DB actor serializes writes. Schema v1 owns:
 - `assignments` and `agent_instances` with group/profile/generation/lifecycle;
 - `provider_sessions` and `turns` with opaque provider IDs and Context revision;
 - `worktrees` for the default PR Implementation Agent workspace;
-- `associations` for direct Issue↔PR edges, observed version, and the
-  edge-scoped visible Issue-description digest used by Cross-surface
-  invalidation;
-- `canonical_objects` for latest object metadata/content digest and deletion
-  tombstones;
+- `associations` for direct Issue↔PR edges and their observed version;
+- `issue_context_sources` for one exact visible-description comparison state
+  per Issue, independent of association fan-out;
+- `canonical_objects` for latest object version/lifecycle, the internal
+  reconciliation equality fingerprint, and deletion tombstones;
 - `deliveries` and `events` for webhook/reconciliation dedupe/classification;
 - `scheduler_batches` and `batch_events` for quiet/count/urgent state;
 - `write_intents`, `reaction_targets`, and `status_comments` for Braid-owned

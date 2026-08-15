@@ -12,7 +12,7 @@
 | Issue Context | GitHub Issue、title、description、纳入范围的 metadata，以及 comments 按生命周期规则组成的 GitHub Context。 |
 | PR Context | 依生命周期规则投影一个或多个当前直接 Associated Issues（open 为完整 Issue Context，closed 仅 reference/metadata），随后是当前 PR 自身的最小实现上下文。 |
 | Context Materialization | 从 GitHub 重新读取 canonical state，并为一次 turn/reset 生成 GitHub Context。 |
-| Context Revision | 一次 Context Materialization 的机械版本；只用于 freshness、fencing 与幂等，不作为 JSON/debug 内容展示给 Agent。 |
+| Context Revision | 一次 Context Materialization 的内部机械版本；只用于 freshness、fencing 与 session compatibility，不进入 Agent Context、Event Reference、`braid gh` 输出或公开 Context 诊断。 |
 | Provider Context | Codex、Pi、Claude Code 等 provider 实际交给模型的 context window/history。 |
 | Context Replacement | 让 Provider Context 对齐当前 GitHub Context；必要时会替换物理 Provider Session。 |
 | Provider Compaction | Provider 自己的有损 compact；不是 Braid 的 GitHub Context，也不能替代 Context Materialization。 |

@@ -798,7 +798,7 @@ fn reconcile_observations(
             author_node_id: previous.author_node_id.clone(),
             author_login: previous.author_login.clone(),
             body: None,
-            content_digest: None,
+            visible_body: None,
         };
         let event =
             reconciled_event(&observation, "deleted", "hard_invalidation", true, false, config);
@@ -837,9 +837,7 @@ fn observation_unchanged(
         return false;
     }
     if matches!(observation.object_kind, "issue" | "pr") {
-        previous.version == observation.version
-            || (previous.digest == observation.digest
-                && previous.content_digest == observation.content_digest)
+        previous.version == observation.version || previous.digest == observation.digest
     } else {
         previous.version == observation.version && previous.digest == observation.digest
     }
@@ -927,19 +925,20 @@ fn reconciled_event(
         object_node_id: Some(observation.object_node_id.clone()),
         object_version: Some(observation.version.clone()),
         object_digest: Some(observation.digest.clone()),
-        content_digest: observation.content_digest.clone(),
+        visible_body: observation.visible_body.clone(),
         actor_node_id: observation.author_node_id.clone(),
         actor_login: observation.author_login.clone(),
         classification: if external { classification } else { "agent_origin" },
         cross_surface_invalidation,
         origin: if external { "reconciliation" } else { "agent" },
-        reference: format!(
-            "GitHub {} {}#{} object {} at {}",
-            observation.work_item_kind,
-            observation.repository,
-            observation.work_item_number,
-            observation.object_node_id,
-            observation.version
+        reference: webhook::event_reference(
+            event_name,
+            Some(action),
+            &observation.repository,
+            Some(observation.work_item_kind),
+            Some(observation.work_item_number),
+            (!observation.database_id.is_empty()).then_some(observation.database_id.as_str()),
+            observation.author_login.as_deref(),
         ),
         mention_candidate,
         reaction_target,
@@ -2434,8 +2433,8 @@ fn agent_attributions(config: &Config) -> Vec<String> {
 fn render_event_references(claim: &TurnClaim) -> String {
     let label = if claim.work_item_kind == "pr" { "PR" } else { "Issue" };
     let mut output = format!(
-        "# Braid Event References\n\nGitHub {label}: {}#{}\nContext Revision: {}\n",
-        claim.repository, claim.number, claim.context_revision,
+        "# Braid Event References\n\nGitHub {label}: {}#{}\n",
+        claim.repository, claim.number,
     );
     for reference in &claim.references {
         output.push_str("- ");

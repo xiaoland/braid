@@ -60,8 +60,8 @@ cmp "$temporary_root/issue-a.md" "$temporary_root/issue-b.md"
 cmp "$temporary_root/pr-a.md" "$temporary_root/pr-b.md"
 
 "$braid" context issue "$issue" --config "$config" --page-size 1 --json > "$temporary_root/issue.json"
-revision=$(sed -n 's/.*"revision": "\([0-9a-f][0-9a-f]*\)".*/\1/p' "$temporary_root/issue.json")
-test "${#revision}" = "64"
+jq -e '.bytes > 0 and (.pressure == "normal" or .pressure == "soft") and (has("revision") | not)' \
+    "$temporary_root/issue.json" >/dev/null
 
 grep -F -q "$BRAID_EXPECT_VISIBLE_TEXT" "$temporary_root/issue-a.md"
 if grep -F -q "$BRAID_EXPECT_FILTERED_TEXT" "$temporary_root/issue-a.md"; then

@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
 use uuid::Uuid;
 
 use super::{
@@ -21,25 +20,19 @@ pub struct NewGhWriteIntent {
     pub request_digest: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct GhWriteReceipt {
     pub intent_id: String,
-    pub request_key: String,
     pub operation: String,
     pub repository: String,
     pub target: String,
     pub profile_id: String,
     pub role: String,
-    pub request_digest: String,
     pub lifecycle: String,
     pub attempts: u64,
     pub remote_database_id: Option<String>,
-    pub remote_node_id: Option<String>,
-    pub remote_url: Option<String>,
     pub last_error: Option<String>,
     pub created_at: String,
-    pub updated_at: String,
-    #[serde(skip)]
     pub payload: String,
 }
 
@@ -56,21 +49,16 @@ pub struct NewImplementationRequest {
     pub pr_profile_id: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ImplementationRequestReceipt {
     pub write: GhWriteReceipt,
     pub comment_database_id: u64,
-    pub comment_node_id: String,
-    pub issue_node_id: String,
     pub issue_number: u64,
     pub issue_title: String,
     pub base_ref: String,
     pub head_ref: String,
     pub pr_profile_id: String,
     pub bootstrap_authored_at: String,
-    pub bootstrap_commit_sha: Option<String>,
-    pub pull_request_database_id: Option<u64>,
-    pub pull_request_node_id: Option<String>,
     pub pull_request_number: Option<u64>,
     pub stage: String,
 }
@@ -246,30 +234,25 @@ fn gh_write_receipt_on(
 ) -> Result<Option<GhWriteReceipt>, StoreError> {
     connection
         .query_row(
-            "SELECT intent_id,request_key,operation,repository,target,profile_id,role,
-                    request_digest,lifecycle,attempts,remote_database_id,remote_node_id,
-                    remote_url,last_error,created_at,updated_at,payload
+            "SELECT intent_id,operation,repository,target,profile_id,role,
+                    lifecycle,attempts,remote_database_id,
+                    last_error,created_at,payload
              FROM write_intents WHERE intent_id=?1 AND request_key IS NOT NULL",
             [intent_id],
             |row| {
                 Ok(GhWriteReceipt {
                     intent_id: row.get(0)?,
-                    request_key: row.get(1)?,
-                    operation: row.get(2)?,
-                    repository: row.get(3)?,
-                    target: row.get(4)?,
-                    profile_id: row.get(5)?,
-                    role: row.get(6)?,
-                    request_digest: row.get(7)?,
-                    lifecycle: row.get(8)?,
-                    attempts: sqlite_i64_to_u64(row.get(9)?, "write attempts")?,
-                    remote_database_id: row.get(10)?,
-                    remote_node_id: row.get(11)?,
-                    remote_url: row.get(12)?,
-                    last_error: row.get(13)?,
-                    created_at: row.get(14)?,
-                    updated_at: row.get(15)?,
-                    payload: row.get(16)?,
+                    operation: row.get(1)?,
+                    repository: row.get(2)?,
+                    target: row.get(3)?,
+                    profile_id: row.get(4)?,
+                    role: row.get(5)?,
+                    lifecycle: row.get(6)?,
+                    attempts: sqlite_i64_to_u64(row.get(7)?, "write attempts")?,
+                    remote_database_id: row.get(8)?,
+                    last_error: row.get(9)?,
+                    created_at: row.get(10)?,
+                    payload: row.get(11)?,
                 })
             },
         )
@@ -295,9 +278,9 @@ fn implementation_request_receipt_on(
     };
     connection
         .query_row(
-            "SELECT comment_database_id,comment_node_id,issue_node_id,issue_number,issue_title,
-                    base_ref,head_ref,pr_profile_id,bootstrap_authored_at,bootstrap_commit_sha,
-                    pull_request_database_id,pull_request_node_id,pull_request_number,stage
+            "SELECT comment_database_id,issue_number,issue_title,
+                    base_ref,head_ref,pr_profile_id,bootstrap_authored_at,
+                    pull_request_number,stage
              FROM implementation_requests WHERE intent_id=?1",
             [intent_id],
             |row| {
@@ -307,25 +290,17 @@ fn implementation_request_receipt_on(
                         row.get(0)?,
                         "Implementation Request comment ID",
                     )?,
-                    comment_node_id: row.get(1)?,
-                    issue_node_id: row.get(2)?,
-                    issue_number: sqlite_i64_to_u64(row.get(3)?, "Issue number")?,
-                    issue_title: row.get(4)?,
-                    base_ref: row.get(5)?,
-                    head_ref: row.get(6)?,
-                    pr_profile_id: row.get(7)?,
-                    bootstrap_authored_at: row.get(8)?,
-                    bootstrap_commit_sha: row.get(9)?,
-                    pull_request_database_id: row
-                        .get::<_, Option<i64>>(10)?
-                        .map(|value| sqlite_i64_to_u64(value, "pull request database ID"))
-                        .transpose()?,
-                    pull_request_node_id: row.get(11)?,
+                    issue_number: sqlite_i64_to_u64(row.get(1)?, "Issue number")?,
+                    issue_title: row.get(2)?,
+                    base_ref: row.get(3)?,
+                    head_ref: row.get(4)?,
+                    pr_profile_id: row.get(5)?,
+                    bootstrap_authored_at: row.get(6)?,
                     pull_request_number: row
-                        .get::<_, Option<i64>>(12)?
+                        .get::<_, Option<i64>>(7)?
                         .map(|value| sqlite_i64_to_u64(value, "pull request number"))
                         .transpose()?,
-                    stage: row.get(13)?,
+                    stage: row.get(8)?,
                 })
             },
         )

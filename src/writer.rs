@@ -52,7 +52,7 @@ pub async fn create_comment(
             validate_request_id(&request_id)?;
             request_id
         }
-        None => digest(&body),
+        None => body.clone(),
     };
     let request_key = format!(
         "comment_create\0{}\0{}\0{}\0{}",
@@ -204,12 +204,6 @@ async fn prepare_pull_request(
             pr_profile_id: profile.id.clone(),
         })
         .map_err(Into::into)
-}
-
-pub fn receipt(store: &StoreActor, intent_id: &str) -> Result<GhWriteReceipt> {
-    store
-        .gh_write_receipt(intent_id.to_owned())?
-        .with_context(|| format!("unknown braid gh receipt {intent_id}"))
 }
 
 fn require_configured_repository(config: &Config, target: &WorkItemLocator) -> Result<()> {
@@ -378,7 +372,10 @@ fn record_pr_activation(
     store
         .ingest_event(
             IngressEvent {
-                delivery_guid: format!("braid-pr-ensure-{}", receipt.write.intent_id),
+                delivery_guid: format!(
+                    "braid-pr-ensure-{repository}-{}",
+                    receipt.comment_database_id
+                ),
                 event_name: "braid".into(),
                 action: Some("pr_ensure".into()),
                 repository_node_id: github.identity().repository_node_id.clone(),
@@ -388,9 +385,9 @@ fn record_pr_activation(
                 work_item_number: Some(pull_request.number),
                 work_item_state: Some(pull_request.state.clone()),
                 object_node_id: None,
-                object_version: Some(receipt.write.request_digest.clone()),
+                object_version: None,
                 object_digest: None,
-                content_digest: None,
+                visible_body: None,
                 actor_node_id: Some(github.identity().actor_node_id.clone()),
                 actor_login: Some(github.identity().actor_login.clone()),
                 classification: "wake",
@@ -536,23 +533,23 @@ async fn claim_or_wait(store: &StoreActor, intent_id: &str) -> Result<Claim> {
     for _ in 0..CLAIM_POLLS {
         let receipt = store
             .gh_write_receipt(intent_id.to_owned())?
-            .with_context(|| format!("write receipt {intent_id} disappeared"))?;
+            .context("Braid write state disappeared while waiting for convergence")?;
         match receipt.lifecycle.as_str() {
             "applied" => return Ok(Claim::Done(receipt)),
             "rejected" | "conflict" | "ambiguous" => {
                 bail!(
-                    "braid gh write {} is {}: {}",
-                    receipt.intent_id,
+                    "braid gh {} for {} is {}: {}",
+                    receipt.operation,
+                    receipt.target,
                     receipt.lifecycle,
                     receipt.last_error.as_deref().unwrap_or("no detail")
                 );
             }
             "pending" | "uncertain" | "sending" => {
                 if store.claim_gh_write(intent_id.to_owned())? {
-                    let claimed =
-                        store.gh_write_receipt(intent_id.to_owned())?.with_context(|| {
-                            format!("claimed write receipt {intent_id} disappeared")
-                        })?;
+                    let claimed = store
+                        .gh_write_receipt(intent_id.to_owned())?
+                        .context("claimed Braid write state disappeared")?;
                     return Ok(Claim::Owned(claimed));
                 }
             }
@@ -560,7 +557,7 @@ async fn claim_or_wait(store: &StoreActor, intent_id: &str) -> Result<Claim> {
         }
         tokio::time::sleep(CLAIM_POLL_INTERVAL).await;
     }
-    bail!("timed out waiting for concurrent braid gh write {intent_id}")
+    bail!("timed out waiting for a concurrent braid gh write to converge")
 }
 
 struct RemoteWrite {
@@ -627,13 +624,16 @@ fn settle_write(store: &StoreActor, intent_id: &str, result: WriteResult) -> Res
 }
 
 fn completed_receipt(store: &StoreActor, intent_id: &str) -> Result<GhWriteReceipt> {
-    let receipt = receipt(store, intent_id)?;
+    let receipt = store
+        .gh_write_receipt(intent_id.to_owned())?
+        .context("Braid write state disappeared before completion")?;
     if receipt.lifecycle == "applied" {
         Ok(receipt)
     } else {
         bail!(
-            "braid gh write {} is {}: {}",
-            receipt.intent_id,
+            "braid gh {} for {} is {}: {}",
+            receipt.operation,
+            receipt.target,
             receipt.lifecycle,
             receipt.last_error.as_deref().unwrap_or("no detail")
         )
@@ -646,13 +646,13 @@ fn completed_implementation_receipt(
 ) -> Result<ImplementationRequestReceipt> {
     let receipt = store
         .implementation_request_receipt(intent_id.to_owned())?
-        .with_context(|| format!("Implementation Request receipt {intent_id} disappeared"))?;
+        .context("Implementation Request state disappeared before completion")?;
     if receipt.write.lifecycle == "applied" {
         Ok(receipt)
     } else {
         bail!(
-            "braid gh pr ensure {} is {}: {}",
-            receipt.write.intent_id,
+            "braid gh pr ensure for Issue #{} is {}: {}",
+            receipt.issue_number,
             receipt.write.lifecycle,
             receipt.write.last_error.as_deref().unwrap_or("no detail")
         )

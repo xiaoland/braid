@@ -189,18 +189,18 @@ braid gh comment create owner/repository#123 \
 
 braid gh pr ensure --comment 123456789 \
   --config /absolute/path/to/braid.toml
-
-braid gh receipt 019... --config /absolute/path/to/braid.toml
 ```
 
 `comment create` derives the public role from the canonical Issue/PR target and
 the Profile tags. The writer prepends one attribution block and removes exact
 repetitions of that generated block from the start of the supplied body, so a
-caller retry or model mistake cannot duplicate it. `--request-id`
-is optional and defaults to the attributed body digest, while supplying it
-allows the Agent to make its retry identity explicit. Receipts expose bounded
-operation/target/Profile/lifecycle/remote-reference evidence and do not echo
-the comment payload. `pr ensure` accepts an optional explicit `--head`, then the
+caller retry or model mistake cannot duplicate it. `--request-id` is optional;
+exact attributed body content provides the fallback retry identity, while an
+explicit value lets the Agent name retry intent. Command results expose only
+bounded operation/target/Profile/lifecycle and semantic GitHub comment/PR
+references. Internal write IDs, node IDs, digests, and retry counters remain in
+SQLite and never enter Agent tool output. `pr ensure` accepts an optional
+explicit `--head`, then the
 sole same-repository Development branch, then its deterministic
 request-comment-derived branch.
 

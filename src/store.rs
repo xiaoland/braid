@@ -26,7 +26,7 @@ use gh_writes::{
     prepare_gh_write, prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 10;
+pub const DATABASE_SCHEMA_VERSION: u32 = 11;
 
 const INITIAL_SQL: &str = include_str!("../migrations/0001_initial.sql");
 const CONTEXT_LEDGER_SQL: &str = include_str!("../migrations/0002_context_ledger.sql");
@@ -40,6 +40,8 @@ const BRAID_GH_SQL: &str = include_str!("../migrations/0008_braid_gh.sql");
 const PR_AGENT_WORKTREE_SQL: &str = include_str!("../migrations/0009_pr_agent_worktree.sql");
 const CROSS_SURFACE_CONTEXT_SQL: &str =
     include_str!("../migrations/0010_cross_surface_context.sql");
+const SEMANTIC_CONTEXT_IDENTITY_SQL: &str =
+    include_str!("../migrations/0011_semantic_context_identity.sql");
 const MIGRATIONS: &[Migration] = &[
     Migration { version: 1, name: "initial", sql: INITIAL_SQL },
     Migration { version: 2, name: "context-ledger", sql: CONTEXT_LEDGER_SQL },
@@ -51,6 +53,11 @@ const MIGRATIONS: &[Migration] = &[
     Migration { version: 8, name: "braid-gh", sql: BRAID_GH_SQL },
     Migration { version: 9, name: "pr-agent-worktree", sql: PR_AGENT_WORKTREE_SQL },
     Migration { version: 10, name: "cross-surface-context", sql: CROSS_SURFACE_CONTEXT_SQL },
+    Migration {
+        version: 11,
+        name: "semantic-context-identity",
+        sql: SEMANTIC_CONTEXT_IDENTITY_SQL,
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -133,7 +140,7 @@ pub struct IngressEvent {
     pub object_node_id: Option<String>,
     pub object_version: Option<String>,
     pub object_digest: Option<String>,
-    pub content_digest: Option<String>,
+    pub visible_body: Option<String>,
     pub actor_node_id: Option<String>,
     pub actor_login: Option<String>,
     pub classification: &'static str,
@@ -248,7 +255,6 @@ pub struct CanonicalObjectState {
     pub lifecycle: String,
     pub author_node_id: Option<String>,
     pub author_login: Option<String>,
-    pub content_digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -295,7 +301,6 @@ pub struct TurnClaim {
     pub repository: String,
     pub work_item_kind: String,
     pub number: u64,
-    pub context_revision: String,
     pub profile_id: String,
     pub references: Vec<String>,
     pub trusted_mention: bool,
@@ -417,7 +422,7 @@ pub struct AssociatedWorkItem {
     pub kind: &'static str,
     pub number: u64,
     pub state: String,
-    pub content_digest: Option<String>,
+    pub visible_description: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -425,7 +430,7 @@ pub struct AssociationSet {
     pub anchor_node_id: String,
     pub anchor_kind: &'static str,
     pub observed_version: String,
-    pub anchor_content_digest: Option<String>,
+    pub anchor_visible_description: Option<String>,
     pub related: Vec<AssociatedWorkItem>,
 }
 
@@ -1971,26 +1976,28 @@ fn reconcile_associations(database: &Path, update: &AssociationSet) -> Result<()
             (related.node_id.as_str(), update.anchor_node_id.as_str())
         };
         active_pairs.insert((issue_node_id.to_owned(), pr_node_id.to_owned()));
-        let issue_content_digest = if update.anchor_kind == "issue" {
-            update.anchor_content_digest.as_deref()
+        let issue_visible_description = if update.anchor_kind == "issue" {
+            update.anchor_visible_description.as_deref()
         } else {
-            related.content_digest.as_deref()
+            related.visible_description.as_deref()
         };
         transaction.execute(
-            "INSERT INTO associations(
-               issue_node_id,pr_node_id,source,observed_version,active,issue_content_digest
-             ) VALUES (?1,?2,'native',?3,1,?4)
+            "INSERT INTO associations(issue_node_id,pr_node_id,source,observed_version,active)
+             VALUES (?1,?2,'native',?3,1)
              ON CONFLICT(issue_node_id,pr_node_id) DO UPDATE SET
                source='native',
                observed_version=excluded.observed_version,
-               issue_content_digest=CASE
-                 WHEN associations.active=0 THEN excluded.issue_content_digest
-                 ELSE COALESCE(associations.issue_content_digest,
-                               excluded.issue_content_digest)
-               END,
                active=1",
-            params![issue_node_id, pr_node_id, update.observed_version, issue_content_digest],
+            params![issue_node_id, pr_node_id, update.observed_version],
         )?;
+        if let Some(visible_description) = issue_visible_description {
+            transaction.execute(
+                "INSERT OR IGNORE INTO issue_context_sources(
+                   issue_node_id,visible_description,observed_at
+                 ) VALUES (?1,?2,?3)",
+                params![issue_node_id, visible_description, observed_at],
+            )?;
+        }
     }
     let anchor_column = if update.anchor_kind == "issue" { "issue_node_id" } else { "pr_node_id" };
     let query = format!(
@@ -2180,9 +2187,8 @@ fn ingest_event(
         };
         transaction.execute(
             "INSERT INTO canonical_objects(
-               node_id,work_item_node_id,object_kind,version,digest,lifecycle,observed_at,
-               content_digest
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?9)
+               node_id,work_item_node_id,object_kind,version,digest,lifecycle,observed_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(node_id) DO UPDATE SET
                work_item_node_id=excluded.work_item_node_id,
                object_kind=excluded.object_kind,
@@ -2193,8 +2199,7 @@ fn ingest_event(
                  ELSE excluded.digest
                END,
                lifecycle=excluded.lifecycle,
-               observed_at=excluded.observed_at,
-               content_digest=COALESCE(excluded.content_digest,canonical_objects.content_digest)",
+               observed_at=excluded.observed_at",
             params![
                 node_id,
                 work_item_node_id,
@@ -2204,7 +2209,6 @@ fn ingest_event(
                 lifecycle,
                 now,
                 i64::from(event.delivery_guid.starts_with("reconcile-")),
-                event.content_digest,
             ],
         )?;
     }
@@ -2264,9 +2268,18 @@ fn schedule_cross_surface_invalidations(
     let Some(issue_node_id) = source.work_item_node_id.as_deref() else {
         return Ok(());
     };
-    let Some(content_digest) = source.content_digest.as_deref() else {
+    let Some(visible_description) = source.visible_body.as_deref() else {
         return Ok(());
     };
+    let previous = transaction
+        .query_row(
+            "SELECT visible_description FROM issue_context_sources WHERE issue_node_id=?1",
+            [issue_node_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let changed =
+        previous.as_deref().map_or(source.origin == "external", |body| body != visible_description);
     let targets = {
         let mut statement = transaction.prepare(
             "SELECT pr.node_id,r.name_with_owner,pr.number
@@ -2275,17 +2288,15 @@ fn schedule_cross_surface_invalidations(
              JOIN repositories r ON r.node_id=pr.repository_node_id
              JOIN assignments a ON a.work_item_node_id=pr.node_id AND a.lifecycle='active'
              WHERE edge.issue_node_id=?1 AND edge.active=1 AND lower(pr.state)='open'
-               AND edge.issue_content_digest IS NOT NULL
-               AND edge.issue_content_digest<>?2
              ORDER BY r.name_with_owner,pr.number",
         )?;
         statement
-            .query_map(params![issue_node_id, content_digest], |row| {
+            .query_map([issue_node_id], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
             })?
             .collect::<Result<Vec<_>, _>>()?
     };
-    for (pr_node_id, repository, number) in targets {
+    for (pr_node_id, repository, number) in targets.into_iter().filter(|_| changed) {
         let event_id = Uuid::now_v7().to_string();
         let dedupe_key = hex::encode(Sha256::digest(
             format!("braid-cross-surface-v1\0{source_event_id}\0{pr_node_id}").as_bytes(),
@@ -2318,9 +2329,12 @@ fn schedule_cross_surface_invalidations(
         }
     }
     transaction.execute(
-        "UPDATE associations SET issue_content_digest=?2
-         WHERE issue_node_id=?1 AND active=1",
-        params![issue_node_id, content_digest],
+        "INSERT INTO issue_context_sources(issue_node_id,visible_description,observed_at)
+         VALUES (?1,?2,?3)
+         ON CONFLICT(issue_node_id) DO UPDATE SET
+           visible_description=excluded.visible_description,
+           observed_at=excluded.observed_at",
+        params![issue_node_id, visible_description, now],
     )?;
     Ok(())
 }
@@ -2932,7 +2946,7 @@ fn canonical_objects(
     let connection = open_read_only(database)?;
     let mut statement = connection.prepare(
         "SELECT node_id,database_id,object_kind,version,digest,lifecycle,
-                author_node_id,author_login,content_digest
+                author_node_id,author_login
          FROM canonical_objects WHERE work_item_node_id=?1
          ORDER BY object_kind,node_id",
     )?;
@@ -2946,7 +2960,6 @@ fn canonical_objects(
             lifecycle: row.get(5)?,
             author_node_id: row.get(6)?,
             author_login: row.get(7)?,
-            content_digest: row.get(8)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -4395,7 +4408,6 @@ fn claim_runnable_turn(
         repository,
         work_item_kind: selected_work_item_kind,
         number,
-        context_revision,
         profile_id,
         references,
         trusted_mention,
@@ -4505,8 +4517,7 @@ fn claim_urgent_steer(database: &Path, turn_id: &str) -> Result<Option<TurnClaim
     let selected = connection
         .query_row(
             "SELECT b.batch_id,ps.provider_session_id,
-                    r.name_with_owner,w.kind,w.number,
-                    COALESCE(w.context_revision,ps.context_revision),ai.profile_id
+                    r.name_with_owner,w.kind,w.number,ai.profile_id
              FROM turns t
              JOIN provider_sessions ps ON ps.session_id=t.session_id
              JOIN agent_instances ai ON ai.agent_id=ps.agent_id
@@ -4526,20 +4537,12 @@ fn claim_urgent_steer(database: &Path, turn_id: &str) -> Result<Option<TurnClaim
                     row.get::<_, String>(3)?,
                     sqlite_i64_to_u64(row.get(4)?, "steer Work Item number")?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((
-        batch_id,
-        provider_session_id,
-        repository,
-        work_item_kind,
-        number,
-        context_revision,
-        profile_id,
-    )) = selected
+    let Some((batch_id, provider_session_id, repository, work_item_kind, number, profile_id)) =
+        selected
     else {
         return Ok(None);
     };
@@ -4551,7 +4554,6 @@ fn claim_urgent_steer(database: &Path, turn_id: &str) -> Result<Option<TurnClaim
         repository,
         work_item_kind,
         number,
-        context_revision,
         profile_id,
         references,
         trusted_mention,

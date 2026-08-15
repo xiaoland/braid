@@ -125,12 +125,27 @@ fi
 /usr/bin/grep -q 'Codex app-server' "$temporary_root/doctor.json"
 
 schema=$(run_clean "$braid" status --config "$config" --json | /usr/bin/sed -n 's/.*"schema_version": \([0-9][0-9]*\).*/\1/p')
-test "$schema" = "10"
+test "$schema" = "11"
 
 v1="$runtime/state/v1.sqlite3"
 /usr/bin/sqlite3 "$v1" < "$repository_root/migrations/0001_initial.sql"
 v1_checksum=$(/usr/bin/shasum -a 256 "$repository_root/migrations/0001_initial.sql" | /usr/bin/awk '{print $1}')
 /usr/bin/sqlite3 "$v1" "INSERT INTO schema_migrations VALUES (1,'initial','$v1_checksum','fixture');"
+/usr/bin/sqlite3 "$v1" "
+INSERT INTO repositories(node_id,name_with_owner,observed_at)
+VALUES ('REPOSITORY_NODE','xiaoland/braid','fixture');
+INSERT INTO work_items(node_id,repository_node_id,kind,number,state,observed_at)
+VALUES ('ISSUE_NODE','REPOSITORY_NODE','issue',9001,'OPEN','fixture'),
+       ('PR_NODE','REPOSITORY_NODE','pr',9002,'OPEN','fixture');
+INSERT INTO associations(issue_node_id,pr_node_id,source,observed_version,active)
+VALUES ('ISSUE_NODE','PR_NODE','native','fixture',1);
+INSERT INTO canonical_objects(
+  node_id,work_item_node_id,object_kind,version,digest,lifecycle,observed_at
+) VALUES (
+  'COMMENT_NODE','ISSUE_NODE','issue_comment','fixture',
+  '0000000000000000000000000000000000000000000000000000000000000000',
+  'active','fixture'
+);"
 v1_config="$temporary_root/v1.toml"
 write_config "$v1_config" "$v1" 1.0 43189
 backup_count_before=$(find "$runtime/state/backups" -type f -name '*.sqlite3' | wc -l | tr -d ' ')
@@ -138,17 +153,29 @@ run_clean "$braid" migrate apply --config "$v1_config"
 backup_count_after=$(find "$runtime/state/backups" -type f -name '*.sqlite3' | wc -l | tr -d ' ')
 test "$backup_count_after" = "$((backup_count_before + 1))"
 v1_schema=$(run_clean "$braid" status --config "$v1_config" --json | /usr/bin/sed -n 's/.*"schema_version": \([0-9][0-9]*\).*/\1/p')
-test "$v1_schema" = "10"
+test "$v1_schema" = "11"
+/usr/bin/sqlite3 "$v1" \
+    "SELECT 1 FROM associations WHERE issue_node_id='ISSUE_NODE' AND pr_node_id='PR_NODE' AND active=1;" \
+    | /usr/bin/grep -q '^1$'
+/usr/bin/sqlite3 "$v1" \
+    "SELECT 1 FROM canonical_objects WHERE node_id='COMMENT_NODE' AND lifecycle='active';" \
+    | /usr/bin/grep -q '^1$'
+test "$(/usr/bin/sqlite3 "$v1" "SELECT count(*) FROM issue_context_sources;")" = "0"
+if /usr/bin/sqlite3 "$v1" "SELECT issue_content_digest FROM associations LIMIT 1;" \
+    >"$temporary_root/removed-column.out" 2>&1; then
+    echo "schema 11 retained the obsolete association digest column" >&2
+    exit 1
+fi
 
 newer="$runtime/state/newer.sqlite3"
-/usr/bin/sqlite3 "$newer" 'CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (11,"future","0000000000000000000000000000000000000000000000000000000000000000","future");'
+/usr/bin/sqlite3 "$newer" 'CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (12,"future","0000000000000000000000000000000000000000000000000000000000000000","future");'
 newer_config="$temporary_root/newer.toml"
 write_config "$newer_config" "$newer" 1.0 43189
 if run_clean "$braid" migrate plan --config "$newer_config" > "$temporary_root/newer.out" 2>&1; then
     echo "schema-newer fixture was accepted unexpectedly" >&2
     exit 1
 fi
-/usr/bin/grep -q 'schema 11 is newer' "$temporary_root/newer.out"
+/usr/bin/grep -q 'schema 12 is newer' "$temporary_root/newer.out"
 
 foreign="$runtime/state/foreign.sqlite3"
 /usr/bin/sqlite3 "$foreign" 'CREATE TABLE prototype_state(id INTEGER PRIMARY KEY);'

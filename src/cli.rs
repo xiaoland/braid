@@ -114,7 +114,6 @@ enum GhCommand {
         #[command(subcommand)]
         command: GhPrCommand,
     },
-    Receipt(GhReceiptArguments),
 }
 
 #[derive(Debug, Subcommand)]
@@ -232,16 +231,6 @@ struct GhPrEnsure {
 }
 
 #[derive(Debug, Args)]
-struct GhReceiptArguments {
-    #[arg(value_name = "RECEIPT_ID")]
-    receipt_id: String,
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Debug, Args)]
 struct ServeArguments {
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
@@ -258,9 +247,33 @@ struct ServeArguments {
 struct ContextReport<'a> {
     target: &'a WorkItemLocator,
     profile: &'a str,
-    revision: &'a str,
     bytes: usize,
     pressure: ContextPressure,
+}
+
+#[derive(Debug, Serialize)]
+struct CommentWriteResult<'a> {
+    operation: &'a str,
+    state: &'a str,
+    target: &'a str,
+    profile: &'a str,
+    role: &'a str,
+    comment: Option<String>,
+    error: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct PullRequestEnsureResult<'a> {
+    operation: &'static str,
+    state: &'a str,
+    stage: &'a str,
+    implementation_request_comment: u64,
+    issue: String,
+    base: &'a str,
+    head: &'a str,
+    profile: &'a str,
+    pull_request: Option<String>,
+    error: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -345,42 +358,55 @@ async fn gh(command: GhCommand) -> Result<()> {
             )
             .await?;
             if arguments.json {
-                print_json(&receipt)?;
+                print_json(&PullRequestEnsureResult {
+                    operation: "pr_ensure",
+                    state: &receipt.write.lifecycle,
+                    stage: &receipt.stage,
+                    implementation_request_comment: receipt.comment_database_id,
+                    issue: format!("{}#{}", receipt.write.repository, receipt.issue_number),
+                    base: &receipt.base_ref,
+                    head: &receipt.head_ref,
+                    profile: &receipt.pr_profile_id,
+                    pull_request: receipt
+                        .pull_request_number
+                        .map(|number| format!("{}#{number}", receipt.write.repository)),
+                    error: receipt.write.last_error.as_deref(),
+                })?;
             } else {
-                println!("receipt: {}", receipt.write.intent_id);
                 println!("state: {} / {}", receipt.write.lifecycle, receipt.stage);
                 println!("Implementation Request: {}", receipt.write.target);
                 println!("head: {}", receipt.head_ref);
-                if let Some(url) = &receipt.write.remote_url {
-                    println!("PR: {url}");
-                }
-                if let Some(sha) = &receipt.bootstrap_commit_sha {
-                    println!("bootstrap commit: {sha}");
+                if let Some(number) = receipt.pull_request_number {
+                    println!("PR: {}#{number}", receipt.write.repository);
                 }
                 println!("PR Profile: {}", receipt.pr_profile_id);
             }
             Ok(())
-        }
-        GhCommand::Receipt(arguments) => {
-            let config = load(&arguments.config)?;
-            let actor = store(&config)?;
-            let receipt = writer::receipt(&actor, &arguments.receipt_id)?;
-            print_gh_receipt(&receipt, arguments.json)
         }
     }
 }
 
 fn print_gh_receipt(receipt: &crate::store::GhWriteReceipt, json: bool) -> Result<()> {
     if json {
-        print_json(receipt)?;
+        print_json(&CommentWriteResult {
+            operation: &receipt.operation,
+            state: &receipt.lifecycle,
+            target: &receipt.target,
+            profile: &receipt.profile_id,
+            role: &receipt.role,
+            comment: receipt
+                .remote_database_id
+                .as_ref()
+                .map(|id| format!("{}#issuecomment-{id}", receipt.repository)),
+            error: receipt.last_error.as_deref(),
+        })?;
     } else {
-        println!("receipt: {}", receipt.intent_id);
         println!("operation: {}", receipt.operation);
         println!("state: {}", receipt.lifecycle);
         println!("target: {}", receipt.target);
         println!("Profile: {} ({})", receipt.profile_id, receipt.role);
-        if let Some(url) = &receipt.remote_url {
-            println!("GitHub: {url}");
+        if let Some(id) = &receipt.remote_database_id {
+            println!("GitHub comment: {}#issuecomment-{id}", receipt.repository);
         }
         if let Some(error) = &receipt.last_error {
             println!("error: {error}");
@@ -439,7 +465,6 @@ async fn context(command: ContextCommand) -> Result<()> {
         print_json(&ContextReport {
             target: &locator,
             profile: &profile.id,
-            revision: &rendered.revision,
             bytes: rendered.bytes,
             pressure: rendered.pressure,
         })?;

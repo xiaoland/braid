@@ -222,7 +222,7 @@ pub struct CanonicalObservation {
     pub author_node_id: Option<String>,
     pub author_login: Option<String>,
     pub body: Option<String>,
-    pub content_digest: Option<String>,
+    pub visible_body: Option<String>,
 }
 
 pub async fn materialize_issue(
@@ -341,7 +341,7 @@ pub fn reconcile_local_state(
                 anchor_node_id: pull_request.node_id.clone(),
                 anchor_kind: "pr",
                 observed_version: pull_request.updated_at.clone(),
-                anchor_content_digest: None,
+                anchor_visible_description: None,
                 related: pull_request
                     .associated_issues
                     .iter()
@@ -352,7 +352,7 @@ pub fn reconcile_local_state(
                         kind: "issue",
                         number: issue.number,
                         state: issue.state.clone(),
-                        content_digest: Some(visible_content_digest(&issue.body)),
+                        visible_description: Some(filter_html_comments(&issue.body)),
                     })
                     .collect(),
             })?;
@@ -471,7 +471,7 @@ fn issue_observation(issue: &IssueSnapshot) -> CanonicalObservation {
         author_node_id: issue.author.as_ref().map(|author| author.node_id.clone()),
         author_login: issue.author.as_ref().map(|author| author.login.clone()),
         body: Some(issue.body.clone()),
-        content_digest: Some(visible_content_digest(&issue.body)),
+        visible_body: Some(filter_html_comments(&issue.body)),
     }
 }
 
@@ -492,7 +492,7 @@ fn pull_request_observation(pull_request: &PullRequestSnapshot) -> CanonicalObse
         author_node_id: pull_request.author.as_ref().map(|author| author.node_id.clone()),
         author_login: pull_request.author.as_ref().map(|author| author.login.clone()),
         body: Some(pull_request.body.clone()),
-        content_digest: Some(visible_content_digest(&pull_request.body)),
+        visible_body: Some(filter_html_comments(&pull_request.body)),
     }
 }
 
@@ -524,7 +524,7 @@ fn review_observation(
         author_node_id: review.author.as_ref().map(|author| author.node_id.clone()),
         author_login: review.author.as_ref().map(|author| author.login.clone()),
         body: Some(review.body.clone()),
-        content_digest: Some(visible_content_digest(&review.body)),
+        visible_body: Some(filter_html_comments(&review.body)),
     }
 }
 
@@ -558,7 +558,7 @@ fn review_thread_observation(
         author_node_id: thread.resolved_by.as_ref().map(|author| author.node_id.clone()),
         author_login: thread.resolved_by.as_ref().map(|author| author.login.clone()),
         body: None,
-        content_digest: None,
+        visible_body: None,
     }
 }
 
@@ -584,7 +584,7 @@ fn observation(
         author_node_id: comment.author.as_ref().map(|author| author.node_id.clone()),
         author_login: comment.author.as_ref().map(|author| author.login.clone()),
         body: comment.body.clone(),
-        content_digest: comment.body.as_deref().map(visible_content_digest),
+        visible_body: comment.body.as_deref().map(filter_html_comments),
     }
 }
 
@@ -610,7 +610,7 @@ fn pr_observation(
         author_node_id: comment.author.as_ref().map(|author| author.node_id.clone()),
         author_login: comment.author.as_ref().map(|author| author.login.clone()),
         body: comment.body.clone(),
-        content_digest: comment.body.as_deref().map(visible_content_digest),
+        visible_body: comment.body.as_deref().map(filter_html_comments),
     }
 }
 
@@ -663,7 +663,7 @@ fn reconcile_issue_comments(
         anchor_node_id: issue.node_id.clone(),
         anchor_kind: "issue",
         observed_version: issue.updated_at.clone(),
-        anchor_content_digest: Some(visible_content_digest(&issue.body)),
+        anchor_visible_description: Some(filter_html_comments(&issue.body)),
         related: issue
             .associated_prs
             .iter()
@@ -674,7 +674,7 @@ fn reconcile_issue_comments(
                 kind: "pr",
                 number: pull_request.number,
                 state: pull_request.state.clone(),
-                content_digest: None,
+                visible_description: None,
             })
             .collect(),
     })?;
@@ -890,11 +890,11 @@ fn render_pull_request(output: &mut String, pull_request: &PullRequestSnapshot) 
     if !pull_request.review_threads.is_empty() {
         push_section(output, "Review Threads");
         for thread in &pull_request.review_threads {
-            push_line(output, &format!("### Review thread: {}", thread.node_id));
             let mut location = thread.path.clone();
             if let Some(line) = thread.line {
                 let _ = write!(location, ":{line}");
             }
+            push_line(output, &format!("### Review thread at {location}"));
             push_line(output, &format!("Location: {location}"));
             let mut states = Vec::new();
             if thread.resolved {
@@ -1109,10 +1109,6 @@ pub fn filter_html_comments(markdown: &str) -> String {
     }
     visible.push_str(&markdown[cursor..]);
     visible
-}
-
-pub fn visible_content_digest(markdown: &str) -> String {
-    hex::encode(Sha256::digest(filter_html_comments(markdown).as_bytes()))
 }
 
 fn line_offsets(markdown: &str) -> Vec<usize> {
