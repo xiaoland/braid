@@ -225,8 +225,8 @@ Every Braid-owned mutation first commits an immutable write intent. States are
 `rejected`, and `superseded`. A timeout becomes `uncertain`; Braid rereads
 canonical state before retrying. Known-object updates/reactions converge by
 desired state. GitHub creates have no persisted queryable exactly-once key, so
-an uncertain comment create accepts only one matching App author/target/body
-digest/time-window candidate; multiple candidates become `ambiguous`.
+an uncertain comment create accepts only one matching App author, target, exact
+body, and creation-window candidate; multiple candidates become `ambiguous`.
 `pr ensure` additionally reconciles the request comment ID, deterministic head
 ref, bootstrap commit ancestry, open PR head/base, and native associations.
 

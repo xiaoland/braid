@@ -111,19 +111,29 @@ Startup is ordered:
    URL, then update the GitHub App webhook;
 9. mark repository ready for assignment/turn claims.
 
-Supervised task exit changes bounded health and triggers restart/backoff where
-safe; provider/tunnel loss does not terminate the whole runtime or invent Agent
-terminal state. Shutdown stops new claims, settles/fences active operations,
-flushes outbox and OTel within bounded deadlines, restores the prior webhook URL
-after a graceful Quick Tunnel stop, releases leases, and closes SQLite.
+The provider adapter reconnects and resumes compatible sessions where the
+provider contract makes that safe. Any other supervised worker exit makes
+readiness false and stops the runtime rather than leaving a partially live
+process. A provider disconnect never invents an Agent terminal state.
 
-Quick Tunnel URLs are temporary. After ungraceful death the operator checks and
-repairs the App webhook before restart. GitHub does not automatically redeliver
-failed webhooks; reconciliation is the recovery path.
+Shutdown first stops new claims, then gives workers, the GitHub outbox, ingress,
+health, and OTel bounded deadlines before releasing the owner lease and closing
+SQLite. An active turn without provider terminal evidence remains `unknown` on
+the next compatible resume; Braid neither starts a parallel turn nor calls it a
+success or failure.
+
+Quick Tunnel URLs are temporary. A graceful stop restores the prior App webhook
+URL. If the supervised Wrangler child exits unexpectedly, Braid immediately
+marks tunnel health unavailable and attempts the same restoration while the
+local runtime and reconciliation remain available. A failed repair stays
+explicit in health and requires operator action. GitHub does not automatically
+redeliver failed webhooks; reconciliation is the recovery path.
 On networks that block outbound QUIC, the Quick Tunnel supervisor explicitly
 uses Cloudflare's TCP HTTP/2 transport. Readiness requires both cloudflared's
 registered-connection signal and a signed request that traverses the public URL
-back into Braid's verified ingress.
+back into Braid's verified ingress. A registered but publicly unreachable
+account-less tunnel is discarded before any GitHub mutation; Braid retries a
+bounded number of fresh tunnel candidates and remains unready if none verifies.
 
 GitHub exposes no API that creates the App webhook configuration from its
 disabled state. The dedicated App therefore needs a one-time Human-confirmed

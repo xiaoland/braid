@@ -313,6 +313,7 @@ pub fn reconcile_local_state(
         CanonicalContext::Issue(issue) => reconcile_issue_comments(issue, store),
         CanonicalContext::PullRequest(pull_request) => {
             let work_item_digest = pull_request_root_digest(pull_request);
+            let work_item_state = pull_request_work_item_state(pull_request);
             for issue in &mut pull_request.associated_issues {
                 reconcile_issue_comments(issue, store)?;
             }
@@ -324,7 +325,7 @@ pub fn reconcile_local_state(
                 &pull_request.node_id,
                 "pr",
                 pull_request.number,
-                &pull_request.state,
+                &work_item_state,
                 &pull_request.updated_at,
                 &work_item_digest,
                 "pr_comment",
@@ -367,7 +368,7 @@ pub fn reconcile_local_state(
                 &pull_request.node_id,
                 "pr",
                 pull_request.number,
-                &pull_request.state,
+                &work_item_state,
                 &pull_request.updated_at,
                 &work_item_digest,
                 "review_comment",
@@ -480,7 +481,7 @@ fn pull_request_observation(pull_request: &PullRequestSnapshot) -> CanonicalObse
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
-        work_item_state: pull_request.state.clone(),
+        work_item_state: pull_request_work_item_state(pull_request),
         repository_node_id: pull_request.repository_node_id.clone(),
         repository: pull_request.repository.clone(),
         object_node_id: pull_request.node_id.clone(),
@@ -512,7 +513,7 @@ fn review_observation(
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
-        work_item_state: pull_request.state.clone(),
+        work_item_state: pull_request_work_item_state(pull_request),
         repository_node_id: pull_request.repository_node_id.clone(),
         repository: pull_request.repository.clone(),
         object_node_id: review.node_id.clone(),
@@ -546,7 +547,7 @@ fn review_thread_observation(
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
-        work_item_state: pull_request.state.clone(),
+        work_item_state: pull_request_work_item_state(pull_request),
         repository_node_id: pull_request.repository_node_id.clone(),
         repository: pull_request.repository.clone(),
         object_node_id: thread.node_id.clone(),
@@ -598,7 +599,7 @@ fn pr_observation(
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
-        work_item_state: pull_request.state.clone(),
+        work_item_state: pull_request_work_item_state(pull_request),
         repository_node_id: pull_request.repository_node_id.clone(),
         repository: pull_request.repository.clone(),
         object_node_id: comment.node_id.clone(),
@@ -624,6 +625,10 @@ fn comment_identity(comment: &CommentSnapshot) -> (String, String, &'static str)
     );
     let digest = object_digest(&comment.node_id, &version, comment.body.as_deref());
     (version, digest, lifecycle)
+}
+
+pub fn pull_request_work_item_state(pull_request: &PullRequestSnapshot) -> String {
+    if pull_request.merged { "merged".into() } else { pull_request.state.clone() }
 }
 
 fn object_digest(node_id: &str, version: &str, body: Option<&str>) -> String {

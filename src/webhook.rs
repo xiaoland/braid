@@ -170,9 +170,9 @@ fn classify(event_name: &str, action: Option<&str>) -> &'static str {
         ("issue_comment" | "pull_request_review_comment", Some("created"))
         | ("pull_request_review", Some("submitted"))
         | ("pull_request_review_thread", Some("unresolved"))
-        | ("pull_request", Some("synchronize" | "review_requested" | "reopened")) => "wake",
+        | ("pull_request", Some("synchronize" | "review_requested")) => "wake",
         ("issues", Some("assigned" | "unassigned" | "closed" | "reopened"))
-        | ("pull_request", Some("closed")) => "lifecycle",
+        | ("pull_request", Some("closed" | "reopened")) => "lifecycle",
         (
             "issues"
             | "issue_comment"
@@ -208,7 +208,9 @@ fn target(event_name: &str, payload: &Payload, action: Option<&str>) -> Target {
         })
     } else {
         payload.pull_request.as_ref().map(|pull_request| {
-            (pull_request.node_id.clone(), "pr", pull_request.number, pull_request.state.clone())
+            let state =
+                if pull_request.merged { "merged".into() } else { pull_request.state.clone() };
+            (pull_request.node_id.clone(), "pr", pull_request.number, state)
         })
     };
     let object = payload
@@ -445,6 +447,8 @@ struct PullRequest {
     node_id: String,
     number: u64,
     state: String,
+    #[serde(default)]
+    merged: bool,
     updated_at: Option<String>,
     body: Option<String>,
 }

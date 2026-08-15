@@ -13,7 +13,7 @@ through real GitHub Work Items and a clean packaged installation.
 
 `00_clean_install.sh` is the Rust foundation gate. It unpacks the release
 artifact, scrubs Python/PDM/Cargo from the binary's `PATH`, exercises only the
-public CLI, verifies schema 0→10, schema 1→10 with a pre-v10 backup, and
+public CLI, verifies schema 0→11, schema 1→11 with a pre-v11 backup, and
 schema-newer refusal, and uses the adjacent
 bounded OTLP/HTTP capture helper to observe sampling. Its direct SQLite write is
 limited to constructing declared migration-compatibility fixtures; it does not
@@ -159,6 +159,34 @@ BRAID_WEBHOOK_SECRET='temporary-repository-hook-secret' \
 scripts/tests/50_issue_to_pr.sh
 ```
 
-Its PASS is deliberately bounded. Configured and unconfigured direct-`gh`
-origins, PR finalization/reopen/merge, and restart recovery remain unproven
-until later Slice 5/6 increments.
+Its PASS is deliberately bounded. The expanded campaign covers external
+direct-`gh` origin, one close/sleep/reopen cycle, merge retirement, compatible
+idle PR provider/worktree resume, and a separate active Issue turn that becomes
+one neutral `unknown` after Braid restart. A Profile configured from the start
+with a distinct stable Agent GitHub identity and native App assignment remain
+separate capability gaps; changing Profile identity under a running assignment
+correctly fails compatibility instead of silently rebinding it.
+
+`60_operations.sh` is the Slice 6 distribution and operations gate. It requires
+the real acceptance config, matching App webhook secret, current candidate, and
+a declared schema-compatible prior binary. Through public CLI/process/health
+boundaries it packages and clean-installs the candidate, verifies upgrade and
+compatible rollback, exercises graceful SIGTERM, forced-exit owner fencing and
+post-expiry recovery, kills the runtime-owned Quick Tunnel and requires
+automatic App webhook repair, and measures trace-consistent 10% sampling plus
+incident-mode 100% sampling against a bounded OTLP receiver. Active-turn
+unknown is deliberately composed with the real Slice 5/6 campaign rather than
+manufactured in the local operations helper.
+
+If the account-less Cloudflare service is externally unavailable, setting
+`BRAID_TEST_SKIP_TUNNEL=1` runs the remaining independent operations journeys
+and reports `tunnel=unavailable`; that result does not accept the tunnel
+child-death/App-webhook-repair journey. A later unskipped run is still required.
+
+```shell
+BRAID_CONFIG=/absolute/path/to/braid.toml \
+BRAID_BIN=/absolute/path/to/current/braid \
+BRAID_PREVIOUS_BIN=/absolute/path/to/schema-compatible/braid \
+BRAID_WEBHOOK_SECRET='dedicated-app-secret' \
+scripts/tests/60_operations.sh
+```

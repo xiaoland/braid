@@ -124,3 +124,31 @@ Versioning once release artifacts are published.
   outcomes, lifecycle reactions, Agent self-publication, and absence of Braid
   turn mirroring. The PoC uses trusted `@braid` to activate a dormant Issue
   because an ordinary GitHub App is not a standard assignable user.
+- PR Work Items now share the explicit close/finalize/sleep/reopen lifecycle:
+  reopen rebuilds current Context in a fresh provider session while preserving
+  the dedicated worktree, and merge grants one final Finalization Turn before
+  retiring the assignment, Agent, session, and worktree.
+- Canonical Work Item state no longer lets the issue-shaped `closed` state on a
+  merged PR conversation event downgrade the more precise `merged` root state;
+  Finalization therefore observes the real terminal lifecycle.
+- Public Agent Group status now includes the bounded logical turn count used by
+  black-box campaigns to distinguish receipt, wake, and no-wake without relying
+  on model prose or internal database inspection.
+- Runtime supervision now treats unexpected worker exit as a whole-runtime
+  readiness failure, handles SIGTERM and Ctrl-C, applies bounded worker/outbox/
+  ingress/health/OTel shutdown, and preserves active turns as neutral `unknown`
+  on compatible restart instead of creating a parallel turn.
+- Unexpected runtime-owned Quick Tunnel exit now immediately marks bounded
+  health unavailable and attempts to restore the prior GitHub App webhook while
+  reconciliation remains available.
+- Runtime-owned Quick Tunnel startup now treats the registered child as a
+  candidate, verifies its public signed ingress before any App webhook mutation,
+  and discards/retries bounded unreachable candidates instead of publishing a
+  dead temporary URL.
+- Runtime-owned uncertain comment creates reread bounded canonical comments and
+  converge only one exact App-authored body candidate; multiple candidates are
+  an explicit ambiguous write rather than a duplicate retry.
+- `scripts/tests/60_operations.sh` composes clean packaging, schema-compatible
+  rollback, owner fencing, graceful/forced process control, runtime-owned tunnel
+  loss, and measured normal/incident OpenTelemetry sampling through public
+  boundaries.

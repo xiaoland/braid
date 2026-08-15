@@ -37,12 +37,13 @@ def main() -> None:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--minimum-requests", type=int, required=True)
     parser.add_argument("--idle-seconds", type=float, default=1.0)
+    parser.add_argument("--deadline-seconds", type=float, default=15.0)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     CaptureHandler.output = arguments.output
     server = ThreadingHTTPServer(("127.0.0.1", arguments.port), CaptureHandler)
     server.timeout = 0.1
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + arguments.deadline_seconds
     while time.monotonic() < deadline:
         server.handle_request()
         if (
