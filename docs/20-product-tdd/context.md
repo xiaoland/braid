@@ -102,10 +102,12 @@ Agent comments remain included. No hidden marker is required.
 ## Snapshot, Revision, and Version Ordering
 
 The internal snapshot is typed Rust data, not an Agent-facing serialization.
-Version comparison uses canonical GitHub timestamps plus stable object IDs and
-the latest observed lifecycle event. A webhook that arrives after a newer
-canonical reread can be recorded as delivery evidence but cannot regress the
-snapshot.
+Only versions from the same GitHub object shape are ordered. A review-thread
+webhook provides authoritative lifecycle evidence but not the full GraphQL
+thread shape, so Braid applies `resolved`/`unresolved`, rereads the canonical
+thread, and then normalizes its stored projection. It never compares a webhook
+timestamp with a synthesized GraphQL thread version. A late delivery can cause
+an extra canonical reread, but cannot become Agent Context without that reread.
 
 `Context Revision` is an internal exact-content fingerprint used only to fence
 stale provider output and determine session compatibility. This is one of the

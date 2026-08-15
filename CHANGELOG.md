@@ -88,9 +88,9 @@ Versioning once release artifacts are published.
 - The Slice 5 campaign now provisions a temporary free Quick Tunnel and
   repository webhook, exercises a real review comment/thread, and checks an
   active cross-surface replacement without restoring Braid turn mirroring.
-  Candidate `b5f72255e79935526fcbed6bf27c402a1ff74d5936842509579122d69aefa612`
-  passed that expanded gate against closed Issue #57 and PR #58 with one
-  continuation, a preserved worktree, and no operator correction.
+  The schema-v10 candidate passed that expanded gate against closed Issue #57
+  and PR #58 with one continuation, a preserved worktree, and no operator
+  correction.
 - `braid gh comment create` now normalizes an accidentally repeated generated
   attribution prefix to one quote block, and Agent system prompts state that
   callers pass only the message body to that command.
@@ -103,6 +103,14 @@ Versioning once release artifacts are published.
   no longer expose Context fingerprints, GraphQL node IDs, local receipt IDs,
   provider IDs, or other internal correlation values; `braid gh receipt` is
   removed in favor of retrying the semantic write operation itself.
+- Review-thread webhook lifecycle is no longer ordered against the different
+  GraphQL projection shape. Braid accepts `resolved`/`unresolved`, rereads the
+  canonical thread, and normalizes that state without losing the Context
+  replacement or generating a second semantic change.
+- The schema-v11 Slice 5 campaign passed against closed Issue #62 and Draft PR
+  #63: semantic `braid gh` results, concurrent idempotency, exact one-file diff,
+  location-based resolved-thread Context, debounced Associated-Issue
+  invalidation, one continuation, and worktree preservation all converged.
 - The expanded Slice 4 public campaign now proves in-place provider resume plus
   a subsequent debounced Wake, complete soft-pressure Context delivery with one
   Operational Status Comment, and hard-pressure refusal with no provider

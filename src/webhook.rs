@@ -233,10 +233,12 @@ fn target(event_name: &str, payload: &Payload, action: Option<&str>) -> Target {
             })
         })
         .or_else(|| {
-            payload
-                .thread
-                .as_ref()
-                .map(|thread| (thread.node_id.clone(), None, thread.updated_at.clone(), None))
+            payload.thread.as_ref().map(|thread| {
+                let version = thread.updated_at.as_deref().map(|updated_at| {
+                    format!("webhook:{updated_at}:{}", action.unwrap_or("changed"))
+                });
+                (thread.node_id.clone(), None, version, None)
+            })
         })
         .or_else(|| {
             payload.pull_request.as_ref().map(|pull_request| {

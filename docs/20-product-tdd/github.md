@@ -148,16 +148,18 @@ direct associations, and all Context connections.
 
 An object previously observed but now missing becomes a tombstone carrying only
 stable ID, last known author/time metadata, and `deleted`. Local state never
-retains a deleted body as Context. Older webhook payloads are stored as evidence
-but cannot replace a newer canonical digest/version.
+retains a deleted body as Context. Older webhook payloads remain delivery
+evidence. Ordering is applied only where GitHub exposes comparable versions;
+otherwise a lifecycle event causes a canonical reread instead of a guessed
+lexicographic comparison.
 
-Cross-surface description detection is edge-scoped rather than inferred from
-the generic root `updatedAt`: every active native Issue↔PR association stores
-the last observed digest of the Issue description after HTML-comment removal.
-Webhook `issues.edited` uses the exact `changes.body` signal; reconciliation
-compares the current visible digest with the edge cursor. The cursor and any
-derived PR event are committed together, so repeated delivery, a metadata-only
-edit, or another Context read cannot manufacture a second invalidation.
+Cross-surface description detection is Issue-owned rather than inferred from
+the generic root `updatedAt`: Braid compares the exact visible Issue description
+after HTML-comment removal once, then fans a real change out to every active
+direct PR association. Webhook `issues.edited` uses the exact `changes.body`
+signal. The new visible description and any derived PR events are committed
+together, so repeated delivery, a metadata-only edit, or another Context read
+cannot manufacture a second invalidation.
 
 Reconciliation records a previously unseen review thread without creating a
 second Wake: the thread's first visible comment/review delivery already owns

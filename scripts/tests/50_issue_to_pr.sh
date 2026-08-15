@@ -6,6 +6,16 @@ fail() {
     exit 1
 }
 
+require_comment_result() {
+    result=$1
+    if ! printf '%s' "$result" | jq -e \
+        '.state == "applied" and (.comment | type == "string") and
+         (.comment | contains("#issuecomment-"))' >/dev/null; then
+        printf 'Unexpected braid gh comment result:\n%s\n' "$result" >&2
+        fail "comment result omitted its semantic GitHub comment reference"
+    fi
+}
+
 source_config=${BRAID_CONFIG:?BRAID_CONFIG must point to the real acceptance config}
 braid=${BRAID_BIN:-braid}
 repository=${BRAID_TEST_REPOSITORY:-xiaoland/braid}
@@ -116,7 +126,6 @@ wrangler=${BRAID_TEST_WRANGLER:-$(command -v wrangler || true)}
 [ "$source_config" = "${source_config#/}" ] && fail "BRAID_CONFIG must be absolute"
 [ -f "$source_config" ] || fail "BRAID_CONFIG does not exist"
 braid_path=$(command -v "$braid" 2>/dev/null || printf '%s' "$braid")
-candidate_sha256=$(shasum -a 256 "$braid_path" | awk '{print $1}')
 
 pr_profile=$("$braid" config check --config "$source_config" --json | jq -er .default_pr_profile)
 mkdir -p "$runtime_root/state/backups"
@@ -232,9 +241,10 @@ comment_json=$("$braid" gh comment create "$repository#$issue_number" \
     --request-id "slice5-$stamp-implementation-request" \
     --body "Implementation Request: implement the exact bounded file change in this Issue description, verify it, push it, and report concisely on the Draft PR." \
     --json)
+require_comment_result "$comment_json"
 comment_id=$(printf '%s' "$comment_json" | jq -r '.comment | split("#issuecomment-")[1]')
 profile_display=$("$braid" profile inspect --config "$config" --profile "$issue_profile" --json | jq -r .display_name)
-[ -n "$comment_id" ] && [ "$comment_id" != null ] || fail "comment receipt omitted remote comment ID"
+[ -n "$comment_id" ] && [ "$comment_id" != null ] || fail "comment result omitted its GitHub comment reference"
 body=$(gh api "repos/$repository/issues/comments/$comment_id" --jq .body)
 first=$(printf '%s\n' "$body" | sed -n '1p')
 second=$(printf '%s\n' "$body" | sed -n '2p')
@@ -246,6 +256,7 @@ comment_retry_json=$("$braid" gh comment create "$repository#$issue_number" \
     --request-id "slice5-$stamp-implementation-request" \
     --body "Implementation Request: implement the exact bounded file change in this Issue description, verify it, push it, and report concisely on the Draft PR." \
     --json)
+require_comment_result "$comment_retry_json"
 retry_comment_id=$(printf '%s' "$comment_retry_json" | jq -r '.comment | split("#issuecomment-")[1]')
 [ "$retry_comment_id" = "$comment_id" ] || fail "idempotent comment retry created a different comment"
 printf '%s' "$comment_retry_json" | jq -e \
@@ -272,7 +283,7 @@ first_pr=$(jq -r '.pull_request | split("#")[1]' "$temporary_root/ensure-a.json"
 second_pr=$(jq -r '.pull_request | split("#")[1]' "$temporary_root/ensure-b.json")
 [ "$first_pr" = "$second_pr" ] || fail "concurrent pr ensure calls returned different PRs"
 pull_number=$first_pr
-[ "$pull_number" != null ] || fail "pr ensure receipt omitted PR number"
+[ "$pull_number" != null ] || fail "pr ensure result omitted its GitHub PR reference"
 jq -e \
     '(has("write") | not) and (has("intent_id") | not) and (has("request_digest") | not) and (has("pull_request_node_id") | not)' \
     "$temporary_root/ensure-a.json" >/dev/null || fail "PR result leaked internal identifiers"
@@ -429,8 +440,8 @@ review_group=$(latest_pr_group)
 [ "$(printf '%s' "$review_group" | jq -r .worktree_path)" = "$initial_worktree" ] || \
     fail "review Context replacement changed the dedicated worktree"
 "$braid" context pr "$repository#$pull_number" --config "$config" >"$temporary_root/review-context.md"
-grep -q "Review thread: $review_thread_id" "$temporary_root/review-context.md" || \
-    fail "resolved review thread is absent from current PR Context"
+grep -q "Review thread at $fixture_path:1" "$temporary_root/review-context.md" || \
+    fail "resolved review thread location is absent from current PR Context"
 grep -q 'State: resolved' "$temporary_root/review-context.md" || \
     fail "review thread did not render its resolved lifecycle"
 grep -q "$review_hidden_marker" "$temporary_root/review-context.md" && \
@@ -525,9 +536,8 @@ gh api "repos/$repository/issues/$pull_number/comments" --paginate --jq '.[].bod
     fail "an Agent comment contains duplicate generated attribution"
 
 echo "PASS: Slice 5 PR review + review-thread reset + debounced cross-surface invalidation"
-echo "candidate=$($braid --version) sha256=$candidate_sha256"
-echo "repository=$repository issue=$issue_number pr=$pull_number comment=$comment_id receipt=$first_receipt"
-echo "worktree=$worktree_path profile=$pr_profile diff=$fixture_path"
-echo "review_comment=$review_comment_id review_thread=$review_thread_id review_session=$review_reset_session cross_session=$cross_reset_session"
-echo "scope=comment receipt, concurrent idempotency, bootstrap, Draft/native association, PR Profile/session/worktree, exact diff, review wake, review-thread invalidation, debounced Associated-Issue active invalidation, worktree preservation"
+echo "candidate=$($braid --version)"
+echo "repository=$repository issue=$issue_number pr=$pull_number comment=$comment_id"
+echo "profile=$pr_profile diff=$fixture_path worktree=preserved"
+echo "scope=semantic comment result, concurrent idempotency, bootstrap, Draft/native association, PR Profile/session/worktree, exact diff, review wake, review-thread invalidation, debounced Associated-Issue active invalidation"
 echo "UNPROVEN: origin variants, PR finalization/reopen/merge, full Slice 5"

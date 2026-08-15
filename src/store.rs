@@ -2115,7 +2115,7 @@ fn ingest_event(
         event.object_version.as_deref(),
         event.object_digest.as_deref(),
     ) {
-        (Some(_), Some(node_id), Some(version), Some(digest)) => transaction
+        (Some(object_kind), Some(node_id), Some(version), Some(digest)) => transaction
             .query_row(
                 "SELECT version,digest FROM canonical_objects WHERE node_id=?1",
                 [node_id],
@@ -2123,8 +2123,12 @@ fn ingest_event(
             )
             .optional()?
             .is_some_and(|(canonical_version, canonical_digest)| {
-                canonical_version.as_str() > version
-                    || (canonical_version == version && canonical_digest == digest)
+                let duplicate = canonical_version == version && canonical_digest == digest;
+                if object_kind == "review_thread" {
+                    duplicate
+                } else {
+                    canonical_version.as_str() > version || duplicate
+                }
             }),
         _ => false,
     };

@@ -852,6 +852,14 @@ fn reconciled_change(
     });
     match observation.object_kind {
         "issue" | "pr" | "review_thread" if previous.is_none() => ("observed", "no_wake"),
+        "review_thread"
+            if previous.is_some_and(|previous| {
+                previous.lifecycle == observation.lifecycle
+                    && previous.version.starts_with("webhook:")
+            }) =>
+        {
+            ("observed", "no_wake")
+        }
         "review" if previous.is_none() => ("submitted", "wake"),
         "review" if observation.lifecycle == "dismissed" => ("dismissed", "hard_invalidation"),
         "review_thread" if observation.lifecycle == "resolved" => ("resolved", "hard_invalidation"),
