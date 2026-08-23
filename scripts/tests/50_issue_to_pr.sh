@@ -138,7 +138,11 @@ command -v jq >/dev/null 2>&1 || fail "jq is unavailable"
 command -v curl >/dev/null 2>&1 || fail "curl is unavailable"
 command -v git >/dev/null 2>&1 || fail "git is unavailable"
 wrangler=${BRAID_TEST_WRANGLER:-$(command -v wrangler || true)}
-[ -n "$wrangler" ] && [ -x "$wrangler" ] || fail "set BRAID_TEST_WRANGLER to Wrangler"
+tunnel_url=${BRAID_TEST_PUBLIC_WEBHOOK_URL:-}
+tunnel_url=${tunnel_url%/webhook}
+if [ -z "$tunnel_url" ]; then
+    [ -n "$wrangler" ] && [ -x "$wrangler" ] || fail "set BRAID_TEST_WRANGLER to Wrangler"
+fi
 [ -n "${BRAID_WEBHOOK_SECRET:-}" ] || fail "BRAID_WEBHOOK_SECRET is required by the runtime"
 [ "$source_config" = "${source_config#/}" ] && fail "BRAID_CONFIG must be absolute"
 [ -f "$source_config" ] || fail "BRAID_CONFIG does not exist"
@@ -209,16 +213,22 @@ start_runtime() {
     fail "Braid did not become provider-ready"
 }
 
-TUNNEL_TRANSPORT_PROTOCOL=http2 "$wrangler" tunnel quick-start \
-    "http://$ingress_address" >"$tunnel_log" 2>&1 &
-tunnel_pid=$!
-for _ in $(seq 1 90); do
-    tunnel_url=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$tunnel_log" | tail -1 || true)
-    [ -n "$tunnel_url" ] && break
-    kill -0 "$tunnel_pid" 2>/dev/null || fail "Quick Tunnel exited before publishing a URL"
-    sleep 1
-done
-[ -n "${tunnel_url:-}" ] || fail "Quick Tunnel did not publish a URL"
+if [ -n "$tunnel_url" ]; then
+    echo "Using external public webhook URL"
+    tunnel_pid=""
+else
+    TUNNEL_TRANSPORT_PROTOCOL=http2 "$wrangler" tunnel quick-start \
+        "http://$ingress_address" >"$tunnel_log" 2>&1 &
+    tunnel_pid=$!
+    tunnel_url=""
+    for _ in $(seq 1 90); do
+        tunnel_url=$(grep -Eo 'https://[a-z0-9-]+\.(trycloudflare\.com|loca\.lt)' "$tunnel_log" | tail -1 || true)
+        [ -n "$tunnel_url" ] && break
+        kill -0 "$tunnel_pid" 2>/dev/null || fail "Quick Tunnel exited before publishing a URL"
+        sleep 1
+    done
+    [ -n "${tunnel_url:-}" ] || fail "Quick Tunnel did not publish a URL"
+fi
 
 start_runtime
 

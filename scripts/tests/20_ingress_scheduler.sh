@@ -68,8 +68,8 @@ trap cleanup EXIT INT TERM
 [[ "$webhook_mode" == "app" || "$webhook_mode" == "repository" ]] || \
     fail "BRAID_TEST_WEBHOOK_MODE must be app or repository"
 if [[ "$webhook_mode" == "repository" ]]; then
-    [[ "$repository_webhook_url" == https://*.trycloudflare.com/webhook ]] || \
-        fail "repository mode requires BRAID_TEST_PUBLIC_WEBHOOK_URL=https://<quick-tunnel>/webhook"
+    [[ "$repository_webhook_url" == https://*/webhook ]] || \
+        fail "repository mode requires BRAID_TEST_PUBLIC_WEBHOOK_URL=https://<host>/webhook"
 fi
 
 for command in curl gh jq sed mktemp; do

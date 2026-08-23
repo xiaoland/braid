@@ -84,7 +84,11 @@ repository="$($binary config check --config "$config_path" --json | jq -er '.rep
 app_actor="$($binary github probe --config "$config_path" --repository "$repository" --json | jq -er '.actor_login')"
 agent_actor="$(gh api user --jq '.login')"
 wrangler="${BRAID_TEST_WRANGLER:-$(command -v wrangler || true)}"
-[[ -n "$wrangler" && -x "$wrangler" ]] || fail "set BRAID_TEST_WRANGLER to Wrangler"
+tunnel_url="${BRAID_TEST_PUBLIC_WEBHOOK_URL:-}"
+tunnel_url="${tunnel_url%/webhook}"
+if [[ -z "$tunnel_url" ]]; then
+    [[ -n "$wrangler" && -x "$wrangler" ]] || fail "set BRAID_TEST_WRANGLER to Wrangler"
+fi
 candidate_version="$($binary --version)"
 candidate_sha256="$(shasum -a 256 "$binary" | sed 's/ .*//')"
 note "candidate $candidate_version sha256=$candidate_sha256"
@@ -123,17 +127,23 @@ $binary status --config "$test_config" --json | \
     jq -e '.database.schema_version == 11 and .database.supported_schema == 11' >/dev/null || \
     fail "candidate does not expose the expected current schema 11"
 
-note "starting a free HTTP/2 Quick Tunnel"
-TUNNEL_TRANSPORT_PROTOCOL=http2 "$wrangler" tunnel quick-start \
-    "http://$ingress_address" >"$tunnel_log" 2>&1 &
-tunnel_pid=$!
-for _ in $(seq 1 90); do
-    tunnel_url="$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$tunnel_log" | tail -1 || true)"
-    [[ -n "$tunnel_url" ]] && break
-    kill -0 "$tunnel_pid" 2>/dev/null || fail "Quick Tunnel exited before publishing a URL"
-    sleep 1
-done
-[[ -n "${tunnel_url:-}" ]] || fail "Quick Tunnel did not publish a URL"
+if [[ -n "$tunnel_url" ]]; then
+    note "using external public webhook URL"
+    tunnel_pid=""
+else
+    note "starting a free HTTP/2 Quick Tunnel"
+    TUNNEL_TRANSPORT_PROTOCOL=http2 "$wrangler" tunnel quick-start \
+        "http://$ingress_address" >"$tunnel_log" 2>&1 &
+    tunnel_pid=$!
+    tunnel_url=""
+    for _ in $(seq 1 90); do
+        tunnel_url="$(grep -Eo 'https://[a-z0-9-]+\.(trycloudflare\.com|loca\.lt)' "$tunnel_log" | tail -1 || true)"
+        [[ -n "$tunnel_url" ]] && break
+        kill -0 "$tunnel_pid" 2>/dev/null || fail "Quick Tunnel exited before publishing a URL"
+        sleep 1
+    done
+    [[ -n "${tunnel_url:-}" ]] || fail "Quick Tunnel did not publish a URL"
+fi
 
 BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
     --config "$test_config" >"$runtime_log" 2>&1 &

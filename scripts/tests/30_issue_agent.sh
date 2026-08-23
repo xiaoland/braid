@@ -91,7 +91,11 @@ repository="$($binary config check --config "$config_path" --json | jq -er '.rep
 app_actor="$($binary github probe --config "$config_path" --repository "$repository" --json | jq -er '.actor_login')"
 agent_actor="$(gh api user --jq '.login')"
 wrangler="${BRAID_TEST_WRANGLER:-$(command -v wrangler || true)}"
-[[ -n "$wrangler" && -x "$wrangler" ]] || fail "set BRAID_TEST_WRANGLER to Wrangler"
+public_url="${BRAID_TEST_PUBLIC_WEBHOOK_URL:-}"
+public_url="${public_url%/webhook}"
+if [[ -z "$public_url" ]]; then
+    [[ -n "$wrangler" && -x "$wrangler" ]] || fail "set BRAID_TEST_WRANGLER to Wrangler"
+fi
 candidate_version="$($binary --version)"
 candidate_sha256="$(shasum -a 256 "$binary" | sed 's/ .*//')"
 note "candidate $candidate_version sha256=$candidate_sha256"
@@ -126,19 +130,26 @@ $binary status --config "$test_config" --json | \
     jq -e '.database.schema_version == 11 and .database.supported_schema == 11' >/dev/null || \
     fail "candidate does not expose the expected current schema 11"
 
-note "starting a free HTTP/2 Quick Tunnel"
-TUNNEL_TRANSPORT_PROTOCOL=http2 "$wrangler" tunnel quick-start \
-    "http://$ingress_address" --log-level info >"$tunnel_log" 2>&1 &
-tunnel_pid=$!
-public_url=""
-for _ in $(seq 1 60); do
-    public_url="$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$tunnel_log" | head -1 || true)"
-    grep -q 'Registered tunnel connection' "$tunnel_log" 2>/dev/null && \
-        [[ -n "$public_url" ]] && break
-    kill -0 "$tunnel_pid" 2>/dev/null || fail "Quick Tunnel exited during startup"
-    sleep 1
-done
-[[ -n "$public_url" ]] || fail "Quick Tunnel did not publish a URL"
+public_url="${BRAID_TEST_PUBLIC_WEBHOOK_URL:-}"
+public_url="${public_url%/webhook}"
+if [[ -n "$public_url" ]]; then
+    note "using external public webhook URL"
+    tunnel_pid=""
+else
+    note "starting a free HTTP/2 Quick Tunnel"
+    TUNNEL_TRANSPORT_PROTOCOL=http2 "$wrangler" tunnel quick-start \
+        "http://$ingress_address" --log-level info >"$tunnel_log" 2>&1 &
+    tunnel_pid=$!
+    public_url=""
+    for _ in $(seq 1 60); do
+        public_url="$(grep -Eo 'https://[a-z0-9-]+\.(trycloudflare\.com|loca\.lt)' "$tunnel_log" | head -1 || true)"
+        grep -q 'Registered tunnel connection' "$tunnel_log" 2>/dev/null && \
+            [[ -n "$public_url" ]] && break
+        kill -0 "$tunnel_pid" 2>/dev/null || fail "Quick Tunnel exited during startup"
+        sleep 1
+    done
+    [[ -n "$public_url" ]] || fail "Quick Tunnel did not publish a URL"
+fi
 
 note "starting packaged Braid with the real Codex app-server"
 BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
