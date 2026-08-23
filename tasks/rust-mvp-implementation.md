@@ -26,9 +26,12 @@
 - **Campaign Progress**:
   - Slice 0 clean-install ✅ passed.
   - Slice 2 transport/scheduler ✅ passed via localtunnel repository-webhook mode.
-  - Slice 3 Issue Agent: blocked by Codex usage limit. Braid correctly receives webhooks, creates the Issue Agent session, accepts the trusted-mention turn, and starts the provider turn, but Codex returns: "You've hit your usage limit. Upgrade to Pro ... or try again at Aug 27th, 2026 12:56 PM." The ChatGPT/Codex usage page confirms "You're out of Codex and Work usage for now".
-  - Slices 4–6 cannot run until Codex usage is available.
-- **Next Steps / Decision Needed**: Purchase Codex Pro/add credits, or wait for the Aug 27 reset, before the remaining real-provider acceptance campaigns can pass.
+  - Slice 3 Issue Agent: **partial with Pi**. Braid accepts the trusted mention and starts the Issue Agent turn, but Pi (RPC chat mode) cannot apply the GitHub side effects the test requires. The provider seam itself works; a tool-capable provider is needed to complete the slice.
+  - Slices 4–6 not run against a real tool-capable provider since Codex is at quota.
+- **Provider pivot findings**:
+  - Localtunnel strips GitHub's `X-Hub-Signature-256`; a local HMAC-signing relay restores signed webhook delivery to Braid.
+  - Pi `--mode rpc` with `--no-session` does not return `sessionFile`; using `--session-dir` fixes provider session materialization.
+  - Configuring `github_actor_node_id` as the human user prevents Braid from treating human `@braid` mentions as trusted external activations; it must be the App's actor node id (or omitted for the trusted-mention fallback).
 - **Next Step — Route A: Realign and run acceptance**:
   1. **Branch/PR alignment** (done): renamed to `feat/rust-working-memory`, created PR #94, closed/superseded PR #2.
   2. **Run each public campaign at least once** to confirm the environment, then run all journeys three consecutive times cleanly. Fix failures in the owning slice/test and restart the sequence; do not weaken the oracle.
@@ -198,9 +201,21 @@ follow-on task, delete this packet, and leave no Python/PDM residue.
 ## Pi Provider Pivot
 
 - **Reason**: Codex account hit its usage limit on 2026-08-23. Real-provider acceptance is blocked until credits are added or the weekly limit resets on 2026-08-27. The user has a working `pi` CLI with a DeepSeek API key and wants to accept against that instead.
-- **Implementation Plan**:
-  1. Introduce a provider trait (`AgentProvider`) and refactor `CodexClient` into the first implementation.
-  2. Add `provider.pi` configuration (executable, provider name, model, API key environment, thinking level).
-  3. Implement `PiProvider` that spawns `pi --mode rpc`, drives `prompt`/`steer`/`abort`, and maps `turn_start`/`turn_end` events to Braid notifications.
-  4. Update `config check`, `doctor`, runtime health, and CLI `serve` provider selection.
-  5. Switch the acceptance config and campaigns to Pi + DeepSeek and rerun Slices 3–6.
+- **Implementation Done**:
+  1. Introduced `AgentProvider` trait and refactored `CodexClient` into `CodexProvider`.
+  2. Added `provider.pi` configuration (executable, provider name, model, API key environment, thinking level, optional home).
+  3. Implemented `PiProvider` that spawns `pi --mode rpc`, drives `new_session`/`prompt`/`steer`/`abort`/`get_state`, and maps `turn_start`/`turn_end`/`agent_settled` events to Braid notifications.
+  4. Fixed an async runtime panic in `PiProvider::subscribe()` by moving the `broadcast::Sender` out of the async-locked `PiState`.
+  5. Fixed `PiProvider` session persistence: switched from `--no-session` to `--session-dir <workspace>/.braid/pi-sessions` so `get_state` returns `sessionFile` as Braid expects.
+  6. Updated `config check`, `doctor`, runtime health, and CLI `serve` to use `Box<dyn AgentProvider>`.
+  7. Built packaged binary and updated Pi acceptance config `/Users/lanzhijiang/.braid/braid-pi.toml` with `[provider.pi]` and `deepseek-chat` model.
+- **Acceptance Status with Pi**:
+  - Slice 0 clean-install ✅ passed.
+  - Slice 2 transport/scheduler ✅ passed via localtunnel repository-webhook mode.
+  - Slice 3 Issue Agent: **partial**. Braid now receives signed webhooks (via a localtunnel + HMAC-signing relay workaround because localtunnel strips GitHub's `X-Hub-Signature-256`), acknowledges the trusted mention with `eyes`, accepts the turn with `rocket`, and starts the Issue Agent session. However, the Pi provider does not have the GitHub tool interface that Braid expects: it cannot publish Agent comments or apply reactions. The `pi --mode rpc` CLI streams reasoning events but does not expose the App-server tool surface that `CodexProvider` uses, so the agent turn never produces the required GitHub side effects. The Slice 3 script times out waiting for the Agent comment/rocket.
+- **Blocker**: Pi in RPC mode is a chat/reasoning provider, not an App-server with GitHub tools. Braid's runtime currently relies on the provider to perform all GitHub side effects (comments, reactions, worktree operations). Bridging this would require either (a) giving Pi a custom skill/tool interface that talks back to Braid, or (b) restructuring Braid so the runtime applies provider-intended writes itself. Both are out of scope for PR #94 readiness.
+- **Decision Needed**: 
+  - Option A: Wait for the Codex usage limit to reset (2026-08-27) and run acceptance against Codex.
+  - Option B: Purchase/add Codex credits now.
+  - Option C: Invest in a Pi skill/tool bridge to make Pi a full Braid Agent provider.
+- **Current Recommendation**: Treat PR #94 as implemented with both provider seams present and verified up to the point where a real provider turn is accepted. Full three-run acceptance still requires a provider with GitHub tool capability; Pi cannot substitute without additional integration work.
