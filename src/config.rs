@@ -71,7 +71,8 @@ pub struct SchedulerConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
-    pub codex: CodexConfig,
+    pub codex: Option<CodexConfig>,
+    pub pi: Option<PiConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -82,6 +83,17 @@ pub struct CodexConfig {
     pub version: String,
     pub stable_schema_sha256: String,
     pub experimental_schema_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PiConfig {
+    pub executable: PathBuf,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub api_key_environment: Option<String>,
+    pub thinking: Option<String>,
+    pub home: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -199,8 +211,6 @@ impl Config {
             ("runtime.database", &self.runtime.database),
             ("runtime.backups", &self.runtime.backups),
             ("github.private_key_file", &self.github.private_key_file),
-            ("provider.codex.executable", &self.provider.codex.executable),
-            ("provider.codex.home", &self.provider.codex.home),
             ("tools.git", &self.tools.git),
             ("tools.gh", &self.tools.gh),
             ("tools.wrangler", &self.tools.wrangler),
@@ -244,14 +254,27 @@ impl Config {
             ));
         }
         self.telemetry.validate()?;
-        validate_sha256(
-            "provider.codex.stable_schema_sha256",
-            &self.provider.codex.stable_schema_sha256,
-        )?;
-        validate_sha256(
-            "provider.codex.experimental_schema_sha256",
-            &self.provider.codex.experimental_schema_sha256,
-        )?;
+        if let Some(codex) = &self.provider.codex {
+            for (name, path) in [
+                ("provider.codex.executable", &codex.executable),
+                ("provider.codex.home", &codex.home),
+            ] {
+                require_absolute(name, path)?;
+            }
+            validate_sha256("provider.codex.stable_schema_sha256", &codex.stable_schema_sha256)?;
+            validate_sha256(
+                "provider.codex.experimental_schema_sha256",
+                &codex.experimental_schema_sha256,
+            )?;
+        }
+        if let Some(pi) = &self.provider.pi {
+            require_absolute("provider.pi.executable", &pi.executable)?;
+        }
+        if self.provider.codex.is_none() && self.provider.pi.is_none() {
+            return Err(ConfigError::Invalid(
+                "at least one provider (codex or pi) must be configured".into(),
+            ));
+        }
         if self.profiles.is_empty() {
             return Err(ConfigError::Invalid("at least one profile is required".into()));
         }
@@ -311,9 +334,9 @@ impl Profile {
                 self.id
             )));
         }
-        if self.provider != "codex" {
+        if self.provider != "codex" && self.provider != "pi" {
             return Err(ConfigError::Invalid(format!(
-                "profile {:?} uses unsupported provider {:?}; Slice 0 supports codex",
+                "profile {:?} uses unsupported provider {:?}; supported: codex, pi",
                 self.id, self.provider
             )));
         }

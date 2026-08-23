@@ -34,8 +34,7 @@ use crate::{
     github::{
         AppWebhookConfig, CreatedIssueComment, GitHubClient, RepositoryName, WorkItemLocator,
     },
-    protocol,
-    provider::{CodexClient, ProviderError, ProviderNotification},
+    provider::{ProviderError, ProviderNotification, connect_provider},
     store::{
         AssignmentCandidate, CanonicalObjectState, ContextResetClaim, IngressEvent, ProfileRecord,
         ReactionTarget, RuntimeLease, SchedulerPolicy, StoreActor, TurnClaim,
@@ -193,9 +192,7 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     workers.spawn(lease_worker(Arc::clone(&store), Arc::clone(&lease), shutdown_receiver.clone()));
 
     if provider_enabled {
-        let identity = protocol::inspect_codex(&config.provider.codex).await?;
-        protocol::verify_identity(&identity, &config.provider.codex)?;
-        let provider = CodexClient::connect(&config.provider.codex).await?;
+        let provider = connect_provider(&config.provider).await?;
         health.write().await.provider = "connected";
         workers.spawn(issue_agent_worker(
             Arc::clone(&store),
@@ -205,7 +202,7 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
             Arc::clone(&health),
             shutdown_receiver.clone(),
         ));
-        let pr_provider = CodexClient::connect(&config.provider.codex).await?;
+        let pr_provider = connect_provider(&config.provider).await?;
         workers.spawn(pr_agent_worker(
             Arc::clone(&store),
             Arc::clone(&github),
@@ -1120,7 +1117,7 @@ async fn issue_agent_worker(
     store: Arc<StoreActor>,
     github: Arc<GitHubClient>,
     config: Config,
-    mut provider: CodexClient,
+    mut provider: Box<dyn crate::provider::AgentProvider>,
     health: Arc<RwLock<HealthSnapshot>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -1178,7 +1175,7 @@ async fn issue_agent_worker(
         loop {
             tokio::select! {
                 _ = shutdown.changed() => return,
-                result = CodexClient::connect(&config.provider.codex) => {
+                result = crate::provider::connect_provider(&config.provider) => {
                     match result {
                         Ok(connected) => {
                             provider = connected;
@@ -1199,7 +1196,7 @@ async fn pr_agent_worker(
     store: Arc<StoreActor>,
     github: Arc<GitHubClient>,
     config: Config,
-    mut provider: CodexClient,
+    mut provider: Box<dyn crate::provider::AgentProvider>,
     health: Arc<RwLock<HealthSnapshot>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -1254,7 +1251,7 @@ async fn pr_agent_worker(
         loop {
             tokio::select! {
                 _ = shutdown.changed() => return,
-                result = CodexClient::connect(&config.provider.codex) => {
+                result = crate::provider::connect_provider(&config.provider) => {
                     match result {
                         Ok(connected) => {
                             provider = connected;
@@ -1276,7 +1273,7 @@ async fn drive_pr_agent_connection(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     profile: &Profile,
     profile_record: &ProfileRecord,
     health: &RwLock<HealthSnapshot>,
@@ -1352,7 +1349,7 @@ async fn drive_pr_agent_connection(
 async fn resume_pr_provider_sessions(
     store: &StoreActor,
     config: &Config,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     profile: &Profile,
     profile_record: &ProfileRecord,
 ) -> Result<()> {
@@ -1429,7 +1426,7 @@ async fn materialize_next_pr_assignment(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     profile: &Profile,
     profile_record: &ProfileRecord,
 ) {
@@ -1539,7 +1536,7 @@ async fn materialize_pr_assignment(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     profile: &Profile,
     profile_record: &ProfileRecord,
     candidate: AssignmentCandidate,
@@ -1641,7 +1638,7 @@ async fn drive_issue_agent_connection(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     profile: &Profile,
     profile_record: &ProfileRecord,
     health: &RwLock<HealthSnapshot>,
@@ -1717,7 +1714,7 @@ async fn drive_issue_agent_connection(
 async fn resume_issue_provider_sessions(
     store: &StoreActor,
     config: &Config,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     profile: &Profile,
     profile_record: &ProfileRecord,
 ) -> Result<()> {
@@ -1810,7 +1807,7 @@ async fn handle_next_work_item_lifecycle(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     profile: &Profile,
     policy: SchedulerPolicy,
     work_item_kind: &'static str,
@@ -1865,7 +1862,7 @@ async fn reactivate_work_item_agent(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     profile: &Profile,
     policy: SchedulerPolicy,
     candidate: WorkItemLifecycleCandidate,
@@ -1991,7 +1988,7 @@ async fn reactivate_work_item_agent(
 
 async fn begin_active_context_reset(
     store: &StoreActor,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     active: &mut RunningAgentTurn,
 ) {
     if active.reset_id.is_some() {
@@ -2029,7 +2026,7 @@ async fn materialize_next_context_reset(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     profile: &Profile,
     work_item_kind: &str,
 ) -> bool {
@@ -2073,7 +2070,7 @@ async fn materialize_context_reset(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     profile: &Profile,
     reset: ContextResetClaim,
 ) -> Result<()> {
@@ -2154,7 +2151,7 @@ async fn materialize_context_reset(
 
 async fn forward_urgent_steer(
     store: &StoreActor,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     active: &RunningAgentTurn,
 ) {
     let steer = match store.claim_urgent_steer(active.claim.turn_id.clone()) {
@@ -2182,7 +2179,7 @@ async fn materialize_next_issue_assignment(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     profile: &Profile,
     profile_record: &ProfileRecord,
 ) {
@@ -2211,7 +2208,7 @@ async fn materialize_next_issue_assignment(
 
 async fn start_next_agent_turn(
     store: &StoreActor,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     profile: &Profile,
     work_item_kind: &str,
 ) -> Option<RunningAgentTurn> {
@@ -2252,7 +2249,7 @@ async fn materialize_issue_assignment(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &CodexClient,
+    provider: &dyn crate::provider::AgentProvider,
     profile: &Profile,
     profile_record: &ProfileRecord,
     candidate: AssignmentCandidate,

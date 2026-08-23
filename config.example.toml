@@ -27,6 +27,14 @@ version = "codex-cli 0.147.0-alpha.6.5"
 stable_schema_sha256 = "7d79fe309dd7520843459070f3884ecf0e39cee2620c1c49aad6efb4eca76ecb"
 experimental_schema_sha256 = "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b5364439063a5c8"
 
+# Alternative: Pi provider with DeepSeek
+# [provider.pi]
+# executable = "/usr/local/bin/pi"
+# provider = "deepseek"
+# model = "deepseek-chat"
+# thinking = "high"
+# api_key_environment = "DEEPSEEK_API_KEY"
+
 [tools]
 git = "/usr/bin/git"
 gh = "/opt/homebrew/bin/gh"

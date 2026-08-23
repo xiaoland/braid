@@ -64,30 +64,66 @@ pub async fn run(config: &Config) -> DoctorReport {
         }
     });
 
-    checks.push(match inspect_codex(&config.provider.codex).await {
-        Ok(identity) => match verify_identity(&identity, &config.provider.codex) {
-            Ok(()) => Check {
-                name: "Codex app-server".into(),
-                state: CheckState::Pass,
-                detail: identity.version,
+    checks.push(match config.provider.codex.as_ref() {
+        Some(codex) => match inspect_codex(codex).await {
+            Ok(identity) => match verify_identity(&identity, codex) {
+                Ok(()) => Check {
+                    name: "Codex app-server".into(),
+                    state: CheckState::Pass,
+                    detail: identity.version,
+                },
+                Err(error) => Check {
+                    name: "Codex app-server".into(),
+                    state: CheckState::Fail,
+                    detail: format!(
+                        "{error}; actual version={}, stable={}, experimental={}",
+                        identity.version,
+                        identity.stable_schema_sha256,
+                        identity.experimental_schema_sha256
+                    ),
+                },
             },
             Err(error) => Check {
                 name: "Codex app-server".into(),
                 state: CheckState::Fail,
-                detail: format!(
-                    "{error}; actual version={}, stable={}, experimental={}",
-                    identity.version,
-                    identity.stable_schema_sha256,
-                    identity.experimental_schema_sha256
-                ),
+                detail: error.to_string(),
             },
         },
-        Err(error) => Check {
+        None => Check {
             name: "Codex app-server".into(),
-            state: CheckState::Fail,
-            detail: error.to_string(),
+            state: CheckState::Pass,
+            detail: "not configured".into(),
         },
     });
+
+    if let Some(pi) = config.provider.pi.as_ref() {
+        checks.push(match command_version("Pi CLI", &pi.executable).await {
+            check if check.state == CheckState::Pass => {
+                let api_key_ok = pi
+                    .api_key_environment
+                    .as_ref()
+                    .is_none_or(|env| std::env::var_os(env).is_some());
+                if api_key_ok {
+                    Check {
+                        name: "Pi provider".into(),
+                        state: CheckState::Pass,
+                        detail: format!("{} (api_key_environment present)", check.detail),
+                    }
+                } else {
+                    Check {
+                        name: "Pi provider".into(),
+                        state: CheckState::Fail,
+                        detail: format!(
+                            "{}; api_key_environment {} is not set",
+                            check.detail,
+                            pi.api_key_environment.as_deref().unwrap_or("")
+                        ),
+                    }
+                }
+            }
+            check => Check { name: "Pi provider".into(), state: check.state, detail: check.detail },
+        });
+    }
 
     for (name, executable) in [
         ("Git", &config.tools.git),

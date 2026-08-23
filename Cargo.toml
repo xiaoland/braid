@@ -39,6 +39,7 @@ tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "registry"] }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.24", features = ["serde", "v7"] }
+async-trait = "0.1.92"
 
 [profile.release]
 codegen-units = 1
