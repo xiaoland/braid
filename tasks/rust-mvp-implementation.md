@@ -194,3 +194,13 @@ do not weaken the oracle around observed behavior.
 After three clean runs: update Product Truth only for proven behavior, finalize
 `CHANGELOG.md`, tag/release the macOS arm64 artifact, open the Linux x86_64
 follow-on task, delete this packet, and leave no Python/PDM residue.
+
+## Pi Provider Pivot
+
+- **Reason**: Codex account hit its usage limit on 2026-08-23. Real-provider acceptance is blocked until credits are added or the weekly limit resets on 2026-08-27. The user has a working `pi` CLI with a DeepSeek API key and wants to accept against that instead.
+- **Implementation Plan**:
+  1. Introduce a provider trait (`AgentProvider`) and refactor `CodexClient` into the first implementation.
+  2. Add `provider.pi` configuration (executable, provider name, model, API key environment, thinking level).
+  3. Implement `PiProvider` that spawns `pi --mode rpc`, drives `prompt`/`steer`/`abort`, and maps `turn_start`/`turn_end` events to Braid notifications.
+  4. Update `config check`, `doctor`, runtime health, and CLI `serve` provider selection.
+  5. Switch the acceptance config and campaigns to Pi + DeepSeek and rerun Slices 3–6.
