@@ -120,8 +120,8 @@ awk \
 
 $binary migrate apply --config "$test_config" >/dev/null
 $binary status --config "$test_config" --json | \
-    jq -e '.database.schema_version == 10 and .database.supported_schema == 10' >/dev/null || \
-    fail "candidate does not expose the expected current schema 10"
+    jq -e '.database.schema_version == 11 and .database.supported_schema == 11' >/dev/null || \
+    fail "candidate does not expose the expected current schema 11"
 
 note "starting a free HTTP/2 Quick Tunnel"
 TUNNEL_TRANSPORT_PROTOCOL=http2 "$wrangler" tunnel quick-start \
