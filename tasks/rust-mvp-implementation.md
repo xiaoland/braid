@@ -20,6 +20,7 @@
   - Clean source checkout for PR worktree at `~/.braid/source/braid`.
   - Acceptance config written to `/Users/lanzhijiang/.braid/braid.toml`; `config check`, `doctor` (except OTLP), `github probe`, `migrate apply`, and `context issue` diagnostics all pass.
   - Packaged release artifact built: `/Users/lanzhijiang/.braid/dist/braid-v0.1.0-aarch64-apple-darwin.tar.gz`.
+  - Fixed stale schema assertions in `scripts/tests/30_issue_agent.sh` and `scripts/tests/40_context_lifecycle.sh` (expected schema 10 → 11).
   - Background campaigns are now running; results will be appended as they complete.
 - **Next Step — Route A: Realign and run acceptance**:
   1. **Branch/PR alignment** (done): renamed to `feat/rust-working-memory`, created PR #94, closed/superseded PR #2.
