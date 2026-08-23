@@ -22,9 +22,11 @@
   - Packaged release artifact built: `/Users/lanzhijiang/.braid/dist/braid-v0.1.0-aarch64-apple-darwin.tar.gz`.
   - Fixed stale schema assertions in `scripts/tests/30_issue_agent.sh` and `scripts/tests/40_context_lifecycle.sh` (expected schema 10 → 11).
   - Background campaigns are now running; results will be appended as they complete.
+- **Tunnel workaround**: Cloudflare Quick Tunnel public routes intermittently return Cloudflare error 1033 (edge cannot resolve tunnel). To unblock acceptance, installed `localtunnel` and patched scripts 20/30/40/50 to accept `BRAID_TEST_PUBLIC_WEBHOOK_URL` with any `https://*/webhook` host. A persistent localtunnel is running at `https://braid-acceptance-test-lan.loca.lt`.
 - **Campaign Progress**:
   - Slice 0 clean-install ✅ passed.
-  - Slice 3 Issue Agent: first run got past activation and trusted-mention acceptance but hung waiting for Agent comment/terminal reaction; a debug run then hit a transient GitHub API EOF at startup. A fresh Slice 2 transport-only run is now in progress to verify the App/webhook/reaction pipeline before retrying Slice 3.
+  - Slice 2 transport/scheduler: running via localtunnel repository-webhook mode.
+  - Slice 3 Issue Agent: first attempt hit Cloudflare 1033; waiting for Slice 2 result before retrying.
 - **Next Step — Route A: Realign and run acceptance**:
   1. **Branch/PR alignment** (done): renamed to `feat/rust-working-memory`, created PR #94, closed/superseded PR #2.
   2. **Run each public campaign at least once** to confirm the environment, then run all journeys three consecutive times cleanly. Fix failures in the owning slice/test and restart the sequence; do not weaken the oracle.
