@@ -25,8 +25,10 @@
 - **Tunnel workaround**: Cloudflare Quick Tunnel public routes intermittently return Cloudflare error 1033 (edge cannot resolve tunnel). To unblock acceptance, installed `localtunnel` and patched scripts 20/30/40/50 to accept `BRAID_TEST_PUBLIC_WEBHOOK_URL` with any `https://*/webhook` host. A persistent localtunnel is running at `https://braid-acceptance-test-lan.loca.lt`.
 - **Campaign Progress**:
   - Slice 0 clean-install ✅ passed.
-  - Slice 2 transport/scheduler: running via localtunnel repository-webhook mode.
-  - Slice 3 Issue Agent: first attempt hit Cloudflare 1033; waiting for Slice 2 result before retrying.
+  - Slice 2 transport/scheduler ✅ passed via localtunnel repository-webhook mode.
+  - Slice 3 Issue Agent: blocked by Codex usage limit. Braid correctly receives webhooks, creates the Issue Agent session, accepts the trusted-mention turn, and starts the provider turn, but Codex returns: "You've hit your usage limit. Upgrade to Pro ... or try again at Aug 27th, 2026 12:56 PM." The ChatGPT/Codex usage page confirms "You're out of Codex and Work usage for now".
+  - Slices 4–6 cannot run until Codex usage is available.
+- **Next Steps / Decision Needed**: Purchase Codex Pro/add credits, or wait for the Aug 27 reset, before the remaining real-provider acceptance campaigns can pass.
 - **Next Step — Route A: Realign and run acceptance**:
   1. **Branch/PR alignment** (done): renamed to `feat/rust-working-memory`, created PR #94, closed/superseded PR #2.
   2. **Run each public campaign at least once** to confirm the environment, then run all journeys three consecutive times cleanly. Fix failures in the owning slice/test and restart the sequence; do not weaken the oracle.
