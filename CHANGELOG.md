@@ -3,6 +3,19 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
+## [0.2.2] - 2026-08-24
+
+### Changed
+
+- Split `src/cli.rs` into a module tree (`cli/mod.rs`, `cli/config.rs`,
+  `cli/profile.rs`, `cli/context_cmd.rs`, `cli/gh.rs`, `cli/gh_cmd.rs`,
+  `cli/migrate.rs`, `cli/doctor_cmd.rs`, `cli/status.rs`, `cli/telemetry_cmd.rs`,
+  `cli/helpers.rs`). Public entry point `cli::run` and all clap derive structs
+  remain unchanged.
+- Split `src/writer.rs` into a module tree (`writer/mod.rs`, `writer/prepare.rs`,
+  `writer/ensure.rs`, `writer/comment.rs`, `writer/helpers.rs`). Public
+  `create_comment` and `ensure_pull_request` signatures remain unchanged.
+
 ## [0.2.1] - 2026-08-24
 
 ### Changed
