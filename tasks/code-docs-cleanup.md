@@ -22,7 +22,7 @@
 - [x] Replace hand-written GitHub App client with `octocrab`.
 - [ ] Replace manual GraphQL query building with typed client (deferred: `octocrab` raw `/graphql` is sufficient for current query surface).
 - [ ] Replace JSON-RPC-ish provider loop with a typed crate (deferred: split into modules; typed crate not yet adopted).
-- [ ] Docs updated.
+- [x] Update acceptance test scripts (`00_clean_install.sh`, `30_issue_agent.sh`, `40_context_lifecycle.sh`) for collapsed schema version 1.
 - [x] Clean release rebuilt and Homebrew formula updated to v0.2.0.
 
 ## Verification
