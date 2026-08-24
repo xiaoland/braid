@@ -1,5 +1,7 @@
 # Homebrew + Bootstrap PoC
 
+> **Status: pivoted.** The Homebrew tap, packaged release, and `braid setup` skeleton are in place. The active task packet is now `tasks/code-docs-cleanup.md`.
+
 - **Goal**: Make Braid installable via Homebrew and bootstrappable through a single `braid setup` / `braid bootstrap` flow, so a user can go from zero to a working Braid Issue Agent / PR Agent on their own repository with minimal operator steps.
 - **Scope for this PoC**:
   1. Homebrew distribution: a public tap (`xiaoland/homebrew-braid`) with a macOS arm64 formula.
