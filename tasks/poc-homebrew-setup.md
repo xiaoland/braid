@@ -48,7 +48,7 @@
 
 ### Step 5 — Documentation
 - [x] Update `README.md` with `brew install xiaoland/braid/braid` and `braid setup --repository owner/repo`.
-- [ ] Add a short `docs/setup.md` describing the one-time bootstrap flow.
+- [x] Add a short `docs/setup.md` describing the one-time bootstrap flow.
 
 ## Done / Closed
 
