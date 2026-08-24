@@ -15,7 +15,7 @@
 - [x] `provider.rs` refactored into a module tree (`provider/mod.rs`, `provider/codex.rs`, `provider/pi.rs`, `provider/util.rs`) with clean public API.
 - [ ] `store.rs` refactored into a module tree (deferred: module cohesion requires keeping `StoreActor`/`Command`/`actor_loop` in `mod.rs`; will extract pure helpers later if needed).
 - [x] `runtime.rs` refactored into a module tree (`runtime/mod.rs`, `runtime/ingress.rs`, `runtime/outbox.rs`, `runtime/reconcile.rs`, `runtime/scheduler.rs`, `runtime/issue_agent.rs`, `runtime/pr_agent.rs`, `runtime/provider.rs`, `runtime/tunnel.rs`).
-- [ ] `context.rs` refactored into a module tree or typed GraphQL client (in progress: subagent splitting into issue/pr/comments/pressure/graphql modules).
+- [ ] `context.rs` refactored into a module tree or typed GraphQL client (deferred: requires AST-aware extraction; manual sed is too risky).
 - [ ] `github.rs` reviewed and split if needed (migrated to `octocrab`; kept as single module due to tight identity/REST coupling).
 - [ ] `writer.rs`, `cli.rs` reviewed and split if needed.
 - [x] Replace worktree shell commands with `git2`.
