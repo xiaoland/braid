@@ -6,6 +6,7 @@ mod github;
 mod protocol;
 mod provider;
 mod runtime;
+mod setup;
 mod store;
 mod telemetry;
 mod tunnel;

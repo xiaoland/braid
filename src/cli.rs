@@ -13,6 +13,7 @@ use crate::{
     context::{self, CanonicalContext, ContextPressure},
     doctor,
     github::{GitHubClient, RepositoryName, WorkItemLocator},
+    setup,
     store::{MigrationPlan, MigrationResult, StoreActor, StoreStatus},
     telemetry,
     writer::{self, CommentCreateRequest, PullRequestEnsureRequest},
@@ -27,6 +28,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Setup(SetupArguments),
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -231,6 +233,20 @@ struct GhPrEnsure {
 }
 
 #[derive(Debug, Args)]
+pub(crate) struct SetupArguments {
+    #[arg(value_name = "OWNER/REPOSITORY")]
+    pub(crate) repository: String,
+    #[arg(long, value_name = "pi|codex", default_value = "pi")]
+    pub(crate) provider: String,
+    #[arg(long, value_name = "MODEL", default_value = "deepseek-chat")]
+    pub(crate) model: String,
+    #[arg(long, value_name = "ENV", default_value = "DEEPSEEK_API_KEY")]
+    pub(crate) api_key_environment: String,
+    #[arg(long, value_name = "DIR", default_value = "~/.braid")]
+    pub(crate) home: PathBuf,
+}
+
+#[derive(Debug, Args)]
 struct ServeArguments {
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
@@ -316,6 +332,9 @@ pub async fn run() -> Result<()> {
         Command::Serve(arguments) => {
             let config = load(&arguments.config)?;
             crate::runtime::serve(config, arguments.tunnel, !arguments.transport_only).await?;
+        }
+        Command::Setup(arguments) => {
+            setup::run(arguments).await?;
         }
     }
     Ok(())

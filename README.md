@@ -9,8 +9,36 @@ local Coding Agents. GitHub holds the current design, implementation state,
 metadata, relationships, and discussion; Braid rebuilds a provider session from
 that state whenever prior context becomes stale.
 
-Braid is implemented as one Rust package and one portable `braid` binary. The
-active product and implementation contracts are:
+Braid is implemented as one Rust package and one portable `braid` binary.
+
+## Install
+
+On macOS arm64:
+
+```shell
+brew install xiaoland/braid/braid
+```
+
+## Bootstrap
+
+`braid setup` creates your own GitHub App, persists credentials outside the
+repository, and writes a starter `braid.toml`:
+
+```shell
+braid setup owner/repository --provider pi --model deepseek-chat --api-key-environment DEEPSEEK_API_KEY
+```
+
+The command opens a browser for GitHub's App Manifest flow, receives the redirect
+locally, and saves the private key and webhook secret to `~/.braid`. After the
+browser installs the App on your repository, export the secret and run Braid:
+
+```shell
+export BRAID_WEBHOOK_SECRET=$(cat ~/.braid/braid-of-owner.webhook_secret)
+braid doctor --config ~/.braid/braid.toml
+braid serve --config ~/.braid/braid.toml --tunnel
+```
+
+The active product and implementation contracts are:
 
 - [Product Truth](docs/10-prd/README.md)
 - [Real end-to-end acceptance](docs/10-prd/acceptance.md)
