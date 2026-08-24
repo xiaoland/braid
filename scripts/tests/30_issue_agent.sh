@@ -333,6 +333,7 @@ if [[ -z "$provider_pid" ]]; then
     provider_pid="$(pgrep -P "$runtime_pid" | head -1 || true)"
 fi
 [[ -n "$provider_pid" ]] || fail "cannot locate the real provider child process"
+pkill -9 -P "$provider_pid" >/dev/null 2>&1 || true
 kill -KILL "$provider_pid"
 for _ in $(seq 1 60); do
     provider_health="$(curl -fsS "$health_url" 2>/dev/null | jq -r '.provider' || true)"
