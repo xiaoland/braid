@@ -328,7 +328,10 @@ for _ in $(seq 1 90); do
 done
 has_reaction "$unknown_comment" rocket || fail "unknown-outcome turn was not accepted"
 provider_pid="$(pgrep -P "$runtime_pid" -f 'codex.*app-server' | head -1 || true)"
-[[ -n "$provider_pid" ]] || fail "cannot locate the real Codex app-server child process"
+if [[ -z "$provider_pid" ]]; then
+    provider_pid="$(pgrep -P "$runtime_pid" -f 'pi' | head -1 || true)"
+fi
+[[ -n "$provider_pid" ]] || fail "cannot locate the real provider child process"
 kill -KILL "$provider_pid"
 for _ in $(seq 1 60); do
     provider_health="$(curl -fsS "$health_url" 2>/dev/null | jq -r '.provider' || true)"
@@ -414,7 +417,7 @@ for _ in $(seq 1 30); do
 done
 has_reaction "$failure_comment" rocket && fail "failed terminal retained stale rocket"
 failure_agent_comments="$(gh api "repos/$repository/issues/$failure_issue/comments" | \
-    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
 [[ "$failure_agent_comments" -eq 0 ]] || fail "failed provider turn fabricated an Agent comment"
 
 stop_process "$runtime_pid"
