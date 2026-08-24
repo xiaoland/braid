@@ -329,7 +329,7 @@ done
 has_reaction "$unknown_comment" rocket || fail "unknown-outcome turn was not accepted"
 provider_pid="$(pgrep -P "$runtime_pid" -f 'codex.*app-server' | head -1 || true)"
 if [[ -z "$provider_pid" ]]; then
-    provider_pid="$(pgrep -P "$runtime_pid" -f 'pi' | head -1 || true)"
+    provider_pid="$(pgrep -P "$runtime_pid" | head -1 || true)"
 fi
 [[ -n "$provider_pid" ]] || fail "cannot locate the real provider child process"
 kill -KILL "$provider_pid"
