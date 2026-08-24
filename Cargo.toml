@@ -20,7 +20,7 @@ comrak = { version = "0.54", default-features = false }
 fs2 = "0.4"
 hex = "0.4"
 hmac = "0.13"
-jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "10.4", features = ["use_pem"] }
 opentelemetry = { version = "0.32", features = ["logs", "metrics", "trace"] }
 opentelemetry-appender-tracing = "0.32"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "logs", "metrics", "trace"] }

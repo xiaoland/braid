@@ -1,15 +1,12 @@
-use std::{collections::BTreeMap, fmt, fs, str::FromStr, time::Duration};
+use std::{collections::BTreeMap, fmt, fs, str::FromStr};
 
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use reqwest::{Client, StatusCode};
+use axum::http::StatusCode;
+use jsonwebtoken::EncodingKey;
+use octocrab::Octocrab;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
-use time::OffsetDateTime;
 
 use crate::config::GitHubConfig;
-
-const API_ROOT: &str = "https://api.github.com";
-const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 
 #[derive(Debug, Error)]
 pub enum GitHubError {
@@ -21,16 +18,10 @@ pub enum GitHubError {
     PrivateKey(#[from] std::io::Error),
     #[error("GitHub App private key is not a usable RSA PEM: {0}")]
     InvalidPrivateKey(jsonwebtoken::errors::Error),
-    #[error("cannot sign GitHub App JWT: {0}")]
-    Jwt(jsonwebtoken::errors::Error),
-    #[error("cannot build GitHub HTTP client: {0}")]
-    Client(reqwest::Error),
-    #[error("GitHub request failed: {0}")]
-    Transport(reqwest::Error),
+    #[error("cannot build GitHub client: {0}")]
+    Client(String),
     #[error("GitHub returned {status}: {body}")]
     Http { status: StatusCode, body: String },
-    #[error("GitHub response shape is unsupported: {0}")]
-    Response(reqwest::Error),
     #[error("GitHub GraphQL returned errors: {0}")]
     GraphQl(String),
     #[error("GitHub GraphQL returned no data")]
@@ -41,11 +32,25 @@ pub enum GitHubError {
     WrongApp { actual: u64, expected: u64 },
     #[error("GitHub App installation lacks required permissions: {0}")]
     InsufficientPermissions(String),
+    #[error("GitHub client error: {0}")]
+    Octocrab(String),
+}
+
+impl From<octocrab::Error> for GitHubError {
+    fn from(error: octocrab::Error) -> Self {
+        match error {
+            octocrab::Error::GitHub { source, .. } => Self::Http {
+                status: source.status_code,
+                body: bounded(&source.message, 1024).to_owned(),
+            },
+            _ => Self::Octocrab(error.to_string()),
+        }
+    }
 }
 
 impl GitHubError {
     pub fn is_unavailable(&self) -> bool {
-        matches!(self, Self::Transport(_) | Self::ConvergencePending(_))
+        matches!(self, Self::Octocrab(_) | Self::ConvergencePending(_))
             || matches!(self, Self::Http { status, .. } if status.is_server_error())
     }
 
@@ -138,10 +143,9 @@ pub struct GitHubIdentity {
 }
 
 pub struct GitHubClient {
-    http: Client,
+    app: Octocrab,
+    installation: Octocrab,
     config: GitHubConfig,
-    api_version: String,
-    installation_token: String,
     identity: GitHubIdentity,
     projects_v2_enabled: bool,
 }
@@ -151,44 +155,44 @@ impl GitHubClient {
         config: &GitHubConfig,
         repository: &RepositoryName,
     ) -> Result<Self, GitHubError> {
-        let http = Client::builder()
-            .user_agent(format!("braid/{}", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(30))
-            .tls_backend_rustls()
+        let pem = fs::read(&config.private_key_file)?;
+        let key = EncodingKey::from_rsa_pem(&pem).map_err(GitHubError::InvalidPrivateKey)?;
+        let app = Octocrab::builder()
+            .app(octocrab::models::AppId(config.app_id), key)
             .build()
-            .map_err(GitHubError::Client)?;
-        let app_jwt = app_jwt(config)?;
-        let app = rest_get::<AppResponse>(&http, "/app", &app_jwt, &config.api_version).await?;
-        if app.id != config.app_id {
-            return Err(GitHubError::WrongApp { actual: app.id, expected: config.app_id });
+            .map_err(|error| GitHubError::Client(error.to_string()))?;
+        let app_info = app.current().app().await?;
+        let app_id = app_info.id.into_inner();
+        if app_id != config.app_id {
+            return Err(GitHubError::WrongApp { actual: app_id, expected: config.app_id });
         }
-        let installation = rest_get::<InstallationResponse>(
-            &http,
-            &format!("/repos/{repository}/installation"),
-            &app_jwt,
-            &config.api_version,
-        )
-        .await?;
-        let access = rest_post_empty::<AccessTokenResponse>(
-            &http,
-            &format!("/app/installations/{}/access_tokens", installation.id),
-            &app_jwt,
-            &config.api_version,
-        )
-        .await?;
-        let repository_info = repository_identity(&http, &access.token, repository).await?;
-        let actor = viewer_identity(&http, &access.token).await?;
+        let installation = app
+            .apps()
+            .get_repository_installation(&repository.owner, &repository.name)
+            .await?;
+        let installation_id = installation.id.into_inner();
+        let access: AccessTokenResponse = app
+            .post(
+                &format!("/app/installations/{installation_id}/access_tokens"),
+                None::<&()>,
+            )
+            .await?;
+        let installation_client = Octocrab::builder()
+            .personal_token(access.token.clone())
+            .build()
+            .map_err(|error| GitHubError::Client(error.to_string()))?;
+        let repository_info = repository_identity(&installation_client, repository).await?;
+        let actor = viewer_identity(&installation_client).await?;
         validate_read_permissions(&access.permissions, config.projects_v2_enabled)?;
         Ok(Self {
-            http,
+            app,
+            installation: installation_client,
             config: config.clone(),
-            api_version: config.api_version.clone(),
-            installation_token: access.token,
             projects_v2_enabled: config.projects_v2_enabled,
             identity: GitHubIdentity {
-                app_id: app.id,
-                app_slug: app.slug,
-                installation_id: installation.id,
+                app_id,
+                app_slug: app_info.slug.unwrap_or_default(),
+                installation_id,
                 repository: repository_info.name_with_owner,
                 repository_node_id: repository_info.id,
                 actor_node_id: actor.id,
@@ -216,23 +220,10 @@ impl GitHubClient {
         V: Serialize + ?Sized,
         T: DeserializeOwned,
     {
-        let response = self
-            .http
-            .post(GRAPHQL_URL)
-            .bearer_auth(&self.installation_token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", &self.api_version)
-            .json(&GraphQlRequest { query, variables })
-            .send()
-            .await
-            .map_err(GitHubError::Transport)?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(GitHubError::Http { status, body: bounded(&body, 1024).to_owned() });
-        }
-        let envelope =
-            response.json::<GraphQlEnvelope<T>>().await.map_err(GitHubError::Response)?;
+        let envelope: GraphQlEnvelope<T> = self
+            .installation
+            .post("/graphql", Some(&GraphQlRequest { query, variables }))
+            .await?;
         if !envelope.errors.is_empty() {
             let messages = envelope
                 .errors
@@ -247,13 +238,7 @@ impl GitHubClient {
 
     pub async fn repository_permission(&self, login: &str) -> Result<String, GitHubError> {
         let path = format!("/repos/{}/collaborators/{login}/permission", self.identity.repository);
-        let permission = rest_get::<PermissionResponse>(
-            &self.http,
-            &path,
-            &self.installation_token,
-            &self.api_version,
-        )
-        .await?;
+        let permission: PermissionResponse = self.installation.get(&path, None::<&()>).await?;
         Ok(permission.role_name.unwrap_or(permission.permission))
     }
 
@@ -276,14 +261,10 @@ impl GitHubClient {
                 return Err(GitHubError::GraphQl(format!("unsupported reaction target {other:?}")));
             }
         };
-        let reaction: ReactionResponse = rest_post(
-            &self.http,
-            &path,
-            &self.installation_token,
-            &self.api_version,
-            &ReactionRequest { content },
-        )
-        .await?;
+        let reaction: ReactionResponse = self
+            .installation
+            .post(&path, Some(&ReactionRequest { content }))
+            .await?;
         Ok(reaction.id)
     }
 
@@ -306,7 +287,7 @@ impl GitHubClient {
                 return Err(GitHubError::GraphQl(format!("unsupported reaction target {other:?}")));
             }
         };
-        rest_delete(&self.http, &path, &self.installation_token, &self.api_version).await
+        octocrab_delete(&self.installation, &path).await
     }
 
     pub async fn create_issue_comment(
@@ -314,39 +295,26 @@ impl GitHubClient {
         issue_number: u64,
         body: &str,
     ) -> Result<CreatedIssueComment, GitHubError> {
-        rest_post(
-            &self.http,
-            &format!("/repos/{}/issues/{issue_number}/comments", self.identity.repository),
-            &self.installation_token,
-            &self.api_version,
-            &IssueCommentRequest { body },
-        )
-        .await
+        self.installation
+            .post(
+                &format!("/repos/{}/issues/{issue_number}/comments", self.identity.repository),
+                Some(&IssueCommentRequest { body }),
+            )
+            .await
+            .map_err(GitHubError::from)
     }
 
-    pub async fn issue_comments(
-        &self,
-        issue_number: u64,
-    ) -> Result<Vec<IssueComment>, GitHubError> {
+    pub async fn issue_comments(&self, issue_number: u64) -> Result<Vec<IssueComment>, GitHubError> {
         let mut comments = Vec::new();
         for page in 1_u16..=100 {
-            let query = url::form_urlencoded::Serializer::new(String::new())
-                .append_pair("per_page", "100")
-                .append_pair("page", &page.to_string())
-                .finish();
-            let response = self
-                .http
-                .get(format!(
-                    "{API_ROOT}/repos/{}/issues/{issue_number}/comments?{query}",
-                    self.identity.repository
-                ))
-                .bearer_auth(&self.installation_token)
-                .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", &self.api_version)
-                .send()
-                .await
-                .map_err(GitHubError::Transport)?;
-            let page_comments = rest_response::<Vec<IssueComment>>(response).await?;
+            let params = PaginationParams { per_page: 100, page };
+            let page_comments: Vec<IssueComment> = self
+                .installation
+                .get(
+                    &format!("/repos/{}/issues/{issue_number}/comments", self.identity.repository),
+                    Some(&params),
+                )
+                .await?;
             let complete = page_comments.len() < 100;
             comments.extend(page_comments);
             if complete {
@@ -363,14 +331,23 @@ impl GitHubClient {
         comment_id: &str,
         body: &str,
     ) -> Result<CreatedIssueComment, GitHubError> {
-        rest_patch(
-            &self.http,
-            &format!("/repos/{}/issues/comments/{comment_id}", self.identity.repository),
-            &self.installation_token,
-            &self.api_version,
-            &IssueCommentRequest { body },
-        )
-        .await
+        self.installation
+            .patch(
+                &format!("/repos/{}/issues/comments/{comment_id}", self.identity.repository),
+                Some(&IssueCommentRequest { body }),
+            )
+            .await
+            .map_err(GitHubError::from)
+    }
+
+    pub async fn issue_comment(&self, comment_id: u64) -> Result<IssueComment, GitHubError> {
+        self.installation
+            .get(
+                &format!("/repos/{}/issues/comments/{comment_id}", self.identity.repository),
+                None::<&()>,
+            )
+            .await
+            .map_err(GitHubError::from)
     }
 
     pub fn require_write_permissions(&self, permissions: &[&str]) -> Result<(), GitHubError> {
@@ -394,58 +371,43 @@ impl GitHubClient {
         }
     }
 
-    pub async fn issue_comment(&self, comment_id: u64) -> Result<IssueComment, GitHubError> {
-        rest_get(
-            &self.http,
-            &format!("/repos/{}/issues/comments/{comment_id}", self.identity.repository),
-            &self.installation_token,
-            &self.api_version,
-        )
-        .await
-    }
-
     pub async fn issue_or_pull_request(
         &self,
         number: u64,
     ) -> Result<IssueOrPullRequest, GitHubError> {
-        rest_get(
-            &self.http,
-            &format!("/repos/{}/issues/{number}", self.identity.repository),
-            &self.installation_token,
-            &self.api_version,
-        )
-        .await
+        self.installation
+            .get(
+                &format!("/repos/{}/issues/{number}", self.identity.repository),
+                None::<&()>,
+            )
+            .await
+            .map_err(GitHubError::from)
     }
 
     pub async fn repository_details(&self) -> Result<RepositoryDetails, GitHubError> {
-        rest_get(
-            &self.http,
-            &format!("/repos/{}", self.identity.repository),
-            &self.installation_token,
-            &self.api_version,
-        )
-        .await
+        self.installation
+            .get(&format!("/repos/{}", self.identity.repository), None::<&()>)
+            .await
+            .map_err(GitHubError::from)
     }
 
     pub async fn git_reference(&self, name: &str) -> Result<Option<GitReference>, GitHubError> {
         let encoded = encode_path(name);
-        rest_get_optional(
-            &self.http,
+        octocrab_get_optional(
+            &self.installation,
             &format!("/repos/{}/git/ref/heads/{encoded}", self.identity.repository),
-            &self.installation_token,
-            &self.api_version,
         )
         .await
     }
 
     pub async fn git_commit(&self, sha: &str) -> Result<GitCommit, GitHubError> {
-        rest_get(
-            &self.http,
-            &format!("/repos/{}/git/commits/{sha}", self.identity.repository),
-            &self.installation_token,
-            &self.api_version,
-        )
-        .await
+        self.installation
+            .get(
+                &format!("/repos/{}/git/commits/{sha}", self.identity.repository),
+                None::<&()>,
+            )
+            .await
+            .map_err(GitHubError::from)
     }
 
     pub async fn create_git_commit(
@@ -457,20 +419,19 @@ impl GitHubClient {
     ) -> Result<GitCommit, GitHubError> {
         let actor = format!("{}[bot]", self.identity.app_slug);
         let email = format!("{}+{}@users.noreply.github.com", self.identity.app_id, actor);
-        rest_post(
-            &self.http,
-            &format!("/repos/{}/git/commits", self.identity.repository),
-            &self.installation_token,
-            &self.api_version,
-            &CreateGitCommit {
-                message,
-                tree,
-                parents: [parent],
-                author: GitSignature { name: &actor, email: &email, date: authored_at },
-                committer: GitSignature { name: &actor, email: &email, date: authored_at },
-            },
-        )
-        .await
+        self.installation
+            .post(
+                &format!("/repos/{}/git/commits", self.identity.repository),
+                Some(&CreateGitCommit {
+                    message,
+                    tree,
+                    parents: [parent],
+                    author: GitSignature { name: &actor, email: &email, date: authored_at },
+                    committer: GitSignature { name: &actor, email: &email, date: authored_at },
+                }),
+            )
+            .await
+            .map_err(GitHubError::from)
     }
 
     pub async fn create_git_reference(
@@ -479,14 +440,13 @@ impl GitHubClient {
         sha: &str,
     ) -> Result<GitReference, GitHubError> {
         let reference = format!("refs/heads/{name}");
-        rest_post(
-            &self.http,
-            &format!("/repos/{}/git/refs", self.identity.repository),
-            &self.installation_token,
-            &self.api_version,
-            &CreateGitReference { reference: &reference, sha },
-        )
-        .await
+        self.installation
+            .post(
+                &format!("/repos/{}/git/refs", self.identity.repository),
+                Some(&CreateGitReference { reference: &reference, sha }),
+            )
+            .await
+            .map_err(GitHubError::from)
     }
 
     pub async fn update_git_reference(
@@ -495,14 +455,13 @@ impl GitHubClient {
         sha: &str,
     ) -> Result<GitReference, GitHubError> {
         let encoded = encode_path(name);
-        rest_patch(
-            &self.http,
-            &format!("/repos/{}/git/refs/heads/{encoded}", self.identity.repository),
-            &self.installation_token,
-            &self.api_version,
-            &UpdateGitReference { sha, force: false },
-        )
-        .await
+        self.installation
+            .patch(
+                &format!("/repos/{}/git/refs/heads/{encoded}", self.identity.repository),
+                Some(&UpdateGitReference { sha, force: false }),
+            )
+            .await
+            .map_err(GitHubError::from)
     }
 
     pub async fn open_pull_requests_for_head(
@@ -510,26 +469,21 @@ impl GitHubClient {
         head: &str,
         base: &str,
     ) -> Result<Vec<PullRequest>, GitHubError> {
-        let head = format!(
-            "{}:{head}",
-            self.identity.repository.split_once('/').map_or("", |(owner, _)| owner)
-        );
-        let query = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("state", "open")
-            .append_pair("head", &head)
-            .append_pair("base", base)
-            .append_pair("per_page", "100")
-            .finish();
-        let response = self
-            .http
-            .get(format!("{API_ROOT}/repos/{}/pulls?{query}", self.identity.repository))
-            .bearer_auth(&self.installation_token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", &self.api_version)
-            .send()
+        let owner = self
+            .identity
+            .repository
+            .split_once('/')
+            .map_or("", |(owner, _)| owner);
+        let params = PullRequestsParams {
+            state: "open",
+            head: format!("{owner}:{head}"),
+            base,
+            per_page: 100,
+        };
+        self.installation
+            .get(&format!("/repos/{}/pulls", self.identity.repository), Some(&params))
             .await
-            .map_err(GitHubError::Transport)?;
-        rest_response(response).await
+            .map_err(GitHubError::from)
     }
 
     pub async fn create_draft_pull_request(
@@ -539,14 +493,13 @@ impl GitHubClient {
         head: &str,
         base: &str,
     ) -> Result<PullRequest, GitHubError> {
-        rest_post(
-            &self.http,
-            &format!("/repos/{}/pulls", self.identity.repository),
-            &self.installation_token,
-            &self.api_version,
-            &CreatePullRequest { title, body, head, base, draft: true },
-        )
-        .await
+        self.installation
+            .post(
+                &format!("/repos/{}/pulls", self.identity.repository),
+                Some(&CreatePullRequest { title, body, head, base, draft: true }),
+            )
+            .await
+            .map_err(GitHubError::from)
     }
 
     pub async fn pull_request_closing_issues(
@@ -599,8 +552,10 @@ impl GitHubClient {
     }
 
     pub async fn app_webhook_config(&self) -> Result<AppWebhookConfig, GitHubError> {
-        let jwt = app_jwt(&self.config)?;
-        rest_get(&self.http, "/app/hook/config", &jwt, &self.api_version).await
+        self.app
+            .get("/app/hook/config", None::<&()>)
+            .await
+            .map_err(GitHubError::from)
     }
 
     pub async fn update_app_webhook(
@@ -608,195 +563,48 @@ impl GitHubClient {
         url: &str,
         secret: Option<&str>,
     ) -> Result<AppWebhookConfig, GitHubError> {
-        let jwt = app_jwt(&self.config)?;
-        rest_patch(
-            &self.http,
-            "/app/hook/config",
-            &jwt,
-            &self.api_version,
-            &AppWebhookUpdate { url, content_type: "json", insecure_ssl: "0", secret },
-        )
-        .await
+        self.app
+            .patch(
+                "/app/hook/config",
+                Some(&AppWebhookUpdate {
+                    url,
+                    content_type: "json",
+                    insecure_ssl: "0",
+                    secret,
+                }),
+            )
+            .await
+            .map_err(GitHubError::from)
     }
 
     pub async fn app_deliveries(&self) -> Result<Vec<AppDeliverySummary>, GitHubError> {
-        let jwt = app_jwt(&self.config)?;
-        rest_get(&self.http, "/app/hook/deliveries?per_page=100", &jwt, &self.api_version).await
+        let params = PaginationParams { per_page: 100, page: 1 };
+        self.app
+            .get("/app/hook/deliveries", Some(&params))
+            .await
+            .map_err(GitHubError::from)
     }
 
     pub async fn redeliver(&self, delivery_id: u64) -> Result<(), GitHubError> {
-        let jwt = app_jwt(&self.config)?;
         let response = self
-            .http
-            .post(format!("{API_ROOT}/app/hook/deliveries/{delivery_id}/attempts"))
-            .bearer_auth(jwt)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", &self.api_version)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .map_err(GitHubError::Transport)?;
+            .app
+            ._post(
+                format!("/app/hook/deliveries/{delivery_id}/attempts"),
+                Some(&serde_json::json!({})),
+            )
+            .await?;
         let status = response.status();
         if status == StatusCode::ACCEPTED {
             Ok(())
         } else {
-            let body = response.text().await.unwrap_or_default();
+            let body = self
+                .app
+                .body_to_string(response)
+                .await
+                .map_err(|error| GitHubError::Octocrab(error.to_string()))?;
             Err(GitHubError::Http { status, body: bounded(&body, 1024).to_owned() })
         }
     }
-}
-
-#[derive(Serialize)]
-struct AppClaims {
-    iat: i64,
-    exp: i64,
-    iss: String,
-}
-
-fn app_jwt(config: &GitHubConfig) -> Result<String, GitHubError> {
-    let pem = fs::read(&config.private_key_file)?;
-    let key = EncodingKey::from_rsa_pem(&pem).map_err(GitHubError::InvalidPrivateKey)?;
-    let now = OffsetDateTime::now_utc().unix_timestamp();
-    let claims = AppClaims { iat: now - 60, exp: now + 540, iss: config.app_id.to_string() };
-    jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &key).map_err(GitHubError::Jwt)
-}
-
-async fn rest_get<T: DeserializeOwned>(
-    client: &Client,
-    path: &str,
-    token: &str,
-    api_version: &str,
-) -> Result<T, GitHubError> {
-    rest_response(
-        client
-            .get(format!("{API_ROOT}{path}"))
-            .bearer_auth(token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", api_version)
-            .send()
-            .await
-            .map_err(GitHubError::Transport)?,
-    )
-    .await
-}
-
-async fn rest_get_optional<T: DeserializeOwned>(
-    client: &Client,
-    path: &str,
-    token: &str,
-    api_version: &str,
-) -> Result<Option<T>, GitHubError> {
-    let response = client
-        .get(format!("{API_ROOT}{path}"))
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", api_version)
-        .send()
-        .await
-        .map_err(GitHubError::Transport)?;
-    if response.status() == StatusCode::NOT_FOUND {
-        Ok(None)
-    } else {
-        rest_response(response).await.map(Some)
-    }
-}
-
-fn encode_path(value: &str) -> String {
-    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
-}
-
-async fn rest_post_empty<T: DeserializeOwned>(
-    client: &Client,
-    path: &str,
-    token: &str,
-    api_version: &str,
-) -> Result<T, GitHubError> {
-    rest_response(
-        client
-            .post(format!("{API_ROOT}{path}"))
-            .bearer_auth(token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", api_version)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .map_err(GitHubError::Transport)?,
-    )
-    .await
-}
-
-async fn rest_post<B: Serialize + ?Sized, T: DeserializeOwned>(
-    client: &Client,
-    path: &str,
-    token: &str,
-    api_version: &str,
-    body: &B,
-) -> Result<T, GitHubError> {
-    rest_response(
-        client
-            .post(format!("{API_ROOT}{path}"))
-            .bearer_auth(token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", api_version)
-            .json(body)
-            .send()
-            .await
-            .map_err(GitHubError::Transport)?,
-    )
-    .await
-}
-
-async fn rest_patch<B: Serialize + ?Sized, T: DeserializeOwned>(
-    client: &Client,
-    path: &str,
-    token: &str,
-    api_version: &str,
-    body: &B,
-) -> Result<T, GitHubError> {
-    rest_response(
-        client
-            .patch(format!("{API_ROOT}{path}"))
-            .bearer_auth(token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", api_version)
-            .json(body)
-            .send()
-            .await
-            .map_err(GitHubError::Transport)?,
-    )
-    .await
-}
-
-async fn rest_delete(
-    client: &Client,
-    path: &str,
-    token: &str,
-    api_version: &str,
-) -> Result<(), GitHubError> {
-    let response = client
-        .delete(format!("{API_ROOT}{path}"))
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", api_version)
-        .send()
-        .await
-        .map_err(GitHubError::Transport)?;
-    let status = response.status();
-    if status.is_success() {
-        Ok(())
-    } else {
-        let body = response.text().await.unwrap_or_default();
-        Err(GitHubError::Http { status, body: bounded(&body, 1024).to_owned() })
-    }
-}
-
-async fn rest_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, GitHubError> {
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(GitHubError::Http { status, body: bounded(&body, 1024).to_owned() });
-    }
-    response.json().await.map_err(GitHubError::Response)
 }
 
 #[derive(Serialize)]
@@ -815,17 +623,6 @@ struct GraphQlEnvelope<T> {
 #[derive(Deserialize)]
 struct GraphQlError {
     message: String,
-}
-
-#[derive(Deserialize)]
-struct AppResponse {
-    id: u64,
-    slug: String,
-}
-
-#[derive(Deserialize)]
-struct InstallationResponse {
-    id: u64,
 }
 
 #[derive(Deserialize)]
@@ -863,6 +660,20 @@ struct ViewerIdentity {
 struct PermissionResponse {
     permission: String,
     role_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PaginationParams {
+    per_page: u8,
+    page: u16,
+}
+
+#[derive(Serialize)]
+struct PullRequestsParams<'a> {
+    state: &'a str,
+    head: String,
+    base: &'a str,
+    per_page: u8,
 }
 
 #[derive(Serialize)]
@@ -1090,30 +901,18 @@ struct AppWebhookUpdate<'a> {
 }
 
 async fn repository_identity(
-    client: &Client,
-    token: &str,
+    client: &Octocrab,
     repository: &RepositoryName,
 ) -> Result<RepositoryIdentityNode, GitHubError> {
-    let response = client
-        .post(GRAPHQL_URL)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .json(&serde_json::json!({
-            "query": "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id nameWithOwner}}",
-            "variables": {"owner": repository.owner, "name": repository.name}
-        }))
-        .send()
-        .await
-        .map_err(GitHubError::Transport)?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(GitHubError::Http { status, body: bounded(&body, 1024).to_owned() });
-    }
-    let envelope = response
-        .json::<GraphQlEnvelope<RepositoryIdentityData>>()
-        .await
-        .map_err(GitHubError::Response)?;
+    let envelope: GraphQlEnvelope<RepositoryIdentityData> = client
+        .post(
+            "/graphql",
+            Some(&serde_json::json!({
+                "query": "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id nameWithOwner}}",
+                "variables": {"owner": repository.owner, "name": repository.name}
+            })),
+        )
+        .await?;
     if !envelope.errors.is_empty() {
         return Err(GitHubError::GraphQl(
             envelope.errors.into_iter().map(|error| error.message).collect::<Vec<_>>().join("; "),
@@ -1122,30 +921,57 @@ async fn repository_identity(
     envelope.data.and_then(|data| data.repository).ok_or(GitHubError::MissingData)
 }
 
-async fn viewer_identity(client: &Client, token: &str) -> Result<ViewerIdentity, GitHubError> {
-    let response = client
-        .post(GRAPHQL_URL)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .json(&serde_json::json!({"query":"query{viewer{id login}}","variables":{}}))
-        .send()
-        .await
-        .map_err(GitHubError::Transport)?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(GitHubError::Http { status, body: bounded(&body, 1024).to_owned() });
-    }
-    let envelope = response
-        .json::<GraphQlEnvelope<ViewerIdentityData>>()
-        .await
-        .map_err(GitHubError::Response)?;
+async fn viewer_identity(client: &Octocrab) -> Result<ViewerIdentity, GitHubError> {
+    let envelope: GraphQlEnvelope<ViewerIdentityData> = client
+        .post(
+            "/graphql",
+            Some(&serde_json::json!({
+                "query": "query{viewer{id login}}",
+                "variables": {}
+            })),
+        )
+        .await?;
     if !envelope.errors.is_empty() {
         return Err(GitHubError::GraphQl(
             envelope.errors.into_iter().map(|error| error.message).collect::<Vec<_>>().join("; "),
         ));
     }
     Ok(envelope.data.ok_or(GitHubError::MissingData)?.viewer)
+}
+
+async fn octocrab_get_optional<T: DeserializeOwned>(
+    client: &Octocrab,
+    route: impl AsRef<str>,
+) -> Result<Option<T>, GitHubError> {
+    match client.get::<T, _, _>(route.as_ref(), None::<&()>).await {
+        Ok(value) => Ok(Some(value)),
+        Err(octocrab::Error::GitHub { source, .. })
+            if source.status_code == StatusCode::NOT_FOUND =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn octocrab_delete(
+    client: &Octocrab,
+    route: impl AsRef<str>,
+) -> Result<(), GitHubError> {
+    let response = client._delete(route.as_ref(), None::<&()>).await?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = client
+        .body_to_string(response)
+        .await
+        .map_err(|error| GitHubError::Octocrab(error.to_string()))?;
+    Err(GitHubError::Http { status, body: bounded(&body, 1024).to_owned() })
+}
+
+fn encode_path(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
 fn bounded(value: &str, bytes: usize) -> &str {

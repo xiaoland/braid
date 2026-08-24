@@ -1,5 +1,6 @@
 #![allow(clippy::needless_raw_string_hashes)]
 
+#![allow(clippy::large_futures)]
 use std::{collections::BTreeSet, fmt::Write as _};
 
 use comrak::{Arena, Options, nodes::NodeValue, parse_document};

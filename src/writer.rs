@@ -1,3 +1,4 @@
+#![allow(clippy::large_futures)]
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};

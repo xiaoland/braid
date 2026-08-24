@@ -16,11 +16,12 @@
 - [ ] `store.rs` refactored into a module tree (deferred: module cohesion requires keeping `StoreActor`/`Command`/`actor_loop` in `mod.rs`; will extract pure helpers later if needed).
 - [ ] `runtime.rs` refactored into a module tree.
 - [ ] `context.rs` refactored into a module tree or typed GraphQL client.
-- [ ] `github.rs`, `writer.rs`, `cli.rs` reviewed and split if needed.
+- [ ] `github.rs` reviewed and split if needed (migrated to `octocrab`; kept as single module due to tight identity/REST coupling).
+- [ ] `writer.rs`, `cli.rs` reviewed and split if needed.
 - [x] Replace worktree shell commands with `git2`.
-- [ ] Replace hand-written GitHub App client with `octocrab`.
-- [ ] Replace manual GraphQL query building with typed client.
-- [ ] Replace JSON-RPC-ish provider loop with a typed crate.
+- [x] Replace hand-written GitHub App client with `octocrab`.
+- [ ] Replace manual GraphQL query building with typed client (deferred: `octocrab` raw `/graphql` is sufficient for current query surface).
+- [ ] Replace JSON-RPC-ish provider loop with a typed crate (deferred: split into modules; typed crate not yet adopted).
 - [ ] Docs updated.
 - [ ] Clean release rebuilt and Homebrew formula updated.
 
