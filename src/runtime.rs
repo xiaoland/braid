@@ -1491,7 +1491,7 @@ async fn prepare_pr_context(
     })
 }
 
-async fn provision_pr_agent_worktree(
+fn provision_pr_agent_worktree(
     store: &StoreActor,
     config: &Config,
     profile: &Profile,
@@ -1516,8 +1516,7 @@ async fn provision_pr_agent_worktree(
         remote: "origin",
         head_ref: &prepared.head_ref,
         local_branch: &local_branch,
-    })
-    .await?;
+    })?;
     store.record_agent_worktree(
         materialization.clone(),
         prepared.repository_node_id.clone(),
@@ -1578,9 +1577,7 @@ async fn materialize_pr_assignment(
         &candidate,
         &materialization,
         &prepared,
-    )
-    .await
-    {
+    ) {
         Ok(profile) => profile,
         Err(error) => {
             store

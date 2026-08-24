@@ -39,7 +39,7 @@ pub struct ProvisionedWorktree {
     pub local_branch: String,
 }
 
-pub async fn provision(
+pub fn provision(
     request: &WorktreeRequest<'_>,
 ) -> Result<ProvisionedWorktree, WorktreeError> {
     let source = tokio::task::block_in_place(|| canonical_repository(request.source))?;
@@ -57,7 +57,7 @@ pub async fn provision(
         )));
     }
     if request.target.exists() {
-        return verify_existing(request, &source).await;
+        return verify_existing(request, &source);
     }
     if let Some(parent) = request.target.parent() {
         std::fs::create_dir_all(parent)
@@ -72,10 +72,7 @@ pub async fn provision(
             None,
         )?;
         let reference = repo
-            .find_reference(&format!(
-                "refs/remotes/{}/{}",
-                request.remote, request.head_ref
-            ))
+            .find_reference(&format!("refs/remotes/{}/{}", request.remote, request.head_ref))
             .map_err(|error| {
                 WorktreeError::Git(format!(
                     "fetched ref refs/remotes/{}/{} not found: {error}",
@@ -94,17 +91,17 @@ pub async fn provision(
             })?;
         Ok::<(), WorktreeError>(())
     })?;
-    verify_existing(request, &source).await
+    verify_existing(request, &source)
 }
 
-async fn verify_existing(
+fn verify_existing(
     request: &WorktreeRequest<'_>,
     source: &Path,
 ) -> Result<ProvisionedWorktree, WorktreeError> {
-    let expected = request
-        .target
-        .canonicalize()
-        .map_err(|source_err| WorktreeError::Io { path: request.target.to_path_buf(), source: source_err })?;
+    let expected = request.target.canonicalize().map_err(|source_err| WorktreeError::Io {
+        path: request.target.to_path_buf(),
+        source: source_err,
+    })?;
     let target_root = tokio::task::block_in_place(|| canonical_repository(request.target))
         .map_err(|_| WorktreeError::TargetConflict(request.target.to_path_buf()))?;
     if target_root != expected {
@@ -131,7 +128,9 @@ fn canonical_repository(path: &Path) -> Result<PathBuf, WorktreeError> {
         return Err(WorktreeError::NotRepository(path.to_path_buf()));
     }
     Repository::discover(path)
-        .map(|repo| repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| repo.path().to_path_buf()))
+        .map(|repo| {
+            repo.workdir().map_or_else(|| repo.path().to_path_buf(), Path::to_path_buf)
+        })
         .map_err(|error| {
             if error.class() == ErrorClass::Repository && error.code() == ErrorCode::NotFound {
                 WorktreeError::NotRepository(path.to_path_buf())
