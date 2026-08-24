@@ -267,6 +267,7 @@ count_comments=()
 for index in $(seq 1 7); do
     count_comments+=("$(gh api --method POST "repos/$repository/issues/$fixture_issue/comments" \
         -f body="Count-threshold event $index of 8. Do not publish yet and do not mention the configured handle." --jq '.id')")
+    sleep 1
 done
 count_comments+=("$(gh api --method POST "repos/$repository/issues/$fixture_issue/comments" \
     -f body="Count-threshold event 8 of 8: run a shell sleep for 8 seconds, then publish one concise attributed comment containing $count_marker. Do not mention the configured handle." --jq '.id')")
