@@ -112,7 +112,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     server.abort();
 
     println!("Exchanging manifest code for App credentials...");
-    let app: AppConversion = gh_api_json(&format!("app-manifests/{code}/conversions"), None)
+    let app: AppConversion = gh_api_json(&format!("app-manifests/{code}/conversions"), Some(""))
         .context("cannot convert GitHub App manifest")?;
     println!("Created GitHub App: {} (ID {})", app.html_url, app.id);
 
