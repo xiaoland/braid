@@ -12,11 +12,14 @@
 
 - [x] Migrations collapsed to one init migration.
 - [x] Unused dependencies removed from `Cargo.toml`/`Cargo.lock`.
-- [ ] `store.rs` refactored into a module tree.
+- [ ] `store.rs` refactored into a module tree (attempted; reverted due to cross-module dependency complexity — needs careful manual extraction).
 - [ ] `runtime.rs` refactored into a module tree.
 - [ ] `context.rs` refactored into a module tree.
 - [ ] `github.rs`, `provider.rs`, `writer.rs`, `cli.rs` reviewed and split if needed.
-- [ ] Duplicate/utility code replaced with mature crates where appropriate.
+- [x] Replace worktree shell commands with `git2`.
+- [ ] Replace hand-written GitHub App client with `octocrab`.
+- [ ] Replace manual GraphQL query building with typed client.
+- [ ] Replace JSON-RPC-ish provider loop with a typed crate.
 - [ ] Docs updated.
 - [ ] Clean release rebuilt and Homebrew formula updated.
 
