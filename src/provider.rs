@@ -463,6 +463,8 @@ struct PiState {
 pub struct PiProvider {
     state: Arc<Mutex<PiState>>,
     notifications: broadcast::Sender<ProviderNotification>,
+    thread_id: Arc<Mutex<String>>,
+    turn_id: Arc<Mutex<String>>,
 }
 
 impl PiProvider {
@@ -478,7 +480,12 @@ impl PiProvider {
             context: String::new(),
             current_turn_id: None,
         };
-        Self { state: Arc::new(Mutex::new(state)), notifications }
+        Self {
+            state: Arc::new(Mutex::new(state)),
+            notifications,
+            thread_id: Arc::new(Mutex::new(String::new())),
+            turn_id: Arc::new(Mutex::new(String::new())),
+        }
     }
 
     fn spawn(
@@ -514,6 +521,24 @@ impl PiProvider {
         {
             cmd.env(api_key_env, api_key);
         }
+        // Ensure the spawned Pi process can find the same `braid` binary and config
+        // so it can execute `braid gh` and `gh` shell commands.
+        if let Ok(current_exe) = std::env::current_exe() {
+            if let Some(exe_dir) = current_exe.parent() {
+                let mut path_parts: Vec<String> =
+                    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
+                let exe_dir_str = exe_dir.to_string_lossy().into_owned();
+                if !path_parts.iter().any(|p| p == &exe_dir_str) {
+                    path_parts.insert(0, exe_dir_str);
+                }
+                cmd.env("PATH", std::env::join_paths(path_parts).unwrap_or_default());
+            }
+        }
+        if let Ok(braid_config) = std::env::var("BRAID_CONFIG") {
+            cmd.env("BRAID_CONFIG", braid_config);
+        }
         if let Some(session_path) = session {
             cmd.args(["--session", session_path]);
         }
@@ -536,8 +561,13 @@ impl PiProvider {
             .stderr
             .take()
             .ok_or_else(|| ProviderError::Protocol("pi stderr was not piped".into()))?;
-        let stdout_handle =
-            spawn_pi_stdout(stdout, Arc::clone(&state.pending), self.notifications.clone());
+        let stdout_handle = spawn_pi_stdout(
+            stdout,
+            Arc::clone(&state.pending),
+            self.notifications.clone(),
+            Arc::clone(&self.thread_id),
+            Arc::clone(&self.turn_id),
+        );
         let stderr_handle = spawn_pi_stderr(stderr);
         state.process = Some(PiProcess { writer, _child: child, stdout_handle, stderr_handle });
         Ok(())
@@ -687,12 +717,11 @@ impl AgentProvider for PiProvider {
 
         let turn_id = uuid::Uuid::now_v7().to_string();
         state.current_turn_id = Some(turn_id.clone());
+        *self.turn_id.lock().await = turn_id.clone();
+        *self.thread_id.lock().await = state.session.clone().unwrap_or_default();
 
-        let result = Self::request(
-            &mut state,
-            json!({"type": "prompt", "message": message, "streamingBehavior": "followUp"}),
-        )
-        .await?;
+        let result =
+            Self::request(&mut state, json!({"type": "prompt", "message": message})).await?;
         Self::success_or_protocol(&result, "prompt")?;
 
         Ok(ProviderTurn { turn_id })
@@ -724,6 +753,8 @@ fn spawn_pi_stdout(
     stdout: tokio::process::ChildStdout,
     pending: Arc<Mutex<PendingRequests>>,
     notifications: broadcast::Sender<ProviderNotification>,
+    thread_id: Arc<Mutex<String>>,
+    turn_id: Arc<Mutex<String>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
@@ -756,7 +787,9 @@ fn spawn_pi_stdout(
                 }
                 continue;
             }
-            if let Some(notification) = parse_pi_event(&frame) {
+            let current_thread = thread_id.lock().await.clone();
+            let current_turn = turn_id.lock().await.clone();
+            if let Some(notification) = parse_pi_event(&frame, &current_thread, &current_turn) {
                 let _ = notifications.send(notification);
             }
         }
@@ -785,12 +818,12 @@ fn spawn_pi_stderr(stderr: tokio::process::ChildStderr) -> tokio::task::JoinHand
     })
 }
 
-fn parse_pi_event(frame: &Value) -> Option<ProviderNotification> {
+fn parse_pi_event(frame: &Value, thread_id: &str, turn_id: &str) -> Option<ProviderNotification> {
     let event_type = frame.get("type")?.as_str()?;
     match event_type {
         "turn_start" => Some(ProviderNotification::TurnStarted {
-            thread_id: String::new(),
-            turn_id: String::new(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
         }),
         "turn_end" | "agent_settled" => {
             let has_error = if event_type == "turn_end" {
@@ -805,11 +838,47 @@ fn parse_pi_event(frame: &Value) -> Option<ProviderNotification> {
             let error =
                 if has_error { Some("pi turn ended with error or abort".into()) } else { None };
             Some(ProviderNotification::TurnCompleted {
-                thread_id: String::new(),
-                turn_id: String::new(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
                 status: if has_error { "failed".into() } else { "completed".into() },
                 error,
             })
+        }
+        "message_end" => {
+            // Fallback for Pi sessions that emit the final assistant message without a
+            // following turn_end (for example, when the model stops cleanly but the
+            // session remains open for follow-ups). Only treat a stopReason of "stop"
+            // as terminal; toolUse means more tool calls are expected.
+            let message = frame.get("message")?;
+            if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                return Some(ProviderNotification::Activity {
+                    method: event_type.into(),
+                    thread_id: None,
+                    turn_id: None,
+                });
+            }
+            let stop_reason = message.get("stopReason").and_then(Value::as_str)?;
+            if stop_reason == "stop" {
+                Some(ProviderNotification::TurnCompleted {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    status: "completed".into(),
+                    error: None,
+                })
+            } else if stop_reason == "error" || stop_reason == "aborted" {
+                Some(ProviderNotification::TurnCompleted {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    status: "failed".into(),
+                    error: Some(format!("pi assistant message ended with {stop_reason}")),
+                })
+            } else {
+                Some(ProviderNotification::Activity {
+                    method: event_type.into(),
+                    thread_id: None,
+                    turn_id: None,
+                })
+            }
         }
         _ => Some(ProviderNotification::Activity {
             method: event_type.into(),
