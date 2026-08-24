@@ -39,9 +39,7 @@ pub struct ProvisionedWorktree {
     pub local_branch: String,
 }
 
-pub fn provision(
-    request: &WorktreeRequest<'_>,
-) -> Result<ProvisionedWorktree, WorktreeError> {
+pub fn provision(request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, WorktreeError> {
     let source = tokio::task::block_in_place(|| canonical_repository(request.source))?;
     let remote_url = tokio::task::block_in_place(|| {
         let repo = Repository::open(&source)?;
@@ -128,9 +126,7 @@ fn canonical_repository(path: &Path) -> Result<PathBuf, WorktreeError> {
         return Err(WorktreeError::NotRepository(path.to_path_buf()));
     }
     Repository::discover(path)
-        .map(|repo| {
-            repo.workdir().map_or_else(|| repo.path().to_path_buf(), Path::to_path_buf)
-        })
+        .map(|repo| repo.workdir().map_or_else(|| repo.path().to_path_buf(), Path::to_path_buf))
         .map_err(|error| {
             if error.class() == ErrorClass::Repository && error.code() == ErrorCode::NotFound {
                 WorktreeError::NotRepository(path.to_path_buf())

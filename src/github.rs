@@ -166,16 +166,11 @@ impl GitHubClient {
         if app_id != config.app_id {
             return Err(GitHubError::WrongApp { actual: app_id, expected: config.app_id });
         }
-        let installation = app
-            .apps()
-            .get_repository_installation(&repository.owner, &repository.name)
-            .await?;
+        let installation =
+            app.apps().get_repository_installation(&repository.owner, &repository.name).await?;
         let installation_id = installation.id.into_inner();
         let access: AccessTokenResponse = app
-            .post(
-                &format!("/app/installations/{installation_id}/access_tokens"),
-                None::<&()>,
-            )
+            .post(&format!("/app/installations/{installation_id}/access_tokens"), None::<&()>)
             .await?;
         let installation_client = Octocrab::builder()
             .personal_token(access.token.clone())
@@ -220,10 +215,8 @@ impl GitHubClient {
         V: Serialize + ?Sized,
         T: DeserializeOwned,
     {
-        let envelope: GraphQlEnvelope<T> = self
-            .installation
-            .post("/graphql", Some(&GraphQlRequest { query, variables }))
-            .await?;
+        let envelope: GraphQlEnvelope<T> =
+            self.installation.post("/graphql", Some(&GraphQlRequest { query, variables })).await?;
         if !envelope.errors.is_empty() {
             let messages = envelope
                 .errors
@@ -261,10 +254,8 @@ impl GitHubClient {
                 return Err(GitHubError::GraphQl(format!("unsupported reaction target {other:?}")));
             }
         };
-        let reaction: ReactionResponse = self
-            .installation
-            .post(&path, Some(&ReactionRequest { content }))
-            .await?;
+        let reaction: ReactionResponse =
+            self.installation.post(&path, Some(&ReactionRequest { content })).await?;
         Ok(reaction.id)
     }
 
@@ -304,7 +295,10 @@ impl GitHubClient {
             .map_err(GitHubError::from)
     }
 
-    pub async fn issue_comments(&self, issue_number: u64) -> Result<Vec<IssueComment>, GitHubError> {
+    pub async fn issue_comments(
+        &self,
+        issue_number: u64,
+    ) -> Result<Vec<IssueComment>, GitHubError> {
         let mut comments = Vec::new();
         for page in 1_u16..=100 {
             let params = PaginationParams { per_page: 100, page };
@@ -376,10 +370,7 @@ impl GitHubClient {
         number: u64,
     ) -> Result<IssueOrPullRequest, GitHubError> {
         self.installation
-            .get(
-                &format!("/repos/{}/issues/{number}", self.identity.repository),
-                None::<&()>,
-            )
+            .get(&format!("/repos/{}/issues/{number}", self.identity.repository), None::<&()>)
             .await
             .map_err(GitHubError::from)
     }
@@ -402,10 +393,7 @@ impl GitHubClient {
 
     pub async fn git_commit(&self, sha: &str) -> Result<GitCommit, GitHubError> {
         self.installation
-            .get(
-                &format!("/repos/{}/git/commits/{sha}", self.identity.repository),
-                None::<&()>,
-            )
+            .get(&format!("/repos/{}/git/commits/{sha}", self.identity.repository), None::<&()>)
             .await
             .map_err(GitHubError::from)
     }
@@ -469,11 +457,7 @@ impl GitHubClient {
         head: &str,
         base: &str,
     ) -> Result<Vec<PullRequest>, GitHubError> {
-        let owner = self
-            .identity
-            .repository
-            .split_once('/')
-            .map_or("", |(owner, _)| owner);
+        let owner = self.identity.repository.split_once('/').map_or("", |(owner, _)| owner);
         let params = PullRequestsParams {
             state: "open",
             head: format!("{owner}:{head}"),
@@ -552,10 +536,7 @@ impl GitHubClient {
     }
 
     pub async fn app_webhook_config(&self) -> Result<AppWebhookConfig, GitHubError> {
-        self.app
-            .get("/app/hook/config", None::<&()>)
-            .await
-            .map_err(GitHubError::from)
+        self.app.get("/app/hook/config", None::<&()>).await.map_err(GitHubError::from)
     }
 
     pub async fn update_app_webhook(
@@ -566,12 +547,7 @@ impl GitHubClient {
         self.app
             .patch(
                 "/app/hook/config",
-                Some(&AppWebhookUpdate {
-                    url,
-                    content_type: "json",
-                    insecure_ssl: "0",
-                    secret,
-                }),
+                Some(&AppWebhookUpdate { url, content_type: "json", insecure_ssl: "0", secret }),
             )
             .await
             .map_err(GitHubError::from)
@@ -579,10 +555,7 @@ impl GitHubClient {
 
     pub async fn app_deliveries(&self) -> Result<Vec<AppDeliverySummary>, GitHubError> {
         let params = PaginationParams { per_page: 100, page: 1 };
-        self.app
-            .get("/app/hook/deliveries", Some(&params))
-            .await
-            .map_err(GitHubError::from)
+        self.app.get("/app/hook/deliveries", Some(&params)).await.map_err(GitHubError::from)
     }
 
     pub async fn redeliver(&self, delivery_id: u64) -> Result<(), GitHubError> {
@@ -954,10 +927,7 @@ async fn octocrab_get_optional<T: DeserializeOwned>(
     }
 }
 
-async fn octocrab_delete(
-    client: &Octocrab,
-    route: impl AsRef<str>,
-) -> Result<(), GitHubError> {
+async fn octocrab_delete(client: &Octocrab, route: impl AsRef<str>) -> Result<(), GitHubError> {
     let response = client._delete(route.as_ref(), None::<&()>).await?;
     let status = response.status();
     if status.is_success() {
