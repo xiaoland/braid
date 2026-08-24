@@ -190,7 +190,7 @@ has_reaction() {
 agent_marker_count() {
     local issue=$1
     local marker=$2
-    gh api "repos/$repository/issues/$issue/comments" | jq --arg actor "$agent_actor" --arg marker "$marker" \
+    gh api "repos/$repository/issues/$issue/comments" | jq --arg actor "$app_actor" --arg marker "$marker" \
         '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")) and (.body | contains($marker)))] | length'
 }
 
@@ -207,7 +207,7 @@ gh api --method PATCH "repos/$repository/issues/comments/$mention_comment" \
 
 for _ in $(seq 1 180); do
     agent_comments="$(gh api "repos/$repository/issues/$fixture_issue/comments" 2>/dev/null | \
-        jq --arg actor "$agent_actor" \
+        jq --arg actor "$app_actor" \
             '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length' || true)"
     if has_reaction "$mention_comment" +1 && [[ "${agent_comments:-0}" -eq 1 ]]; then
         break
@@ -233,7 +233,7 @@ jq -e --argjson number "$fixture_issue" '
 ' >/dev/null <<<"$status_payload" || fail "Issue Agent did not converge to one idle session"
 app_comments="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
     jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor)] | length')"
-[[ "$app_comments" -eq 0 ]] || fail "Braid mirrored turn activity into an App comment"
+[[ "$app_comments" -eq 1 ]] || fail "Braid did not publish exactly one App-authored comment"
 
 note "proving one ordinary comment waits for the complete quiet window"
 ordinary_marker="BRAID_ORDINARY_COMPLETE_$(date -u +%s)"
