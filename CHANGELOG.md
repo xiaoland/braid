@@ -3,6 +3,25 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
+## [0.2.0] - 2026-08-24
+
+### Changed
+
+- Collapsed all pre-release schema migrations into `migrations/0001_initial.sql`
+  and reset the supported schema version to 1.
+- Replaced shell `git` invocations in worktree handling with the `git2` crate.
+- Replaced the hand-written `reqwest`/JWT GitHub App client in `src/github.rs`
+  with `octocrab` for App authentication, installation tokens, and REST calls.
+  GraphQL remains raw `octocrab` POSTs to keep the existing query envelope.
+- Split `src/provider.rs` into `src/provider/mod.rs`, `src/provider/codex.rs`,
+  `src/provider/pi.rs`, and `src/provider/util.rs`.
+- Aligned `jsonwebtoken` with the version required by `octocrab`.
+
+### Fixed
+
+- Updated `scripts/tests/00_clean_install.sh`, `30_issue_agent.sh`, and
+  `40_context_lifecycle.sh` for the collapsed schema version 1.
+
 ## [Unreleased]
 
 ### Changed
