@@ -23,7 +23,7 @@
 - [ ] Replace manual GraphQL query building with typed client (deferred: `octocrab` raw `/graphql` is sufficient for current query surface).
 - [ ] Replace JSON-RPC-ish provider loop with a typed crate (deferred: split into modules; typed crate not yet adopted).
 - [ ] Docs updated.
-- [ ] Clean release rebuilt and Homebrew formula updated.
+- [x] Clean release rebuilt and Homebrew formula updated to v0.2.0.
 
 ## Verification
 
