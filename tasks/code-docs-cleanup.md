@@ -12,10 +12,11 @@
 
 - [x] Migrations collapsed to one init migration.
 - [x] Unused dependencies removed from `Cargo.toml`/`Cargo.lock`.
-- [ ] `store.rs` refactored into a module tree (attempted; reverted due to cross-module dependency complexity — needs careful manual extraction).
+- [x] `provider.rs` refactored into a module tree (`provider/mod.rs`, `provider/codex.rs`, `provider/pi.rs`, `provider/util.rs`) with clean public API.
+- [ ] `store.rs` refactored into a module tree (deferred: module cohesion requires keeping `StoreActor`/`Command`/`actor_loop` in `mod.rs`; will extract pure helpers later if needed).
 - [ ] `runtime.rs` refactored into a module tree.
-- [ ] `context.rs` refactored into a module tree.
-- [ ] `github.rs`, `provider.rs`, `writer.rs`, `cli.rs` reviewed and split if needed.
+- [ ] `context.rs` refactored into a module tree or typed GraphQL client.
+- [ ] `github.rs`, `writer.rs`, `cli.rs` reviewed and split if needed.
 - [x] Replace worktree shell commands with `git2`.
 - [ ] Replace hand-written GitHub App client with `octocrab`.
 - [ ] Replace manual GraphQL query building with typed client.
