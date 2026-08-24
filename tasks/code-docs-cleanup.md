@@ -14,7 +14,7 @@
 - [x] Unused dependencies removed from `Cargo.toml`/`Cargo.lock`.
 - [x] `provider.rs` refactored into a module tree (`provider/mod.rs`, `provider/codex.rs`, `provider/pi.rs`, `provider/util.rs`) with clean public API.
 - [ ] `store.rs` refactored into a module tree (deferred: module cohesion requires keeping `StoreActor`/`Command`/`actor_loop` in `mod.rs`; will extract pure helpers later if needed).
-- [ ] `runtime.rs` refactored into a module tree (in progress: subagent splitting).
+- [x] `runtime.rs` refactored into a module tree (`runtime/mod.rs`, `runtime/ingress.rs`, `runtime/outbox.rs`, `runtime/reconcile.rs`, `runtime/scheduler.rs`, `runtime/issue_agent.rs`, `runtime/pr_agent.rs`, `runtime/provider.rs`, `runtime/tunnel.rs`).
 - [ ] `context.rs` refactored into a module tree or typed GraphQL client.
 - [ ] `github.rs` reviewed and split if needed (migrated to `octocrab`; kept as single module due to tight identity/REST coupling).
 - [ ] `writer.rs`, `cli.rs` reviewed and split if needed.
