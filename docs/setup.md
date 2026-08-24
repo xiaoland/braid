@@ -82,14 +82,17 @@ braid setup owner/repository --no-browser
 
 This prints:
 
-- A pre-filled GitHub App Manifest URL you can paste into a browser.
+- A generated auto-submitting HTML form file; open it in any browser to POST
+  the manifest to GitHub.
+- A `curl` command that performs the same POST.
 - The full manifest JSON for copy-paste creation.
 - The generated webhook secret.
 - The install URL for the repository.
 - Instructions on how to persist the PEM, secret, and config so Braid can run.
 
-Use this when setting Braid up on a remote machine, CI, or any environment
-where `open`/`xdg-open` is not available.
+GitHub expects the manifest as a `POST` form field named `manifest`; a plain
+query parameter will not pre-fill the form. The generated HTML file handles this
+automatically.
 
 ## Notes
 

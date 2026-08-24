@@ -83,25 +83,26 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         }
     });
     let manifest_json = serde_json::to_string(&manifest)?;
-    let manifest_encoded = urlencoding::encode(&manifest_json);
-    let browser_url = if owner.eq_ignore_ascii_case(&gh_user) {
-        format!("https://github.com/settings/apps/new?manifest={manifest_encoded}&state={state}")
+    let form_action = if owner.eq_ignore_ascii_case(&gh_user) {
+        format!("https://github.com/settings/apps/new?state={state}")
     } else {
-        format!(
-            "https://github.com/organizations/{owner}/settings/apps/new?manifest={manifest_encoded}&state={state}"
-        )
+        format!("https://github.com/organizations/{owner}/settings/apps/new?state={state}")
     };
 
     if arguments.no_browser {
+        let html_path = write_manifest_html(&form_action, &manifest_json)?;
         print_manual_guide(
             &arguments.repository,
             owner,
-            &browser_url,
+            &form_action,
+            html_path.as_os_str().to_str().unwrap_or(""),
             &manifest_json,
             &webhook_secret,
         );
         return Ok(());
     }
+
+    let html_path = write_manifest_html(&form_action, &manifest_json)?;
 
     let shared = Arc::new(Mutex::new(CallbackState::default()));
     let app = Router::new()
@@ -115,8 +116,8 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     });
 
     println!("\nOpening browser to create the GitHub App...");
-    open_browser(&browser_url)?;
-    println!("If the browser did not open, visit:\n{browser_url}\n");
+    open_browser(html_path.as_os_str().to_str().unwrap_or(""))?;
+    println!("If the browser did not open, open this file manually:\n{}\n", html_path.display());
 
     println!("Waiting for GitHub to redirect back with the manifest code...");
     let code = wait_for_code(shared).await?;
@@ -155,35 +156,68 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
 fn print_manual_guide(
     repository: &str,
     owner: &str,
-    browser_url: &str,
+    form_action: &str,
+    html_path: &str,
     manifest_json: &str,
     webhook_secret: &str,
 ) {
+    let manifest_shell = manifest_json.replace('\'', "'\\''");
     println!("\n=== Manual GitHub App creation guide ===\n");
     println!("Repository: {repository}");
     println!("App owner:  {owner}\n");
     println!(
-        "You can either:\n\
-         1. Open this pre-filled manifest URL in a browser:\n   {browser_url}\n\n\
-         2. Or create the App manually at https://github.com/settings/apps/new \
+        "GitHub requires the manifest to be submitted as a POST request.\n\
+         The easiest option is to open this generated HTML file in a browser:\n   {html_path}\n\n\
+         It will auto-submit the manifest to:\n   {form_action}\n\n\
+         If you cannot transfer the HTML file, you can POST manually with curl:\n\n\
+            curl -X POST '{form_action}' \\\n\
+              -d 'manifest={manifest_shell}'\n\n\
+         Or create the App manually at https://github.com/settings/apps/new \
             (or https://github.com/organizations/{owner}/settings/apps/new for an org) \
-            with the values below.\n"
+            with the manifest JSON below.\n"
     );
-    println!("Manifest JSON (copy-paste into the manifest form if asked):\n{manifest_json}\n");
+    println!("Manifest JSON:\n{manifest_json}\n");
     println!(
         "After creating the App:\n\
          - Install it on {repository}: https://github.com/apps/braid-of-{owner}/installations/new\n\
-         - Set the App's webhook URL to the public tunnel URL you will get from \
+         - Set the App's webhook URL to the public tunnel URL from \
            `braid serve --config ~/.braid/braid.toml --tunnel` (ends in `/webhook`).\n\
          - Set the webhook secret to:\n   {webhook_secret}\n\n\
-         - Create ~/.braid/braid-of-{owner}.pem from the downloaded private key, \
-           create ~/.braid/braid-of-{owner}.webhook_secret containing the secret above, \
-           then run `braid setup` again without `--no-browser` so it can capture the manifest redirect.\n"
+         - Download the private key, save it as ~/.braid/braid-of-{owner}.pem, \
+           save the secret above as ~/.braid/braid-of-{owner}.webhook_secret, \
+           then run `braid setup` without `--no-browser` to capture the manifest redirect.\n"
     );
     println!(
         "If you already have the App's ID, slug, PEM, and webhook secret, you can \
          also write ~/.braid/braid.toml manually; see docs/setup.md.\n"
     );
+}
+
+fn write_manifest_html(form_action: &str, manifest_json: &str) -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join("braid-setup");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("manifest-{}.html", random_hex(8)));
+    let manifest_attr = manifest_json
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Braid GitHub App Manifest</title></head>
+<body>
+<form action="{form_action}" method="post" id="manifest-form">
+  <input type="hidden" name="manifest" value="{manifest_attr}">
+</form>
+<script>document.getElementById('manifest-form').submit();</script>
+<p>Submitting manifest to GitHub...</p>
+</body>
+</html>"#
+    );
+    fs::write(&path, html)?;
+    Ok(path)
 }
 
 async fn callback(
