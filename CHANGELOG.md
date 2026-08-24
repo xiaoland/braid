@@ -3,6 +3,16 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
+## [0.2.1] - 2026-08-24
+
+### Changed
+
+- Split `src/runtime.rs` into a module tree (`runtime/mod.rs`, `runtime/ingress.rs`,
+  `runtime/outbox.rs`, `runtime/reconcile.rs`, `runtime/scheduler.rs`,
+  `runtime/issue_agent.rs`, `runtime/pr_agent.rs`, `runtime/provider.rs`,
+  `runtime/tunnel.rs`). Public entry point `runtime::serve` and health snapshot
+  types remain unchanged.
+
 ## [0.2.0] - 2026-08-24
 
 ### Changed
