@@ -523,18 +523,18 @@ impl PiProvider {
         }
         // Ensure the spawned Pi process can find the same `braid` binary and config
         // so it can execute `braid gh` and `gh` shell commands.
-        if let Ok(current_exe) = std::env::current_exe() {
-            if let Some(exe_dir) = current_exe.parent() {
-                let mut path_parts: Vec<String> =
-                    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .collect();
-                let exe_dir_str = exe_dir.to_string_lossy().into_owned();
-                if !path_parts.iter().any(|p| p == &exe_dir_str) {
-                    path_parts.insert(0, exe_dir_str);
-                }
-                cmd.env("PATH", std::env::join_paths(path_parts).unwrap_or_default());
+        if let Ok(current_exe) = std::env::current_exe()
+            && let Some(exe_dir) = current_exe.parent()
+        {
+            let mut path_parts: Vec<String> =
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+            let exe_dir_str = exe_dir.to_string_lossy().into_owned();
+            if !path_parts.iter().any(|p| p == &exe_dir_str) {
+                path_parts.insert(0, exe_dir_str);
             }
+            cmd.env("PATH", std::env::join_paths(path_parts).unwrap_or_default());
         }
         if let Ok(braid_config) = std::env::var("BRAID_CONFIG") {
             cmd.env("BRAID_CONFIG", braid_config);
@@ -824,11 +824,6 @@ fn parse_pi_event(frame: &Value, thread_id: &str, turn_id: &str) -> Option<Provi
         "turn_start" => Some(ProviderNotification::TurnStarted {
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
-        }),
-        "turn_end" => Some(ProviderNotification::Activity {
-            method: event_type.into(),
-            thread_id: None,
-            turn_id: None,
         }),
         "agent_settled" => Some(ProviderNotification::TurnCompleted {
             thread_id: thread_id.to_owned(),
