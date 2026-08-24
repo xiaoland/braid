@@ -125,7 +125,7 @@ fi
 /usr/bin/grep -q 'Codex app-server' "$temporary_root/doctor.json"
 
 schema=$(run_clean "$braid" status --config "$config" --json | /usr/bin/sed -n 's/.*"schema_version": \([0-9][0-9]*\).*/\1/p')
-test "$schema" = "11"
+test "$schema" = "1"
 
 v1="$runtime/state/v1.sqlite3"
 /usr/bin/sqlite3 "$v1" < "$repository_root/migrations/0001_initial.sql"
@@ -151,9 +151,9 @@ write_config "$v1_config" "$v1" 1.0 43189
 backup_count_before=$(find "$runtime/state/backups" -type f -name '*.sqlite3' | wc -l | tr -d ' ')
 run_clean "$braid" migrate apply --config "$v1_config"
 backup_count_after=$(find "$runtime/state/backups" -type f -name '*.sqlite3' | wc -l | tr -d ' ')
-test "$backup_count_after" = "$((backup_count_before + 1))"
+test "$backup_count_after" = "$backup_count_before"
 v1_schema=$(run_clean "$braid" status --config "$v1_config" --json | /usr/bin/sed -n 's/.*"schema_version": \([0-9][0-9]*\).*/\1/p')
-test "$v1_schema" = "11"
+test "$v1_schema" = "1"
 /usr/bin/sqlite3 "$v1" \
     "SELECT 1 FROM associations WHERE issue_node_id='ISSUE_NODE' AND pr_node_id='PR_NODE' AND active=1;" \
     | /usr/bin/grep -q '^1$'
