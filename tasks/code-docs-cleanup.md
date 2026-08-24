@@ -16,7 +16,7 @@
 - [ ] `store.rs` refactored into a module tree (deferred: module cohesion requires keeping `StoreActor`/`Command`/`actor_loop` in `mod.rs`; will extract pure helpers later if needed).
 - [x] `runtime.rs` refactored into a module tree (`runtime/mod.rs`, `runtime/ingress.rs`, `runtime/outbox.rs`, `runtime/reconcile.rs`, `runtime/scheduler.rs`, `runtime/issue_agent.rs`, `runtime/pr_agent.rs`, `runtime/provider.rs`, `runtime/tunnel.rs`).
 - [ ] `context.rs` refactored into a module tree or typed GraphQL client (deferred: requires AST-aware extraction; manual sed is too risky).
-- [ ] `github.rs` reviewed and split if needed (migrated to `octocrab`; kept as single module due to tight identity/REST coupling).
+- [x] `github.rs` reviewed and split if needed (migrated to `octocrab`; kept as single module due to tight identity/REST coupling).
 - [x] `cli.rs` refactored into a module tree (`cli/mod.rs`, `cli/config.rs`, `cli/profile.rs`, `cli/context_cmd.rs`, `cli/gh.rs`, `cli/gh_cmd.rs`, `cli/migrate.rs`, `cli/doctor_cmd.rs`, `cli/status.rs`, `cli/telemetry_cmd.rs`, `cli/helpers.rs`).
 - [x] `writer.rs` refactored into a module tree (`writer/mod.rs`, `writer/prepare.rs`, `writer/ensure.rs`, `writer/comment.rs`, `writer/helpers.rs`).
 - [x] Replace worktree shell commands with `git2`.
