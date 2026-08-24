@@ -825,25 +825,17 @@ fn parse_pi_event(frame: &Value, thread_id: &str, turn_id: &str) -> Option<Provi
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
         }),
-        "turn_end" | "agent_settled" => {
-            let has_error = if event_type == "turn_end" {
-                frame
-                    .get("message")
-                    .and_then(|message| message.get("stopReason"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|reason| reason == "error" || reason == "aborted")
-            } else {
-                false
-            };
-            let error =
-                if has_error { Some("pi turn ended with error or abort".into()) } else { None };
-            Some(ProviderNotification::TurnCompleted {
-                thread_id: thread_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-                status: if has_error { "failed".into() } else { "completed".into() },
-                error,
-            })
-        }
+        "turn_end" => Some(ProviderNotification::Activity {
+            method: event_type.into(),
+            thread_id: None,
+            turn_id: None,
+        }),
+        "agent_settled" => Some(ProviderNotification::TurnCompleted {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            status: "completed".into(),
+            error: None,
+        }),
         "message_end" => {
             // Fallback for Pi sessions that emit the final assistant message without a
             // following turn_end (for example, when the model stops cleanly but the
