@@ -34,6 +34,7 @@
   - Starts an ephemeral Axum/HTTP server on a free localhost port and waits for the redirect.
   - Exchanges the `code` via `POST /app-manifests/{code}/conversions`.
   - Writes the PEM to `~/.braid/braid-of-<owner>.pem`, the webhook secret to `~/.braid/braid-of-<owner>.webhook_secret`, and the TOML config to `~/.braid/braid.toml`.
+  - Provides `--no-browser` guidance with the manifest URL, JSON, webhook secret, and install URL.
 
 ### Step 3 — Tunnel and webhook verification
 - [ ] In setup, start a localtunnel (or Cloudflare Quick Tunnel) and obtain the public URL.
