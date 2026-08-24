@@ -26,39 +26,10 @@ use gh_writes::{
     prepare_gh_write, prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 11;
+pub const DATABASE_SCHEMA_VERSION: u32 = 1;
 
-const INITIAL_SQL: &str = include_str!("../migrations/0001_initial.sql");
-const CONTEXT_LEDGER_SQL: &str = include_str!("../migrations/0002_context_ledger.sql");
-const TRANSPORT_RUNTIME_SQL: &str = include_str!("../migrations/0003_transport_runtime.sql");
-const PROVIDER_RUNTIME_SQL: &str = include_str!("../migrations/0004_provider_runtime.sql");
-const OPERATIONAL_STATUS_SQL: &str = include_str!("../migrations/0005_operational_status.sql");
-const CONTEXT_RESETS_SQL: &str = include_str!("../migrations/0006_context_resets.sql");
-const OPERATIONAL_CONVERGENCE_SQL: &str =
-    include_str!("../migrations/0007_operational_convergence.sql");
-const BRAID_GH_SQL: &str = include_str!("../migrations/0008_braid_gh.sql");
-const PR_AGENT_WORKTREE_SQL: &str = include_str!("../migrations/0009_pr_agent_worktree.sql");
-const CROSS_SURFACE_CONTEXT_SQL: &str =
-    include_str!("../migrations/0010_cross_surface_context.sql");
-const SEMANTIC_CONTEXT_IDENTITY_SQL: &str =
-    include_str!("../migrations/0011_semantic_context_identity.sql");
-const MIGRATIONS: &[Migration] = &[
-    Migration { version: 1, name: "initial", sql: INITIAL_SQL },
-    Migration { version: 2, name: "context-ledger", sql: CONTEXT_LEDGER_SQL },
-    Migration { version: 3, name: "transport-runtime", sql: TRANSPORT_RUNTIME_SQL },
-    Migration { version: 4, name: "provider-runtime", sql: PROVIDER_RUNTIME_SQL },
-    Migration { version: 5, name: "operational-status", sql: OPERATIONAL_STATUS_SQL },
-    Migration { version: 6, name: "context-resets", sql: CONTEXT_RESETS_SQL },
-    Migration { version: 7, name: "operational-convergence", sql: OPERATIONAL_CONVERGENCE_SQL },
-    Migration { version: 8, name: "braid-gh", sql: BRAID_GH_SQL },
-    Migration { version: 9, name: "pr-agent-worktree", sql: PR_AGENT_WORKTREE_SQL },
-    Migration { version: 10, name: "cross-surface-context", sql: CROSS_SURFACE_CONTEXT_SQL },
-    Migration {
-        version: 11,
-        name: "semantic-context-identity",
-        sql: SEMANTIC_CONTEXT_IDENTITY_SQL,
-    },
-];
+const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
+const MIGRATIONS: &[Migration] = &[Migration { version: 1, name: "initial", sql: INITIAL_SQL }];
 
 #[derive(Debug, Error)]
 pub enum StoreError {
