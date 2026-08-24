@@ -72,6 +72,25 @@ After setup:
 
 The tunnel receives GitHub webhooks and routes them to Braid's local ingress.
 
+## Headless / manual App creation
+
+If you cannot or do not want to open a browser from the terminal, run:
+
+```shell
+braid setup owner/repository --no-browser
+```
+
+This prints:
+
+- A pre-filled GitHub App Manifest URL you can paste into a browser.
+- The full manifest JSON for copy-paste creation.
+- The generated webhook secret.
+- The install URL for the repository.
+- Instructions on how to persist the PEM, secret, and config so Braid can run.
+
+Use this when setting Braid up on a remote machine, CI, or any environment
+where `open`/`xdg-open` is not available.
+
 ## Notes
 
 - The GitHub App Manifest flow is the supported path for creating Apps
