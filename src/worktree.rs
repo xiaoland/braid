@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use git2::{ErrorClass, ErrorCode, Repository, WorktreeAddOptions};
 use thiserror::Error;
-use tokio::process::Command;
 
 #[derive(Debug, Error)]
 pub enum WorktreeError {
@@ -9,17 +9,20 @@ pub enum WorktreeError {
     NotRepository(PathBuf),
     #[error("worktree target {0} already exists but is not the requested checkout")]
     TargetConflict(PathBuf),
-    #[error("Git command failed: {0}")]
+    #[error("Git operation failed: {0}")]
     Git(String),
-    #[error("worktree path is not valid UTF-8: {0}")]
-    NonUtf8(PathBuf),
     #[error("cannot prepare worktree directory {path}: {source}")]
     Io { path: PathBuf, source: std::io::Error },
 }
 
+impl From<git2::Error> for WorktreeError {
+    fn from(error: git2::Error) -> Self {
+        Self::Git(error.to_string())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorktreeRequest<'a> {
-    pub git: &'a Path,
     pub source: &'a Path,
     pub target: &'a Path,
     pub repository: &'a str,
@@ -39,10 +42,13 @@ pub struct ProvisionedWorktree {
 pub async fn provision(
     request: &WorktreeRequest<'_>,
 ) -> Result<ProvisionedWorktree, WorktreeError> {
-    let source = canonical_repository(request.git, request.source).await?;
-    let remote_url =
-        git_output(request.git, &source, &["remote", "get-url", request.remote]).await?;
-    if normalized_github_repository(remote_url.trim()).as_deref()
+    let source = tokio::task::block_in_place(|| canonical_repository(request.source))?;
+    let remote_url = tokio::task::block_in_place(|| {
+        let repo = Repository::open(&source)?;
+        let remote = repo.find_remote(request.remote)?;
+        Ok::<String, WorktreeError>(remote.url()?.to_owned())
+    })?;
+    if normalized_github_repository(&remote_url).as_deref()
         != Some(&request.repository.to_ascii_lowercase())
     {
         return Err(WorktreeError::Git(format!(
@@ -57,34 +63,37 @@ pub async fn provision(
         std::fs::create_dir_all(parent)
             .map_err(|source| WorktreeError::Io { path: parent.to_path_buf(), source })?;
     }
-    git(
-        request.git,
-        &source,
-        &[
-            "fetch",
-            "--no-tags",
-            request.remote,
-            &format!(
-                "+refs/heads/{}:refs/remotes/{}/{}",
-                request.head_ref, request.remote, request.head_ref
-            ),
-        ],
-    )
-    .await?;
-    let target = path_text(request.target)?;
-    git(
-        request.git,
-        &source,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            request.local_branch,
-            target,
-            &format!("refs/remotes/{}/{}", request.remote, request.head_ref),
-        ],
-    )
-    .await?;
+    tokio::task::block_in_place(|| {
+        let repo = Repository::open(&source)?;
+        let mut remote = repo.find_remote(request.remote)?;
+        remote.fetch(
+            &[&format!("refs/heads/{0}:refs/remotes/{1}/{0}", request.head_ref, request.remote)],
+            None,
+            None,
+        )?;
+        let reference = repo
+            .find_reference(&format!(
+                "refs/remotes/{}/{}",
+                request.remote, request.head_ref
+            ))
+            .map_err(|error| {
+                WorktreeError::Git(format!(
+                    "fetched ref refs/remotes/{}/{} not found: {error}",
+                    request.remote, request.head_ref
+                ))
+            })?;
+        let mut options = WorktreeAddOptions::new();
+        options.reference(Some(&reference));
+        let _worktree = repo
+            .worktree(request.local_branch, request.target, Some(&options))
+            .map_err(|error| {
+                WorktreeError::Git(format!(
+                    "cannot add worktree at {}: {error}",
+                    request.target.display()
+                ))
+            })?;
+        Ok::<(), WorktreeError>(())
+    })?;
     verify_existing(request, &source).await
 }
 
@@ -92,18 +101,21 @@ async fn verify_existing(
     request: &WorktreeRequest<'_>,
     source: &Path,
 ) -> Result<ProvisionedWorktree, WorktreeError> {
-    let target_root = canonical_repository(request.git, request.target)
-        .await
-        .map_err(|_| WorktreeError::TargetConflict(request.target.to_path_buf()))?;
     let expected = request
         .target
         .canonicalize()
-        .map_err(|source| WorktreeError::Io { path: request.target.to_path_buf(), source })?;
+        .map_err(|source_err| WorktreeError::Io { path: request.target.to_path_buf(), source: source_err })?;
+    let target_root = tokio::task::block_in_place(|| canonical_repository(request.target))
+        .map_err(|_| WorktreeError::TargetConflict(request.target.to_path_buf()))?;
     if target_root != expected {
         return Err(WorktreeError::TargetConflict(request.target.to_path_buf()));
     }
-    let branch = git_output(request.git, request.target, &["branch", "--show-current"]).await?;
-    if branch.trim() != request.local_branch {
+    let branch = tokio::task::block_in_place(|| {
+        let repo = Repository::open(request.target)?;
+        let head = repo.head()?;
+        Ok::<String, WorktreeError>(head.shorthand()?.to_owned())
+    })?;
+    if branch != request.local_branch {
         return Err(WorktreeError::TargetConflict(request.target.to_path_buf()));
     }
     Ok(ProvisionedWorktree {
@@ -114,42 +126,19 @@ async fn verify_existing(
     })
 }
 
-async fn canonical_repository(git_path: &Path, path: &Path) -> Result<PathBuf, WorktreeError> {
+fn canonical_repository(path: &Path) -> Result<PathBuf, WorktreeError> {
     if !path.is_dir() {
         return Err(WorktreeError::NotRepository(path.to_path_buf()));
     }
-    let output = git_output(git_path, path, &["rev-parse", "--show-toplevel"])
-        .await
-        .map_err(|_| WorktreeError::NotRepository(path.to_path_buf()))?;
-    PathBuf::from(output.trim())
-        .canonicalize()
-        .map_err(|source| WorktreeError::Io { path: path.to_path_buf(), source })
-}
-
-async fn git(git_path: &Path, cwd: &Path, arguments: &[&str]) -> Result<(), WorktreeError> {
-    git_output(git_path, cwd, arguments).await.map(|_| ())
-}
-
-async fn git_output(
-    git_path: &Path,
-    cwd: &Path,
-    arguments: &[&str],
-) -> Result<String, WorktreeError> {
-    let output = Command::new(git_path)
-        .args(arguments)
-        .current_dir(cwd)
-        .output()
-        .await
-        .map_err(|error| WorktreeError::Git(error.to_string()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(WorktreeError::Git(stderr.trim().to_owned()));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-fn path_text(path: &Path) -> Result<&str, WorktreeError> {
-    path.to_str().ok_or_else(|| WorktreeError::NonUtf8(path.to_path_buf()))
+    Repository::discover(path)
+        .map(|repo| repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| repo.path().to_path_buf()))
+        .map_err(|error| {
+            if error.class() == ErrorClass::Repository && error.code() == ErrorCode::NotFound {
+                WorktreeError::NotRepository(path.to_path_buf())
+            } else {
+                WorktreeError::Git(error.to_string())
+            }
+        })
 }
 
 fn normalized_github_repository(remote: &str) -> Option<String> {

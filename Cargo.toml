@@ -43,6 +43,8 @@ async-trait = "0.1.92"
 rand = "0.10.2"
 dirs = "6.0.0"
 which = "8.0.5"
+octocrab = "0.54.1"
+git2 = "0.21.0"
 
 [profile.release]
 codegen-units = 1

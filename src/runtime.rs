@@ -1510,7 +1510,6 @@ async fn provision_pr_agent_worktree(
         candidate.number, profile.id, materialization.generation
     );
     let provisioned = worktree::provision(&WorktreeRequest {
-        git: &config.tools.git,
         source: &profile.workspace,
         target: &target,
         repository: &config.github.repository,
