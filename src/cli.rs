@@ -244,6 +244,11 @@ pub(crate) struct SetupArguments {
     pub(crate) api_key_environment: String,
     #[arg(long, value_name = "DIR", default_value = "~/.braid")]
     pub(crate) home: PathBuf,
+    #[arg(
+        long,
+        help = "Skip opening a browser; print manifest values and manual instructions instead"
+    )]
+    pub(crate) no_browser: bool,
 }
 
 #[derive(Debug, Args)]

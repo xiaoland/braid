@@ -92,6 +92,17 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         )
     };
 
+    if arguments.no_browser {
+        print_manual_guide(
+            &arguments.repository,
+            owner,
+            &browser_url,
+            &manifest_json,
+            &webhook_secret,
+        );
+        return Ok(());
+    }
+
     let shared = Arc::new(Mutex::new(CallbackState::default()));
     let app = Router::new()
         .route("/callback", get(callback))
@@ -139,6 +150,40 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn print_manual_guide(
+    repository: &str,
+    owner: &str,
+    browser_url: &str,
+    manifest_json: &str,
+    webhook_secret: &str,
+) {
+    println!("\n=== Manual GitHub App creation guide ===\n");
+    println!("Repository: {repository}");
+    println!("App owner:  {owner}\n");
+    println!(
+        "You can either:\n\
+         1. Open this pre-filled manifest URL in a browser:\n   {browser_url}\n\n\
+         2. Or create the App manually at https://github.com/settings/apps/new \
+            (or https://github.com/organizations/{owner}/settings/apps/new for an org) \
+            with the values below.\n"
+    );
+    println!("Manifest JSON (copy-paste into the manifest form if asked):\n{manifest_json}\n");
+    println!(
+        "After creating the App:\n\
+         - Install it on {repository}: https://github.com/apps/braid-of-{owner}/installations/new\n\
+         - Set the App's webhook URL to the public tunnel URL you will get from \
+           `braid serve --config ~/.braid/braid.toml --tunnel` (ends in `/webhook`).\n\
+         - Set the webhook secret to:\n   {webhook_secret}\n\n\
+         - Create ~/.braid/braid-of-{owner}.pem from the downloaded private key, \
+           create ~/.braid/braid-of-{owner}.webhook_secret containing the secret above, \
+           then run `braid setup` again without `--no-browser` so it can capture the manifest redirect.\n"
+    );
+    println!(
+        "If you already have the App's ID, slug, PEM, and webhook secret, you can \
+         also write ~/.braid/braid.toml manually; see docs/setup.md.\n"
+    );
 }
 
 async fn callback(
