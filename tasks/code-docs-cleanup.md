@@ -10,8 +10,8 @@
 
 ## Done
 
-- [ ] Migrations collapsed to one init migration.
-- [ ] Unused dependencies removed from `Cargo.toml`/`Cargo.lock`.
+- [x] Migrations collapsed to one init migration.
+- [x] Unused dependencies removed from `Cargo.toml`/`Cargo.lock`.
 - [ ] `store.rs` refactored into a module tree.
 - [ ] `runtime.rs` refactored into a module tree.
 - [ ] `context.rs` refactored into a module tree.
