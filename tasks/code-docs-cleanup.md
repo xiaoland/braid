@@ -17,7 +17,7 @@
 - [x] `runtime.rs` refactored into a module tree (`runtime/mod.rs`, `runtime/ingress.rs`, `runtime/outbox.rs`, `runtime/reconcile.rs`, `runtime/scheduler.rs`, `runtime/issue_agent.rs`, `runtime/pr_agent.rs`, `runtime/provider.rs`, `runtime/tunnel.rs`).
 - [ ] `context.rs` refactored into a module tree or typed GraphQL client (deferred: requires AST-aware extraction; manual sed is too risky).
 - [ ] `github.rs` reviewed and split if needed (migrated to `octocrab`; kept as single module due to tight identity/REST coupling).
-- [ ] `writer.rs`, `cli.rs` reviewed and split if needed.
+- [ ] `writer.rs`, `cli.rs` reviewed and split if needed (in progress: subagent splitting into handler modules).
 - [x] Replace worktree shell commands with `git2`.
 - [x] Replace hand-written GitHub App client with `octocrab`.
 - [ ] Replace manual GraphQL query building with typed client (deferred: `octocrab` raw `/graphql` is sufficient for current query surface).
