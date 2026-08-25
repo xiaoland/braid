@@ -23,7 +23,9 @@
 - [x] Replace hand-written GitHub App client with `octocrab`.
 - [ ] Replace manual GraphQL query building with typed client (deferred: `octocrab` raw `/graphql` is sufficient for current query surface).
 - [ ] Replace JSON-RPC-ish provider loop with a typed crate (deferred: split into modules; typed crate not yet adopted).
-- [x] Update acceptance test scripts (`00_clean_install.sh`, `30_issue_agent.sh`, `40_context_lifecycle.sh`) for collapsed schema version 1.
+- [x] PR #94 review: CI formatting failure fixed.
+- [x] PR #94 review: docs reorganized — `docs/setup.md` → `docs/user-manual/setup.md`, `glossary.md` → `docs/10-prd/glossary.md`, split `docs/10-prd/README.md` into focused capability files, clarified `acceptance.md` role, added boundary notes to TDD `context.md`/`github.md`.
+- [x] PR #94 body updated: schema references changed from v11 to v1.
 - [x] Clean release rebuilt and Homebrew formula updated to v0.2.2.
 
 ## Verification
