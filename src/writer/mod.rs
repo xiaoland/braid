@@ -14,10 +14,10 @@ use crate::{
     },
 };
 
-mod prepare;
-mod ensure;
 mod comment;
+mod ensure;
 mod helpers;
+mod prepare;
 
 const COMMENT_BODY_LIMIT: usize = 60_000;
 const CLAIM_POLLS: usize = 240;
@@ -97,9 +97,12 @@ pub async fn ensure_pull_request(
     let github = GitHubClient::connect(&config.github, &repository)
         .await
         .context("cannot authenticate Braid App PR writer")?;
-    let receipt = prepare::prepare_pull_request(config, store, &github, repository, request).await?;
+    let receipt =
+        prepare::prepare_pull_request(config, store, &github, repository, request).await?;
     match helpers::claim_or_wait(store, &receipt.write.intent_id).await? {
-        helpers::Claim::Done(_) => helpers::completed_implementation_receipt(store, &receipt.write.intent_id),
+        helpers::Claim::Done(_) => {
+            helpers::completed_implementation_receipt(store, &receipt.write.intent_id)
+        }
         helpers::Claim::Owned(_) => {
             let result = ensure::converge_pull_request(config, &github, store, &receipt).await;
             match result {

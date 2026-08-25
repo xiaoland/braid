@@ -8,9 +8,13 @@ pub async fn converge_pull_request(
     receipt: &ImplementationRequestReceipt,
 ) -> Result<PullRequest, GitHubError> {
     let request_marker = format!("Implementation request: {}", receipt.write.target);
-    let mut pull_request =
-        helpers::unique_request_pull_request(github, &receipt.head_ref, &receipt.base_ref, &request_marker)
-            .await?;
+    let mut pull_request = helpers::unique_request_pull_request(
+        github,
+        &receipt.head_ref,
+        &receipt.base_ref,
+        &request_marker,
+    )
+    .await?;
     if pull_request.is_none() {
         helpers::ensure_head(github, store, receipt).await?;
         pull_request = helpers::unique_request_pull_request(

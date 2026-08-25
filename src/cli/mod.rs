@@ -21,15 +21,15 @@ use crate::{
 };
 
 mod config;
-mod profile;
 mod context_cmd;
+mod doctor_cmd;
 mod gh;
 mod gh_cmd;
+mod helpers;
 mod migrate;
-mod doctor_cmd;
+mod profile;
 mod status;
 mod telemetry_cmd;
-mod helpers;
 
 #[derive(Debug, Parser)]
 #[command(name = "braid", version, about = "GitHub working memory for local coding agents")]
