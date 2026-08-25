@@ -23,7 +23,7 @@ Use the installed `svc` CLI when SVC guidance or project integration is relevant
 - GitHub contract: `docs/20-product-tdd/github.md`
 - Distribution, observability, migration, and operation:
   `docs/40-deployment/README.md`
-- Project vocabulary: `glossary.md`
+- Project vocabulary: `docs/10-prd/glossary.md`
 - Volatile task control: `tasks/`; retain at most one active packet and delete
   it when the task closes after promoting binding truth.
 

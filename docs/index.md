@@ -16,7 +16,7 @@ Read owners progressively from the problem being changed:
 - [Codex app-server](20-product-tdd/app-server.md): provider capability mapping
 - [GitHub boundary](20-product-tdd/github.md): ingress, reads, association, writes
 - [Deployment](40-deployment/README.md): artifact, config, SQLite migration, OTel, tunnel, operation
-- [Glossary](../glossary.md): canonical vocabulary
+- [Glossary](10-prd/glossary.md): canonical vocabulary
 
 Root [`AGENTS.md`](../AGENTS.md) is the actual project instruction entry point.
 Task packets are disposable control state and are not linked as durable owners.

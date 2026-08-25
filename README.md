@@ -49,7 +49,7 @@ The active product and implementation contracts are:
 - [Codex provider contract](docs/20-product-tdd/app-server.md)
 - [GitHub boundary](docs/20-product-tdd/github.md)
 - [Deployment and observability](docs/40-deployment/README.md)
-- [Glossary](glossary.md)
+- [Glossary](docs/10-prd/glossary.md)
 
 The first supported delivery target is a packaged macOS arm64 binary; Linux
 x86_64 follows. Build and inspect the public operator surface with:
