@@ -58,6 +58,32 @@ SQLite stores enough canonical object metadata and lifecycle tombstones to
 compare versions, but it does not become an alternate Issue/PR or provider
 transcript authority. A full Context is rebuilt from GitHub before every turn.
 
+## Single Source of Truth for Schema
+
+A schema must have exactly one authority. When the same shape is defined both
+by typed Rust structs and by a hand-written text template, the two drift and
+Humans lose track of which one is "real". The Rust type is the source of truth;
+any file that claims to be a valid instance of that schema must be provable
+against it.
+
+- **`Config` owns `braid.toml`**: `src/config.rs` defines the single source of
+truth for the config schema. `braid setup` builds a `Config` value and
+serializes it, rather than formatting a template. If the type changes, the
+compiler forces the generator to change with it.
+- **Round-trip tests for generated artifacts**: Any code that emits a
+structured file a Human might edit must be covered by a test that parses the
+output back through the canonical type and validates it.
+- **No parallel string templates**: Do not maintain a separate text template
+for a file whose shape is already defined by a Rust type. Avoid
+`format!`-based generators for config, manifest, or protocol files.
+- **ROI boundary**: Not every documentation snippet is a schema instance.
+Only canonical or generated artifacts participate in SSoT validation. For
+example, `config.example.toml` is the canonical starter template, so it is
+loaded through `Config::load` in tests; a partial snippet in a runbook is not.
+- **Migrations are the exception**: SQLite schema is forward-only, immutable,
+and checksum-verified; it is not derived from Rust structs because the database
+must outlive any single binary version.
+
 ## Rust Runtime Shape
 
 MVP is one Rust package and one `braid` binary rather than a workspace of thin

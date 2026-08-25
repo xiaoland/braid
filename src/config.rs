@@ -198,7 +198,7 @@ impl Config {
         }
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != CONFIG_SCHEMA_VERSION {
             return Err(ConfigError::Schema {
                 found: self.schema_version,
@@ -415,4 +415,21 @@ fn validate_sha256(name: &str, value: &str) -> Result<(), ConfigError> {
 
 const fn default_log_format() -> LogFormat {
     LogFormat::Text
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::Config;
+
+    /// `config.example.toml` is the canonical starter template, not a loose
+    /// documentation snippet. It must parse and validate against the canonical
+    /// `Config` type so that it cannot drift from the real schema. Partial
+    /// examples in runbooks are not required to pass this test.
+    #[test]
+    fn example_config_matches_schema() {
+        Config::load(Path::new("config.example.toml"))
+            .expect("config.example.toml must match the Config schema");
+    }
 }
