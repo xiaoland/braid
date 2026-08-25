@@ -1,5 +1,11 @@
 # GitHub Boundary Contract
 
+This document owns the technical boundary between Braid and GitHub: App
+identity, permissions, installation scope, webhook/GraphQL/REST contracts, and
+write reconciliation. For the product-level description of how Braid uses
+GitHub as durable working memory, see `docs/10-prd/purpose.md`,
+`docs/10-prd/objects.md`, and `docs/10-prd/workflow.md`.
+
 GitHub is canonical for Work Item content and collaboration lifecycle. Braid
 uses webhooks for low-latency observation and complete GraphQL/REST rereads for
 truth. Arrival order is never canonical order.

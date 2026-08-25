@@ -1,3 +1,11 @@
+# Example OpenTelemetry Collector configuration for Braid.
+#
+# This is optional external infrastructure, not a required part of Braid. It
+# demonstrates outcome-aware tail sampling: keep all error traces and 10% of
+# successful traces. The portable Braid binary exports 100% when
+# telemetry.sample_ratio=1.0; use this Collector to reduce backend volume.
+# See docs/40-deployment/README.md for operator guidance.
+#
 # Run Braid with telemetry.sample_ratio=1.0 when using this optional
 # outcome-aware Collector policy. The portable Braid binary does not require it.
 receivers:

@@ -1,7 +1,9 @@
 # GitHub Context Contract
 
 This document owns the deterministic model-to-text projection that makes GitHub
-the Agent's working memory. It does not own webhook scheduling or provider
+the Agent's working memory. For the product-level description of what belongs
+in Issue Context and PR Context, see `docs/10-prd/objects.md` and
+`docs/10-prd/workflow.md`. It does not own webhook scheduling or provider
 history.
 
 ## Materialization Transaction

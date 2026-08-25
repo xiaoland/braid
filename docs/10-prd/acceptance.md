@@ -1,5 +1,10 @@
 # End-to-End Acceptance
 
+This document is the PRD acceptance oracle. It defines what "done" means for
+Braid: real GitHub Work Items, the packaged Rust binary, a real public webhook
+path, a real Codex app-server, and observable Agent behavior. Unit/component/
+fake transport checks may diagnose code but do not satisfy this contract.
+
 Braid is accepted only through real GitHub Work Items, the packaged Rust
 binary, a real public webhook path, a real Codex app-server, and observable
 Agent behavior. Unit/component/fake transport checks may diagnose code but do

@@ -22,7 +22,8 @@ brew install xiaoland/braid/braid
 ## Bootstrap
 
 `braid setup` creates your own GitHub App, persists credentials outside the
-repository, and writes a starter `braid.toml`:
+repository, and writes a starter `braid.toml`. The full setup guide is in
+[`docs/user-manual/setup.md`](docs/user-manual/setup.md).
 
 ```shell
 braid setup owner/repository --provider pi --model deepseek-chat --api-key-environment DEEPSEEK_API_KEY
