@@ -135,7 +135,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
 
     let provider_block = build_provider_block(&arguments);
     let config_path = home.join("braid.toml");
-    let config = build_config(&home, app.id, &arguments.repository, &pem_path, &provider_block);
+    let config = build_config(&home, app.id, &arguments, &pem_path, &provider_block);
     write_secret(&config_path, config.as_bytes())?;
 
     println!("\nWrote configuration to: {}", config_path.display());
@@ -189,7 +189,7 @@ fn print_manual_guide(
     );
     println!(
         "If you already have the App's ID, slug, PEM, and webhook secret, you can \
-         also write ~/.braid/braid.toml manually; see docs/setup.md.\n"
+         also write ~/.braid/braid.toml manually; see docs/user-manual/setup.md.\n"
     );
 }
 
@@ -336,6 +336,30 @@ fn pi_executable_path() -> String {
     if Path::new(candidate).is_file() { candidate.to_owned() } else { "pi".to_owned() }
 }
 
+fn build_profiles_block(home: &Path, arguments: &SetupArguments) -> String {
+    format!(
+        r#"[[profiles]]
+id = "default"
+display_name = "Braid Agent"
+tags = ["issue", "pr"]
+provider = "{provider}"
+model = "{model}"
+reasoning = "high"
+user_instructions = "You are Braid, a helpful coding assistant. Work from the supplied GitHub Context, publish concise public comments, and keep descriptions and implementation state current."
+workspace = "{workspace}"
+status_surfaces = ["comment"]
+github_context_soft_ratio = 0.80
+github_context_hard_bytes = 100000
+
+[profile_selection]
+default_pr_profile = "default"
+"#,
+        provider = arguments.provider,
+        model = arguments.model,
+        workspace = home.join("profiles/default").display(),
+    )
+}
+
 fn build_provider_block(arguments: &SetupArguments) -> String {
     if arguments.provider == "codex" {
         return "[provider.codex]\n\
@@ -362,7 +386,7 @@ fn build_provider_block(arguments: &SetupArguments) -> String {
 fn build_config(
     home: &Path,
     app_id: u64,
-    repository: &str,
+    arguments: &SetupArguments,
     private_key_file: &Path,
     provider_block: &str,
 ) -> String {
@@ -407,20 +431,75 @@ incident_mode = false
 export_timeout_seconds = 5
 service_name = "braid"
 log_format = "text"
+
+{profiles_block}
 "#,
         root = home.join("runtime").display(),
         database = home.join("runtime/state/braid.sqlite3").display(),
         backups = home.join("runtime/state/backups").display(),
         app_id = app_id,
-        repository = repository,
+        repository = arguments.repository,
         private_key_file = private_key_file.display(),
         provider_block = provider_block,
         git = tool_path("git", "/usr/bin/git"),
         gh = tool_path("gh", "/opt/homebrew/bin/gh"),
         wrangler = tool_path("wrangler", "wrangler"),
+        profiles_block = build_profiles_block(home, arguments),
     )
 }
 
 fn tool_path(name: &str, fallback: &str) -> String {
     which::which(name).map_or_else(|_| fallback.to_owned(), |p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::config::Config;
+
+    fn args(repo: &str, provider: &str, model: &str) -> SetupArguments {
+        SetupArguments {
+            repository: repo.to_owned(),
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            api_key_environment: "DEEPSEEK_API_KEY".to_owned(),
+            home: PathBuf::from("/tmp/braid-setup-test"),
+            no_browser: false,
+        }
+    }
+
+    #[test]
+    fn generated_config_loads_for_pi() {
+        let home = PathBuf::from("/tmp/braid-setup-test");
+        let provider = build_provider_block(&args("xiaoland/braid", "pi", "deepseek-chat"));
+        let config = build_config(
+            &home,
+            123_456,
+            &args("xiaoland/braid", "pi", "deepseek-chat"),
+            &home.join("key.pem"),
+            &provider,
+        );
+        let parsed: Config = toml::from_str(&config).expect("generated config should parse");
+        assert_eq!(parsed.schema_version, 1);
+        assert!(!parsed.profiles.is_empty());
+        assert_eq!(parsed.profile_selection.default_pr_profile, "default");
+    }
+
+    #[test]
+    fn generated_config_loads_for_codex() {
+        let home = PathBuf::from("/tmp/braid-setup-test");
+        let provider = build_provider_block(&args("xiaoland/braid", "codex", "gpt-4o"));
+        let config = build_config(
+            &home,
+            123_456,
+            &args("xiaoland/braid", "codex", "gpt-4o"),
+            &home.join("key.pem"),
+            &provider,
+        );
+        let parsed: Config = toml::from_str(&config).expect("generated codex config should parse");
+        assert_eq!(parsed.schema_version, 1);
+        assert!(!parsed.profiles.is_empty());
+    }
 }
