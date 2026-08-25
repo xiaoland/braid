@@ -1,14 +1,10 @@
-# svc:begin local-config sha256=1c799ae619bf818114d80699d514f5e62f20f4082367cf70b8d0bb2936fdf0d3
-svc.local.json
-# svc:end local-config
-
-.venv/
-.pdm-python
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.coverage
-build/
-dist/
-config.local.json
-runtime/
+/target/
+/dist/
+/runtime/
+/config.local.toml
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+.DS_Store
+.pi/
+.wrangler/

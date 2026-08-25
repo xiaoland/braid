@@ -1,0 +1,86 @@
+schema_version = 1
+
+[runtime]
+root = "/absolute/path/to/braid-runtime"
+database = "/absolute/path/to/braid-runtime/state/braid.sqlite3"
+backups = "/absolute/path/to/braid-runtime/state/backups"
+auto_migrate = false
+
+[github]
+app_id = 123456
+repository = "owner/repository"
+handle = "braid"
+api_version = "2022-11-28"
+private_key_file = "/absolute/path/to/github-app-private-key.pem"
+webhook_secret_environment = "BRAID_WEBHOOK_SECRET"
+projects_v2_enabled = false
+
+[scheduler]
+quiet_seconds = 30
+event_threshold = 8
+reconciliation_seconds = 60
+
+[provider.codex]
+executable = "/Applications/ChatGPT.app/Contents/Resources/codex"
+home = "/absolute/path/to/braid-runtime/provider"
+version = "codex-cli 0.147.0-alpha.6.5"
+stable_schema_sha256 = "7d79fe309dd7520843459070f3884ecf0e39cee2620c1c49aad6efb4eca76ecb"
+experimental_schema_sha256 = "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b5364439063a5c8"
+
+# Alternative: Pi provider with DeepSeek
+# [provider.pi]
+# executable = "/usr/local/bin/pi"
+# provider = "deepseek"
+# model = "deepseek-chat"
+# thinking = "high"
+# api_key_environment = "DEEPSEEK_API_KEY"
+
+[tools]
+git = "/usr/bin/git"
+gh = "/opt/homebrew/bin/gh"
+wrangler = "/opt/homebrew/bin/wrangler"
+
+[server]
+ingress = "127.0.0.1:8080"
+health = "127.0.0.1:8081"
+
+[telemetry]
+endpoint = "http://127.0.0.1:4318"
+sample_ratio = 0.10
+incident_mode = false
+export_timeout_seconds = 5
+service_name = "braid"
+log_format = "text"
+
+[[profiles]]
+id = "issue-codex"
+display_name = "Codex design partner"
+tags = ["issue"]
+provider = "codex"
+model = "gpt-5.6-sol"
+reasoning = "high"
+user_instructions = "Keep design discussion concise and maintain the Issue description as working memory."
+workspace = "/absolute/path/to/issue-workspace"
+github_actor_node_id = "MDQ6VXNlcjEyMzQ1"
+status_surfaces = ["issue"]
+github_context_soft_ratio = 0.80
+github_context_hard_bytes = 524288
+
+[[profiles]]
+id = "pr-codex"
+display_name = "Codex implementation agent"
+tags = ["pr", "implementation"]
+provider = "codex"
+model = "gpt-5.6-sol"
+reasoning = "high"
+user_instructions = "Implement from linked Issue working memory and keep GitHub comments brief."
+# A clean source checkout for the configured repository. Braid fetches from its
+# origin and provisions generation-scoped PR worktrees below runtime.root.
+workspace = "/absolute/path/to/repository-source-checkout"
+github_actor_node_id = "MDQ6VXNlcjEyMzQ1"
+status_surfaces = ["pr"]
+github_context_soft_ratio = 0.80
+github_context_hard_bytes = 524288
+
+[profile_selection]
+default_pr_profile = "pr-codex"
