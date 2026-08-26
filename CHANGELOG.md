@@ -3,6 +3,26 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
+## [0.2.3] - 2026-08-24
+
+### Added
+
+- `braid setup` now writes per-owner config (`~/.braid/braid-of-<owner>.toml`)
+  and a single per-owner secrets file (`~/.braid/braid-of-<owner>.secrets.toml`).
+- Runtime, `braid doctor`, tunnel verification, and the Pi provider now load
+  secrets from the config file instead of requiring environment variables.
+- `braid setup` now generates a composite GitHub App logo
+  (`~/.braid/braid-of-<owner>-logo.png`) using a transparent Braid logo as the
+  main content and the owner avatar as a bottom-right circular badge.
+- Added `docs/user-manual/tunnel.md` explaining that `serve --tunnel` uses a
+  free Cloudflare Quick Tunnel, automatically obtains a public URL, and updates
+  the GitHub App webhook.
+
+### Changed
+
+- `braid setup` now generates `braid.toml` from the canonical `Config` type so
+  the file is always valid against the current schema.
+
 ## [0.2.2] - 2026-08-24
 
 ### Changed
