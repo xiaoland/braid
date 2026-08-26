@@ -74,6 +74,9 @@ After setup:
    braid serve --config ~/.braid/braid-of-<owner>.toml --tunnel
    ```
 
+   See [`tunnel.md`](tunnel.md) for how the tunnel works and why no
+   Cloudflare account is required.
+
 The tunnel receives GitHub webhooks and routes them to Braid's local ingress.
 
 ## Headless / manual App creation
