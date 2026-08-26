@@ -89,12 +89,9 @@ pub async fn probe_public_webhook(config: &Config, url: &str) -> Result<()> {
     {
         bail!("public webhook URL must be an HTTPS trycloudflare.com /webhook endpoint");
     }
-    let secret = env::var(&config.github.webhook_secret_environment).with_context(|| {
-        format!(
-            "environment variable {} must contain the GitHub webhook secret",
-            config.github.webhook_secret_environment
-        )
-    })?;
+    let secret = config
+        .webhook_secret()
+        .with_context(|| "cannot load GitHub webhook secret from configured source")?;
     if secret.is_empty() {
         bail!("GitHub webhook secret must not be empty");
     }
