@@ -24,6 +24,9 @@
   provider API key; `Config` supports `github.webhook_secret_file` and
   `provider.pi.api_key_file`; `BRAID_WEBHOOK_SECRET` and provider env vars are
   no longer required at runtime.
+- [x] **Tunnel explanation / setup UX**: added `docs/user-manual/tunnel.md`
+  explaining that `serve --tunnel` uses free Cloudflare Quick Tunnel, obtains a
+  public URL automatically, and updates the GitHub App webhook URL.
 
 ## Open / To Be Discovered
 
@@ -32,14 +35,8 @@
   App creation via the GitHub API. Proposed: fetch the owner avatar, composite
   the Braid logo at the bottom-right, handle light/dark/transparency, and
   upload it.
-- [ ] **Tunnel explanation / setup UX**: users may think `serve --tunnel`
-  requires a Cloudflare account. Clarify that Wrangler Quick Tunnel uses the
-  free `trycloudflare.com` service without an account, and that `serve --tunnel`
-  automatically starts the tunnel, verifies reachability, and updates the GitHub
-  App webhook URL to the public tunnel URL.
 - [ ] **Collect and fix other setup UX issues** found during real end-to-end
   runs.
-- [ ] **Update `docs/user-manual/setup.md`** once the final flow stabilizes.
 - [ ] **Release a new version** after the setup fixes are complete.
 
 ## Verification
