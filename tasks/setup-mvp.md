@@ -27,14 +27,13 @@
 - [x] **Tunnel explanation / setup UX**: added `docs/user-manual/tunnel.md`
   explaining that `serve --tunnel` uses free Cloudflare Quick Tunnel, obtains a
   public URL automatically, and updates the GitHub App webhook URL.
+- [x] **App logo**: `braid setup` now generates
+  `~/.braid/braid-of-<owner>-logo.png` by compositing the Braid logo onto the
+  owner avatar, then opens the GitHub App logo upload page. GitHub App Manifest
+  does not allow pre-setting a logo, so this is still a manual upload step.
 
 ## Open / To Be Discovered
 
-- [ ] **App logo**: `braid-of-<owner>` should visually brand the App. GitHub App
-  Manifest does not support a logo field, so a logo must be uploaded after
-  App creation via the GitHub API. Proposed: fetch the owner avatar, composite
-  the Braid logo at the bottom-right, handle light/dark/transparency, and
-  upload it.
 - [ ] **Collect and fix other setup UX issues** found during real end-to-end
   runs.
 - [ ] **Release a new version** after the setup fixes are complete.
