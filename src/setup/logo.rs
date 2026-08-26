@@ -6,61 +6,50 @@ use serde::Deserialize;
 
 use super::gh_api_json;
 
-const AVATAR_SIZE: u32 = 512;
+const CANVAS_SIZE: u32 = 512;
 const BADGE_SIZE: u32 = 112;
-const LOGO_SIZE: u32 = 80;
-const PADDING: u32 = 24;
-const BACKGROUND_BRIGHTNESS_THRESHOLD: u32 = 50;
+const BORDER_WIDTH: u32 = 6;
 
 #[derive(Debug, Deserialize)]
 struct OwnerInfo {
     avatar_url: String,
 }
 
+/// Generate a GitHub App logo where the Braid logo is the main avatar content
+/// and the owner avatar appears as a small circular badge at the bottom-right.
 pub fn generate(owner: &str, output: &Path) -> Result<()> {
     let avatar_url = fetch_avatar_url(owner)?;
     let avatar_bytes = download(&avatar_url).context("cannot download owner avatar")?;
-    let mut avatar =
+    let owner_avatar =
         image::load_from_memory(&avatar_bytes).context("cannot decode owner avatar")?.to_rgba8();
-    avatar = image::imageops::resize(&avatar, AVATAR_SIZE, AVATAR_SIZE, FilterType::Lanczos3);
 
     let braid_logo =
-        image::load_from_memory(include_bytes!("../../docs/assets/braid-logo-128.png"))
+        image::load_from_memory(include_bytes!("../../docs/assets/braid-logo-transparent.png"))
             .context("cannot decode embedded Braid logo")?;
-    let logo = image::imageops::resize(&braid_logo, LOGO_SIZE, LOGO_SIZE, FilterType::Lanczos3);
 
-    let mut badge = RgbaImage::from_pixel(BADGE_SIZE, BADGE_SIZE, Rgba([255, 255, 255, 0]));
-    draw_circle(
+    let mut canvas = RgbaImage::from_pixel(CANVAS_SIZE, CANVAS_SIZE, Rgba([0, 0, 0, 0]));
+
+    // Braid logo is the main content; keep some padding inside the square.
+    let braid_size = CANVAS_SIZE - 96;
+    let braid = image::imageops::resize(&braid_logo, braid_size, braid_size, FilterType::Lanczos3);
+    let braid_offset = (CANVAS_SIZE - braid_size) / 2;
+    image::imageops::overlay(&mut canvas, &braid, i64::from(braid_offset), i64::from(braid_offset));
+
+    // Owner avatar badge at bottom-right, with a white border.
+    let badge_x = CANVAS_SIZE - BADGE_SIZE - 20;
+    let badge_y = CANVAS_SIZE - BADGE_SIZE - 20;
+    let mut badge = circular_avatar(&owner_avatar, BADGE_SIZE);
+    // White border ring.
+    draw_ring(
         &mut badge,
         BADGE_SIZE / 2,
         BADGE_SIZE / 2,
         BADGE_SIZE / 2,
         Rgba([255, 255, 255, 255]),
     );
+    image::imageops::overlay(&mut canvas, &badge, i64::from(badge_x), i64::from(badge_y));
 
-    let mut logo_layer = RgbaImage::from_pixel(BADGE_SIZE, BADGE_SIZE, Rgba([0, 0, 0, 0]));
-    let offset = (BADGE_SIZE - LOGO_SIZE) / 2;
-    for y in 0..LOGO_SIZE {
-        for x in 0..LOGO_SIZE {
-            let pixel = logo.get_pixel(x, y);
-            let brightness = (u32::from(pixel[0]) + u32::from(pixel[1]) + u32::from(pixel[2])) / 3;
-            // The Braid logo has a dark background and bright loops. Make the
-            // dark background transparent so it floats over the white badge.
-            let alpha = if brightness < BACKGROUND_BRIGHTNESS_THRESHOLD { 0 } else { 255 };
-            logo_layer.put_pixel(
-                offset + x,
-                offset + y,
-                Rgba([pixel[0], pixel[1], pixel[2], alpha]),
-            );
-        }
-    }
-
-    let x = avatar.width() - BADGE_SIZE - PADDING;
-    let y = avatar.height() - BADGE_SIZE - PADDING;
-    image::imageops::overlay(&mut avatar, &badge, i64::from(x), i64::from(y));
-    image::imageops::overlay(&mut avatar, &logo_layer, i64::from(x), i64::from(y));
-
-    avatar.save_with_format(output, ImageFormat::Png).context("cannot save composite logo")?;
+    canvas.save_with_format(output, ImageFormat::Png).context("cannot save composite logo")?;
     Ok(())
 }
 
@@ -81,14 +70,36 @@ fn download(url: &str) -> Result<Vec<u8>> {
     response.bytes().context("cannot read avatar bytes").map(|b| b.to_vec())
 }
 
-fn draw_circle(image: &mut RgbaImage, cx: u32, cy: u32, radius: u32, color: Rgba<u8>) {
+fn circular_avatar(image: &RgbaImage, size: u32) -> RgbaImage {
+    let resized = image::imageops::resize(image, size, size, FilterType::Lanczos3);
+    let mut out = RgbaImage::from_pixel(size, size, Rgba([0, 0, 0, 0]));
+    let radius_squared = i64::from(size / 2) * i64::from(size / 2);
+    let cx = size / 2;
+    let cy = size / 2;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = i64::from(x) - i64::from(cx);
+            let dy = i64::from(y) - i64::from(cy);
+            if dx * dx + dy * dy <= radius_squared {
+                out.put_pixel(x, y, *resized.get_pixel(x, y));
+            }
+        }
+    }
+    out
+}
+
+fn draw_ring(image: &mut RgbaImage, cx: u32, cy: u32, radius: u32, color: Rgba<u8>) {
     let (width, height) = (image.width(), image.height());
-    let radius_squared = i64::from(radius) * i64::from(radius);
+    let outer = i64::from(radius);
+    let inner = i64::from(radius.saturating_sub(BORDER_WIDTH));
+    let outer_sq = outer * outer;
+    let inner_sq = inner * inner;
     for y in 0..height {
         for x in 0..width {
             let dx = i64::from(x) - i64::from(cx);
             let dy = i64::from(y) - i64::from(cy);
-            if dx * dx + dy * dy <= radius_squared {
+            let dist_sq = dx * dx + dy * dy;
+            if dist_sq <= outer_sq && dist_sq >= inner_sq {
                 image.put_pixel(x, y, color);
             }
         }
