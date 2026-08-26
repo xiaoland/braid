@@ -77,6 +77,12 @@ After setup:
    See [`tunnel.md`](tunnel.md) for how the tunnel works and why no
    Cloudflare account is required.
 
+4. `braid setup` also generates a composite App logo at
+   `~/.braid/braid-of-<owner>-logo.png` and opens its upload page in your
+   browser. GitHub App Manifest does not allow pre-setting a logo, so this is
+   a manual upload step for now. The logo combines the owner avatar with the
+   Braid logo at the bottom-right.
+
 The tunnel receives GitHub webhooks and routes them to Braid's local ingress.
 
 ## Headless / manual App creation

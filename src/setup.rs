@@ -22,6 +22,8 @@ use tokio::sync::Mutex;
 
 use crate::cli::SetupArguments;
 
+mod logo;
+
 use crate::config::{
     CONFIG_SCHEMA_VERSION, CodexConfig, Config, GitHubConfig, LogFormat, PiConfig, Profile,
     ProfileSelection, ProviderConfig, RuntimeConfig, SchedulerConfig, ServerConfig,
@@ -165,6 +167,26 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         config_path.display()
     );
 
+    let logo_path = home.join(format!("braid-of-{owner}-logo.png"));
+    match logo::generate(owner, &logo_path) {
+        Ok(()) => {
+            println!("Generated App logo: {}", logo_path.display());
+            println!(
+                "Upload it at https://github.com/settings/apps/{slug}/logo \
+                 (or https://github.com/organizations/{owner}/settings/apps/{slug}/logo for an org).\n",
+                slug = app.slug,
+                owner = owner
+            );
+            let _ = open_browser(&format!(
+                "https://github.com/settings/apps/{slug}/logo",
+                slug = app.slug
+            ));
+        }
+        Err(error) => {
+            eprintln!("Could not generate App logo: {error}");
+        }
+    }
+
     Ok(())
 }
 
@@ -278,7 +300,7 @@ fn gh_user() -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
-fn gh_api_json<T>(endpoint: &str, payload: Option<&str>) -> Result<T>
+pub(crate) fn gh_api_json<T>(endpoint: &str, payload: Option<&str>) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
