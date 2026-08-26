@@ -1,7 +1,6 @@
 #![allow(clippy::large_futures)]
 use std::{
     collections::BTreeMap,
-    env,
     fmt::Write as _,
     sync::{Arc, Mutex as StdMutex},
 };
@@ -152,12 +151,9 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     {
         bail!("Slice 2 requires GitHub App Issues: write for Braid-owned reactions");
     }
-    let secret = env::var(&config.github.webhook_secret_environment).with_context(|| {
-        format!(
-            "environment variable {} must contain the GitHub webhook secret",
-            config.github.webhook_secret_environment
-        )
-    })?;
+    let secret = config
+        .webhook_secret()
+        .with_context(|| "cannot load GitHub webhook secret from configured source")?;
     if secret.is_empty() {
         bail!("GitHub webhook secret must not be empty");
     }

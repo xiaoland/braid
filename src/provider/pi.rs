@@ -78,8 +78,8 @@ impl PiProvider {
         if let Some(home) = &state.config.home {
             cmd.env("PI_CODING_AGENT_DIR", home);
         }
-        if let Some(api_key_env) = &state.config.api_key_environment
-            && let Ok(api_key) = std::env::var(api_key_env)
+        if let Ok(api_key) = state.config.api_key()
+            && let Some(api_key_env) = &state.config.api_key_environment
         {
             cmd.env(api_key_env, api_key);
         }

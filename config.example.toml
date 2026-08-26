@@ -12,7 +12,9 @@ repository = "owner/repository"
 handle = "braid"
 api_version = "2022-11-28"
 private_key_file = "/absolute/path/to/github-app-private-key.pem"
-webhook_secret_environment = "BRAID_WEBHOOK_SECRET"
+# Either set webhook_secret_environment or webhook_secret_file. The file approach
+# lets multiple Braid instances for different owners run on the same machine.
+webhook_secret_file = "/absolute/path/to/braid-of-owner.secrets.toml"
 projects_v2_enabled = false
 
 [scheduler]
@@ -34,6 +36,7 @@ experimental_schema_sha256 = "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b
 # model = "deepseek-chat"
 # thinking = "high"
 # api_key_environment = "DEEPSEEK_API_KEY"
+# api_key_file = "/absolute/path/to/braid-of-owner.secrets.toml"
 
 [tools]
 git = "/usr/bin/git"

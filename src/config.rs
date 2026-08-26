@@ -56,7 +56,10 @@ pub struct GitHubConfig {
     pub handle: String,
     pub api_version: String,
     pub private_key_file: PathBuf,
-    pub webhook_secret_environment: String,
+    #[serde(default)]
+    pub webhook_secret_environment: Option<String>,
+    #[serde(default)]
+    pub webhook_secret_file: Option<PathBuf>,
     pub projects_v2_enabled: bool,
 }
 
@@ -91,9 +94,32 @@ pub struct PiConfig {
     pub executable: PathBuf,
     pub provider: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
     pub api_key_environment: Option<String>,
+    #[serde(default)]
+    pub api_key_file: Option<PathBuf>,
     pub thinking: Option<String>,
     pub home: Option<PathBuf>,
+}
+
+impl PiConfig {
+    /// Load the provider API key from `api_key_file` if set, otherwise from
+    /// `api_key_environment`.
+    pub fn api_key(&self) -> Result<String, ConfigError> {
+        if let Some(path) = &self.api_key_file {
+            return Ok(load_secret_file(path)?.provider_api_key);
+        }
+        if let Some(env) = &self.api_key_environment {
+            return std::env::var(env).map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "environment variable {env:?} for provider.pi.api_key_environment is not set"
+                ))
+            });
+        }
+        Err(ConfigError::Invalid(
+            "one of provider.pi.api_key_environment or provider.pi.api_key_file must be set".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -167,6 +193,21 @@ pub struct ConfigSummary<'a> {
     pub effective_trace_sample_ratio: f64,
 }
 
+/// Secrets file shape referenced by `github.webhook_secret_file` and
+/// `provider.pi.api_key_file`. A single file can hold both secrets for an
+/// owner, keeping user-scope runtime directories out of the secret lookup path.
+#[derive(Debug, Deserialize)]
+pub struct SecretsFile {
+    pub webhook_secret: String,
+    pub provider_api_key: String,
+}
+
+fn load_secret_file(path: &Path) -> Result<SecretsFile, ConfigError> {
+    let text = fs::read_to_string(path)
+        .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
+    toml::from_str(&text).map_err(|source| ConfigError::Parse { path: path.to_path_buf(), source })
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = fs::read_to_string(path)
@@ -198,7 +239,48 @@ impl Config {
         }
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// Load the GitHub webhook secret from `github.webhook_secret_file` if set,
+    /// otherwise from `github.webhook_secret_environment`.
+    pub fn webhook_secret(&self) -> Result<String, ConfigError> {
+        if let Some(path) = &self.github.webhook_secret_file {
+            return Ok(load_secret_file(path)?.webhook_secret);
+        }
+        if let Some(env) = &self.github.webhook_secret_environment {
+            return std::env::var(env).map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "environment variable {env:?} for github.webhook_secret_environment is not set"
+                ))
+            });
+        }
+        Err(ConfigError::Invalid(
+            "one of github.webhook_secret_environment or github.webhook_secret_file must be set"
+                .into(),
+        ))
+    }
+
+    /// Load the Pi provider API key from `provider.pi.api_key_file` if set,
+    /// otherwise from `provider.pi.api_key_environment`.
+    pub fn pi_api_key(&self) -> Result<String, ConfigError> {
+        let pi = self.provider.pi.as_ref().ok_or_else(|| {
+            ConfigError::Invalid("provider.pi must be configured to read its API key".into())
+        })?;
+        if let Some(path) = &pi.api_key_file {
+            return Ok(load_secret_file(path)?.provider_api_key);
+        }
+        if let Some(env) = &pi.api_key_environment {
+            return std::env::var(env).map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "environment variable {env:?} for provider.pi.api_key_environment is not set"
+                ))
+            });
+        }
+        Err(ConfigError::Invalid(
+            "one of provider.pi.api_key_environment or provider.pi.api_key_file must be set".into(),
+        ))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != CONFIG_SCHEMA_VERSION {
             return Err(ConfigError::Schema {
                 found: self.schema_version,
@@ -214,7 +296,21 @@ impl Config {
             ("tools.git", &self.tools.git),
             ("tools.gh", &self.tools.gh),
             ("tools.wrangler", &self.tools.wrangler),
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            self.github
+                .webhook_secret_file
+                .as_ref()
+                .map(|path| ("github.webhook_secret_file", path)),
+        )
+        .chain(
+            self.provider
+                .pi
+                .as_ref()
+                .and_then(|pi| pi.api_key_file.as_ref())
+                .map(|path| ("provider.pi.api_key_file", path)),
+        ) {
             require_absolute(name, path)?;
         }
         if !self.runtime.database.starts_with(&self.runtime.root)
@@ -229,10 +325,16 @@ impl Config {
         }
         validate_repository(&self.github.repository)?;
         validate_token("github.handle", &self.github.handle)?;
-        validate_token(
-            "github.webhook_secret_environment",
-            &self.github.webhook_secret_environment,
-        )?;
+        if self.github.webhook_secret_environment.is_none()
+            && self.github.webhook_secret_file.is_none()
+        {
+            return Err(ConfigError::Invalid(
+                "one of github.webhook_secret_environment or github.webhook_secret_file must be set".into(),
+            ));
+        }
+        if let Some(env) = &self.github.webhook_secret_environment {
+            validate_token("github.webhook_secret_environment", env)?;
+        }
         if self.scheduler.quiet_seconds == 0
             || self.scheduler.event_threshold == 0
             || self.scheduler.reconciliation_seconds == 0
@@ -269,6 +371,19 @@ impl Config {
         }
         if let Some(pi) = &self.provider.pi {
             require_absolute("provider.pi.executable", &pi.executable)?;
+            if pi.api_key_environment.is_none() && pi.api_key_file.is_none() {
+                return Err(ConfigError::Invalid(
+                    "one of provider.pi.api_key_environment or provider.pi.api_key_file must be set".into(),
+                ));
+            }
+            if pi.api_key_file.is_some() && pi.api_key_environment.is_none() {
+                return Err(ConfigError::Invalid(
+                    "provider.pi.api_key_environment must be set when provider.pi.api_key_file is used".into(),
+                ));
+            }
+            if let Some(env) = &pi.api_key_environment {
+                validate_token("provider.pi.api_key_environment", env)?;
+            }
         }
         if self.provider.codex.is_none() && self.provider.pi.is_none() {
             return Err(ConfigError::Invalid(
@@ -415,4 +530,21 @@ fn validate_sha256(name: &str, value: &str) -> Result<(), ConfigError> {
 
 const fn default_log_format() -> LogFormat {
     LogFormat::Text
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::Config;
+
+    /// `config.example.toml` is the canonical starter template, not a loose
+    /// documentation snippet. It must parse and validate against the canonical
+    /// `Config` type so that it cannot drift from the real schema. Partial
+    /// examples in runbooks are not required to pass this test.
+    #[test]
+    fn example_config_matches_schema() {
+        Config::load(Path::new("config.example.toml"))
+            .expect("config.example.toml must match the Config schema");
+    }
 }

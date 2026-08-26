@@ -1,4 +1,4 @@
-# Code and Documentation Cleanup
+# [Pivoted to tasks/setup-mvp.md] Code and Documentation Cleanup
 
 - **Goal**: Get the Rust codebase into a maintainable, pre-release shape before any production artifact ships.
 - **Scope**:

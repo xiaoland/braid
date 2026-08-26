@@ -46,7 +46,7 @@ pub async fn run(config: &Config) -> DoctorReport {
         ),
         path_check("backup directory", &config.runtime.backups, true),
         path_check("GitHub App private key", &config.github.private_key_file, false),
-        environment_check(&config.github.webhook_secret_environment),
+        secret_check("GitHub webhook secret", || config.webhook_secret()),
     ];
 
     let store = StoreActor::start(config.runtime.database.clone(), config.runtime.backups.clone());
@@ -98,29 +98,18 @@ pub async fn run(config: &Config) -> DoctorReport {
 
     if let Some(pi) = config.provider.pi.as_ref() {
         checks.push(match command_version("Pi CLI", &pi.executable).await {
-            check if check.state == CheckState::Pass => {
-                let api_key_ok = pi
-                    .api_key_environment
-                    .as_ref()
-                    .is_none_or(|env| std::env::var_os(env).is_some());
-                if api_key_ok {
-                    Check {
-                        name: "Pi provider".into(),
-                        state: CheckState::Pass,
-                        detail: format!("{} (api_key_environment present)", check.detail),
-                    }
-                } else {
-                    Check {
-                        name: "Pi provider".into(),
-                        state: CheckState::Fail,
-                        detail: format!(
-                            "{}; api_key_environment {} is not set",
-                            check.detail,
-                            pi.api_key_environment.as_deref().unwrap_or("")
-                        ),
-                    }
-                }
-            }
+            check if check.state == CheckState::Pass => match config.pi_api_key() {
+                Ok(_) => Check {
+                    name: "Pi provider".into(),
+                    state: CheckState::Pass,
+                    detail: format!("{} (API key present)", check.detail),
+                },
+                Err(error) => Check {
+                    name: "Pi provider".into(),
+                    state: CheckState::Fail,
+                    detail: format!("{}; {}", check.detail, error),
+                },
+            },
             check => Check { name: "Pi provider".into(), state: check.state, detail: check.detail },
         });
     }
@@ -189,16 +178,19 @@ fn path_check(name: &str, path: &Path, directory: bool) -> Check {
     }
 }
 
-fn environment_check(name: &str) -> Check {
-    let present = std::env::var_os(name).is_some();
-    Check {
-        name: "webhook secret environment".into(),
-        state: if present { CheckState::Pass } else { CheckState::Fail },
-        detail: if present {
-            format!("{name} is set; value not inspected")
-        } else {
-            format!("{name} is not set")
+fn secret_check<F>(name: &str, loader: F) -> Check
+where
+    F: FnOnce() -> Result<String, crate::config::ConfigError>,
+{
+    match loader() {
+        Ok(_) => Check {
+            name: name.into(),
+            state: CheckState::Pass,
+            detail: "loaded from configured source; value not inspected".into(),
         },
+        Err(error) => {
+            Check { name: name.into(), state: CheckState::Fail, detail: error.to_string() }
+        }
     }
 }
 

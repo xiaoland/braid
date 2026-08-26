@@ -22,6 +22,14 @@ use tokio::sync::Mutex;
 
 use crate::cli::SetupArguments;
 
+mod logo;
+
+use crate::config::{
+    CONFIG_SCHEMA_VERSION, CodexConfig, Config, GitHubConfig, LogFormat, PiConfig, Profile,
+    ProfileSelection, ProviderConfig, RuntimeConfig, SchedulerConfig, ServerConfig,
+    TelemetryConfig, ToolConfig,
+};
+
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct AppConversion {
@@ -39,6 +47,7 @@ struct CallbackState {
     state: Option<String>,
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn run(arguments: SetupArguments) -> Result<()> {
     let home = expand_home(&arguments.home)?;
     fs::create_dir_all(&home)?;
@@ -97,7 +106,6 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
             &form_action,
             html_path.as_os_str().to_str().unwrap_or(""),
             &manifest_json,
-            &webhook_secret,
         );
         return Ok(());
     }
@@ -130,25 +138,54 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
 
     let pem_path = home.join(format!("braid-of-{owner}.pem"));
     write_secret(&pem_path, app.pem.as_bytes())?;
-    let secret_path = home.join(format!("braid-of-{owner}.webhook_secret"));
-    write_secret(&secret_path, webhook_secret.as_bytes())?;
 
-    let provider_block = build_provider_block(&arguments);
-    let config_path = home.join("braid.toml");
-    let config = build_config(&home, app.id, &arguments.repository, &pem_path, &provider_block);
-    write_secret(&config_path, config.as_bytes())?;
+    // Collect secrets into a single per-owner file instead of environment
+    // variables, so multiple Braid instances for different owners can run on
+    // the same machine without env var collisions.
+    let api_key = std::env::var(&arguments.api_key_environment).with_context(|| {
+        format!(
+            "provider API key environment variable {} must be set during setup",
+            arguments.api_key_environment
+        )
+    })?;
+    let secrets_path = home.join(format!("braid-of-{owner}.secrets.toml"));
+    let secrets_toml =
+        format!("webhook_secret = {webhook_secret:?}\nprovider_api_key = {api_key:?}\n",);
+    write_secret(&secrets_path, secrets_toml.as_bytes())?;
+
+    let config_path = home.join(format!("braid-of-{owner}.toml"));
+    let config = build_config(&home, app.id, &arguments, &pem_path, &secrets_path)?;
+    let config_text = toml::to_string(&config).context("cannot serialize generated config")?;
+    write_secret(&config_path, config_text.as_bytes())?;
 
     println!("\nWrote configuration to: {}", config_path.display());
-    println!(
-        "Set the webhook secret in your environment before running Braid:\n  export BRAID_WEBHOOK_SECRET=$(cat {})",
-        secret_path.display()
-    );
+    println!("Wrote secrets to: {}", secrets_path.display());
     println!("\nNext, install the App on {}:\n{}\n", arguments.repository, install_url(&app.slug));
     println!(
         "Then run:\n  braid doctor --config {}\n  braid serve --config {} --tunnel\n",
         config_path.display(),
         config_path.display()
     );
+
+    let logo_path = home.join(format!("braid-of-{owner}-logo.png"));
+    match logo::generate(owner, &logo_path) {
+        Ok(()) => {
+            println!("Generated App logo: {}", logo_path.display());
+            println!(
+                "Upload it at https://github.com/settings/apps/{slug}/logo \
+                 (or https://github.com/organizations/{owner}/settings/apps/{slug}/logo for an org).\n",
+                slug = app.slug,
+                owner = owner
+            );
+            let _ = open_browser(&format!(
+                "https://github.com/settings/apps/{slug}/logo",
+                slug = app.slug
+            ));
+        }
+        Err(error) => {
+            eprintln!("Could not generate App logo: {error}");
+        }
+    }
 
     Ok(())
 }
@@ -159,7 +196,6 @@ fn print_manual_guide(
     form_action: &str,
     html_path: &str,
     manifest_json: &str,
-    webhook_secret: &str,
 ) {
     let manifest_shell = manifest_json.replace('\'', "'\\''");
     println!("\n=== Manual GitHub App creation guide ===\n");
@@ -181,15 +217,16 @@ fn print_manual_guide(
         "After creating the App:\n\
          - Install it on {repository}: https://github.com/apps/braid-of-{owner}/installations/new\n\
          - Set the App's webhook URL to the public tunnel URL from \
-           `braid serve --config ~/.braid/braid.toml --tunnel` (ends in `/webhook`).\n\
-         - Set the webhook secret to:\n   {webhook_secret}\n\n\
+           `braid serve --config ~/.braid/braid-of-{owner}.toml --tunnel` (ends in `/webhook`).\n\
+         - The generated webhook secret and provider API key are stored in \
+           ~/.braid/braid-of-{owner}.secrets.toml; no environment variables are required.\n\n\
          - Download the private key, save it as ~/.braid/braid-of-{owner}.pem, \
-           save the secret above as ~/.braid/braid-of-{owner}.webhook_secret, \
+           save the secrets as ~/.braid/braid-of-{owner}.secrets.toml, \
            then run `braid setup` without `--no-browser` to capture the manifest redirect.\n"
     );
     println!(
-        "If you already have the App's ID, slug, PEM, and webhook secret, you can \
-         also write ~/.braid/braid.toml manually; see docs/setup.md.\n"
+        "If you already have the App's ID, slug, PEM, and secrets, you can \
+         also write ~/.braid/braid-of-{owner}.toml manually; see docs/user-manual/setup.md.\n"
     );
 }
 
@@ -263,7 +300,7 @@ fn gh_user() -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
-fn gh_api_json<T>(endpoint: &str, payload: Option<&str>) -> Result<T>
+pub(crate) fn gh_api_json<T>(endpoint: &str, payload: Option<&str>) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -336,91 +373,170 @@ fn pi_executable_path() -> String {
     if Path::new(candidate).is_file() { candidate.to_owned() } else { "pi".to_owned() }
 }
 
-fn build_provider_block(arguments: &SetupArguments) -> String {
+fn build_provider_config(arguments: &SetupArguments, secrets_file: &Path) -> ProviderConfig {
     if arguments.provider == "codex" {
-        return "[provider.codex]\n\
-                executable = \"/Users/lanzhijiang/.braid/codex-pkg/node_modules/.bin/codex\"\n\
-                home = \"/Users/lanzhijiang/.braid/provider\"\n\
-                version = \"codex-cli 0.147.0-alpha.6.5\"\n\
-                stable_schema_sha256 = \"7d79fe309dd7520843459070f3884ecf0e39cee2620c1c49aad6efb4eca76ecb\"\n\
-                experimental_schema_sha256 = \"a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b5364439063a5c8\"\n"
-            .to_owned();
+        ProviderConfig {
+            codex: Some(CodexConfig {
+                executable: PathBuf::from(
+                    "/Users/lanzhijiang/.braid/codex-pkg/node_modules/.bin/codex",
+                ),
+                home: PathBuf::from("/Users/lanzhijiang/.braid/provider"),
+                version: "codex-cli 0.147.0-alpha.6.5".to_owned(),
+                stable_schema_sha256:
+                    "7d79fe309dd7520843459070f3884ecf0e39cee2620c1c49aad6efb4eca76ecb".to_owned(),
+                experimental_schema_sha256:
+                    "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b5364439063a5c8".to_owned(),
+            }),
+            pi: None,
+        }
+    } else {
+        ProviderConfig {
+            codex: None,
+            pi: Some(PiConfig {
+                executable: PathBuf::from(pi_executable_path()),
+                provider: Some("deepseek".to_owned()),
+                model: Some(arguments.model.clone()),
+                api_key_environment: Some(arguments.api_key_environment.clone()),
+                api_key_file: Some(secrets_file.to_path_buf()),
+                thinking: Some("high".to_owned()),
+                home: Some(PathBuf::from("/Users/lanzhijiang/.braid/pi")),
+            }),
+        }
     }
-    format!(
-        "[provider.pi]\n\
-         executable = \"{pi}\"\n\
-         provider = \"deepseek\"\n\
-         model = \"{model}\"\n\
-         api_key_environment = \"{api_key}\"\n\
-         thinking = \"high\"\n",
-        pi = pi_executable_path(),
-        model = arguments.model,
-        api_key = arguments.api_key_environment
-    )
 }
 
 fn build_config(
     home: &Path,
     app_id: u64,
-    repository: &str,
+    arguments: &SetupArguments,
     private_key_file: &Path,
-    provider_block: &str,
-) -> String {
-    format!(
-        r#"schema_version = 1
-
-[runtime]
-root = "{root}"
-database = "{database}"
-backups = "{backups}"
-auto_migrate = false
-
-[github]
-app_id = {app_id}
-repository = "{repository}"
-handle = "braid"
-api_version = "2022-11-28"
-private_key_file = "{private_key_file}"
-webhook_secret_environment = "BRAID_WEBHOOK_SECRET"
-projects_v2_enabled = false
-
-[scheduler]
-quiet_seconds = 30
-event_threshold = 8
-reconciliation_seconds = 60
-
-{provider_block}
-
-[tools]
-git = "{git}"
-gh = "{gh}"
-wrangler = "{wrangler}"
-
-[server]
-ingress = "127.0.0.1:18080"
-health = "127.0.0.1:18081"
-
-[telemetry]
-endpoint = "http://127.0.0.1:4318"
-sample_ratio = 0.10
-incident_mode = false
-export_timeout_seconds = 5
-service_name = "braid"
-log_format = "text"
-"#,
-        root = home.join("runtime").display(),
-        database = home.join("runtime/state/braid.sqlite3").display(),
-        backups = home.join("runtime/state/backups").display(),
-        app_id = app_id,
-        repository = repository,
-        private_key_file = private_key_file.display(),
-        provider_block = provider_block,
-        git = tool_path("git", "/usr/bin/git"),
-        gh = tool_path("gh", "/opt/homebrew/bin/gh"),
-        wrangler = tool_path("wrangler", "wrangler"),
-    )
+    secrets_file: &Path,
+) -> anyhow::Result<Config> {
+    let runtime_root = home.join("runtime");
+    let config = Config {
+        schema_version: CONFIG_SCHEMA_VERSION,
+        runtime: RuntimeConfig {
+            root: runtime_root.clone(),
+            database: runtime_root.join("state/braid.sqlite3"),
+            backups: runtime_root.join("state/backups"),
+            auto_migrate: false,
+        },
+        github: GitHubConfig {
+            app_id,
+            repository: arguments.repository.clone(),
+            handle: "braid".to_owned(),
+            api_version: "2022-11-28".to_owned(),
+            private_key_file: private_key_file.to_path_buf(),
+            webhook_secret_environment: None,
+            webhook_secret_file: Some(secrets_file.to_path_buf()),
+            projects_v2_enabled: false,
+        },
+        scheduler: SchedulerConfig {
+            quiet_seconds: 30,
+            event_threshold: 8,
+            reconciliation_seconds: 60,
+        },
+        provider: build_provider_config(arguments, secrets_file),
+        tools: ToolConfig {
+            git: PathBuf::from(tool_path("git", "/usr/bin/git")),
+            gh: PathBuf::from(tool_path("gh", "/opt/homebrew/bin/gh")),
+            wrangler: PathBuf::from(tool_path("wrangler", "wrangler")),
+        },
+        server: ServerConfig {
+            ingress: "127.0.0.1:18080".parse().expect("valid socket address"),
+            health: "127.0.0.1:18081".parse().expect("valid socket address"),
+        },
+        telemetry: TelemetryConfig {
+            endpoint: "http://127.0.0.1:4318".parse().expect("valid URL"),
+            sample_ratio: 0.10,
+            incident_mode: false,
+            export_timeout_seconds: 5,
+            service_name: "braid".to_owned(),
+            log_format: LogFormat::Text,
+        },
+        profiles: vec![Profile {
+            id: "default".to_owned(),
+            display_name: "Braid Agent".to_owned(),
+            tags: vec!["issue".to_owned(), "pr".to_owned()],
+            provider: arguments.provider.clone(),
+            model: Some(arguments.model.clone()),
+            reasoning: Some("high".to_owned()),
+            user_instructions: "You are Braid, a helpful coding assistant. Work from the supplied GitHub Context, publish concise public comments, and keep descriptions and implementation state current.".to_owned(),
+            workspace: home.join("profiles/default"),
+            github_actor_node_id: None,
+            status_surfaces: vec!["issue".to_owned(), "pr".to_owned()],
+            github_context_soft_ratio: 0.80,
+            github_context_hard_bytes: 100_000,
+        }],
+        profile_selection: ProfileSelection {
+            default_pr_profile: "default".to_owned(),
+        },
+    };
+    config.validate().context("generated config failed validation")?;
+    Ok(config)
 }
 
 fn tool_path(name: &str, fallback: &str) -> String {
     which::which(name).map_or_else(|_| fallback.to_owned(), |p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn args(repo: &str, provider: &str, model: &str) -> SetupArguments {
+        SetupArguments {
+            repository: repo.to_owned(),
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            api_key_environment: "DEEPSEEK_API_KEY".to_owned(),
+            home: PathBuf::from("/tmp/braid-setup-test"),
+            no_browser: false,
+        }
+    }
+
+    #[test]
+    fn generated_config_loads_for_pi() {
+        let home = PathBuf::from("/tmp/braid-setup-test");
+        fs::create_dir_all(&home).unwrap();
+        let secrets_path = home.join("braid-of-xiaoland.secrets.toml");
+        std::fs::write(&secrets_path, "webhook_secret = \"test\"\nprovider_api_key = \"key\"\n")
+            .unwrap();
+        let config = build_config(
+            &home,
+            123_456,
+            &args("xiaoland/braid", "pi", "deepseek-chat"),
+            &home.join("key.pem"),
+            &secrets_path,
+        )
+        .expect("config should build");
+        let text = toml::to_string(&config).expect("config should serialize");
+        let parsed: Config = toml::from_str(&text).expect("serialized config should parse");
+        assert_eq!(parsed.schema_version, 1);
+        assert!(!parsed.profiles.is_empty());
+        assert_eq!(parsed.profile_selection.default_pr_profile, "default");
+    }
+
+    #[test]
+    fn generated_config_loads_for_codex() {
+        let home = PathBuf::from("/tmp/braid-setup-test");
+        fs::create_dir_all(&home).unwrap();
+        let secrets_path = home.join("braid-of-xiaoland.secrets.toml");
+        std::fs::write(&secrets_path, "webhook_secret = \"test\"\nprovider_api_key = \"key\"\n")
+            .unwrap();
+        let config = build_config(
+            &home,
+            123_456,
+            &args("xiaoland/braid", "codex", "gpt-4o"),
+            &home.join("key.pem"),
+            &secrets_path,
+        )
+        .expect("codex config should build");
+        let text = toml::to_string(&config).expect("config should serialize");
+        let parsed: Config = toml::from_str(&text).expect("serialized codex config should parse");
+        assert_eq!(parsed.schema_version, 1);
+        assert!(!parsed.profiles.is_empty());
+    }
 }
