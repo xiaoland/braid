@@ -1,59 +1,86 @@
 # Implementation Plan
 
-Ordered as incremental, independently mergeable PRs. Each PR keeps
-`cargo fmt/check/clippy/test` green and preserves existing product behavior.
+Single PR on branch `feat/agent-architecture` (task packet rides along).
+Ordered as sequential commits, each keeping `cargo fmt/check/clippy/test`
+green. Product behavior is preserved; only internal architecture moves.
 
-## PR 1 — Worker folder layout
+## Rehearsal Findings
 
-- Introduce `~/.braid/workers/<name>/` with `config.toml`, `secrets.toml`,
-  `braid.db`, `runtimes/`, `worktrees/`, `logs/`.
-- `braid setup --worker <name>` writes into the folder; `braid serve --worker
-  <name>` resolves config/secrets/db from it.
-- Keep `--config <path>` as a low-level override.
-- Make `runtime_root` / `database` optional with worker-folder defaults.
-- `braid doctor` validates the worker folder shape.
+### Current architecture map
 
-## PR 2 — Profile / provider / runtime config schema
+- `src/config.rs`: `provider.codex/pi` per-runtime sections; Profile has
+  `tags`, `provider: String`, no `adapter`; `runtime.root/database/backups`
+  are mandatory absolute paths.
+- `src/provider/mod.rs`: `AgentProvider` is a **process-level** trait keyed by
+  `thread_id` (start/resume/inject_context/start_turn/steer/interrupt) plus a
+  process-wide `broadcast<ProviderNotification>`.
+- `src/runtime/scheduler.rs` + `pr_agent.rs`: ~10 call sites drive sessions;
+  context reset (`materialize_context_reset`) is done **by the scheduler**, not
+  the provider — this logic moves into the adapter.
+- `src/store/mod.rs`: quiet window / event threshold / pending batches already
+  exist as store machinery — the Event Queue is a reorganization, not new
+  mechanism.
+- `src/setup.rs`: **hardcoded machine-specific paths and pins**
+  (`/Users/lanzhijiang/Library/pnpm/bin/pi`, codex executable path, version
+  string, schema sha256). This is a portability bug the runtime registry must
+  fix.
 
-- Profile: rename `tags` → `scopes` (issue|pr), add `adapter` reference; keep
-  `github_actor_node_id`, `status_surfaces`, context pressure fields.
-- Add global `llm_providers` table (protocol, connection, `api_key_file`,
-  models with costs, allowances as metadata only).
-- Add runtime registry table (per worker): adapter type, pinned version,
-  install path, checksum.
-- Profiles reference `provider` + `model` into `llm_providers`; resolution is
-  validated at config load (unknown provider/model = config error).
-- Round-trip tests: generated setup config and `config.example.toml` validate
-  against `Config` (extend the existing SSoT tests).
+### Risk register
 
-## PR 3 — Setup flow: runtime selection + default profile
+| # | Risk | Mitigation |
+| --- | --- | --- |
+| R1 | Config schema is breaking (`deny_unknown_fields`); example/template/setup/doctor must move atomically | Existing SSoT round-trip tests catch drift; update all four in one commit |
+| R2 | AgentSession trait refactor touches ~10 scheduler call sites | Shim-first: wrap existing `AgentProvider` behind the new trait, then rewire call sites, then move reset ownership |
+| R3 | On-demand runtime install needs a package mechanism | codex/pi are npm packages; install via `npm install --prefix <worker>/runtimes/<name> <pkg>@<pin>`; if npm absent, error with manual instructions and keep executable-path override |
+| R4 | Schema hash pins currently user-configured (drift source) | Pins move into the Braid-managed registry entry (known-good pins ship with the binary) |
+| R5 | `handoff/slice7-wip` branch has an uncertain-write test harness not in main | **Needs owner decision**: merge, rebase later, or drop |
+| R6 | Breaking config vs released v0.2.3 | CHANGELOG breaking entry; migration = re-run `braid setup` |
+| R7 | Codex OAuth home moves into worker folder | Copy or re-login on first serve; document in CHANGELOG |
 
-- `braid setup` asks which default agent runtime (codex app-server / pi),
-  creates the default agent profile referencing it, and installs that runtime
-  into `runtimes/` on demand.
-- `braid serve` verifies pinned runtimes exist and installs missing ones before
-  starting.
-- No default runtime install without a profile that references it.
+### Branch convergence
 
-## PR 4 — AgentSession trait + adapter refactor
+- Done: deleted local `feat/setup-mvp`, `feat/rust-working-memory` (content
+  already in main via squash).
+- Pending: `handoff/slice7-wip` (see R5).
 
-- Core trait: `send_user_msg(msg, steering, reset_context_to) -> AgentSession`
-  (returns immediately), `status()`, `status_stream()` via
-  `tokio::sync::watch`.
-- Adapter owns physical session replacement/fork internally; caller never
-  branches on status before sending.
-- Refactor existing codex/pi providers behind the trait without changing
-  behavior; `recv()` stays adapter-internal for debugging.
+## Execution Order (sequential commits in one PR)
 
-## PR 5 — Event producer / queue / group wiring
+### A. Worker folder layout
+1. `--worker <name>` flag on setup/serve/doctor; resolve config/secrets/db/
+   runtimes/worktrees/logs from `~/.braid/workers/<name>/`.
+2. `runtime.root/database` become optional with worker-folder defaults;
+   `--config` stays as low-level override.
 
-- Event Producer: webhook/GraphQL ingress → classify → explicit routing to
-  (work-item, agent-group) queues; Agent-origin events dropped for the
-  originating group.
-- Event Queue: per work-item per agent-group; owns quiet window/threshold;
-  emits batch (user message text + optional new context + steering).
-- Agent Group: thin forwarder — holds the session handle created at
-  activation, calls `send_user_msg(...)`; one session per group in MVP.
+### B. Config schema
+3. Profile: `tags` → `scopes`, add `adapter`; keep `github_actor_node_id`,
+   `status_surfaces`, context-pressure fields.
+4. Add `llm_providers` (metadata-only allowances) and runtime registry tables;
+   profiles resolve provider+model at load time.
+5. Update `config.example.toml`, `config/setup.template.toml`, `setup.rs`
+   generation, `doctor.rs`, and SSoT tests atomically.
+
+### C. Setup + runtime install
+6. `braid setup` asks for default agent runtime, creates default profile, and
+   installs the pinned runtime into `runtimes/` on demand; remove hardcoded
+   paths from `setup.rs`.
+7. `braid serve` verifies pinned runtimes, installs missing ones.
+
+### D. AgentSession trait
+8. Define core trait (`send_user_msg`, `status`, `status_stream` via
+   `tokio::sync::watch`); implement codex/pi adapter shims over existing
+   `AgentProvider`.
+9. Rewire scheduler call sites onto the trait.
+10. Move physical session replacement / context reset into the adapter
+    (`reset_context_to`); collapse the scheduler-side reset path.
+
+### E. Event producer / queue / group naming
+11. Reorganize ingress → Event Producer, store-backed debounce → Event Queue,
+    batch sender → thin Agent Group; update module names and docs.
+
+### F. Verification
+12. Update `scripts/tests/*.sh`, run the shell suite against a local worker;
+    CHANGELOG breaking-change entry; promote packet decisions into
+    `docs/20-product-tdd/`.
 
 ## Out of scope (this pass)
 
