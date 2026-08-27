@@ -14,7 +14,11 @@ Decide what belongs in Agent Profile and what belongs in referenced registries.
   - `id`, `display_name`, `priority`
   - `scopes` (`issue|pr`) replacing current `tags`
   - `user_instructions`
-  - `adapter` reference (e.g., `"codex-app-server"`)
+  - `adapter_type` + `adapter_version` reference (locates an Agent Runtime
+    Adapter class; connectivity config lives in the worker-level runtime
+    registry, never in the profile — including `CODEX_HOME`/`PI_HOME`-style
+    homes, because profile user_instructions/skills/mcps are implemented
+    against a fixed runtime home)
   - `provider` + `model` reference
   - `reasoning`, `sandbox` policy, `workspace`
   - `skills` and `mcps` as **references to a global registry**
@@ -27,25 +31,33 @@ Decide what belongs in Agent Profile and what belongs in referenced registries.
 1. `github_actor_node_id` and `status_surfaces` stay in the Agent Profile. Both
    are product-defined profile behavior (glossary: Agent Attribution /
    Operational Status Comment), not implementation detail.
-2. Adapter version pin lives in the runtime registry; the profile references
-   the adapter id only.
+2. Adapter contract version pin: profile carries `adapter_type` +
+   `adapter_version`; the worker-level registry entry holds the connectivity
+   config for that adapter class.
 3. MVP TOML layout:
 
 ```toml
+[[runtimes]]
+adapter_type = "pi"
+version = "0.84.3"
+executable_path = "..."     # adapter-defined connectivity config
+home = "..."                # PI_HOME lives here, not in any profile
+
 [[profiles]]
 id = "default"
 display_name = "Default"
 priority = 1
 scopes = ["issue", "pr"]
 user_instructions = "..."
-adapter = "pi"
-provider = "openai-codex"
-model = "gpt-5.2-codex"
+adapter_type = "pi"
+adapter_version = "0.84.3"
+provider = "deepseek"
+model = "deepseek-v4-pro"
 reasoning = "high"
 sandbox = "workspace-write"
 workspace = "agent"
 github_actor_node_id = "..."
-status_surfaces = ["issue_body", "pr_body"]
+status_surfaces = ["issue", "pr"]
 skills = ["gh"]
 mcps = ["time"]
 ```

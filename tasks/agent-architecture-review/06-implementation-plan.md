@@ -77,12 +77,13 @@ pub trait AgentSession: Send + Sync {
 ### Config TOML (schema_version bumps 1 → 2)
 
 ```toml
-[[runtimes]]
-id = "pi"
-adapter = "pi"                 # braid-internal adapter id
-version = "0.84.3"             # informational pin from verification
-executable_path = "..."        # OR api_url = "http://127.0.0.1:PORT"
-# api_url used by HTTP-serving runtimes such as deepseek-harness
+[[runtimes]]                 # one entry per adapter_type per worker
+adapter_type = "pi"
+version = "0.84.3"           # verified at setup time
+# connectivity config below has an adapter-defined shape; examples:
+executable_path = "..."      # spawn a process
+# api_url = "http://127.0.0.1:PORT"   # HTTP runtime, e.g. deepseek-harness
+home = "..."                 # CODEX_HOME/PI_HOME-style runtime home
 
 [[llm_providers]]
 id = "deepseek"
@@ -96,15 +97,18 @@ api_key_file = "secrets.toml"  # relative to worker folder
 
 [[profiles]]
 id = "default"
-scopes = ["issue", "pr"]       # renamed from tags
-adapter = "pi"                 # -> runtimes.adapter
-provider = "deepseek"          # -> llm_providers.id
-model = "deepseek-v4-pro"      # -> llm_providers.models.model_id
+scopes = ["issue", "pr"]     # renamed from tags
+adapter_type = "pi"          # -> runtimes.adapter_type
+adapter_version = "0.84.3"   # contract pin, checked against runtimes.version
+provider = "deepseek"        # -> llm_providers.id
+model = "deepseek-v4-pro"    # -> llm_providers.models.model_id
 # display_name, priority, user_instructions, reasoning, sandbox, workspace,
-# github_actor_node_id, status_surfaces, context pressure fields unchanged
+# github_actor_node_id, status_surfaces, context pressure fields unchanged.
+# Profiles NEVER carry connectivity config (executable_path/api_url/home).
 ```
 
-Load-time validation: profile.adapter must match a `runtimes` entry;
+Load-time validation: profile.adapter_type must match a `runtimes` entry and
+`adapter_version` must be contract-compatible with the entry's `version`;
 profile.provider+model must resolve in `llm_providers`; unknown references are
 config errors.
 

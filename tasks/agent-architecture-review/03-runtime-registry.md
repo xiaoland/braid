@@ -2,16 +2,37 @@
 
 ## Terminology
 
-- **Adapter**: Braid-internal protocol implementation (e.g. the codex-app-server
-  adapter, the pi adapter). It ships inside the Braid binary and is never
-  downloaded.
-- **Agent Runtime**: the external executable/SDK or HTTP service the adapter
-  drives (Codex app-server, Pi, a deepseek-harness endpoint). Runtimes are
-  declared in the registry but **never auto-installed**.
+- **Agent Runtime Adapter**: a Braid-internal protocol implementation class
+  (e.g. codex-app-server adapter, pi adapter), shipped inside the Braid binary.
+  Identified by `adapter_type` + contract `version`.
+- **Agent Runtime**: the external executable/SDK or HTTP service an adapter
+  instance connects to (Codex app-server, Pi, a deepseek-harness endpoint).
+- **Connectivity config**: adapter-defined parameters used at instantiation to
+  connect to/use a runtime — e.g. `executable_path`, `api_url`,
+  `CODEX_HOME`/`PI_HOME`, schema pins. Its shape is owned by each adapter,
+  not by a universal schema.
 
-## Goal
+## Relationship Model
 
-Define how Braid declares, discovers, and connects to agent runtimes.
+```
+Agent Profile (adapter_type + version)
+        │  locates
+        ▼
+Agent Runtime Adapter class ──instantiated with──▶ connectivity config
+        │                                              (registry entry,
+        ▼                                               worker-level)
+   connects to / uses
+        ▼
+Agent Runtime
+```
+
+- A profile references **only** `adapter_type` + `version`; it never carries
+  connectivity parameters.
+- Connectivity config (including `CODEX_HOME`/`PI_HOME`-style homes) lives in
+  the per-worker registry entry. Rationale: a profile's `user_instructions`,
+  `skills`, and `mcps` are implemented against a specific runtime home;
+  allowing per-profile homes would make the same profile resolve different
+  skill sets and break the role-snapshot abstraction.
 
 ## Design Principle
 
@@ -19,28 +40,31 @@ Define how Braid declares, discovers, and connects to agent runtimes.
 not install runtimes itself. It discovers what exists, prints exact install
 commands when nothing is found, and lets the user execute them.
 
-## Agreed Direction
+## Registry Entry (per worker, in `config.toml`)
 
-- Profiles reference an adapter by id (e.g., `adapter = "codex-app-server"`).
-- Each adapter ships with Braid and provides:
-  - a **discovery probe** (find candidate runtimes on the machine, e.g. Codex
-    CLI's bundled `codex app-server`, `pi` on PATH/pnpm bin);
-  - an **install instruction** (pnpm preferred, npm fallback) printed when
-    discovery finds nothing;
-  - a **connection verifier** (version/schema handshake; `protocol.rs` already
-    does this for Codex).
-- Runtime registry entry (per worker, in `config.toml`):
-  - `id`, `adapter` (adapter id), `version` (informational pin);
-  - connection config — exactly one of:
-    - `executable_path` (+ adapter-specific extras like `home`, schema pins);
-    - `api_url` (HTTP endpoint, e.g. deepseek-harness);
-  - Braid never writes this entry by itself beyond what `braid setup` persists
-    after explicit user selection.
-- `braid setup` flow: run discovery probes → list candidates → user selects
-  one → verify connection → persist. If discovery is empty, print the
-  adapter's install command and exit with instructions.
-- `braid serve` / `braid doctor` verify the configured runtime is reachable;
-  they report, never install.
+- `adapter_type`, `version` (verified at setup time);
+- connectivity config in the adapter's own shape (e.g. Codex:
+  `executable_path` + `home` + schema pins; Pi: `executable_path` + `home`,
+  or `api_url` for HTTP-serving runtimes such as deepseek-harness);
+- one entry per `adapter_type` per worker.
+
+## Adapter Responsibilities (compiled into Braid)
+
+- **Discovery probe**: find candidate runtimes (e.g. Codex CLI's bundled
+  `codex app-server`, `pi` on PATH/pnpm bin).
+- **Install instruction**: printed when discovery finds nothing (pnpm
+  preferred, npm fallback); Braid never executes it.
+- **Connection verifier**: version/schema handshake (`protocol.rs` already
+  does this for Codex).
+
+## Setup / Serve Flow
+
+- `braid setup`: run discovery probes → list candidates → user selects →
+  verify → persist registry entry + default profile. Empty discovery prints
+  the install command and exits with instructions. Manual flags
+  (`--runtime-executable`, `--runtime-api-url`) bypass discovery.
+- `braid serve` / `braid doctor`: verify the configured runtime is reachable
+  and contract-compatible; report, never install.
 
 ## Pending Decision
 
