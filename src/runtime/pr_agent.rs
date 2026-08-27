@@ -149,9 +149,9 @@ pub(crate) async fn drive_pr_agent_connection(
             }
             _ = tick.tick() => {
                 if let Some(active) = &mut running {
-                    begin_active_context_reset(store, &provider, active).await;
+                    begin_active_context_reset(store, Arc::clone(&sessions), active).await;
                     if active.reset_id.is_none() {
-                        forward_urgent_steer(store, &provider, active).await;
+                        forward_urgent_steer(store, Arc::clone(&sessions), active).await;
                     }
                     continue;
                 }
@@ -535,9 +535,9 @@ pub(crate) async fn drive_issue_agent_connection(
             }
             _ = tick.tick() => {
                 if let Some(active) = &mut running {
-                    begin_active_context_reset(store, &provider, active).await;
+                    begin_active_context_reset(store, Arc::clone(&sessions), active).await;
                     if active.reset_id.is_none() {
-                        forward_urgent_steer(store, &provider, active).await;
+                        forward_urgent_steer(store, Arc::clone(&sessions), active).await;
                     }
                     continue;
                 }

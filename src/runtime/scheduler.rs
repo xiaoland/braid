@@ -230,7 +230,7 @@ pub(crate) async fn reactivate_work_item_agent(
 
 pub(crate) async fn begin_active_context_reset(
     store: &StoreActor,
-    provider: &dyn crate::provider::AgentProvider,
+    sessions: Arc<SessionManager>,
     active: &mut RunningAgentTurn,
 ) {
     if active.reset_id.is_some() {
@@ -257,10 +257,18 @@ pub(crate) async fn begin_active_context_reset(
         return;
     }
     active.reset_id = Some(reset.reset_id.clone());
-    if let Err(error) =
-        provider.interrupt(&reset.old_provider_session_id, &active.provider_turn_id).await
-    {
-        tracing::warn!(%error, reset = %reset.reset_id, "active Context reset is waiting for a safe provider terminal");
+    match sessions.get(&reset.old_provider_session_id).await {
+        Some(session) => {
+            if let Err(error) = session.send_user_msg(String::new(), false, None).await {
+                tracing::warn!(%error, reset = %reset.reset_id, "active Context reset interrupt via AgentSession failed");
+            }
+        }
+        None => {
+            tracing::warn!(
+                provider_session = %reset.old_provider_session_id,
+                "no AgentSession for active reset; cannot interrupt"
+            );
+        }
     }
 }
 
@@ -413,7 +421,7 @@ pub(crate) async fn materialize_context_reset(
 
 pub(crate) async fn forward_urgent_steer(
     store: &StoreActor,
-    provider: &dyn crate::provider::AgentProvider,
+    sessions: Arc<SessionManager>,
     active: &RunningAgentTurn,
 ) {
     let steer = match store.claim_urgent_steer(active.claim.turn_id.clone()) {
@@ -425,10 +433,14 @@ pub(crate) async fn forward_urgent_steer(
     };
     let Some(steer) = steer else { return };
     let reference = render_event_references(&steer);
-    if let Err(error) = provider
-        .steer(&active.claim.provider_session_id, &active.provider_turn_id, &reference)
-        .await
-    {
+    let Some(session) = sessions.get(&active.claim.provider_session_id).await else {
+        tracing::warn!(
+            provider_session = %active.claim.provider_session_id,
+            "no AgentSession for steer; batch remains runnable"
+        );
+        return;
+    };
+    if let Err(error) = session.send_user_msg(reference, true, None).await {
         tracing::warn!(%error, "active turn did not accept urgent steer; batch remains runnable");
         return;
     }
@@ -472,7 +484,7 @@ pub(crate) async fn materialize_next_issue_assignment(
 
 pub(crate) async fn start_next_agent_turn(
     store: &StoreActor,
-    provider: &dyn crate::provider::AgentProvider,
+    _provider: &dyn crate::provider::AgentProvider,
     sessions: Arc<SessionManager>,
     profile: &Profile,
     work_item_kind: &str,
@@ -486,51 +498,43 @@ pub(crate) async fn start_next_agent_turn(
     }?;
     let reference = render_event_references(&claim);
 
-    // Prefer the wrapped AgentSession when one has been materialized.
-    let provider_turn_id = match sessions.get(&claim.provider_session_id).await {
-        Some(session) => match session.send_user_msg(reference, false, None).await {
-            Ok(SendResult::Started { provider_turn_id }) => provider_turn_id,
-            Ok(SendResult::Acknowledged) => {
-                tracing::error!(turn = %claim.turn_id, "AgentSession did not start a turn");
-                let _ = store.mark_turn_terminal(claim.turn_id.clone(), "failed".into());
-                return None;
+    // Every assignment materialization and resume path now populates the
+    // SessionManager, so a missing session is a genuine error.
+    let Some(session) = sessions.get(&claim.provider_session_id).await else {
+        tracing::error!(
+            turn = %claim.turn_id,
+            provider_session = %claim.provider_session_id,
+            "no AgentSession found for claimed turn"
+        );
+        let _ = store.mark_turn_terminal(claim.turn_id.clone(), "failed".into());
+        return None;
+    };
+    let provider_turn_id = match session.send_user_msg(reference, false, None).await {
+        Ok(SendResult::Started { provider_turn_id }) => provider_turn_id,
+        Ok(SendResult::Acknowledged) => {
+            tracing::error!(turn = %claim.turn_id, "AgentSession did not start a turn");
+            let _ = store.mark_turn_terminal(claim.turn_id.clone(), "failed".into());
+            return None;
+        }
+        Err(error) => {
+            let lifecycle = match error {
+                crate::agent_session::SessionError::Unavailable => "unknown".into(),
+                crate::agent_session::SessionError::Failed(_) => provider_error_lifecycle(
+                    &crate::provider::ProviderError::Protocol(error.to_string()),
+                )
+                .to_string(),
+            };
+            let _ = store.mark_turn_terminal(claim.turn_id.clone(), lifecycle.clone());
+            if claim.trusted_mention && lifecycle == "failed" {
+                let _ = store.enqueue_turn_reaction(claim.turn_id, "confused".into());
             }
-            Err(error) => {
-                let lifecycle = match error {
-                    crate::agent_session::SessionError::Unavailable => "unknown".into(),
-                    crate::agent_session::SessionError::Failed(_) => provider_error_lifecycle(
-                        &crate::provider::ProviderError::Protocol(error.to_string()),
-                    )
-                    .to_string(),
-                };
-                let _ = store.mark_turn_terminal(claim.turn_id.clone(), lifecycle.clone());
-                if claim.trusted_mention && lifecycle == "failed" {
-                    let _ = store.enqueue_turn_reaction(claim.turn_id, "confused".into());
-                }
-                tracing::error!(%error, "cannot send user message through AgentSession");
-                return None;
-            }
-        },
-        None => {
-            // Fallback to the bare provider primitive until all callers
-            // populate the SessionManager.
-            match provider.start_turn(&claim.provider_session_id, profile, &reference).await {
-                Ok(turn) => turn.turn_id,
-                Err(error) => {
-                    let lifecycle = provider_error_lifecycle(&error);
-                    let _ = store.mark_turn_terminal(claim.turn_id.clone(), lifecycle.into());
-                    if claim.trusted_mention && lifecycle == "failed" {
-                        let _ = store.enqueue_turn_reaction(claim.turn_id, "confused".into());
-                    }
-                    tracing::error!(%error, "cannot start provider turn");
-                    return None;
-                }
-            }
+            tracing::error!(%error, "cannot send user message through AgentSession");
+            return None;
         }
     };
     if let Err(error) = store.mark_turn_started(claim.turn_id.clone(), provider_turn_id.clone()) {
         tracing::error!(%error, "cannot record provider turn start");
-        let _ = provider.interrupt(&claim.provider_session_id, &provider_turn_id).await;
+        // TODO(D2c): interrupt via AgentSession once the bare provider fallback is removed.
         return None;
     }
     if claim.trusted_mention
