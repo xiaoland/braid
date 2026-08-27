@@ -8,13 +8,15 @@ Versioning once release artifacts are published.
 ### Added
 
 - Worker layout: `braid setup/serve/doctor --worker <name>` resolves config,
-  secrets, database, worktrees, and logs under `~/.braid/workners/<name>/`.
+  secrets, database, worktrees, and logs under `~/.braid/workers/<name>/`.
 - Config schema version 2 with `[[runtimes]]`, `[[llm_providers]]`, and profile
   `adapter_type` / `adapter_version` references. Runtime connectivity no longer
   lives in profiles.
 - `src/agent_session.rs` defines the core `AgentSession` trait and event stream;
   `ProviderAgentSession` in `src/provider/session.rs` maps it to the existing
   provider primitives.
+- `SessionManager` in `src/runtime/session_manager.rs` manages per-provider-thread
+  `ProviderAgentSession` handles (start/resume/replace/remove).
 - New architecture boundary modules `src/producer.rs`, `src/queue.rs`, and
   `src/group.rs` (currently boundary placeholders; implementation moves in
   future commits).
@@ -27,6 +29,20 @@ Versioning once release artifacts are published.
 - `braid setup` discovers local runtimes, prints install instructions when none
   are found, and never auto-installs. Manual flags `--runtime-executable` and
   `--runtime-api-url` bypass discovery.
+- All scheduler dispatch paths (`start_next_agent_turn`, `forward_urgent_steer`,
+  `begin_active_context_reset`, `materialize_context_reset`) now route through
+  `AgentSession::send_user_msg` instead of calling provider primitives directly.
+- Worker loops (`issue_agent_worker`, `pr_agent_worker`) consume `SessionEvent`
+  from the active `AgentSession` rather than raw provider notifications.
+- `connect_provider` returns `Arc<dyn AgentProvider>` so the adapter and
+  `SessionManager` share ownership.
+
+### Removed
+
+- Deprecated `Config::provider_config()` bridge removed; callers use
+  `default_provider_config()` or `RuntimeEntry` directly.
+- Direct provider notification subscription removed from worker loops; the
+  `AgentSession` event stream is the sole signal boundary.
 
 ## [0.2.3] - 2026-08-24
 

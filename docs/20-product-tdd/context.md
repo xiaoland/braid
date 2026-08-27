@@ -147,3 +147,16 @@ Provider instructions, tool schemas, Event References, and response reserve are
 not included in this byte count; the operator chooses the Profile limit with
 those costs in mind. This explicit contract is more honest than pretending all
 providers expose the same tokenizer or effective window.
+
+## Context Reset and Resume Compatibility
+
+Context reset and provider session resume compatibility are **adapter-internal**.
+The core contract never includes revision or digest fields in the Profile;
+instead, the caller passes the latest materialized `reset_context_to` content
+when it has one. The adapter (`ProviderAgentSession`) decides whether the
+incoming context differs from the last known hash and, if so, whether to
+replace the physical provider session, inject context into the existing
+session, or fence an active turn and retry after interruption.
+
+This keeps the Profile as plain configuration and avoids coupling the core
+runtime to provider-specific compaction or resume rules.

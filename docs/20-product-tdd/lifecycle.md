@@ -144,3 +144,21 @@ side effects. It reconnects/resumes the same physical session when compatible;
 if the provider proves it unavailable, the group becomes `blocked` and Braid
 updates Operational Status. Context replacement may create a fresh session
 only after the old turn is terminal or fenced so its later output is ignored.
+
+## AgentSession Event Stream
+
+The core signal between the adapter and the runtime is the `AgentSession` event
+stream, not raw provider notifications. The runtime receives a
+`broadcast::Receiver<SessionEvent>` from each active session and reacts to:
+
+| Event | Meaning | Runtime reaction |
+| --- | --- | --- |
+| `TurnStarted { provider_turn_id }` | The adapter accepted a new turn. | Record `provider_turn_id` in store; mark turn `starting`. |
+| `TurnTerminal { provider_turn_id, outcome }` | A turn ended with a known outcome (`Completed`, `Interrupted`, `Failed`, `Unknown`). | Mark turn terminal, update reactions, schedule next batch. |
+| `SessionReplaced { old_id, new_id }` | The adapter created a fresh physical provider session (e.g. after context reset). | Persist the new `provider_session_id` in store; update `SessionManager` key. |
+| `Failed { reason }` | The adapter encountered an unrecoverable error. | Enter failure/recovery path; mark group `blocked` or `unknown`. |
+
+The adapter internally owns queuing, steering, physical session replacement,
+and context-reset compatibility. The caller only dispatches through
+`AgentSession::send_user_msg(msg, steering, reset_context_to)` and consumes
+the event stream for reactions.

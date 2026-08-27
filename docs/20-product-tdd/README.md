@@ -98,7 +98,12 @@ crates. Modules are deep and align with authority boundaries:
 | `events` | Canonical diff classification and compact Event Reference rendering. |
 | `store` | One dedicated SQLite actor, transactions, migrations, leases, ledgers, sessions, batches, and outbox. |
 | `scheduler` | Quiet/count/urgent coalescing and single-flight group turn claims. |
-| `sessions` | Assignment generation, Context generation, invalidation fencing, finalization, and provider/worktree handles. |
+| `producer` | Webhook/GraphQL ingress → canonical diff → classified events (boundary placeholder; currently implemented by `webhook` and `reconcile`). |
+| `queue` | Per-work-item per-agent-group quiet window and batch emission (boundary placeholder; currently implemented by `scheduler_batches` in `store`). |
+| `group` | Thin forwarder from the Event Queue to an `AgentSession` (boundary placeholder; currently implemented by `issue_agent` and `pr_agent`). |
+| `agent_session` | Core `AgentSession` trait and event stream (`TurnStarted`, `TurnTerminal`, `SessionReplaced`, `Failed`). |
+| `provider::session` | `ProviderAgentSession` adapter that maps `AgentSession` to `AgentProvider` primitives and translates provider notifications into `SessionEvent`s. |
+| `session_manager` | In-process `SessionManager` keyed by provider thread id; start/resume/replace/remove. |
 | `provider` | Provider-neutral capability contract and Codex NDJSON implementation. |
 | `worktree` | Validate a Profile source checkout, fetch the bound PR head, provision one generation-scoped worktree per Implementation Agent, and expose recovery diagnostics; no Git-operation sandbox. |
 | `writer` | `braid gh`, attribution, reaction/status desired state, and write-outbox convergence. |

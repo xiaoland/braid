@@ -24,7 +24,9 @@ braid="$package_root/bin/braid"
 runtime="$temporary_root/runtime"
 mkdir -p "$runtime/state/backups" "$runtime/provider" "$runtime/workspace"
 private_key="$runtime/github-app.pem"
+secrets_file="$runtime/secrets.toml"
 printf '%s\n' 'diagnostic placeholder; no GitHub API call is made in Slice 0' > "$private_key"
+touch "$secrets_file"
 
 write_config() {
     config_path=$1
@@ -32,7 +34,7 @@ write_config() {
     sample_ratio=$3
     port=$4
     cat > "$config_path" <<EOF
-schema_version = 1
+schema_version = 2
 [runtime]
 root = "$runtime"
 database = "$database_path"
@@ -50,12 +52,22 @@ projects_v2_enabled = false
 quiet_seconds = 30
 event_threshold = 8
 reconciliation_seconds = 60
-[provider.codex]
+[[runtimes]]
+adapter_type = "codex"
+version = "codex-cli 0.147.0-alpha.6.5"
 executable = "/usr/bin/false"
 home = "$runtime/provider"
-version = "codex-cli 0.147.0-alpha.6.5"
 stable_schema_sha256 = "7d79fe309dd7520843459070f3884ecf0e39cee2620c1c49aad6efb4eca76ecb"
 experimental_schema_sha256 = "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b5364439063a5c8"
+[[llm_providers]]
+id = "openai"
+protocol = "openai"
+api_key_file = "$secrets_file"
+[[llm_providers.models]]
+model_id = "gpt-5.6-sol"
+input_cost = 0.0
+output_cost = 0.0
+cache_input_cost = 0.0
 [tools]
 git = "/usr/bin/git"
 gh = "/usr/bin/false"
@@ -74,9 +86,11 @@ log_format = "text"
 id = "issue-codex"
 display_name = "Issue Codex"
 tags = ["issue"]
-provider = "codex"
+provider = "openai"
 model = "gpt-5.6-sol"
 reasoning = "high"
+adapter_type = "codex"
+adapter_version = "codex-cli 0.147.0-alpha.6.5"
 user_instructions = "Use the Issue as working memory."
 workspace = "$runtime/workspace"
 status_surfaces = ["issue"]
@@ -86,9 +100,11 @@ github_context_hard_bytes = 524288
 id = "pr-codex"
 display_name = "PR Codex"
 tags = ["pr", "implementation"]
-provider = "codex"
+provider = "openai"
 model = "gpt-5.6-sol"
 reasoning = "high"
+adapter_type = "codex"
+adapter_version = "codex-cli 0.147.0-alpha.6.5"
 user_instructions = "Use linked Issues and the PR as working memory."
 workspace = "$runtime/workspace"
 status_surfaces = ["pr"]
@@ -125,8 +141,9 @@ fi
 /usr/bin/grep -q 'Codex app-server' "$temporary_root/doctor.json"
 
 schema=$(run_clean "$braid" status --config "$config" --json | /usr/bin/sed -n 's/.*"schema_version": \([0-9][0-9]*\).*/\1/p')
-test "$schema" = "1"
+test "$schema" = "2"
 
+# v1 fixture: intentionally a v1 DB that must migrate forward to v2
 v1="$runtime/state/v1.sqlite3"
 /usr/bin/sqlite3 "$v1" < "$repository_root/migrations/0001_initial.sql"
 v1_checksum=$(/usr/bin/shasum -a 256 "$repository_root/migrations/0001_initial.sql" | /usr/bin/awk '{print $1}')
@@ -153,7 +170,7 @@ run_clean "$braid" migrate apply --config "$v1_config"
 backup_count_after=$(find "$runtime/state/backups" -type f -name '*.sqlite3' | wc -l | tr -d ' ')
 test "$backup_count_after" = "$backup_count_before"
 v1_schema=$(run_clean "$braid" status --config "$v1_config" --json | /usr/bin/sed -n 's/.*"schema_version": \([0-9][0-9]*\).*/\1/p')
-test "$v1_schema" = "1"
+test "$v1_schema" = "2"
 /usr/bin/sqlite3 "$v1" \
     "SELECT 1 FROM associations WHERE issue_node_id='ISSUE_NODE' AND pr_node_id='PR_NODE' AND active=1;" \
     | /usr/bin/grep -q '^1$'

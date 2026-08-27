@@ -16,5 +16,6 @@ Split into focused sub-packets so each boundary can be closed independently.
 - **07-topology-audit.md**: object/edge topology, defect fixes T1–T10, binding
   corrections.
 
-**Current status**: topology-audited; all packets decided; plan ready for
-execution.
+**Current status**: implementation complete through D2 on branch
+`feat/agent-architecture`. Remaining commit F: update shell tests for schema v2,
+final CHANGELOG pass, and promote these packets into `docs/20-product-tdd/`.
