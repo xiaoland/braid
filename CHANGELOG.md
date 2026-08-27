@@ -3,6 +3,31 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
+## [0.3.0] - unreleased
+
+### Added
+
+- Worker layout: `braid setup/serve/doctor --worker <name>` resolves config,
+  secrets, database, worktrees, and logs under `~/.braid/workners/<name>/`.
+- Config schema version 2 with `[[runtimes]]`, `[[llm_providers]]`, and profile
+  `adapter_type` / `adapter_version` references. Runtime connectivity no longer
+  lives in profiles.
+- `src/agent_session.rs` defines the core `AgentSession` trait and event stream;
+  `ProviderAgentSession` in `src/provider/session.rs` maps it to the existing
+  provider primitives.
+- New architecture boundary modules `src/producer.rs`, `src/queue.rs`, and
+  `src/group.rs` (currently boundary placeholders; implementation moves in
+  future commits).
+
+### Changed
+
+- **Breaking**: `schema_version` must be `2`; old v1 configs must be regenerated
+  by re-running `braid setup --worker <name>`.
+- `provider.codex` / `provider.pi` are replaced by `[[runtimes]]` entries.
+- `braid setup` discovers local runtimes, prints install instructions when none
+  are found, and never auto-installs. Manual flags `--runtime-executable` and
+  `--runtime-api-url` bypass discovery.
+
 ## [0.2.3] - 2026-08-24
 
 ### Added

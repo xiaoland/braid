@@ -53,7 +53,7 @@ mod pr_agent;
 mod provider;
 mod reconcile;
 mod scheduler;
-mod session_manager;
+pub mod session_manager;
 mod tunnel;
 
 pub use tunnel::probe_public_webhook;
