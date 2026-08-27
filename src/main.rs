@@ -1,3 +1,4 @@
+mod agent_session;
 mod cli;
 mod config;
 mod context;

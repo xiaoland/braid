@@ -96,9 +96,11 @@ pub trait AgentProvider: Send + Sync {
 
 mod codex;
 mod pi;
+mod session;
 mod util;
 
 pub use codex::CodexProvider;
 pub use pi::PiProvider;
+pub use session::ProviderAgentSession;
 pub use util::connect_provider;
 pub(crate) use util::{path_text, required_string};

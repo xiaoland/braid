@@ -174,14 +174,7 @@ fn codex_candidates() -> Vec<(PathBuf, String)> {
 
 async fn version_line(executable: &Path) -> Result<String> {
     let output = run(executable, &["--version"]).await?;
-    Ok(output
-        .stdout
-        .lines()
-        .map_while(Result::ok)
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_owned())
+    Ok(output.stdout.lines().map_while(Result::ok).next().unwrap_or_default().trim().to_owned())
 }
 
 async fn run(executable: &Path, args: &[&str]) -> Result<Output> {
