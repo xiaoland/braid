@@ -408,23 +408,12 @@ impl Config {
 
     /// Temporary MVP bridge: synthesize a legacy `ProviderConfig` from the
     /// first `[[runtimes]]` entry so `connect_provider` can still be called
-    /// from `runtime::serve` until the `AgentSession` refactor removes the
-    /// need.
-    ///
-    /// TODO(D2c): remove once callers use `RuntimeEntry` directly.
+    /// from `runtime::serve`.
     pub fn default_provider_config(&self) -> Result<ProviderConfig, ConfigError> {
         let runtime = self
             .runtimes
             .first()
             .ok_or_else(|| ConfigError::Invalid("no runtimes configured".into()))?;
-        self.provider_config_for_runtime(runtime)
-    }
-
-    /// Deprecated: use `default_provider_config` or `RuntimeEntry` directly.
-    #[deprecated(note = "use default_provider_config or RuntimeEntry directly")]
-    pub fn provider_config(&self) -> Result<ProviderConfig, ConfigError> {
-        let default_profile = self.profile(&self.profile_selection.default_pr_profile)?;
-        let runtime = self.runtime_for(default_profile)?;
         self.provider_config_for_runtime(runtime)
     }
 
