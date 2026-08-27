@@ -36,9 +36,15 @@ pub(crate) async fn issue_agent_worker(
     }
 
     loop {
-        let convergence_failed = if let Err(error) =
-            resume_issue_provider_sessions(&store, &config, &provider, &profile, &profile_record)
-                .await
+        let convergence_failed = if let Err(error) = resume_issue_provider_sessions(
+            &store,
+            &config,
+            Arc::clone(&provider),
+            Arc::clone(&sessions),
+            &profile,
+            &profile_record,
+        )
+        .await
         {
             tracing::error!(%error, "cannot converge persisted provider sessions");
             set_provider_unavailable(&health, &error.to_string()).await;

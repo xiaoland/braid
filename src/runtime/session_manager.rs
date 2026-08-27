@@ -9,7 +9,10 @@ use crate::{
 };
 
 /// In-process manager for the active Agent Sessions of this worker.
-/// MVP: one session per work-item assignment; retrieved by assignment id.
+///
+/// MVP: one session per physical provider thread id. The key is the current
+/// `provider_session_id` (a.k.a. provider thread id). When a context reset
+/// replaces the physical session, `replace` updates the key atomically.
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Arc<ProviderAgentSession>>>,
 }
@@ -19,54 +22,77 @@ impl SessionManager {
         Self { sessions: Mutex::new(HashMap::new()) }
     }
 
-    pub async fn get_or_start(
+    pub async fn get(&self, provider_session_id: &str) -> Option<Arc<dyn AgentSession>> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(provider_session_id).map(|s| Arc::clone(s) as Arc<dyn AgentSession>)
+    }
+
+    pub async fn insert(&self, provider_session_id: String, session: Arc<ProviderAgentSession>) {
+        let mut sessions = self.sessions.lock().await;
+        sessions.insert(provider_session_id, session);
+    }
+
+    pub async fn replace(
         &self,
-        assignment_id: &str,
+        old_provider_session_id: &str,
+        new_provider_session_id: String,
+        session: Arc<ProviderAgentSession>,
+    ) {
+        let mut sessions = self.sessions.lock().await;
+        sessions.remove(old_provider_session_id);
+        sessions.insert(new_provider_session_id, session);
+    }
+
+    pub async fn start(
+        &self,
+        provider_session_id: String,
         provider: Arc<dyn AgentProvider>,
         profile: Profile,
         instructions: String,
         initial_context: Option<String>,
-    ) -> Result<Arc<dyn AgentSession>, anyhow::Error> {
+    ) -> Result<Arc<ProviderAgentSession>, anyhow::Error> {
         let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get(assignment_id) {
-            return Ok(Arc::clone(session) as Arc<dyn AgentSession>);
+        if let Some(session) = sessions.get(&provider_session_id) {
+            return Ok(Arc::clone(session));
         }
         let session = ProviderAgentSession::start(
-            assignment_id.to_owned(),
+            provider_session_id.clone(),
             provider,
             profile,
             instructions,
             initial_context,
         )
         .await?;
-        sessions.insert(assignment_id.to_owned(), Arc::clone(&session));
-        Ok(session as Arc<dyn AgentSession>)
+        sessions.insert(provider_session_id, Arc::clone(&session));
+        Ok(session)
     }
 
     pub async fn resume(
         &self,
-        assignment_id: &str,
+        provider_session_id: String,
         provider: Arc<dyn AgentProvider>,
         profile: Profile,
         instructions: String,
-        thread_id: &str,
-    ) -> Result<Arc<dyn AgentSession>, anyhow::Error> {
+    ) -> Result<Arc<ProviderAgentSession>, anyhow::Error> {
         let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get(&provider_session_id) {
+            return Ok(Arc::clone(session));
+        }
         let session = ProviderAgentSession::resume(
-            assignment_id.to_owned(),
+            provider_session_id.clone(),
             provider,
             profile,
             instructions,
-            thread_id,
+            &provider_session_id,
         )
         .await?;
-        sessions.insert(assignment_id.to_owned(), Arc::clone(&session));
-        Ok(session as Arc<dyn AgentSession>)
+        sessions.insert(provider_session_id, Arc::clone(&session));
+        Ok(session)
     }
 
-    pub async fn remove(&self, assignment_id: &str) {
+    pub async fn remove(&self, provider_session_id: &str) {
         let mut sessions = self.sessions.lock().await;
-        sessions.remove(assignment_id);
+        sessions.remove(provider_session_id);
     }
 }
 

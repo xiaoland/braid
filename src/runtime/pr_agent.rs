@@ -49,8 +49,15 @@ pub(crate) async fn pr_agent_worker(
     }
 
     loop {
-        let convergence_failed = if let Err(error) =
-            resume_pr_provider_sessions(&store, &config, &provider, &profile, &profile_record).await
+        let convergence_failed = if let Err(error) = resume_pr_provider_sessions(
+            &store,
+            &config,
+            Arc::clone(&provider),
+            Arc::clone(&sessions),
+            &profile,
+            &profile_record,
+        )
+        .await
         {
             tracing::error!(%error, "cannot converge persisted PR provider sessions");
             set_provider_unavailable(&health, &error.to_string()).await;
@@ -178,7 +185,8 @@ pub(crate) async fn drive_pr_agent_connection(
 pub(crate) async fn resume_pr_provider_sessions(
     store: &StoreActor,
     config: &Config,
-    provider: &dyn crate::provider::AgentProvider,
+    provider: Arc<dyn crate::provider::AgentProvider>,
+    sessions: Arc<crate::runtime::session_manager::SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
 ) -> Result<()> {
@@ -230,6 +238,14 @@ pub(crate) async fn resume_pr_provider_sessions(
         {
             Ok(session) => {
                 store.record_provider_resume(session.thread_id.clone())?;
+                let _ = sessions
+                    .resume(
+                        session.thread_id.clone(),
+                        Arc::clone(&provider),
+                        effective_profile.clone(),
+                        instructions.clone(),
+                    )
+                    .await;
                 tracing::info!(
                     pr = candidate.number,
                     provider_session = %session.thread_id,
@@ -539,7 +555,8 @@ pub(crate) async fn drive_issue_agent_connection(
 pub(crate) async fn resume_issue_provider_sessions(
     store: &StoreActor,
     config: &Config,
-    provider: &dyn crate::provider::AgentProvider,
+    provider: Arc<dyn crate::provider::AgentProvider>,
+    sessions: Arc<crate::runtime::session_manager::SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
 ) -> Result<()> {
@@ -574,6 +591,14 @@ pub(crate) async fn resume_issue_provider_sessions(
         {
             Ok(session) => {
                 store.record_provider_resume(session.thread_id.clone())?;
+                let _ = sessions
+                    .resume(
+                        session.thread_id.clone(),
+                        Arc::clone(&provider),
+                        profile.clone(),
+                        instructions.clone(),
+                    )
+                    .await;
                 tracing::info!(
                     issue = candidate.number,
                     provider_session = %session.thread_id,
