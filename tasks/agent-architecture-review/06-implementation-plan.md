@@ -123,7 +123,7 @@ config errors.
 | B | `src/config.rs`, `config.example.toml`, `config/setup.template.toml`, `src/setup.rs`, `src/doctor.rs`, config tests |
 | C | `src/setup.rs`, adapter discovery in `src/provider/{codex,pi}.rs`, `src/protocol.rs` |
 | D | `src/agent_session.rs` (new), `src/provider/{mod,codex,pi}.rs`, `src/runtime/scheduler.rs`, `src/runtime/pr_agent.rs` |
-| E | `src/runtime/*` renames/reorganization, `docs/20-product-tdd/*` |
+| E | `src/producer.rs`, `src/queue.rs`, `src/group.rs` (new modules re-homed from `src/runtime/{reconcile,scheduler,pr_agent}.rs`), `docs/20-product-tdd/*` |
 | F | `scripts/tests/*.sh`, `CHANGELOG.md`, docs promotion |
 
 
@@ -138,9 +138,10 @@ config errors.
 ### B. Config schema
 3. Profile: keep `tags`, add `adapter_type` + `adapter_version`; keep
    `github_actor_node_id`, `status_surfaces`, context-pressure fields.
-4. Add `llm_providers` (metadata-only allowances; flagged as Braid-internal
-   extension, not product-doc-defined) and runtime registry tables;
-   profiles resolve provider+model at load time.
+4. Add `llm_providers` (product behavior; this pass delivers the
+   **configuration** surface only — schema, resolution, validation; no usage
+   tracking or enforcement) and runtime registry tables; profiles resolve
+   provider+model at load time.
 5. Update `config.example.toml`, `config/setup.template.toml`, `setup.rs`
    generation, `doctor.rs`, and SSoT tests atomically.
 
@@ -156,16 +157,16 @@ config errors.
    the process-wide broadcast, tracking `expectedTurnId` internally).
 9. Rewire scheduler call sites onto the trait.
 10. Move physical session replacement / context reset into the adapter
-    (`reset_context_to`); collapse the scheduler-side reset path. Caller
-    passes `reset_context_to=Some` iff the freshly materialized Context
-    revision advanced (covers Hard Invalidation and Dependency Dirty alike).
+    (`reset_context_to`); collapse the scheduler-side reset path. The caller
+    passes the latest materialized Context; the adapter internally decides
+    whether a physical reset is needed. No revision/digest model anywhere.
 
-### E. Module alignment with TDD names
-11. Align module boundaries with the TDD table: ingress+classification →
-    `events` (Event Producer role), batch coalescing → `scheduler` (Event
-    Queue role), group/session lifecycle → `sessions` (Agent Group role).
-    Rename/reorganize `src/runtime/*` only where the trait refactor already
-    touches the code; no gratuitous moves.
+### E. New module boundaries
+11. Re-home the runtime into the new architecture's own modules:
+    `src/producer.rs` (ingress + classification + routing), `src/queue.rs`
+    (quiet window / threshold / batch emission), `src/group.rs` (thin
+    forwarder + group state machine + reactions). Rewrite the TDD module
+    table at promotion time to match.
 
 ### F. Verification
 12. Update `scripts/tests/*.sh`, run the shell suite against a local worker;

@@ -8,9 +8,10 @@ Decide what belongs in Agent Profile and what belongs in referenced registries.
 
 - `braid gh` is exposed as a **command-line tool in the Agent runtime's shell
   environment**, not as a tool-use / JSON-RPC call.
-- Agent Profile is a **versioned, immutable role snapshot** (store:
-  `profiles` with immutable revision + effective-config digest), not a
-  provider connection spec.
+- Agent Profile is a **plain role-snapshot config**. Changes take effect on
+  restart / next activation; no revision or digest machinery exists in the
+  core contract. Resume-ability after config change is an adapter-internal
+  judgment with fresh-session fallback.
 - Fields:
   - `id`, `display_name`, `priority`
   - `tags` (`issue`/`pr`) — product vocabulary (glossary: Profile Tag); **not**
@@ -33,9 +34,8 @@ Decide what belongs in Agent Profile and what belongs in referenced registries.
 
 1. `github_actor_node_id` and `status_surfaces` stay in the Agent Profile
    (glossary: Agent Attribution / Operational Status Comment).
-2. Profile revision/digest participates in session compatibility checks
-   (TDD invariant 4): a changed profile revision forces fresh session
-   materialization.
+2. Profile config changes apply at restart / next activation; the core does
+   not track profile revisions or digests.
 3. MVP TOML layout:
 
 ```toml

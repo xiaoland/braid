@@ -42,12 +42,13 @@ pub trait AgentSession: Send + Sync {
   running turn (adapter uses `turn/steer` with its own tracked
   `expectedTurnId`; a non-steerable turn defers to the next boundary). If no
   turn is running, the adapter starts one.
-- `reset_context_to = Some(context)`: the caller materialized Context and its
-  revision advanced. The adapter fences the old revision, waits for the
-  current turn to reach a terminal/safe boundary, replaces the physical
+- `reset_context_to = Some(context)`: the caller passes the latest
+  materialized Context. The adapter internally owns the reset: it decides
+  whether replacement is needed (content compare) and how — fence old output,
+  wait for the current turn's terminal/safe boundary, replace the physical
   session (Codex v1: fresh `thread/start` + `thread/inject_items`; inject
-  cannot replace history), then starts the turn. The caller invokes
-  `send_user_msg` exactly once.
+  cannot replace history), then start the turn. The caller invokes
+  `send_user_msg` exactly once and never models revisions.
 - `send_user_msg` returns immediately with the logical session handle
   (usually the same `Arc`); physical replacement is adapter-internal.
 - The caller never branches on `status()` before sending; queuing/steering/
@@ -67,12 +68,12 @@ pub trait AgentSession: Send + Sync {
 | `send_user_msg(m, _, Some(ctx))` | fence → wait terminal/safe boundary → fresh `thread/start` + `thread/inject_items(ctx)` → `turn/start(m)` |
 | disconnect mid-turn | reconnect + `thread/resume` if compatible (context/instruction/profile revisions, cwd, sandbox); else `Failed` |
 
-## Session compatibility (TDD invariant 4)
+## Session compatibility
 
-A physical session is reusable only while context schema/revision, effective
-instruction revision, profile revision, cwd, and sandbox all match. Any drift
-⇒ fresh materialization path. The caller (sessions) decides by comparing the
-freshly materialized revision against the session's recorded revision.
+Resume-ability after restart is an **adapter-internal** judgment: the adapter
+resumes the physical session when it can prove compatibility, otherwise it
+falls back to a fresh session. No revision/digest/profile-digest concepts exist
+in the core contract.
 
 ## Transport unknown
 

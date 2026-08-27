@@ -3,9 +3,9 @@
 ## Goal
 
 Define the boundary between the GitHub-facing **Event Producer**, the per-work-item
-per-profile **Event Queue**, and the **Agent Group**. Module names in code follow
-the TDD (`events`, `scheduler`, `sessions`); the producer/queue/group terms are
-the conceptual roles of those modules.
+per-profile **Event Queue**, and the **Agent Group**. These three are the new
+architecture's own modules (`producer`, `queue`, `group`); the old TDD module
+table is being replaced, not mapped onto.
 
 ## Taxonomy (aligned with `lifecycle.md` and `store.events`)
 
@@ -17,18 +17,12 @@ the conceptual roles of those modules.
 
 ## Agreed Direction
 
-- **Event Producer** (`github` ingress + `events` classification):
-  - consumes webhooks and GraphQL reconciliation;
-  - diffs against the canonical ledger and emits classified events with
-    origin attribution (agent-origin writes are attributed via durable
-    operation correlation or the profile's configured stable actor node id);
-  - agent-origin events update the ledger but never wake/reset the
-    originating group; other groups see them as external.
-- **Event Queue** (`store.scheduler_batches` + `scheduler`): per work-item per
-  profile; owns quiet window (30s default) and count threshold (8 default),
-  both profile-overridable; one pending batch per group; emits
-  (user message text, optional new context, steering) to the Agent Group.
-- **Agent Group** (`sessions`): thin forwarder. It does not manage session
+- **Event Producer** (`producer`): webhook/GraphQL ingress, canonical
+  diff classification, origin attribution, explicit routing.
+- **Event Queue** (`queue`): per work-item per profile; quiet window (30s) and
+  count threshold (8), profile-overridable; one pending batch per group; emits
+  (user message text, latest Context, steering) to the Agent Group.
+- **Agent Group** (`group`): thin forwarder. It does not manage session
   lifecycle, inspect `status()` before sending, or create sessions; the
   producer/activation path creates the session and hands it over. It calls
   `send_user_msg(...)` and consumes `SessionEvent`s for reactions and the
@@ -44,10 +38,9 @@ the conceptual roles of those modules.
    fallback / PR activation), the producer-side wrapper asks `sessions` to
    materialize Context + create the physical session via the adapter; the
    resulting logical `AgentSession` handle is stored with the group.
-3. **Hard Invalidation / Dependency Dirty**: on batch emission, `sessions`
-   materializes the current Context; if its revision advanced, the batch is
-   sent with `reset_context_to=Some(context)`. The Agent Group does not know
-   invalidation semantics.
+3. **Context freshness**: on batch emission, the group-side materializes the
+   current Context from GitHub and passes it as `reset_context_to`; the adapter
+   internally decides whether a physical reset is needed (no revision model).
 4. **Transport unknown**: disconnect is not terminal; the adapter
    reconnects/resumes internally and the core keeps seeing `running` until
    the adapter proves failure.
