@@ -32,15 +32,12 @@ impl SessionManager {
         sessions.insert(provider_session_id, session);
     }
 
-    pub async fn replace(
-        &self,
-        old_provider_session_id: &str,
-        new_provider_session_id: String,
-        session: Arc<ProviderAgentSession>,
-    ) {
+    pub async fn replace(&self, old_provider_session_id: &str, new_provider_session_id: String) {
         let mut sessions = self.sessions.lock().await;
-        sessions.remove(old_provider_session_id);
-        sessions.insert(new_provider_session_id, session);
+        let session = sessions.remove(old_provider_session_id);
+        if let Some(session) = session {
+            sessions.insert(new_provider_session_id, session);
+        }
     }
 
     pub async fn start(

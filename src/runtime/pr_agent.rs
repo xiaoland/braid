@@ -1,4 +1,5 @@
 use super::*;
+use crate::provider::ProviderAgentSession;
 use crate::runtime::provider::{
     handle_provider_notification, materialized_profile, operational_status_unknown_profile,
     pr_system_prompt, provider_error_lifecycle, set_provider_unavailable,
@@ -106,6 +107,7 @@ pub(crate) async fn pr_agent_worker(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn drive_pr_agent_connection(
     store: &StoreActor,
     github: &GitHubClient,
@@ -119,17 +121,90 @@ pub(crate) async fn drive_pr_agent_connection(
 ) -> bool {
     let mut notifications = provider.subscribe();
     let mut running: Option<RunningAgentTurn> = None;
+    let mut active_events: Option<
+        tokio::sync::broadcast::Receiver<crate::agent_session::SessionEvent>,
+    > = None;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = shutdown.changed() => return false,
+            event = async {
+                if let Some(ref mut rx) = active_events {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            }, if active_events.is_some() => {
+                match event {
+                    Ok(crate::agent_session::SessionEvent::TurnStarted { provider_turn_id }) => {
+                        tracing::debug!(%provider_turn_id, "PR AgentSession turn started");
+                    }
+                    Ok(crate::agent_session::SessionEvent::TurnTerminal { provider_turn_id, outcome }) => {
+                        if let Some(active) = running.take()
+                            && active.provider_turn_id == provider_turn_id
+                        {
+                            let lifecycle = outcome.lifecycle();
+                            if let Some(reset_id) = &active.reset_id {
+                                let _ = store.mark_context_reset_turn_terminal(
+                                    reset_id.clone(),
+                                    active.claim.turn_id.clone(),
+                                    lifecycle.into(),
+                                );
+                            } else {
+                                let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), lifecycle.into());
+                                if active.claim.trusted_mention {
+                                    let reaction = if lifecycle == "completed" { "+1" } else { "confused" };
+                                    let _ = store.enqueue_turn_reaction(active.claim.turn_id.clone(), reaction.into());
+                                }
+                            }
+                        }
+                        active_events = None;
+                    }
+                    Ok(crate::agent_session::SessionEvent::SessionReplaced { old_id, new_id }) => {
+                        let _ = store.replace_provider_session(old_id.clone(), new_id.clone());
+                        () = sessions.replace(&old_id, new_id.clone()).await;
+                        if let Some(ref active) = running
+                            && active.claim.provider_session_id == old_id
+                            && let Some(session) = sessions.get(&new_id).await
+                        {
+                            active_events = Some(session.events());
+                        }
+                    }
+                    Ok(crate::agent_session::SessionEvent::Failed { reason }) => {
+                        if let Some(active) = running.take() {
+                            let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
+                            let _ = store.enqueue_operational_status(
+                                active.claim.turn_id.clone(),
+                                operational_status_unknown_profile(&active.claim.profile_id),
+                            );
+                            if let Some(reset_id) = active.reset_id {
+                                let _ = store.fail_context_reset(reset_id, reason.clone());
+                            }
+                        }
+                        set_provider_unavailable(health, &format!("PR AgentSession failed: {reason}")).await;
+                        return true;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "PR AgentSession event consumer lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        if let Some(active) = running.take() {
+                            let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
+                            let _ = store.enqueue_operational_status(
+                                active.claim.turn_id,
+                                operational_status_unknown_profile(&active.claim.profile_id),
+                            );
+                        }
+                        set_provider_unavailable(health, "PR AgentSession event stream closed").await;
+                        return true;
+                    }
+                }
+            }
             notification = notifications.recv() => {
                 match notification {
                     Ok(notification) => {
-                        if handle_provider_notification(store, health, &mut running, notification).await {
-                            return true;
-                        }
+                        tracing::debug!(?notification, "PR provider notification fallback");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "PR provider notification consumer lagged");
@@ -167,6 +242,11 @@ pub(crate) async fn drive_pr_agent_connection(
                 )).await;
                 if handled_lifecycle {
                     running = lifecycle_turn;
+                    if let Some(ref active) = running
+                        && let Some(session) = sessions.get(&active.claim.provider_session_id).await
+                    {
+                        active_events = Some(session.events());
+                    }
                     continue;
                 }
                 if Box::pin(materialize_next_context_reset(
@@ -180,6 +260,11 @@ pub(crate) async fn drive_pr_agent_connection(
                     store, github, config, Arc::clone(&provider), Arc::clone(&sessions), profile, profile_record,
                 )).await;
                 running = start_next_agent_turn(store, &*provider, Arc::clone(&sessions), profile, "pr").await;
+                if let Some(ref active) = running
+                    && let Some(session) = sessions.get(&active.claim.provider_session_id).await
+                {
+                    active_events = Some(session.events());
+                }
             }
         }
     }
@@ -492,6 +577,7 @@ pub(crate) async fn materialize_pr_assignment(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn drive_issue_agent_connection(
     store: &StoreActor,
     github: &GitHubClient,
@@ -505,17 +591,90 @@ pub(crate) async fn drive_issue_agent_connection(
 ) -> bool {
     let mut notifications = provider.subscribe();
     let mut running: Option<RunningAgentTurn> = None;
+    let mut active_events: Option<
+        tokio::sync::broadcast::Receiver<crate::agent_session::SessionEvent>,
+    > = None;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = shutdown.changed() => return false,
+            event = async {
+                if let Some(ref mut rx) = active_events {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            }, if active_events.is_some() => {
+                match event {
+                    Ok(crate::agent_session::SessionEvent::TurnStarted { provider_turn_id }) => {
+                        tracing::debug!(%provider_turn_id, "Issue AgentSession turn started");
+                    }
+                    Ok(crate::agent_session::SessionEvent::TurnTerminal { provider_turn_id, outcome }) => {
+                        if let Some(active) = running.take()
+                            && active.provider_turn_id == provider_turn_id
+                        {
+                            let lifecycle = outcome.lifecycle();
+                            if let Some(reset_id) = &active.reset_id {
+                                let _ = store.mark_context_reset_turn_terminal(
+                                    reset_id.clone(),
+                                    active.claim.turn_id.clone(),
+                                    lifecycle.into(),
+                                );
+                            } else {
+                                let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), lifecycle.into());
+                                if active.claim.trusted_mention {
+                                    let reaction = if lifecycle == "completed" { "+1" } else { "confused" };
+                                    let _ = store.enqueue_turn_reaction(active.claim.turn_id.clone(), reaction.into());
+                                }
+                            }
+                        }
+                        active_events = None;
+                    }
+                    Ok(crate::agent_session::SessionEvent::SessionReplaced { old_id, new_id }) => {
+                        let _ = store.replace_provider_session(old_id.clone(), new_id.clone());
+                        () = sessions.replace(&old_id, new_id.clone()).await;
+                        if let Some(ref active) = running
+                            && active.claim.provider_session_id == old_id
+                            && let Some(session) = sessions.get(&new_id).await
+                        {
+                            active_events = Some(session.events());
+                        }
+                    }
+                    Ok(crate::agent_session::SessionEvent::Failed { reason }) => {
+                        if let Some(active) = running.take() {
+                            let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
+                            let _ = store.enqueue_operational_status(
+                                active.claim.turn_id.clone(),
+                                operational_status_unknown_profile(&active.claim.profile_id),
+                            );
+                            if let Some(reset_id) = active.reset_id {
+                                let _ = store.fail_context_reset(reset_id, reason.clone());
+                            }
+                        }
+                        set_provider_unavailable(health, &format!("Issue AgentSession failed: {reason}")).await;
+                        return true;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "Issue AgentSession event consumer lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        if let Some(active) = running.take() {
+                            let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
+                            let _ = store.enqueue_operational_status(
+                                active.claim.turn_id,
+                                operational_status_unknown_profile(&active.claim.profile_id),
+                            );
+                        }
+                        set_provider_unavailable(health, "Issue AgentSession event stream closed").await;
+                        return true;
+                    }
+                }
+            }
             notification = notifications.recv() => {
                 match notification {
                     Ok(notification) => {
-                        if handle_provider_notification(store, health, &mut running, notification).await {
-                            return true;
-                        }
+                        tracing::debug!(?notification, "Issue provider notification fallback");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "provider notification consumer lagged");
@@ -553,6 +712,11 @@ pub(crate) async fn drive_issue_agent_connection(
                 )).await;
                 if handled_lifecycle {
                     running = lifecycle_turn;
+                    if let Some(ref active) = running
+                        && let Some(session) = sessions.get(&active.claim.provider_session_id).await
+                    {
+                        active_events = Some(session.events());
+                    }
                     continue;
                 }
                 if Box::pin(materialize_next_context_reset(
@@ -566,6 +730,11 @@ pub(crate) async fn drive_issue_agent_connection(
                     store, github, config, Arc::clone(&provider), Arc::clone(&sessions), profile, profile_record,
                 ).await;
                 running = start_next_agent_turn(store, &*provider, Arc::clone(&sessions), profile, "issue").await;
+                if let Some(ref active) = running
+                    && let Some(session) = sessions.get(&active.claim.provider_session_id).await
+                {
+                    active_events = Some(session.events());
+                }
             }
         }
     }

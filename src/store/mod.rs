@@ -1043,6 +1043,18 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
+    pub fn replace_provider_session(
+        &self,
+        old_id: String,
+        new_id: String,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::ReplaceProviderSession(old_id, new_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
     pub fn claim_urgent_steer(&self, turn_id: String) -> Result<Option<TurnClaim>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
@@ -1280,6 +1292,7 @@ enum Command {
     ),
     MarkTurnStarted(String, String, Sender<Result<(), StoreError>>),
     MarkTurnTerminal(String, String, Sender<Result<(), StoreError>>),
+    ReplaceProviderSession(String, String, Sender<Result<(), StoreError>>),
     ClaimUrgentSteer(String, Sender<Result<Option<TurnClaim>, StoreError>>),
     ConsumeSteerBatch(String, Sender<Result<(), StoreError>>),
     EnqueueTurnReaction(String, String, Sender<Result<(), StoreError>>),
@@ -1585,6 +1598,9 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             }
             Command::MarkTurnTerminal(turn_id, lifecycle, reply) => {
                 let _ = reply.send(mark_turn_terminal(database, &turn_id, &lifecycle));
+            }
+            Command::ReplaceProviderSession(old_id, new_id, reply) => {
+                let _ = reply.send(replace_provider_session(database, &old_id, &new_id));
             }
             Command::ClaimUrgentSteer(turn_id, reply) => {
                 let _ = reply.send(claim_urgent_steer(database, &turn_id));
@@ -4552,6 +4568,27 @@ fn mark_turn_terminal(database: &Path, turn_id: &str, lifecycle: &str) -> Result
             params![work_item_node_id, now],
         )?;
     }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn replace_provider_session(database: &Path, old_id: &str, new_id: &str) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    // provider_sessions: update the row that currently carries old_id
+    transaction.execute(
+        "UPDATE provider_sessions SET provider_session_id=?2,updated_at=?3
+         WHERE provider_session_id=?1",
+        params![old_id, new_id, now],
+    )?;
+    // turns: update any turn whose provider_turn_id matches old_id
+    transaction.execute(
+        "UPDATE turns SET provider_turn_id=?2 WHERE provider_turn_id=?1",
+        params![old_id, new_id],
+    )?;
     transaction.commit()?;
     Ok(())
 }
