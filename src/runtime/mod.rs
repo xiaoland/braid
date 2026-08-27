@@ -209,7 +209,7 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     workers.spawn(lease_worker(Arc::clone(&store), Arc::clone(&lease), shutdown_receiver.clone()));
 
     if provider_enabled {
-        let provider = connect_provider(&config.provider_config()?).await?;
+        let provider = connect_provider(&config.default_provider_config()?).await?;
         health.write().await.provider = "connected";
         let sessions = Arc::new(crate::runtime::session_manager::SessionManager::new());
         workers.spawn(issue_agent_worker(
@@ -221,7 +221,7 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
             Arc::clone(&health),
             shutdown_receiver.clone(),
         ));
-        let pr_provider = connect_provider(&config.provider_config()?).await?;
+        let pr_provider = connect_provider(&config.default_provider_config()?).await?;
         workers.spawn(pr_agent_worker(
             Arc::clone(&store),
             Arc::clone(&github),

@@ -23,7 +23,7 @@ pub(crate) async fn issue_agent_worker(
             return;
         }
     };
-    let provider_config = match config.provider_config() {
+    let provider_config = match config.default_provider_config() {
         Ok(config) => config,
         Err(error) => {
             set_provider_unavailable(&health, &error.to_string()).await;

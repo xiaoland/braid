@@ -1,6 +1,8 @@
 use super::*;
 use crate::runtime::reconcile::RunningAgentTurn;
 
+#[allow(dead_code)]
+// TODO(D2c): remove once all callers use AgentSession events.
 pub(crate) async fn handle_provider_notification(
     store: &StoreActor,
     health: &RwLock<HealthSnapshot>,
@@ -88,6 +90,8 @@ pub(crate) async fn handle_provider_notification(
     }
 }
 
+#[allow(dead_code)]
+// TODO(D2c): remove once all callers use AgentSession events.
 fn operational_status_unknown(claim: &TurnClaim) -> String {
     operational_status_unknown_profile(&claim.profile_id)
 }

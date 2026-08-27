@@ -67,7 +67,7 @@ pub async fn run(config: &Config) -> DoctorReport {
         }
     });
 
-    match config.provider_config() {
+    match config.default_provider_config() {
         Ok(provider_config) => {
             if let Some(codex) = provider_config.codex {
                 checks.push(match inspect_codex(&codex).await {

@@ -1,8 +1,7 @@
 use super::*;
-use crate::provider::ProviderAgentSession;
 use crate::runtime::provider::{
-    handle_provider_notification, materialized_profile, operational_status_unknown_profile,
-    pr_system_prompt, provider_error_lifecycle, set_provider_unavailable,
+    materialized_profile, operational_status_unknown_profile, pr_system_prompt,
+    provider_error_lifecycle, set_provider_unavailable,
 };
 use crate::runtime::reconcile::RunningAgentTurn;
 // pr_agent functions are defined in this module
@@ -30,7 +29,7 @@ pub(crate) async fn pr_agent_worker(
             return;
         }
     };
-    let provider_config = match config.provider_config() {
+    let provider_config = match config.default_provider_config() {
         Ok(config) => config,
         Err(error) => {
             set_provider_unavailable(&health, &error.to_string()).await;
@@ -119,7 +118,7 @@ pub(crate) async fn drive_pr_agent_connection(
     health: &RwLock<HealthSnapshot>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
-    let mut notifications = provider.subscribe();
+    let _ = provider;
     let mut running: Option<RunningAgentTurn> = None;
     let mut active_events: Option<
         tokio::sync::broadcast::Receiver<crate::agent_session::SessionEvent>,
@@ -197,27 +196,6 @@ pub(crate) async fn drive_pr_agent_connection(
                             );
                         }
                         set_provider_unavailable(health, "PR AgentSession event stream closed").await;
-                        return true;
-                    }
-                }
-            }
-            notification = notifications.recv() => {
-                match notification {
-                    Ok(notification) => {
-                        tracing::debug!(?notification, "PR provider notification fallback");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "PR provider notification consumer lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        if let Some(active) = running.take() {
-                            let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
-                            let _ = store.enqueue_operational_status(
-                                active.claim.turn_id,
-                                operational_status_unknown_profile(&active.claim.profile_id),
-                            );
-                        }
-                        set_provider_unavailable(health, "PR Codex notification stream closed").await;
                         return true;
                     }
                 }
@@ -589,7 +567,7 @@ pub(crate) async fn drive_issue_agent_connection(
     health: &RwLock<HealthSnapshot>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
-    let mut notifications = provider.subscribe();
+    let _ = provider;
     let mut running: Option<RunningAgentTurn> = None;
     let mut active_events: Option<
         tokio::sync::broadcast::Receiver<crate::agent_session::SessionEvent>,
@@ -667,27 +645,6 @@ pub(crate) async fn drive_issue_agent_connection(
                             );
                         }
                         set_provider_unavailable(health, "Issue AgentSession event stream closed").await;
-                        return true;
-                    }
-                }
-            }
-            notification = notifications.recv() => {
-                match notification {
-                    Ok(notification) => {
-                        tracing::debug!(?notification, "Issue provider notification fallback");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "provider notification consumer lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        if let Some(active) = running.take() {
-                            let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
-                            let _ = store.enqueue_operational_status(
-                                active.claim.turn_id,
-                                operational_status_unknown_profile(&active.claim.profile_id),
-                            );
-                        }
-                        set_provider_unavailable(health, "Codex notification stream closed").await;
                         return true;
                     }
                 }
