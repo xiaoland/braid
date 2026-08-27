@@ -6,7 +6,8 @@ pub(crate) async fn issue_agent_worker(
     store: Arc<StoreActor>,
     github: Arc<GitHubClient>,
     config: Config,
-    mut provider: Box<dyn crate::provider::AgentProvider>,
+    mut provider: Arc<dyn crate::provider::AgentProvider>,
+    sessions: Arc<crate::runtime::session_manager::SessionManager>,
     health: Arc<RwLock<HealthSnapshot>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
