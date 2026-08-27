@@ -22,6 +22,7 @@ use tokio::sync::Mutex;
 
 use crate::cli::SetupArguments;
 
+mod discovery;
 mod logo;
 
 use crate::config::{
@@ -143,25 +144,34 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         .context("cannot convert GitHub App manifest")?;
     println!("Created GitHub App: {} (ID {})", app.html_url, app.id);
 
+    let runtime = select_runtime(&arguments).await?;
+
     let pem_path = base_dir.join("github-app.pem");
     write_secret(&pem_path, app.pem.as_bytes())?;
 
-    // Collect secrets into a single per-worker file instead of environment
-    // variables, so multiple Braid workers can run on the same machine
-    // without env var collisions.
-    let api_key = std::env::var(&arguments.api_key_environment).with_context(|| {
-        format!(
-            "provider API key environment variable {} must be set during setup",
-            arguments.api_key_environment
-        )
-    })?;
     let secrets_path = base_dir.join("secrets.toml");
+    let api_key = provider_secret(&runtime.adapter_type, &arguments)?;
     let secrets_toml =
         format!("webhook_secret = {webhook_secret:?}\nprovider_api_key = {api_key:?}\n",);
     write_secret(&secrets_path, secrets_toml.as_bytes())?;
 
+    let llm_provider = build_llm_provider(
+        &runtime.adapter_type,
+        &arguments.model,
+        &arguments.api_key_environment,
+        &secrets_path,
+    );
+
     let config_path = base_dir.join("config.toml");
-    let config = build_config(&base_dir, app.id, &arguments, &pem_path, &secrets_path)?;
+    let config = build_config(
+        &base_dir,
+        app.id,
+        &arguments,
+        &pem_path,
+        &secrets_path,
+        runtime,
+        llm_provider,
+    )?;
     let config_text = toml::to_string(&config).context("cannot serialize generated config")?;
     write_secret(&config_path, config_text.as_bytes())?;
 
@@ -374,49 +384,92 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn pi_executable_path() -> String {
-    let candidate = "/Users/lanzhijiang/Library/pnpm/bin/pi";
-    if Path::new(candidate).is_file() { candidate.to_owned() } else { "pi".to_owned() }
-}
-
-fn build_runtime_entry(arguments: &SetupArguments, base_dir: &Path) -> RuntimeEntry {
-    if arguments.provider == "codex" {
-        RuntimeEntry {
-            adapter_type: "codex".to_owned(),
-            version: "codex-cli 0.147.0-alpha.6.5".to_owned(),
-            executable: PathBuf::from(
-                "/Users/lanzhijiang/.braid/codex-pkg/node_modules/.bin/codex",
-            ),
-            api_url: None,
-            home: Some(base_dir.join("provider")),
-            stable_schema_sha256: Some(
-                "7d79fe309dd7520843459070f3884ecf0e39cee2620c1c49aad6efb4eca76ecb".to_owned(),
-            ),
-            experimental_schema_sha256: Some(
-                "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b5364439063a5c8".to_owned(),
-            ),
-        }
-    } else {
-        RuntimeEntry {
-            adapter_type: "pi".to_owned(),
-            version: "0.84.3".to_owned(),
-            executable: PathBuf::from(pi_executable_path()),
-            api_url: None,
-            home: Some(base_dir.join("pi")),
-            stable_schema_sha256: None,
-            experimental_schema_sha256: None,
-        }
+async fn select_runtime(arguments: &SetupArguments) -> Result<RuntimeEntry> {
+    if let Some(api_url) = &arguments.runtime_api_url {
+        return discovery::from_api_url(&arguments.provider, api_url.clone());
     }
+    if let Some(executable) = &arguments.runtime_executable {
+        return discovery::from_executable(&arguments.provider, executable).await;
+    }
+
+    let candidates = discovery::discover(&arguments.provider).await?;
+    if candidates.is_empty() {
+        eprintln!(
+            "No {} runtime found on this machine.\n\n{}",
+            arguments.provider,
+            discovery::install_hint(&arguments.provider)
+        );
+        bail!("setup requires a {} runtime; install it and re-run", arguments.provider);
+    }
+
+    let chosen = if candidates.len() == 1 {
+        println!(
+            "Found one {} runtime: {} ({})",
+            arguments.provider,
+            candidates[0].executable.display(),
+            candidates[0].source
+        );
+        candidates.into_iter().next().expect("one candidate")
+    } else {
+        println!("Found {} {} runtimes:", candidates.len(), arguments.provider);
+        for (index, candidate) in candidates.iter().enumerate() {
+            println!(
+                "  [{}] {} ({}) version {}",
+                index + 1,
+                candidate.executable.display(),
+                candidate.source,
+                candidate.version
+            );
+        }
+        print!("Select runtime (1-{}): ", candidates.len());
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let choice: usize = input
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .filter(|&n| n < candidates.len())
+            .ok_or_else(|| anyhow::anyhow!("invalid runtime selection"))?;
+        candidates.into_iter().nth(choice).expect("valid index")
+    };
+
+    discovery::verify(chosen)
+        .await
+        .with_context(|| format!("cannot verify {} runtime", arguments.provider))
 }
 
-fn build_llm_provider(arguments: &SetupArguments, secrets_file: &Path) -> LlmProvider {
+fn provider_secret(adapter_type: &str, arguments: &SetupArguments) -> Result<String> {
+    if adapter_type == "pi" {
+        return std::env::var(&arguments.api_key_environment).with_context(|| {
+            format!(
+                "provider API key environment variable {} must be set during setup",
+                arguments.api_key_environment
+            )
+        });
+    }
+    Ok(String::new())
+}
+
+fn build_llm_provider(
+    adapter_type: &str,
+    model: &str,
+    api_key_environment: &str,
+    secrets_file: &Path,
+) -> LlmProvider {
+    let (id, protocol) = if adapter_type == "codex" {
+        ("openai".to_owned(), "openai".to_owned())
+    } else {
+        ("deepseek".to_owned(), "openai-compatible".to_owned())
+    };
     LlmProvider {
-        id: "deepseek".to_owned(),
-        protocol: "openai-compatible".to_owned(),
-        api_key_environment: Some(arguments.api_key_environment.clone()),
+        id,
+        protocol,
+        api_key_environment: Some(api_key_environment.to_owned()),
         api_key_file: Some(secrets_file.to_path_buf()),
         models: vec![LlmModel {
-            model_id: arguments.model.clone(),
+            model_id: model.to_owned(),
             input_cost: 0.0,
             output_cost: 0.0,
             cache_input_cost: 0.0,
@@ -435,6 +488,8 @@ fn build_config(
     arguments: &SetupArguments,
     private_key_file: &Path,
     secrets_file: &Path,
+    runtime: RuntimeEntry,
+    llm_provider: LlmProvider,
 ) -> anyhow::Result<Config> {
     let mut config = Config {
         schema_version: CONFIG_SCHEMA_VERSION,
@@ -459,8 +514,8 @@ fn build_config(
             event_threshold: 8,
             reconciliation_seconds: 60,
         },
-        runtimes: vec![build_runtime_entry(arguments, base_dir)],
-        llm_providers: vec![build_llm_provider(arguments, secrets_file)],
+        runtimes: vec![runtime],
+        llm_providers: vec![llm_provider],
         tools: ToolConfig {
             git: PathBuf::from(tool_path("git", "/usr/bin/git")),
             gh: PathBuf::from(tool_path("gh", "/opt/homebrew/bin/gh")),
@@ -488,7 +543,11 @@ fn build_config(
             } else {
                 "0.84.3".to_owned()
             },
-            provider: "deepseek".to_owned(),
+            provider: if arguments.provider == "codex" {
+                "openai".to_owned()
+            } else {
+                "deepseek".to_owned()
+            },
             model: Some(arguments.model.clone()),
             reasoning: Some("high".to_owned()),
             user_instructions: "You are Braid, a helpful coding assistant. Work from the supplied GitHub Context, publish concise public comments, and keep descriptions and implementation state current.".to_owned(),
@@ -525,6 +584,8 @@ mod tests {
             api_key_environment: "DEEPSEEK_API_KEY".to_owned(),
             worker: None,
             home: PathBuf::from("/tmp/braid-setup-test"),
+            runtime_executable: None,
+            runtime_api_url: None,
             no_browser: false,
         }
     }
@@ -536,12 +597,25 @@ mod tests {
         let secrets_path = home.join("braid-of-xiaoland.secrets.toml");
         std::fs::write(&secrets_path, "webhook_secret = \"test\"\nprovider_api_key = \"key\"\n")
             .unwrap();
+        let runtime = RuntimeEntry {
+            adapter_type: "pi".to_owned(),
+            version: "0.84.3".to_owned(),
+            executable: PathBuf::from("/tmp/pi"),
+            api_url: None,
+            home: None,
+            stable_schema_sha256: None,
+            experimental_schema_sha256: None,
+        };
+        let llm_provider =
+            build_llm_provider("pi", "deepseek-chat", "DEEPSEEK_API_KEY", &secrets_path);
         let config = build_config(
             &home,
             123_456,
             &args("xiaoland/braid", "pi", "deepseek-chat"),
             &home.join("key.pem"),
             &secrets_path,
+            runtime,
+            llm_provider,
         )
         .expect("config should build");
         let text = toml::to_string(&config).expect("config should serialize");
@@ -560,12 +634,28 @@ mod tests {
         let secrets_path = home.join("braid-of-xiaoland.secrets.toml");
         std::fs::write(&secrets_path, "webhook_secret = \"test\"\nprovider_api_key = \"key\"\n")
             .unwrap();
+        let runtime = RuntimeEntry {
+            adapter_type: "codex".to_owned(),
+            version: "codex-cli 0.147.0-alpha.6.5".to_owned(),
+            executable: PathBuf::from("/tmp/codex"),
+            api_url: None,
+            home: Some(home.join("provider")),
+            stable_schema_sha256: Some(
+                "7d79fe309dd7520843459070f3884ecf0e39cee2620c1c49aad6efb4eca76ecb".to_owned(),
+            ),
+            experimental_schema_sha256: Some(
+                "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b5364439063a5c8".to_owned(),
+            ),
+        };
+        let llm_provider = build_llm_provider("codex", "gpt-4o", "OPENAI_API_KEY", &secrets_path);
         let config = build_config(
             &home,
             123_456,
             &args("xiaoland/braid", "codex", "gpt-4o"),
             &home.join("key.pem"),
             &secrets_path,
+            runtime,
+            llm_provider,
         )
         .expect("codex config should build");
         let text = toml::to_string(&config).expect("config should serialize");

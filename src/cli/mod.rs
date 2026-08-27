@@ -272,6 +272,10 @@ pub(crate) struct SetupArguments {
     pub(crate) worker: Option<String>,
     #[arg(long, value_name = "DIR", default_value = "~/.braid")]
     pub(crate) home: PathBuf,
+    #[arg(long, value_name = "PATH", conflicts_with = "runtime_api_url")]
+    pub(crate) runtime_executable: Option<PathBuf>,
+    #[arg(long, value_name = "URL", conflicts_with = "runtime_executable")]
+    pub(crate) runtime_api_url: Option<String>,
     #[arg(
         long,
         help = "Skip opening a browser; print manifest values and manual instructions instead"

@@ -782,14 +782,6 @@ fn validate_token(name: &str, value: &str) -> Result<(), ConfigError> {
     }
 }
 
-pub fn validate_sha256(name: &str, value: &str) -> Result<(), ConfigError> {
-    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        Ok(())
-    } else {
-        Err(ConfigError::Invalid(format!("{name} must be a 64-character SHA-256")))
-    }
-}
-
 const fn default_log_format() -> LogFormat {
     LogFormat::Text
 }
