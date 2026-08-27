@@ -120,8 +120,8 @@ impl Drop for RuntimeLeaseGuard {
 pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -> Result<()> {
     let telemetry = TelemetryGuard::install(&config.telemetry)?;
     let store = Arc::new(StoreActor::start(
-        config.runtime.database.clone(),
-        config.runtime.backups.clone(),
+        config.runtime.database().to_path_buf(),
+        config.runtime.backups().to_path_buf(),
     )?);
     let plan = store.plan()?;
     if !plan.pending.is_empty() {

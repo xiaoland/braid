@@ -322,7 +322,7 @@ pub(crate) fn provision_pr_agent_worktree(
 ) -> Result<Profile> {
     let target = config
         .runtime
-        .root
+        .root()
         .join("worktrees")
         .join(format!("pr-{}", candidate.number))
         .join(format!("{}-g{}", profile.id, materialization.generation));

@@ -38,18 +38,21 @@ pub struct DoctorReport {
 
 pub async fn run(config: &Config) -> DoctorReport {
     let mut checks = vec![
-        path_check("runtime root", &config.runtime.root, true),
+        path_check("runtime root", config.runtime.root(), true),
         path_check(
             "database parent",
-            config.runtime.database.parent().unwrap_or(Path::new("/")),
+            config.runtime.database().parent().unwrap_or(Path::new("/")),
             true,
         ),
-        path_check("backup directory", &config.runtime.backups, true),
+        path_check("backup directory", config.runtime.backups(), true),
         path_check("GitHub App private key", &config.github.private_key_file, false),
         secret_check("GitHub webhook secret", || config.webhook_secret()),
     ];
 
-    let store = StoreActor::start(config.runtime.database.clone(), config.runtime.backups.clone());
+    let store = StoreActor::start(
+        config.runtime.database().to_path_buf(),
+        config.runtime.backups().to_path_buf(),
+    );
     checks.push(match store.and_then(|actor| actor.status()) {
         Ok(status) => Check {
             name: "SQLite".into(),

@@ -142,10 +142,24 @@ enum GhPrCommand {
 
 #[derive(Debug, Args)]
 struct ConfigPath {
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    #[arg(long, value_name = "PATH", conflicts_with = "worker")]
+    config: Option<PathBuf>,
+    #[arg(long, value_name = "NAME", conflicts_with = "config")]
+    worker: Option<String>,
     #[arg(long)]
     json: bool,
+}
+
+impl ConfigPath {
+    fn resolve_config_path(&self) -> Result<PathBuf> {
+        if let Some(path) = &self.config {
+            return Ok(path.clone());
+        }
+        if let Some(name) = &self.worker {
+            return Ok(crate::worker::Worker::from_name(name)?.config_path());
+        }
+        bail!("either --config <PATH> or --worker <NAME> is required")
+    }
 }
 
 #[derive(Debug, Args)]
@@ -254,6 +268,8 @@ pub(crate) struct SetupArguments {
     pub(crate) model: String,
     #[arg(long, value_name = "ENV", default_value = "DEEPSEEK_API_KEY")]
     pub(crate) api_key_environment: String,
+    #[arg(long, value_name = "NAME")]
+    pub(crate) worker: Option<String>,
     #[arg(long, value_name = "DIR", default_value = "~/.braid")]
     pub(crate) home: PathBuf,
     #[arg(
@@ -265,8 +281,10 @@ pub(crate) struct SetupArguments {
 
 #[derive(Debug, Args)]
 struct ServeArguments {
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    #[arg(long, value_name = "PATH", conflicts_with = "worker")]
+    config: Option<PathBuf>,
+    #[arg(long, value_name = "NAME", conflicts_with = "config")]
+    worker: Option<String>,
     #[arg(
         long,
         help = "Expose ingress through a free Wrangler Quick Tunnel and own the App webhook while running"
@@ -347,7 +365,8 @@ pub async fn run() -> Result<()> {
             helpers::tunnel_probe(arguments).await?;
         }
         Command::Serve(arguments) => {
-            let config = helpers::load(&arguments.config)?;
+            let config_path = resolve_serve_config(&arguments)?;
+            let config = helpers::load(&config_path)?;
             crate::runtime::serve(config, arguments.tunnel, !arguments.transport_only).await?;
         }
         Command::Setup(arguments) => {
@@ -363,4 +382,14 @@ fn parse_page_size(value: &str) -> Result<usize, String> {
         .ok()
         .filter(|page_size| (1..=100).contains(page_size))
         .ok_or_else(|| "page size must be between 1 and 100".to_owned())
+}
+
+fn resolve_serve_config(arguments: &ServeArguments) -> Result<PathBuf> {
+    if let Some(path) = &arguments.config {
+        return Ok(path.clone());
+    }
+    if let Some(name) = &arguments.worker {
+        return Ok(crate::worker::Worker::from_name(name)?.config_path());
+    }
+    bail!("either --config <PATH> or --worker <NAME> is required")
 }

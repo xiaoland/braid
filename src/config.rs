@@ -41,11 +41,65 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
-    pub root: PathBuf,
-    pub database: PathBuf,
-    pub backups: PathBuf,
+    /// Defaults to the worker directory.
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+    /// Defaults to `<root>/braid.db`.
+    #[serde(default)]
+    pub database: Option<PathBuf>,
+    /// Defaults to `<root>/backups`.
+    #[serde(default)]
+    pub backups: Option<PathBuf>,
     #[serde(default)]
     pub auto_migrate: bool,
+}
+
+impl RuntimeConfig {
+    /// Fill omitted/relative paths using `base` (the directory containing the
+    /// loaded config file) and canonicalize relative paths to absolute paths.
+    pub fn resolve(&mut self, base: &Path) {
+        if self.root.is_none() {
+            self.root = Some(base.to_path_buf());
+        }
+        let root = self.root.clone().expect("root resolved above");
+        let root = if root.is_relative() { base.join(&root) } else { root };
+        if self.database.is_none() {
+            self.database = Some(root.join("braid.db"));
+        }
+        if self.backups.is_none() {
+            self.backups = Some(root.join("backups"));
+        }
+        self.root = Some(resolve_path(base, &root));
+        self.database =
+            Some(resolve_path(base, self.database.as_ref().expect("database resolved")));
+        self.backups = Some(resolve_path(base, self.backups.as_ref().expect("backups resolved")));
+    }
+
+    fn require_resolved(&self) {
+        assert!(
+            self.root.is_some() && self.database.is_some() && self.backups.is_some(),
+            "RuntimeConfig paths must be resolved before use"
+        );
+    }
+
+    pub fn root(&self) -> &Path {
+        self.require_resolved();
+        self.root.as_ref().expect("resolved")
+    }
+
+    pub fn database(&self) -> &Path {
+        self.require_resolved();
+        self.database.as_ref().expect("resolved")
+    }
+
+    pub fn backups(&self) -> &Path {
+        self.require_resolved();
+        self.backups.as_ref().expect("resolved")
+    }
+}
+
+fn resolve_path(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() { path.to_path_buf() } else { base.join(path) }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -212,8 +266,10 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = fs::read_to_string(path)
             .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
-        let config: Self = toml::from_str(&text)
+        let mut config: Self = toml::from_str(&text)
             .map_err(|source| ConfigError::Parse { path: path.to_path_buf(), source })?;
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        config.runtime.resolve(base);
         config.validate()?;
         Ok(config)
     }
@@ -229,8 +285,8 @@ impl Config {
         ConfigSummary {
             schema_version: self.schema_version,
             repository: &self.github.repository,
-            runtime_root: &self.runtime.root,
-            database: &self.runtime.database,
+            runtime_root: self.runtime.root(),
+            database: self.runtime.database(),
             profile_ids: self.profiles.iter().map(|profile| profile.id.as_str()).collect(),
             default_pr_profile: &self.profile_selection.default_pr_profile,
             trace_sample_ratio: self.telemetry.sample_ratio,
@@ -289,9 +345,9 @@ impl Config {
         }
 
         for (name, path) in [
-            ("runtime.root", &self.runtime.root),
-            ("runtime.database", &self.runtime.database),
-            ("runtime.backups", &self.runtime.backups),
+            ("runtime.root", self.runtime.root()),
+            ("runtime.database", self.runtime.database()),
+            ("runtime.backups", self.runtime.backups()),
             ("github.private_key_file", &self.github.private_key_file),
             ("tools.git", &self.tools.git),
             ("tools.gh", &self.tools.gh),
@@ -302,19 +358,19 @@ impl Config {
             self.github
                 .webhook_secret_file
                 .as_ref()
-                .map(|path| ("github.webhook_secret_file", path)),
+                .map(|path| ("github.webhook_secret_file", path.as_path())),
         )
         .chain(
             self.provider
                 .pi
                 .as_ref()
                 .and_then(|pi| pi.api_key_file.as_ref())
-                .map(|path| ("provider.pi.api_key_file", path)),
+                .map(|path| ("provider.pi.api_key_file", path.as_path())),
         ) {
             require_absolute(name, path)?;
         }
-        if !self.runtime.database.starts_with(&self.runtime.root)
-            || !self.runtime.backups.starts_with(&self.runtime.root)
+        if !self.runtime.database().starts_with(self.runtime.root())
+            || !self.runtime.backups().starts_with(self.runtime.root())
         {
             return Err(ConfigError::Invalid(
                 "runtime database and backups must be inside runtime.root".into(),

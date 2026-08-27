@@ -11,6 +11,7 @@ mod store;
 mod telemetry;
 mod tunnel;
 mod webhook;
+mod worker;
 mod worktree;
 mod writer;
 

@@ -2,7 +2,7 @@
 use super::*;
 
 pub async fn doctor(arguments: &ConfigPath) -> Result<()> {
-    let config = helpers::load(&arguments.config)?;
+    let config = helpers::load(&arguments.resolve_config_path()?)?;
     let report = doctor::run(&config).await;
     if arguments.json {
         helpers::print_json(&report)?;

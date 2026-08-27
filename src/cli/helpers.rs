@@ -9,8 +9,11 @@ pub fn load(path: &Path) -> Result<Config> {
 }
 
 pub fn store(config: &Config) -> Result<StoreActor> {
-    StoreActor::start(config.runtime.database.clone(), config.runtime.backups.clone())
-        .context("cannot start SQLite actor")
+    StoreActor::start(
+        config.runtime.database().to_path_buf(),
+        config.runtime.backups().to_path_buf(),
+    )
+    .context("cannot start SQLite actor")
 }
 
 pub fn print_json(value: &impl Serialize) -> Result<()> {
