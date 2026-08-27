@@ -3,49 +3,54 @@
 ## Goal
 
 Define the boundary between the GitHub-facing **Event Producer**, the per-work-item
-per-agent-group **Event Queue**, and the **Agent Group**.
+per-profile **Event Queue**, and the **Agent Group**. Module names in code follow
+the TDD (`events`, `scheduler`, `sessions`); the producer/queue/group terms are
+the conceptual roles of those modules.
+
+## Taxonomy (aligned with `lifecycle.md` and `store.events`)
+
+- `classification` ∈ `wake | hard_invalidation | cross_surface_invalidation |
+  dependency_dirty | lifecycle` (+ none for non-semantic changes).
+- `origin` ∈ `agent | external` — a separate field, not a classification.
+- A Trusted Braid Mention is an **urgent property** of a `wake` event, not a
+  type; it bypasses quiet window and count.
 
 ## Agreed Direction
 
-- **Event Producer** sits behind GitHub:
-  - consumes webhooks and/or GraphQL reconciliation;
-  - normalizes raw GitHub activity into Braid domain events (comment created,
-    title edited, review submitted, etc.);
-  - classifies events by semantic type: `Wake`, `HardInvalidation`,
-    `CrossSurfaceInvalidation`, `Lifecycle`, `UrgentMention`, `AgentOrigin`.
-- **Event Queue** is **per work-item per agent-group** and owns the quiet window
-  / threshold. When the window closes or the threshold is hit, the queue emits
-  a batch (a plain user message plus optional new context and steering flag) to
-  its Agent Group.
-- **Agent Group** is a thin manager that sends user messages to the Agent
-  Session. It does **not** manage session lifecycle, inspect `status()`, or
-  decide when to create sessions. It receives user message text, optional new
-  context, and steering flag, and forwards them via `send_user_msg(...)`.
-- The Agent Session internally handles queuing, steering, and context-replacement
-  decisions. The caller does not branch on `status()` before calling
-  `send_user_msg`.
-- Events carry:
-  - `source`: the work item / surface they came from (used to match
-    `profile.handlers_of`).
-  - semantic `type` (see above).
+- **Event Producer** (`github` ingress + `events` classification):
+  - consumes webhooks and GraphQL reconciliation;
+  - diffs against the canonical ledger and emits classified events with
+    origin attribution (agent-origin writes are attributed via durable
+    operation correlation or the profile's configured stable actor node id);
+  - agent-origin events update the ledger but never wake/reset the
+    originating group; other groups see them as external.
+- **Event Queue** (`store.scheduler_batches` + `scheduler`): per work-item per
+  profile; owns quiet window (30s default) and count threshold (8 default),
+  both profile-overridable; one pending batch per group; emits
+  (user message text, optional new context, steering) to the Agent Group.
+- **Agent Group** (`sessions`): thin forwarder. It does not manage session
+  lifecycle, inspect `status()` before sending, or create sessions; the
+  producer/activation path creates the session and hands it over. It calls
+  `send_user_msg(...)` and consumes `SessionEvent`s for reactions and the
+  group state machine.
 - `ordinary|interrupt` is a scheduler action, not an event type.
 
 ## Decisions
 
-1. **Routing model**: explicit routing. The Event Producer determines which
-   (work-item, agent-group) queues need an event and pushes it directly. This
-   avoids a shared bus and keeps queue ownership simple for MVP.
-2. **Session provisioning**: the Event Producer / its wrapper creates the Agent
-   Session at Issue/PR activation time and passes the session handle to the
-   Agent Group. The Event Queue does not know about sessions; it only emits
-   batches to the Agent Group.
-3. **AgentOrigin events**: dropped at the producer for the originating group
-   (no wake / no reset). They may still update the local canonical ledger.
-   Other groups see them as ordinary external events.
-4. **Hard Invalidation**: the Event Queue turns the latest Context into the
-   optional new context and passes it to the Agent Group with the batch. The
-   Agent Group does not know about invalidation semantics; it just forwards
-   `reset_context_to` if present.
+1. **Routing**: explicit — the producer writes each event into the queues of
+   the (work-item, profile) pairs it affects (cross-surface fan-out for
+   direct Associated Issues per lifecycle.md). No shared bus.
+2. **Session provisioning**: at activation (Issue assignment / mention
+   fallback / PR activation), the producer-side wrapper asks `sessions` to
+   materialize Context + create the physical session via the adapter; the
+   resulting logical `AgentSession` handle is stored with the group.
+3. **Hard Invalidation / Dependency Dirty**: on batch emission, `sessions`
+   materializes the current Context; if its revision advanced, the batch is
+   sent with `reset_context_to=Some(context)`. The Agent Group does not know
+   invalidation semantics.
+4. **Transport unknown**: disconnect is not terminal; the adapter
+   reconnects/resumes internally and the core keeps seeing `running` until
+   the adapter proves failure.
 
 ## MVP Simplification
 

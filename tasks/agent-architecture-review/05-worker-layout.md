@@ -14,7 +14,8 @@ One worker = one folder:
   config.toml      # was braid-of-<owner>.toml
   secrets.toml     # mode 0600
   braid.db         # SQLite local state
-  worktrees/       # PR implementation worktrees
+  worktrees/       # PR implementation worktrees:
+                   #   worktrees/pr-<number>/<profile>-g<generation> (per TDD)
   logs/            # runtime / tunnel logs
 ```
 

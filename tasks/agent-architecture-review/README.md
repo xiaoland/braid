@@ -12,7 +12,9 @@ Split into focused sub-packets so each boundary can be closed independently.
 - **04-llm-provider.md**: LLM service config, models, cost, allowance.
 - **05-worker-layout.md**: per-worker folder consolidating config, secrets, db,
   runtimes, worktrees, logs.
-- **06-implementation-plan.md**: incremental PR sequence.
+- **06-implementation-plan.md**: single-PR execution order.
+- **07-topology-audit.md**: object/edge topology, defect fixes T1–T10, binding
+  corrections.
 
-**Current status**: all packets are decided; implementation plan drafted and
-ready for review.
+**Current status**: topology-audited; all packets decided; plan ready for
+execution.

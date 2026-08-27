@@ -2,73 +2,81 @@
 
 ## Goal
 
-Define the exact contract between the Agent Group and an `AgentSession`,
-especially the meaning of `send_user_msg` and `reset_context_to`.
+Define the exact contract between the Agent Group (`sessions`) and an
+`AgentSession`, especially the meaning of `send_user_msg` and
+`reset_context_to`.
 
-## Current Direction
+## Contract (binding)
 
-- `AgentSession` has a provider/runtime-unique id, stable for its lifetime.
-- `send_user_msg(new_user_msg, steering, reset_context_to)` is the high-level
-  entry point used by the Agent Group.
-- `new_user_msg` is a plain user message constructed by the Agent Group from a
-  batch of events / event references. The session interface is event-agnostic;
-  raw event refs do not cross this boundary.
-- `reset_context_to` is the **new context content** (Markdown), not a revision id.
-- `steering` is a boolean flag meaning "do not queue; deliver this user message
-  to the running turn at the nearest safe point". It is used for urgent events
-  such as `@braid` mentions. If no turn is running, the adapter starts one.
-- `send_user_msg` **always returns an `AgentSession` instance** (which may or
-  may not be the same logical instance as the caller held) and returns
-  **immediately**. The caller uses the returned instance going forward.
-- The caller does **not** inspect `status()` to decide whether to call
-  `send_user_msg`; the session internally queues, steers, or waits for context
-  replacement.
-- `status()` returns the current `idle | running | failed` state synchronously,
-  mainly for introspection/debugging.
-- `status_stream()` (or equivalent async stream / watch channel) provides
-  lifecycle changes to the Agent Group without polling.
-- `recv()` is **not part of the core interface**. It may exist in
-  adapter-specific implementations for debugging, but Braid core does not
-  depend on it.
+```rust
+pub enum SessionStatus { Idle, Running, Failed }
 
-## Agreed Decisions
+pub enum TurnOutcome { Completed, Interrupted, Failed, Unknown }
 
-- **Adapter owns physical session replacement internally.** The caller holds
-  one stable logical `AgentSession` instance; the adapter may fork or swap the
-  underlying physical session transparently.
-- **`send_user_msg` returns immediately** with a (possibly new) session
-  instance; the Agent Group consumes async lifecycle changes via `status_stream()`.
-- **`steering` means urgent delivery**: skip internal queueing and reach the
-  current or next turn as soon as the adapter allows.
-- **Reset waits for turn completion.** When `reset_context_to` is set and a turn
-  is running, the adapter waits for that turn to reach a terminal state (or
-  safely interruptable boundary), then applies the context reset and starts the
-  next turn. The caller invokes `send_user_msg` only once.
-- **`recv()` is not a core requirement.** Braid core only needs session
-  lifecycle/health. `status()` is synchronous; `status_stream()` is the primary
-  async signal.
+pub enum SessionEvent {
+    TurnStarted { turn_id: String },
+    TurnTerminal { turn_id: String, outcome: TurnOutcome },
+    SessionReplaced { old_id: String, new_id: String },
+    Failed { reason: String },
+}
 
-## Open Questions
+#[async_trait::async_trait]
+pub trait AgentSession: Send + Sync {
+    fn id(&self) -> &str;
+    fn status(&self) -> SessionStatus;
+    fn events(&self) -> broadcast::Receiver<SessionEvent>;
+    async fn send_user_msg(
+        self: &Arc<Self>,
+        msg: String,
+        steering: bool,
+        reset_context_to: Option<String>,
+    ) -> Result<Arc<dyn AgentSession>, SessionError>;
+}
+```
 
-1. Should the async signal be a `futures::Stream<SessionStatusEvent>`, a
-   `tokio::sync::watch::Receiver<SessionStatus>`, or something else?
+## Semantics
 
-## Pending Decision
+- `msg` is a plain user message (Event Reference batch text) built by the
+  caller; raw event refs never cross this boundary.
+- `steering = true`: do not queue; deliver at the nearest safe point of the
+  running turn (adapter uses `turn/steer` with its own tracked
+  `expectedTurnId`; a non-steerable turn defers to the next boundary). If no
+  turn is running, the adapter starts one.
+- `reset_context_to = Some(context)`: the caller materialized Context and its
+  revision advanced. The adapter fences the old revision, waits for the
+  current turn to reach a terminal/safe boundary, replaces the physical
+  session (Codex v1: fresh `thread/start` + `thread/inject_items`; inject
+  cannot replace history), then starts the turn. The caller invokes
+  `send_user_msg` exactly once.
+- `send_user_msg` returns immediately with the logical session handle
+  (usually the same `Arc`); physical replacement is adapter-internal.
+- The caller never branches on `status()` before sending; queuing/steering/
+  waiting is adapter-internal.
+- `events()` is the core's only async signal. Turn terminal outcomes drive
+  the Reaction Lifecycle and the group state machine; a bare status watch
+  channel was rejected because it loses terminal reasons.
+- `recv()` of conversation items is adapter-internal only (sampled telemetry /
+  debugging). Braid never mirrors turn output.
 
-Choose the concrete async signal mechanism.
+## Adapter mapping (Codex v1, per app-server.md)
 
-## Recommendation
+| Core call | Adapter action |
+| --- | --- |
+| `send_user_msg(m, false, None)`, idle | `turn/start` with `m` |
+| `send_user_msg(m, true, None)`, running | `turn/steer` with tracked `expectedTurnId` |
+| `send_user_msg(m, _, Some(ctx))` | fence → wait terminal/safe boundary → fresh `thread/start` + `thread/inject_items(ctx)` → `turn/start(m)` |
+| disconnect mid-turn | reconnect + `thread/resume` if compatible (context/instruction/profile revisions, cwd, sandbox); else `Failed` |
 
-Use a `tokio::sync::watch::Receiver<SessionStatus>` for the core contract.
+## Session compatibility (TDD invariant 4)
 
-- `watch` gives every consumer the *latest* state immediately on subscribe, and
-  emits only when the state changes. This is exactly what an Agent Group needs
-  to decide when to send the next batch.
-- It is cheap, single-producer/multi-consumer, and already used elsewhere in the
-  Braid runtime (`health` watcher, `shutdown` channel).
-- A `Stream` of deltas is more powerful but unnecessary if the only states are
-  `idle|running|failed`; a consumer can derive "turn completed" by observing a
-  transition from `running` to `idle`/`failed`.
-- If we later need richer lifecycle events (token usage, turn IDs, errors), we
-  can replace `SessionStatus` with `SessionState { status, last_error, turn_id }`
-  without changing the channel shape.
+A physical session is reusable only while context schema/revision, effective
+instruction revision, profile revision, cwd, and sandbox all match. Any drift
+⇒ fresh materialization path. The caller (sessions) decides by comparing the
+freshly materialized revision against the session's recorded revision.
+
+## Transport unknown
+
+Disconnect without a terminal leaves the turn outcome `Unknown`: no parallel
+turn, no terminal reaction, no retry of agent side effects. The adapter
+reconnects/resumes; proven unavailability surfaces as `Failed` and the group
+becomes `blocked`.

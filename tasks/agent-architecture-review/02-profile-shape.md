@@ -7,47 +7,49 @@ Decide what belongs in Agent Profile and what belongs in referenced registries.
 ## Agreed Direction
 
 - `braid gh` is exposed as a **command-line tool in the Agent runtime's shell
-  environment**, not as a tool-use / JSON-RPC call. The Agent invokes it via
-  shell commands.
-- Agent Profile is a **role snapshot**, not a provider connection spec.
+  environment**, not as a tool-use / JSON-RPC call.
+- Agent Profile is a **versioned, immutable role snapshot** (store:
+  `profiles` with immutable revision + effective-config digest), not a
+  provider connection spec.
 - Fields:
   - `id`, `display_name`, `priority`
-  - `scopes` (`issue|pr`) replacing current `tags`
+  - `tags` (`issue`/`pr`) — product vocabulary (glossary: Profile Tag); **not**
+    renamed to `scopes`
   - `user_instructions`
-  - `adapter_type` + `adapter_version` reference (locates an Agent Runtime
-    Adapter class; connectivity config lives in the worker-level runtime
-    registry, never in the profile — including `CODEX_HOME`/`PI_HOME`-style
-    homes, because profile user_instructions/skills/mcps are implemented
-    against a fixed runtime home)
-  - `provider` + `model` reference
+  - `adapter_type` + `adapter_version` (locates an Agent Runtime Adapter
+    class)
+  - `provider` + `model` (resolves into `llm_providers`)
   - `reasoning`, `sandbox` policy, `workspace`
-  - `skills` and `mcps` as **references to a global registry**
-- Sub-agent config is **adapter/skill-specific**, not inline in the generic
-  profile.
-- LLM cost/allowance is **not** in profile.
+  - `skills` and `mcps` as names resolved by the adapter against the runtime
+    home
+- Profile **never** carries connectivity config (`executable_path`, `api_url`,
+  `CODEX_HOME`/`PI_HOME`-style homes): profile user_instructions/skills/mcps
+  are implemented against one fixed runtime home, so the home lives in the
+  worker-level runtime registry entry.
+- Sub-agent config is adapter/skill-specific, not inline in the profile.
+- LLM cost/allowance is not in the profile.
 
 ## Decisions
 
-1. `github_actor_node_id` and `status_surfaces` stay in the Agent Profile. Both
-   are product-defined profile behavior (glossary: Agent Attribution /
-   Operational Status Comment), not implementation detail.
-2. Adapter contract version pin: profile carries `adapter_type` +
-   `adapter_version`; the worker-level registry entry holds the connectivity
-   config for that adapter class.
+1. `github_actor_node_id` and `status_surfaces` stay in the Agent Profile
+   (glossary: Agent Attribution / Operational Status Comment).
+2. Profile revision/digest participates in session compatibility checks
+   (TDD invariant 4): a changed profile revision forces fresh session
+   materialization.
 3. MVP TOML layout:
 
 ```toml
-[[runtimes]]
+[[runtimes]]                  # one entry per adapter_type per worker
 adapter_type = "pi"
-version = "0.84.3"
-executable_path = "..."     # adapter-defined connectivity config
-home = "..."                # PI_HOME lives here, not in any profile
+version = "0.84.3"            # verified at setup time
+executable_path = "..."       # adapter-defined connectivity config
+home = "..."                  # PI_HOME lives here, not in any profile
 
 [[profiles]]
 id = "default"
 display_name = "Default"
 priority = 1
-scopes = ["issue", "pr"]
+tags = ["issue", "pr"]
 user_instructions = "..."
 adapter_type = "pi"
 adapter_version = "0.84.3"
@@ -64,4 +66,4 @@ mcps = ["time"]
 
 ## Pending Decision
 
-None; finalize the implementation layout when the new schema lands.
+None.

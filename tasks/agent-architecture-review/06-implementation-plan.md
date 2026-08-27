@@ -3,6 +3,8 @@
 Single PR on branch `feat/agent-architecture` (task packet rides along).
 Ordered as sequential commits, each keeping `cargo fmt/check/clippy/test`
 green. Product behavior is preserved; only internal architecture moves.
+`07-topology-audit.md` is binding: its node/edge model, defect fixes T1–T10,
+and corrected `AgentSession` contract override anything below that conflicts.
 
 ## Rehearsal Findings
 
@@ -49,22 +51,11 @@ are binding; deviating requires updating this packet first.
 
 ### Core trait (`src/agent_session.rs`, new)
 
-```rust
-pub enum SessionStatus { Idle, Running, Failed }
-
-#[async_trait::async_trait]
-pub trait AgentSession: Send + Sync {
-    fn id(&self) -> &str;
-    fn status(&self) -> SessionStatus;
-    fn status_stream(&self) -> watch::Receiver<SessionStatus>;
-    async fn send_user_msg(
-        self: &Arc<Self>,
-        msg: String,
-        steering: bool,
-        reset_context_to: Option<String>,
-    ) -> Result<Arc<dyn AgentSession>, SessionError>;
-}
-```
+See `01-session-interface.md` for the binding contract. Key points:
+`events()` returns `broadcast::Receiver<SessionEvent>` carrying turn lifecycle
+with terminal outcomes (drives Reaction Lifecycle) — not a bare status watch;
+`status()` is a sync snapshot; `send_user_msg` returns immediately and the
+adapter owns steering/queuing/physical replacement.
 
 ### Worker CLI surface
 
@@ -97,7 +88,7 @@ api_key_file = "secrets.toml"  # relative to worker folder
 
 [[profiles]]
 id = "default"
-scopes = ["issue", "pr"]     # renamed from tags
+tags = ["issue", "pr"]       # product vocabulary (glossary: Profile Tag)
 adapter_type = "pi"          # -> runtimes.adapter_type
 adapter_version = "0.84.3"   # contract pin, checked against runtimes.version
 provider = "deepseek"        # -> llm_providers.id
@@ -105,6 +96,8 @@ model = "deepseek-v4-pro"    # -> llm_providers.models.model_id
 # display_name, priority, user_instructions, reasoning, sandbox, workspace,
 # github_actor_node_id, status_surfaces, context pressure fields unchanged.
 # Profiles NEVER carry connectivity config (executable_path/api_url/home).
+# Profiles are versioned immutable snapshots; store keeps a
+# revision + effective-config digest per profile.
 ```
 
 Load-time validation: profile.adapter_type must match a `runtimes` entry and
@@ -143,9 +136,10 @@ config errors.
    `--config` stays as low-level override.
 
 ### B. Config schema
-3. Profile: `tags` → `scopes`, add `adapter`; keep `github_actor_node_id`,
-   `status_surfaces`, context-pressure fields.
-4. Add `llm_providers` (metadata-only allowances) and runtime registry tables;
+3. Profile: keep `tags`, add `adapter_type` + `adapter_version`; keep
+   `github_actor_node_id`, `status_surfaces`, context-pressure fields.
+4. Add `llm_providers` (metadata-only allowances; flagged as Braid-internal
+   extension, not product-doc-defined) and runtime registry tables;
    profiles resolve provider+model at load time.
 5. Update `config.example.toml`, `config/setup.template.toml`, `setup.rs`
    generation, `doctor.rs`, and SSoT tests atomically.
@@ -157,16 +151,21 @@ config errors.
    fallback) and exits with instructions. No auto-install anywhere.
 
 ### D. AgentSession trait
-8. Define core trait (`send_user_msg`, `status`, `status_stream` via
-   `tokio::sync::watch`); implement codex/pi adapter shims over existing
-   `AgentProvider`.
+8. Define core trait per `01-session-interface.md`; implement codex/pi
+   adapter shims over existing `AgentProvider` (mapping `SessionEvent`s from
+   the process-wide broadcast, tracking `expectedTurnId` internally).
 9. Rewire scheduler call sites onto the trait.
 10. Move physical session replacement / context reset into the adapter
-    (`reset_context_to`); collapse the scheduler-side reset path.
+    (`reset_context_to`); collapse the scheduler-side reset path. Caller
+    passes `reset_context_to=Some` iff the freshly materialized Context
+    revision advanced (covers Hard Invalidation and Dependency Dirty alike).
 
-### E. Event producer / queue / group naming
-11. Reorganize ingress → Event Producer, store-backed debounce → Event Queue,
-    batch sender → thin Agent Group; update module names and docs.
+### E. Module alignment with TDD names
+11. Align module boundaries with the TDD table: ingress+classification →
+    `events` (Event Producer role), batch coalescing → `scheduler` (Event
+    Queue role), group/session lifecycle → `sessions` (Agent Group role).
+    Rename/reorganize `src/runtime/*` only where the trait refactor already
+    touches the code; no gratuitous moves.
 
 ### F. Verification
 12. Update `scripts/tests/*.sh`, run the shell suite against a local worker;
