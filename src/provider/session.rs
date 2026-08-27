@@ -39,6 +39,50 @@ struct PendingReset {
 }
 
 impl ProviderAgentSession {
+    pub async fn resume(
+        id: String,
+        provider: Arc<dyn AgentProvider>,
+        profile: Profile,
+        instructions: String,
+        thread_id: &str,
+    ) -> Result<Arc<Self>, SessionError> {
+        let (events, _) = broadcast::channel(512);
+        let session = Arc::new(Self {
+            id,
+            provider,
+            profile,
+            instructions,
+            inner: Mutex::new(SessionInner {
+                status: SessionStatus::Idle,
+                thread_id: Some(thread_id.to_owned()),
+                current_turn_id: None,
+                pending_reset: None,
+                last_context_hash: None,
+            }),
+            events,
+        });
+        let mut notifications = session.provider.subscribe();
+        let listener = Arc::downgrade(&session);
+        tokio::spawn(async move {
+            while let Ok(notification) = notifications.recv().await {
+                let Some(session) = listener.upgrade() else { break };
+                if session.handle_notification(notification).await {
+                    break;
+                }
+            }
+        });
+        session
+            .provider
+            .resume_session(thread_id, &session.profile, &session.instructions)
+            .await
+            .map_err(map_provider_error)?;
+        Ok(session)
+    }
+
+    pub fn provider_thread_id(&self) -> Option<String> {
+        self.inner.try_lock().ok().and_then(|inner| inner.thread_id.clone())
+    }
+
     pub async fn start(
         id: String,
         provider: Arc<dyn AgentProvider>,
