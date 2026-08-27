@@ -16,6 +16,5 @@ Split into focused sub-packets so each boundary can be closed independently.
 - **07-topology-audit.md**: object/edge topology, defect fixes T1–T10, binding
   corrections.
 
-**Current status**: implementation complete through D2 on branch
-`feat/agent-architecture`. Remaining commit F: update shell tests for schema v2,
-final CHANGELOG pass, and promote these packets into `docs/20-product-tdd/`.
+**Current status**: all implementation (A/B/C/D/E/F) complete on branch
+`feat/agent-architecture`. `cargo fmt/check/clippy/test` green; `scripts/tests/00_clean_install.sh` passes.
