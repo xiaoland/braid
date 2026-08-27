@@ -1,83 +1,79 @@
 # Agent Session Interface
 
-## Goal
+## Decision
 
-Define the exact contract between the Agent Group (`sessions`) and an
-`AgentSession`, especially the meaning of `send_user_msg` and
-`reset_context_to`.
-
-## Contract (binding)
+The core agent-session contract is a trait plus an event stream.
 
 ```rust
-pub enum SessionStatus { Idle, Running, Failed }
-
-pub enum TurnOutcome { Completed, Interrupted, Failed, Unknown }
-
-pub enum SessionEvent {
-    TurnStarted { turn_id: String },
-    TurnTerminal { turn_id: String, outcome: TurnOutcome },
-    SessionReplaced { old_id: String, new_id: String },
-    Failed { reason: String },
-}
-
-#[async_trait::async_trait]
+#[async_trait]
 pub trait AgentSession: Send + Sync {
-    fn id(&self) -> &str;
-    fn status(&self) -> SessionStatus;
     fn events(&self) -> broadcast::Receiver<SessionEvent>;
+
+    /// Dispatch a user-level message to the adapter.
+    ///
+    /// * `message` – rendered event references or reset context payload.
+    /// * `steering` – if true, the message is an urgent steer for the currently
+    ///   running turn.
+    /// * `reset_context_to` – if present, the adapter must replace the
+    ///   physical provider thread with a fresh session whose context is exactly
+    ///   this materialized context.
+    ///
+    /// The call returns as soon as the adapter has accepted the message. The
+    /// concrete provider turn id for a newly started turn is returned in
+    /// `SendResult::started` so the caller can record it synchronously; terminal
+    /// outcomes are delivered asynchronously through `events()`.
     async fn send_user_msg(
-        self: &Arc<Self>,
-        msg: String,
+        &self,
+        message: String,
         steering: bool,
         reset_context_to: Option<String>,
-    ) -> Result<Arc<dyn AgentSession>, SessionError>;
+    ) -> Result<SendResult, SessionError>;
+}
+
+#[derive(Debug)]
+pub enum SendResult {
+    /// A new turn was accepted; `provider_turn_id` is the concrete provider's
+    /// turn identifier.
+    Started { provider_turn_id: String },
+    /// The message was accepted but does not start a new turn (steer/reset).
+    Acknowledged,
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionEvent {
+    TurnStarted { provider_turn_id: String },
+    TurnTerminal { outcome: TurnOutcome },
+    SessionReplaced { provider_session_id: String },
+    Failed { error: SessionError },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Completed,
+    Cancelled,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SessionError {
+    #[error("session is no longer connected")]
+    Disconnected,
+    #[error("provider rejected the message: {0}")]
+    Provider(String),
+    #[error("internal session error: {0}")]
+    Internal(String),
 }
 ```
 
-## Semantics
+## Rationale
 
-- `msg` is a plain user message (Event Reference batch text) built by the
-  caller; raw event refs never cross this boundary.
-- `steering = true`: do not queue; deliver at the nearest safe point of the
-  running turn (adapter uses `turn/steer` with its own tracked
-  `expectedTurnId`; a non-steerable turn defers to the next boundary). If no
-  turn is running, the adapter starts one.
-- `reset_context_to = Some(context)`: the caller passes the latest
-  materialized Context. The adapter internally owns the reset: it decides
-  whether replacement is needed (content compare) and how — fence old output,
-  wait for the current turn's terminal/safe boundary, replace the physical
-  session (Codex v1: fresh `thread/start` + `thread/inject_items`; inject
-  cannot replace history), then start the turn. The caller invokes
-  `send_user_msg` exactly once and never models revisions.
-- `send_user_msg` returns immediately with the logical session handle
-  (usually the same `Arc`); physical replacement is adapter-internal.
-- The caller never branches on `status()` before sending; queuing/steering/
-  waiting is adapter-internal.
-- `events()` is the core's only async signal. Turn terminal outcomes drive
-  the Reaction Lifecycle and the group state machine; a bare status watch
-  channel was rejected because it loses terminal reasons.
-- `recv()` of conversation items is adapter-internal only (sampled telemetry /
-  debugging). Braid never mirrors turn output.
+Earlier drafts returned `Result<(), SessionError>`. That is too lossy for the
+scheduler: it records `provider_turn_id` synchronously after `start_turn` and
+must know the id before the event loop sees `TurnStarted`. Returning the id in
+the result keeps the scheduler's synchronous book-keeping intact while still
+moving all transport-level work (queueing, steering, physical session
+replacement) inside the adapter.
 
-## Adapter mapping (Codex v1, per app-server.md)
-
-| Core call | Adapter action |
-| --- | --- |
-| `send_user_msg(m, false, None)`, idle | `turn/start` with `m` |
-| `send_user_msg(m, true, None)`, running | `turn/steer` with tracked `expectedTurnId` |
-| `send_user_msg(m, _, Some(ctx))` | fence → wait terminal/safe boundary → fresh `thread/start` + `thread/inject_items(ctx)` → `turn/start(m)` |
-| disconnect mid-turn | reconnect + `thread/resume` if compatible (context/instruction/profile revisions, cwd, sandbox); else `Failed` |
-
-## Session compatibility
-
-Resume-ability after restart is an **adapter-internal** judgment: the adapter
-resumes the physical session when it can prove compatibility, otherwise it
-falls back to a fresh session. No revision/digest/profile-digest concepts exist
-in the core contract.
-
-## Transport unknown
-
-Disconnect without a terminal leaves the turn outcome `Unknown`: no parallel
-turn, no terminal reaction, no retry of agent side effects. The adapter
-reconnects/resumes; proven unavailability surfaces as `Failed` and the group
-becomes `blocked`.
+The event stream remains the source of truth for turn terminal outcomes and for
+physical-session replacement events.

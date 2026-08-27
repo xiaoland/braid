@@ -63,6 +63,7 @@ pub(crate) async fn issue_agent_worker(
                 &github,
                 &config,
                 &provider,
+                Arc::clone(&sessions),
                 &profile,
                 &profile_record,
                 &health,

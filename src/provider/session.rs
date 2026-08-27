@@ -8,7 +8,9 @@ use std::{
 use tokio::sync::{Mutex, broadcast};
 
 use crate::{
-    agent_session::{AgentSession, SessionError, SessionEvent, SessionStatus, TurnOutcome},
+    agent_session::{
+        AgentSession, SendResult, SessionError, SessionEvent, SessionStatus, TurnOutcome,
+    },
     config::Profile,
     provider::{AgentProvider, ProviderError, ProviderNotification},
 };
@@ -118,7 +120,7 @@ impl ProviderAgentSession {
         });
 
         if let Some(context) = initial_context {
-            session.send_user_msg(String::new(), false, Some(context)).await?;
+            session.send_user_msg(String::new(), false, Some(context)).await.map(|_| ())?;
         }
         Ok(session)
     }
@@ -130,7 +132,8 @@ impl ProviderAgentSession {
                 if inner.thread_id.as_ref() == Some(&thread_id) {
                     inner.current_turn_id = Some(turn_id.clone());
                     inner.status = SessionStatus::Running;
-                    let _ = self.events.send(SessionEvent::TurnStarted { turn_id });
+                    let _ =
+                        self.events.send(SessionEvent::TurnStarted { provider_turn_id: turn_id });
                 }
                 false
             }
@@ -145,9 +148,10 @@ impl ProviderAgentSession {
                     let is_current = inner.current_turn_id.as_ref() == Some(&turn_id);
                     inner.current_turn_id = None;
                     inner.status = SessionStatus::Idle;
-                    let _ = self
-                        .events
-                        .send(SessionEvent::TurnTerminal { turn_id: turn_id.clone(), outcome });
+                    let _ = self.events.send(SessionEvent::TurnTerminal {
+                        provider_turn_id: turn_id.clone(),
+                        outcome,
+                    });
                     if let Some(reason) = error {
                         let _ = self.events.send(SessionEvent::Failed { reason });
                     }
@@ -202,7 +206,7 @@ impl AgentSession for ProviderAgentSession {
         msg: String,
         steering: bool,
         reset_context_to: Option<String>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<SendResult, SessionError> {
         let mut inner = self.inner.lock().await;
 
         if inner.status == SessionStatus::Failed {
@@ -211,8 +215,7 @@ impl AgentSession for ProviderAgentSession {
 
         let context_changed = reset_context_to.as_ref().map_or(false, |context| {
             let hash = Self::context_hash(context);
-            let changed = inner.last_context_hash != Some(hash);
-            changed
+            inner.last_context_hash != Some(hash)
         });
 
         // If a turn is running and we need to replace context, fence the turn.
@@ -224,7 +227,7 @@ impl AgentSession for ProviderAgentSession {
             {
                 let _ = self.provider.interrupt(&thread_id, &turn_id).await;
             }
-            return Ok(());
+            return Ok(SendResult::Acknowledged);
         }
 
         // If context changed while idle, replace the physical session.
@@ -280,22 +283,28 @@ impl AgentSession for ProviderAgentSession {
                     .steer(&thread_id, &turn_id, &msg)
                     .await
                     .map_err(map_provider_error)?;
+                return Ok(SendResult::Acknowledged);
             }
             // Non-steering messages while running are dropped; the caller is
             // expected to emit them through the event queue debounce path so
             // they arrive when the session is idle.
-        } else if !msg.is_empty() {
-            let turn = self
-                .provider
-                .start_turn(&thread_id, &self.profile, &msg)
-                .await
-                .map_err(map_provider_error)?;
-            inner.current_turn_id = Some(turn.turn_id.clone());
-            inner.status = SessionStatus::Running;
-            let _ = self.events.send(SessionEvent::TurnStarted { turn_id: turn.turn_id });
+            return Ok(SendResult::Acknowledged);
         }
 
-        Ok(())
+        if msg.is_empty() {
+            return Ok(SendResult::Acknowledged);
+        }
+
+        let turn = self
+            .provider
+            .start_turn(&thread_id, &self.profile, &msg)
+            .await
+            .map_err(map_provider_error)?;
+        inner.current_turn_id = Some(turn.turn_id.clone());
+        inner.status = SessionStatus::Running;
+        let _ =
+            self.events.send(SessionEvent::TurnStarted { provider_turn_id: turn.turn_id.clone() });
+        Ok(SendResult::Started { provider_turn_id: turn.turn_id })
     }
 }
 

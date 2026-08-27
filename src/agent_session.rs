@@ -40,11 +40,20 @@ impl TurnOutcome {
     }
 }
 
+/// Result returned synchronously by `send_user_msg`.
+#[derive(Debug, Clone)]
+pub enum SendResult {
+    /// A new turn was accepted; the value is the concrete provider turn id.
+    Started { provider_turn_id: String },
+    /// The message was accepted but does not create a new turn.
+    Acknowledged,
+}
+
 /// Lifecycle events that the core needs to react to.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
-    TurnStarted { turn_id: String },
-    TurnTerminal { turn_id: String, outcome: TurnOutcome },
+    TurnStarted { provider_turn_id: String },
+    TurnTerminal { provider_turn_id: String, outcome: TurnOutcome },
     SessionReplaced { old_id: String, new_id: String },
     Failed { reason: String },
 }
@@ -60,8 +69,9 @@ pub enum SessionError {
 /// The core-facing Agent Session handle.
 ///
 /// Callers never inspect `status()` before sending; `send_user_msg` returns
-/// immediately and the adapter internally owns queuing, steering, and physical
-/// session replacement. The only asynchronous signal is `events()`.
+/// as soon as the adapter has accepted the message and the event stream carries
+/// asynchronous lifecycle changes. The adapter internally owns queuing,
+/// steering, and physical session replacement.
 #[async_trait::async_trait]
 pub trait AgentSession: Send + Sync {
     fn id(&self) -> &str;
@@ -69,13 +79,13 @@ pub trait AgentSession: Send + Sync {
     fn events(&self) -> broadcast::Receiver<SessionEvent>;
 
     /// Send a user message batch. The caller supplies the latest materialized
-    /// Context when it has one; the adapter decides whether a physical reset is
-    /// required. The returned handle is the logical session to use for the
-    /// next call (usually the same `Arc`).
+    /// context when it has one; the adapter decides whether a physical reset is
+    /// required. For new turns the concrete provider turn id is returned
+    /// synchronously so the caller can record it immediately.
     async fn send_user_msg(
         &self,
         msg: String,
         steering: bool,
         reset_context_to: Option<String>,
-    ) -> Result<(), SessionError>;
+    ) -> Result<SendResult, SessionError>;
 }

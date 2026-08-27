@@ -1,7 +1,11 @@
+use std::sync::Arc;
+
 use super::*;
+use crate::agent_session::{AgentSession, SendResult};
 use crate::runtime::provider::render_event_references;
 use crate::runtime::provider::{issue_system_prompt, pr_system_prompt, provider_error_lifecycle};
 use crate::runtime::reconcile::RunningAgentTurn;
+use crate::runtime::session_manager::SessionManager;
 
 pub(crate) fn policy_from_config(config: &Config) -> SchedulerPolicy {
     SchedulerPolicy {
@@ -10,11 +14,13 @@ pub(crate) fn policy_from_config(config: &Config) -> SchedulerPolicy {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_next_work_item_lifecycle(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
     provider: &dyn crate::provider::AgentProvider,
+    sessions: Arc<SessionManager>,
     profile: &Profile,
     policy: SchedulerPolicy,
     work_item_kind: &'static str,
@@ -37,7 +43,17 @@ pub(crate) async fn handle_next_work_item_lifecycle(
                     number = candidate.number,
                     "Agent Group entered finalization"
                 );
-                (true, start_next_agent_turn(store, provider, profile, work_item_kind).await)
+                (
+                    true,
+                    start_next_agent_turn(
+                        store,
+                        provider,
+                        Arc::clone(&sessions),
+                        profile,
+                        work_item_kind,
+                    )
+                    .await,
+                )
             }
             Ok(false) => (true, None),
             Err(error) => {
@@ -416,6 +432,7 @@ pub(crate) async fn materialize_next_issue_assignment(
 pub(crate) async fn start_next_agent_turn(
     store: &StoreActor,
     provider: &dyn crate::provider::AgentProvider,
+    sessions: Arc<SessionManager>,
     profile: &Profile,
     work_item_kind: &str,
 ) -> Option<RunningAgentTurn> {
@@ -427,21 +444,52 @@ pub(crate) async fn start_next_agent_turn(
         }
     }?;
     let reference = render_event_references(&claim);
-    let turn = match provider.start_turn(&claim.provider_session_id, profile, &reference).await {
-        Ok(turn) => turn,
-        Err(error) => {
-            let lifecycle = provider_error_lifecycle(&error);
-            let _ = store.mark_turn_terminal(claim.turn_id.clone(), lifecycle.into());
-            if claim.trusted_mention && lifecycle == "failed" {
-                let _ = store.enqueue_turn_reaction(claim.turn_id, "confused".into());
+
+    // Prefer the wrapped AgentSession when one has been materialized.
+    let provider_turn_id = match sessions.get(&claim.provider_session_id).await {
+        Some(session) => match session.send_user_msg(reference, false, None).await {
+            Ok(SendResult::Started { provider_turn_id }) => provider_turn_id,
+            Ok(SendResult::Acknowledged) => {
+                tracing::error!(turn = %claim.turn_id, "AgentSession did not start a turn");
+                let _ = store.mark_turn_terminal(claim.turn_id.clone(), "failed".into());
+                return None;
             }
-            tracing::error!(%error, "cannot start provider turn");
-            return None;
+            Err(error) => {
+                let lifecycle = match error {
+                    crate::agent_session::SessionError::Unavailable => "unknown".into(),
+                    crate::agent_session::SessionError::Failed(_) => provider_error_lifecycle(
+                        &crate::provider::ProviderError::Protocol(error.to_string()),
+                    )
+                    .to_string(),
+                };
+                let _ = store.mark_turn_terminal(claim.turn_id.clone(), lifecycle.clone());
+                if claim.trusted_mention && lifecycle == "failed" {
+                    let _ = store.enqueue_turn_reaction(claim.turn_id, "confused".into());
+                }
+                tracing::error!(%error, "cannot send user message through AgentSession");
+                return None;
+            }
+        },
+        None => {
+            // Fallback to the bare provider primitive until all callers
+            // populate the SessionManager.
+            match provider.start_turn(&claim.provider_session_id, profile, &reference).await {
+                Ok(turn) => turn.turn_id,
+                Err(error) => {
+                    let lifecycle = provider_error_lifecycle(&error);
+                    let _ = store.mark_turn_terminal(claim.turn_id.clone(), lifecycle.into());
+                    if claim.trusted_mention && lifecycle == "failed" {
+                        let _ = store.enqueue_turn_reaction(claim.turn_id, "confused".into());
+                    }
+                    tracing::error!(%error, "cannot start provider turn");
+                    return None;
+                }
+            }
         }
     };
-    if let Err(error) = store.mark_turn_started(claim.turn_id.clone(), turn.turn_id.clone()) {
+    if let Err(error) = store.mark_turn_started(claim.turn_id.clone(), provider_turn_id.clone()) {
         tracing::error!(%error, "cannot record provider turn start");
-        let _ = provider.interrupt(&claim.provider_session_id, &turn.turn_id).await;
+        let _ = provider.interrupt(&claim.provider_session_id, &provider_turn_id).await;
         return None;
     }
     if claim.trusted_mention
@@ -449,7 +497,7 @@ pub(crate) async fn start_next_agent_turn(
     {
         tracing::error!(%error, "cannot enqueue trusted-mention start reaction");
     }
-    Some(RunningAgentTurn { claim, provider_turn_id: turn.turn_id, reset_id: None })
+    Some(RunningAgentTurn { claim, provider_turn_id, reset_id: None })
 }
 
 pub(crate) async fn materialize_issue_assignment(

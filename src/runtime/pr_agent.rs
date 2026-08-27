@@ -73,6 +73,7 @@ pub(crate) async fn pr_agent_worker(
                 &github,
                 &config,
                 &provider,
+                Arc::clone(&sessions),
                 &profile,
                 &profile_record,
                 &health,
@@ -110,6 +111,7 @@ pub(crate) async fn drive_pr_agent_connection(
     github: &GitHubClient,
     config: &Config,
     provider: &dyn crate::provider::AgentProvider,
+    sessions: Arc<crate::runtime::session_manager::SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
     health: &RwLock<HealthSnapshot>,
@@ -158,6 +160,7 @@ pub(crate) async fn drive_pr_agent_connection(
                     github,
                     config,
                     provider,
+                    Arc::clone(&sessions),
                     profile,
                     policy_from_config(config),
                     "pr",
@@ -176,7 +179,7 @@ pub(crate) async fn drive_pr_agent_connection(
                 Box::pin(materialize_next_pr_assignment(
                     store, github, config, provider, profile, profile_record,
                 )).await;
-                running = start_next_agent_turn(store, provider, profile, "pr").await;
+                running = start_next_agent_turn(store, provider, Arc::clone(&sessions), profile, "pr").await;
             }
         }
     }
@@ -480,6 +483,7 @@ pub(crate) async fn drive_issue_agent_connection(
     github: &GitHubClient,
     config: &Config,
     provider: &dyn crate::provider::AgentProvider,
+    sessions: Arc<crate::runtime::session_manager::SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
     health: &RwLock<HealthSnapshot>,
@@ -528,6 +532,7 @@ pub(crate) async fn drive_issue_agent_connection(
                     github,
                     config,
                     provider,
+                    Arc::clone(&sessions),
                     profile,
                     policy_from_config(config),
                     "issue",
@@ -546,7 +551,7 @@ pub(crate) async fn drive_issue_agent_connection(
                 materialize_next_issue_assignment(
                     store, github, config, provider, profile, profile_record,
                 ).await;
-                running = start_next_agent_turn(store, provider, profile, "issue").await;
+                running = start_next_agent_turn(store, provider, Arc::clone(&sessions), profile, "issue").await;
             }
         }
     }
