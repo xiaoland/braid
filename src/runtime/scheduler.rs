@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::agent_session::{AgentSession, SendResult};
+use crate::agent_session::SendResult;
 use crate::runtime::provider::render_event_references;
 use crate::runtime::provider::{issue_system_prompt, pr_system_prompt, provider_error_lifecycle};
 use crate::runtime::reconcile::RunningAgentTurn;
