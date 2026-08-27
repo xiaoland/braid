@@ -14,10 +14,13 @@ One worker = one folder:
   config.toml      # was braid-of-<owner>.toml
   secrets.toml     # mode 0600
   braid.db         # SQLite local state
-  runtimes/        # managed agent runtime installs
   worktrees/       # PR implementation worktrees
   logs/            # runtime / tunnel logs
 ```
+
+- Runtimes are **not** stored here: Braid never installs runtimes (see
+  `03-runtime-registry.md`); `executable_path` / `api_url` point wherever the
+  user installed them.
 
 - CLI: `braid serve --worker <name>` (and `setup --worker <name>`) replaces
   `--config <path>` as the primary entry; `--config` stays as a low-level

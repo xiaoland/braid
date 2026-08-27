@@ -5,37 +5,43 @@
 - **Adapter**: Braid-internal protocol implementation (e.g. the codex-app-server
   adapter, the pi adapter). It ships inside the Braid binary and is never
   downloaded.
-- **Agent Runtime**: the external executable/SDK the adapter drives (Codex
-  app-server, Pi). Runtimes are managed by the registry.
+- **Agent Runtime**: the external executable/SDK or HTTP service the adapter
+  drives (Codex app-server, Pi, a deepseek-harness endpoint). Runtimes are
+  declared in the registry but **never auto-installed**.
 
 ## Goal
 
-Define how Braid declares and manages agent runtime executables.
+Define how Braid declares, discovers, and connects to agent runtimes.
+
+## Design Principle
+
+**Never modify the user's machine without explicit authorization.** Braid does
+not install runtimes itself. It discovers what exists, prints exact install
+commands when nothing is found, and lets the user execute them.
 
 ## Agreed Direction
 
-- Profiles reference an adapter/runtime by id (e.g., `adapter = "codex-app-server"`).
-- Runtime registry defines:
-  - `type`: protocol/adapter identifier
-  - `version`: pinned version for contract compatibility
-  - `download_url` / checksum / executable path
-  - isolated installation directory inside the worker folder so Braid can manage
-    the binary without polluting the user environment
-- Version pin helps Braid avoid contract drift and enables reproducible installs.
-
-## Decisions
-
-1. Registry scope: per worker folder (see `05-worker-layout.md`). Each worker
-   pins its own runtime versions without affecting others.
-2. Install trigger: `braid setup` asks the user to pick a default agent runtime,
-   creates a default agent profile referencing it, and installs that runtime on
-   demand. `braid serve` verifies pinned runtimes are present and installs any
-   missing ones before starting. A dedicated `braid runtime install` command can
-   be added later.
-3. Adapter capabilities are declared by the adapter implementation itself
-   (compiled into Braid), not by the runtime registry. Profiles do not configure
-   capabilities; they only reference the adapter id.
+- Profiles reference an adapter by id (e.g., `adapter = "codex-app-server"`).
+- Each adapter ships with Braid and provides:
+  - a **discovery probe** (find candidate runtimes on the machine, e.g. Codex
+    CLI's bundled `codex app-server`, `pi` on PATH/pnpm bin);
+  - an **install instruction** (pnpm preferred, npm fallback) printed when
+    discovery finds nothing;
+  - a **connection verifier** (version/schema handshake; `protocol.rs` already
+    does this for Codex).
+- Runtime registry entry (per worker, in `config.toml`):
+  - `id`, `adapter` (adapter id), `version` (informational pin);
+  - connection config — exactly one of:
+    - `executable_path` (+ adapter-specific extras like `home`, schema pins);
+    - `api_url` (HTTP endpoint, e.g. deepseek-harness);
+  - Braid never writes this entry by itself beyond what `braid setup` persists
+    after explicit user selection.
+- `braid setup` flow: run discovery probes → list candidates → user selects
+  one → verify connection → persist. If discovery is empty, print the
+  adapter's install command and exit with instructions.
+- `braid serve` / `braid doctor` verify the configured runtime is reachable;
+  they report, never install.
 
 ## Pending Decision
 
-None; implement registry schema and setup/serve integration in code.
+None.
