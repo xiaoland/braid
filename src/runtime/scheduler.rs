@@ -19,8 +19,8 @@ pub(crate) async fn handle_next_work_item_lifecycle(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &dyn crate::provider::AgentProvider,
-    sessions: Arc<SessionManager>,
+    provider: Arc<dyn crate::provider::AgentProvider>,
+    sessions: Arc<crate::runtime::session_manager::SessionManager>,
     profile: &Profile,
     policy: SchedulerPolicy,
     work_item_kind: &'static str,
@@ -47,7 +47,7 @@ pub(crate) async fn handle_next_work_item_lifecycle(
                     true,
                     start_next_agent_turn(
                         store,
-                        provider,
+                        &provider,
                         Arc::clone(&sessions),
                         profile,
                         work_item_kind,
@@ -63,7 +63,14 @@ pub(crate) async fn handle_next_work_item_lifecycle(
         },
         "reopened" => {
             if let Err(error) = Box::pin(reactivate_work_item_agent(
-                store, github, config, provider, profile, policy, candidate,
+                store,
+                github,
+                config,
+                Arc::clone(&provider),
+                Arc::clone(&sessions),
+                profile,
+                policy,
+                candidate,
             ))
             .await
             {
@@ -81,11 +88,13 @@ pub(crate) async fn handle_next_work_item_lifecycle(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reactivate_work_item_agent(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &dyn crate::provider::AgentProvider,
+    provider: Arc<dyn crate::provider::AgentProvider>,
+    sessions: Arc<crate::runtime::session_manager::SessionManager>,
     profile: &Profile,
     policy: SchedulerPolicy,
     candidate: WorkItemLifecycleCandidate,
@@ -167,6 +176,16 @@ pub(crate) async fn reactivate_work_item_agent(
             rendered.text
         );
         provider.inject_context(&session.thread_id, &context).await?;
+        sessions
+            .start(
+                session.thread_id.clone(),
+                Arc::clone(&provider),
+                effective_profile.clone(),
+                instructions.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .ok();
         Ok::<_, anyhow::Error>((session, rendered, instruction_revision))
     })
     .await;
@@ -249,7 +268,8 @@ pub(crate) async fn materialize_next_context_reset(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &dyn crate::provider::AgentProvider,
+    provider: Arc<dyn crate::provider::AgentProvider>,
+    sessions: Arc<crate::runtime::session_manager::SessionManager>,
     profile: &Profile,
     work_item_kind: &str,
 ) -> bool {
@@ -272,8 +292,16 @@ pub(crate) async fn materialize_next_context_reset(
     let Some(reset) = reset else { return false };
     let reset_id = reset.reset_id.clone();
     let assignment_id = reset.assignment_id.clone();
-    if let Err(error) =
-        Box::pin(materialize_context_reset(store, github, config, provider, profile, reset)).await
+    if let Err(error) = Box::pin(materialize_context_reset(
+        store,
+        github,
+        config,
+        Arc::clone(&provider),
+        Arc::clone(&sessions),
+        profile,
+        reset,
+    ))
+    .await
     {
         if !is_context_too_large(&error)
             && let Err(status_error) =
@@ -293,7 +321,8 @@ pub(crate) async fn materialize_context_reset(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &dyn crate::provider::AgentProvider,
+    provider: Arc<dyn crate::provider::AgentProvider>,
+    sessions: Arc<crate::runtime::session_manager::SessionManager>,
     profile: &Profile,
     reset: ContextResetClaim,
 ) -> Result<()> {
@@ -352,6 +381,16 @@ pub(crate) async fn materialize_context_reset(
         rendered.text
     );
     provider.inject_context(&session.thread_id, &context).await?;
+    sessions
+        .start(
+            session.thread_id.clone(),
+            Arc::clone(&provider),
+            effective_profile.clone(),
+            instructions.clone(),
+            Some(context.clone()),
+        )
+        .await
+        .ok();
     store.complete_context_reset(
         reset.reset_id.clone(),
         session.thread_id.clone(),
@@ -402,7 +441,8 @@ pub(crate) async fn materialize_next_issue_assignment(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &dyn crate::provider::AgentProvider,
+    provider: Arc<dyn crate::provider::AgentProvider>,
+    sessions: Arc<crate::runtime::session_manager::SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
 ) {
@@ -418,7 +458,8 @@ pub(crate) async fn materialize_next_issue_assignment(
         store,
         github,
         config,
-        provider,
+        Arc::clone(&provider),
+        Arc::clone(&sessions),
         profile,
         profile_record,
         candidate,
@@ -500,11 +541,13 @@ pub(crate) async fn start_next_agent_turn(
     Some(RunningAgentTurn { claim, provider_turn_id, reset_id: None })
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn materialize_issue_assignment(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &dyn crate::provider::AgentProvider,
+    provider: Arc<dyn crate::provider::AgentProvider>,
+    sessions: Arc<crate::runtime::session_manager::SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
     candidate: AssignmentCandidate,
@@ -569,6 +612,16 @@ pub(crate) async fn materialize_issue_assignment(
             rendered.text
         );
         provider.inject_context(&session.thread_id, &context).await?;
+        sessions
+            .start(
+                session.thread_id.clone(),
+                Arc::clone(&provider),
+                profile.clone(),
+                instructions.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .ok();
         Ok::<_, ProviderError>(session)
     }
     .await;

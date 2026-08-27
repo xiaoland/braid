@@ -72,7 +72,7 @@ pub(crate) async fn pr_agent_worker(
                 &store,
                 &github,
                 &config,
-                &provider,
+                Arc::clone(&provider),
                 Arc::clone(&sessions),
                 &profile,
                 &profile_record,
@@ -110,7 +110,7 @@ pub(crate) async fn drive_pr_agent_connection(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &dyn crate::provider::AgentProvider,
+    provider: Arc<dyn crate::provider::AgentProvider>,
     sessions: Arc<crate::runtime::session_manager::SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
@@ -149,9 +149,9 @@ pub(crate) async fn drive_pr_agent_connection(
             }
             _ = tick.tick() => {
                 if let Some(active) = &mut running {
-                    begin_active_context_reset(store, provider, active).await;
+                    begin_active_context_reset(store, &provider, active).await;
                     if active.reset_id.is_none() {
-                        forward_urgent_steer(store, provider, active).await;
+                        forward_urgent_steer(store, &provider, active).await;
                     }
                     continue;
                 }
@@ -159,7 +159,7 @@ pub(crate) async fn drive_pr_agent_connection(
                     store,
                     github,
                     config,
-                    provider,
+                    Arc::clone(&provider),
                     Arc::clone(&sessions),
                     profile,
                     policy_from_config(config),
@@ -170,16 +170,16 @@ pub(crate) async fn drive_pr_agent_connection(
                     continue;
                 }
                 if Box::pin(materialize_next_context_reset(
-                    store, github, config, provider, profile, "pr",
+                    store, github, config, Arc::clone(&provider), Arc::clone(&sessions), profile, "pr",
                 ))
                 .await
                 {
                     continue;
                 }
                 Box::pin(materialize_next_pr_assignment(
-                    store, github, config, provider, profile, profile_record,
+                    store, github, config, Arc::clone(&provider), Arc::clone(&sessions), profile, profile_record,
                 )).await;
-                running = start_next_agent_turn(store, provider, Arc::clone(&sessions), profile, "pr").await;
+                running = start_next_agent_turn(store, &*provider, Arc::clone(&sessions), profile, "pr").await;
             }
         }
     }
@@ -274,7 +274,8 @@ pub(crate) async fn materialize_next_pr_assignment(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &dyn crate::provider::AgentProvider,
+    provider: Arc<dyn crate::provider::AgentProvider>,
+    sessions: Arc<crate::runtime::session_manager::SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
 ) {
@@ -290,7 +291,8 @@ pub(crate) async fn materialize_next_pr_assignment(
         store,
         github,
         config,
-        provider,
+        Arc::clone(&provider),
+        Arc::clone(&sessions),
         profile,
         profile_record,
         candidate,
@@ -378,11 +380,13 @@ pub(crate) fn provision_pr_agent_worktree(
     Ok(effective_profile)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn materialize_pr_assignment(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &dyn crate::provider::AgentProvider,
+    provider: Arc<dyn crate::provider::AgentProvider>,
+    sessions: Arc<crate::runtime::session_manager::SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
     candidate: AssignmentCandidate,
@@ -443,6 +447,16 @@ pub(crate) async fn materialize_pr_assignment(
             prepared.rendered.text
         );
         provider.inject_context(&session.thread_id, &memory).await?;
+        sessions
+            .start(
+                session.thread_id.clone(),
+                Arc::clone(&provider),
+                effective_profile.clone(),
+                instructions.clone(),
+                Some(memory.clone()),
+            )
+            .await
+            .ok();
         Ok::<_, ProviderError>(session)
     }
     .await;
@@ -482,7 +496,7 @@ pub(crate) async fn drive_issue_agent_connection(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    provider: &dyn crate::provider::AgentProvider,
+    provider: Arc<dyn crate::provider::AgentProvider>,
     sessions: Arc<crate::runtime::session_manager::SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
@@ -521,9 +535,9 @@ pub(crate) async fn drive_issue_agent_connection(
             }
             _ = tick.tick() => {
                 if let Some(active) = &mut running {
-                    begin_active_context_reset(store, provider, active).await;
+                    begin_active_context_reset(store, &provider, active).await;
                     if active.reset_id.is_none() {
-                        forward_urgent_steer(store, provider, active).await;
+                        forward_urgent_steer(store, &provider, active).await;
                     }
                     continue;
                 }
@@ -531,7 +545,7 @@ pub(crate) async fn drive_issue_agent_connection(
                     store,
                     github,
                     config,
-                    provider,
+                    Arc::clone(&provider),
                     Arc::clone(&sessions),
                     profile,
                     policy_from_config(config),
@@ -542,16 +556,16 @@ pub(crate) async fn drive_issue_agent_connection(
                     continue;
                 }
                 if Box::pin(materialize_next_context_reset(
-                    store, github, config, provider, profile, "issue",
+                    store, github, config, Arc::clone(&provider), Arc::clone(&sessions), profile, "issue",
                 ))
                 .await
                 {
                     continue;
                 }
                 materialize_next_issue_assignment(
-                    store, github, config, provider, profile, profile_record,
+                    store, github, config, Arc::clone(&provider), Arc::clone(&sessions), profile, profile_record,
                 ).await;
-                running = start_next_agent_turn(store, provider, Arc::clone(&sessions), profile, "issue").await;
+                running = start_next_agent_turn(store, &*provider, Arc::clone(&sessions), profile, "issue").await;
             }
         }
     }
