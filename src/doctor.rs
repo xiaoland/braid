@@ -67,54 +67,61 @@ pub async fn run(config: &Config) -> DoctorReport {
         }
     });
 
-    checks.push(match config.provider.codex.as_ref() {
-        Some(codex) => match inspect_codex(codex).await {
-            Ok(identity) => match verify_identity(&identity, codex) {
-                Ok(()) => Check {
-                    name: "Codex app-server".into(),
-                    state: CheckState::Pass,
-                    detail: identity.version,
-                },
-                Err(error) => Check {
-                    name: "Codex app-server".into(),
-                    state: CheckState::Fail,
-                    detail: format!(
-                        "{error}; actual version={}, stable={}, experimental={}",
-                        identity.version,
-                        identity.stable_schema_sha256,
-                        identity.experimental_schema_sha256
-                    ),
-                },
-            },
-            Err(error) => Check {
-                name: "Codex app-server".into(),
-                state: CheckState::Fail,
-                detail: error.to_string(),
-            },
-        },
-        None => Check {
-            name: "Codex app-server".into(),
-            state: CheckState::Pass,
-            detail: "not configured".into(),
-        },
-    });
-
-    if let Some(pi) = config.provider.pi.as_ref() {
-        checks.push(match command_version("Pi CLI", &pi.executable).await {
-            check if check.state == CheckState::Pass => match config.pi_api_key() {
-                Ok(_) => Check {
-                    name: "Pi provider".into(),
-                    state: CheckState::Pass,
-                    detail: format!("{} (API key present)", check.detail),
-                },
-                Err(error) => Check {
-                    name: "Pi provider".into(),
-                    state: CheckState::Fail,
-                    detail: format!("{}; {}", check.detail, error),
-                },
-            },
-            check => Check { name: "Pi provider".into(), state: check.state, detail: check.detail },
-        });
+    match config.provider_config() {
+        Ok(provider_config) => {
+            if let Some(codex) = provider_config.codex {
+                checks.push(match inspect_codex(&codex).await {
+                    Ok(identity) => match verify_identity(&identity, &codex) {
+                        Ok(()) => Check {
+                            name: "Codex app-server".into(),
+                            state: CheckState::Pass,
+                            detail: identity.version,
+                        },
+                        Err(error) => Check {
+                            name: "Codex app-server".into(),
+                            state: CheckState::Fail,
+                            detail: format!(
+                                "{error}; actual version={}, stable={}, experimental={}",
+                                identity.version,
+                                identity.stable_schema_sha256,
+                                identity.experimental_schema_sha256
+                            ),
+                        },
+                    },
+                    Err(error) => Check {
+                        name: "Codex app-server".into(),
+                        state: CheckState::Fail,
+                        detail: error.to_string(),
+                    },
+                });
+            }
+            if let Some(pi) = provider_config.pi {
+                checks.push(match command_version("Pi CLI", &pi.executable).await {
+                    check if check.state == CheckState::Pass => match pi.api_key() {
+                        Ok(_) => Check {
+                            name: "Pi provider".into(),
+                            state: CheckState::Pass,
+                            detail: format!("{} (API key present)", check.detail),
+                        },
+                        Err(error) => Check {
+                            name: "Pi provider".into(),
+                            state: CheckState::Fail,
+                            detail: format!("{}; {}", check.detail, error),
+                        },
+                    },
+                    check => Check {
+                        name: "Pi provider".into(),
+                        state: check.state,
+                        detail: check.detail,
+                    },
+                });
+            }
+        }
+        Err(error) => checks.push(Check {
+            name: "runtime configuration".into(),
+            state: CheckState::Fail,
+            detail: error.to_string(),
+        }),
     }
 
     for (name, executable) in [

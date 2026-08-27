@@ -108,7 +108,7 @@ pub(crate) fn materialized_profile(profile: &Profile) -> Result<ProfileRecord> {
         profile_id: profile.id.clone(),
         revision,
         effective_digest: digest,
-        provider_kind: profile.provider.clone(),
+        provider_kind: profile.adapter_type.clone(),
         tags: serde_json::to_string(&profile.tags)?,
     })
 }

@@ -28,6 +28,13 @@ pub(crate) async fn pr_agent_worker(
             return;
         }
     };
+    let provider_config = match config.provider_config() {
+        Ok(config) => config,
+        Err(error) => {
+            set_provider_unavailable(&health, &error.to_string()).await;
+            return;
+        }
+    };
     let profile_record = match materialized_profile(&profile) {
         Ok(profile) => profile,
         Err(error) => {
@@ -72,7 +79,7 @@ pub(crate) async fn pr_agent_worker(
         loop {
             tokio::select! {
                 _ = shutdown.changed() => return,
-                result = crate::provider::connect_provider(&config.provider) => {
+                result = crate::provider::connect_provider(&provider_config) => {
                     match result {
                         Ok(connected) => {
                             provider = connected;

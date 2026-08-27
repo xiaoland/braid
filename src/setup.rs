@@ -25,10 +25,10 @@ use crate::cli::SetupArguments;
 mod logo;
 
 use crate::config::{
-    CONFIG_SCHEMA_VERSION, CodexConfig, Config, GitHubConfig, LogFormat, PiConfig, Profile,
-    ProfileSelection, ProviderConfig, RuntimeConfig, SchedulerConfig, ServerConfig,
-    TelemetryConfig, ToolConfig,
+    CONFIG_SCHEMA_VERSION, Config, GitHubConfig, LogFormat, Profile, ProfileSelection,
+    RuntimeConfig, RuntimeEntry, SchedulerConfig, ServerConfig, TelemetryConfig, ToolConfig,
 };
+use crate::config::{LlmAllowance, LlmModel, LlmProvider};
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -379,39 +379,53 @@ fn pi_executable_path() -> String {
     if Path::new(candidate).is_file() { candidate.to_owned() } else { "pi".to_owned() }
 }
 
-fn build_provider_config(
-    arguments: &SetupArguments,
-    secrets_file: &Path,
-    base_dir: &Path,
-) -> ProviderConfig {
+fn build_runtime_entry(arguments: &SetupArguments, base_dir: &Path) -> RuntimeEntry {
     if arguments.provider == "codex" {
-        ProviderConfig {
-            codex: Some(CodexConfig {
-                executable: PathBuf::from(
-                    "/Users/lanzhijiang/.braid/codex-pkg/node_modules/.bin/codex",
-                ),
-                home: base_dir.join("provider"),
-                version: "codex-cli 0.147.0-alpha.6.5".to_owned(),
-                stable_schema_sha256:
-                    "7d79fe309dd7520843459070f3884ecf0e39cee2620c1c49aad6efb4eca76ecb".to_owned(),
-                experimental_schema_sha256:
-                    "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b5364439063a5c8".to_owned(),
-            }),
-            pi: None,
+        RuntimeEntry {
+            adapter_type: "codex".to_owned(),
+            version: "codex-cli 0.147.0-alpha.6.5".to_owned(),
+            executable: PathBuf::from(
+                "/Users/lanzhijiang/.braid/codex-pkg/node_modules/.bin/codex",
+            ),
+            api_url: None,
+            home: Some(base_dir.join("provider")),
+            stable_schema_sha256: Some(
+                "7d79fe309dd7520843459070f3884ecf0e39cee2620c1c49aad6efb4eca76ecb".to_owned(),
+            ),
+            experimental_schema_sha256: Some(
+                "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b5364439063a5c8".to_owned(),
+            ),
         }
     } else {
-        ProviderConfig {
-            codex: None,
-            pi: Some(PiConfig {
-                executable: PathBuf::from(pi_executable_path()),
-                provider: Some("deepseek".to_owned()),
-                model: Some(arguments.model.clone()),
-                api_key_environment: Some(arguments.api_key_environment.clone()),
-                api_key_file: Some(secrets_file.to_path_buf()),
-                thinking: Some("high".to_owned()),
-                home: Some(base_dir.join("pi")),
-            }),
+        RuntimeEntry {
+            adapter_type: "pi".to_owned(),
+            version: "0.84.3".to_owned(),
+            executable: PathBuf::from(pi_executable_path()),
+            api_url: None,
+            home: Some(base_dir.join("pi")),
+            stable_schema_sha256: None,
+            experimental_schema_sha256: None,
         }
+    }
+}
+
+fn build_llm_provider(arguments: &SetupArguments, secrets_file: &Path) -> LlmProvider {
+    LlmProvider {
+        id: "deepseek".to_owned(),
+        protocol: "openai-compatible".to_owned(),
+        api_key_environment: Some(arguments.api_key_environment.clone()),
+        api_key_file: Some(secrets_file.to_path_buf()),
+        models: vec![LlmModel {
+            model_id: arguments.model.clone(),
+            input_cost: 0.0,
+            output_cost: 0.0,
+            cache_input_cost: 0.0,
+        }],
+        allowances: vec![LlmAllowance {
+            since: "2026-01-01".to_owned(),
+            until: "2027-01-01".to_owned(),
+            amount: 0.0,
+        }],
     }
 }
 
@@ -445,7 +459,8 @@ fn build_config(
             event_threshold: 8,
             reconciliation_seconds: 60,
         },
-        provider: build_provider_config(arguments, secrets_file, base_dir),
+        runtimes: vec![build_runtime_entry(arguments, base_dir)],
+        llm_providers: vec![build_llm_provider(arguments, secrets_file)],
         tools: ToolConfig {
             git: PathBuf::from(tool_path("git", "/usr/bin/git")),
             gh: PathBuf::from(tool_path("gh", "/opt/homebrew/bin/gh")),
@@ -467,7 +482,13 @@ fn build_config(
             id: "default".to_owned(),
             display_name: "Braid Agent".to_owned(),
             tags: vec!["issue".to_owned(), "pr".to_owned()],
-            provider: arguments.provider.clone(),
+            adapter_type: arguments.provider.clone(),
+            adapter_version: if arguments.provider == "codex" {
+                "codex-cli 0.147.0-alpha.6.5".to_owned()
+            } else {
+                "0.84.3".to_owned()
+            },
+            provider: "deepseek".to_owned(),
             model: Some(arguments.model.clone()),
             reasoning: Some("high".to_owned()),
             user_instructions: "You are Braid, a helpful coding assistant. Work from the supplied GitHub Context, publish concise public comments, and keep descriptions and implementation state current.".to_owned(),
@@ -525,7 +546,9 @@ mod tests {
         .expect("config should build");
         let text = toml::to_string(&config).expect("config should serialize");
         let parsed: Config = toml::from_str(&text).expect("serialized config should parse");
-        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(parsed.schema_version, 2);
+        assert!(!parsed.runtimes.is_empty());
+        assert!(!parsed.llm_providers.is_empty());
         assert!(!parsed.profiles.is_empty());
         assert_eq!(parsed.profile_selection.default_pr_profile, "default");
     }
@@ -547,7 +570,9 @@ mod tests {
         .expect("codex config should build");
         let text = toml::to_string(&config).expect("config should serialize");
         let parsed: Config = toml::from_str(&text).expect("serialized codex config should parse");
-        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(parsed.schema_version, 2);
+        assert!(!parsed.runtimes.is_empty());
+        assert!(!parsed.llm_providers.is_empty());
         assert!(!parsed.profiles.is_empty());
     }
 }
