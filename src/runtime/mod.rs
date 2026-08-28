@@ -14,9 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tokio::{
     net::TcpListener,
     sync::{RwLock, watch},
@@ -32,7 +30,7 @@ use crate::{
         RenderedContext,
     },
     github::{
-        AppWebhookConfig, CreatedIssueComment, GitHubClient, RepositoryName, WorkItemLocator,
+        CreatedIssueComment, GitHubClient, RepositoryName, WorkItemLocator,
     },
     provider::{ProviderError, ProviderNotification, connect_provider},
     store::{
@@ -41,8 +39,6 @@ use crate::{
         WorkItemLifecycleCandidate,
     },
     telemetry::{self, PayloadEvidence, TelemetryGuard},
-    tunnel::QuickTunnel,
-    webhook::{self, WebhookHeaders},
     worktree::{self, WorktreeRequest},
 };
 
@@ -54,9 +50,6 @@ mod provider;
 mod reconcile;
 mod scheduler;
 pub mod session_manager;
-mod tunnel;
-
-pub use tunnel::probe_public_webhook;
 
 use crate::runtime::ingress::{event_worker, webhook_handler};
 use crate::runtime::issue_agent::issue_agent_worker;
@@ -64,9 +57,8 @@ use crate::runtime::outbox::drain_one_write;
 use crate::runtime::pr_agent::pr_agent_worker;
 use crate::runtime::provider::agent_attributions;
 use crate::runtime::reconcile::{lease_worker, reconciliation_worker};
-use crate::runtime::tunnel::{restore_webhook, start_verified_quick_tunnel};
+use crate::tunnel::{restore_webhook, start_verified_quick_tunnel};
 
-type HmacSha256 = Hmac<Sha256>;
 const LEASE_TTL_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize)]

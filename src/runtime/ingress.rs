@@ -1,5 +1,6 @@
 use super::*;
 use crate::runtime::outbox::drain_one_write;
+use crate::webhook::{self, WebhookHeaders};
 
 pub(crate) async fn webhook_handler(
     State(state): State<Arc<IngressState>>,

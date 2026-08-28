@@ -46,7 +46,7 @@ pub fn print_migration_result(result: &MigrationResult) {
 
 pub async fn tunnel_probe(arguments: TunnelProbe) -> Result<()> {
     let config = load(&arguments.config)?;
-    crate::runtime::probe_public_webhook(&config, &arguments.url).await?;
+    crate::tunnel::probe_public_webhook(&config, &arguments.url).await?;
     println!("public webhook probe: accepted");
     Ok(())
 }

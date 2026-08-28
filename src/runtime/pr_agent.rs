@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use super::*;
 use crate::runtime::provider::{
     materialized_profile, operational_status_unknown_profile, pr_system_prompt,
