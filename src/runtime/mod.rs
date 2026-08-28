@@ -108,7 +108,7 @@ impl Drop for RuntimeLeaseGuard {
 
 #[allow(clippy::too_many_lines)]
 pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -> Result<()> {
-    let telemetry = TelemetryGuard::install(&config.telemetry)?;
+    let telemetry = TelemetryGuard::install(&config.telemetry, config.instance_key())?;
     let store = Arc::new(StoreActor::start(
         config.runtime.database().to_path_buf(),
         config.runtime.backups().to_path_buf(),

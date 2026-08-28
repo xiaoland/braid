@@ -348,6 +348,7 @@ struct PullRequestEnsureResult<'a> {
 struct LocalStatus<'a> {
     binary_version: &'static str,
     config_schema: u32,
+    instance_key: &'a str,
     repository: &'a str,
     default_pr_profile: &'a str,
     database: StoreStatus,

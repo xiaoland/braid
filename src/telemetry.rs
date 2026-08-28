@@ -63,7 +63,7 @@ pub struct TelemetryGuard {
 }
 
 impl TelemetryGuard {
-    pub fn install(config: &TelemetryConfig) -> Result<Self, TelemetryError> {
+    pub fn install(config: &TelemetryConfig, instance_key: &str) -> Result<Self, TelemetryError> {
         let endpoint = config.endpoint.as_str().trim_end_matches('/').to_owned();
         let trace_endpoint = format!("{endpoint}/v1/traces");
         let metric_endpoint = format!("{endpoint}/v1/metrics");
@@ -72,6 +72,7 @@ impl TelemetryGuard {
         let resource = Resource::builder()
             .with_service_name(config.service_name.clone())
             .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
+            .with_attribute(KeyValue::new("service.instance.id", instance_key.to_owned()))
             .build();
 
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -186,7 +187,7 @@ pub fn emit_payload_event(evidence: &PayloadEvidence<'_>) -> bool {
 }
 
 pub fn run_probe(config: &TelemetryConfig, marker: &str) -> Result<ProbeResult, TelemetryError> {
-    let telemetry = TelemetryGuard::install(config)?;
+    let telemetry = TelemetryGuard::install(config, "probe")?;
     let root = tracing::info_span!("braid.telemetry.probe", marker);
     let sampled = root.context().span().is_recording();
     let payload_emitted = {
