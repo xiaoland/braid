@@ -27,7 +27,8 @@ mod logo;
 
 use crate::config::{
     CONFIG_SCHEMA_VERSION, Config, GitHubConfig, LogFormat, Profile, ProfileSelection,
-    RuntimeConfig, RuntimeEntry, SchedulerConfig, ServerConfig, TelemetryConfig, ToolConfig,
+    ProviderSecretFile, RuntimeConfig, RuntimeEntry, SchedulerConfig, ServerConfig,
+    TelemetryConfig, ToolConfig,
 };
 use crate::config::{LlmAllowance, LlmModel, LlmProvider};
 use crate::home::{InstanceEntry, UserHome, allocate_server_ports, validate_instance_key};
@@ -158,16 +159,17 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     write_secret(&pem_path, app.pem.as_bytes())?;
 
     let secrets_path = base_dir.join("secrets.toml");
-    let api_key = provider_secret(&runtime.adapter_type, &arguments)?;
-    let secrets_toml =
-        format!("webhook_secret = {webhook_secret:?}\nprovider_api_key = {api_key:?}\n",);
-    write_secret(&secrets_path, secrets_toml.as_bytes())?;
+    let webhook_toml = format!("webhook_secret = {webhook_secret:?}\n");
+    write_secret(&secrets_path, webhook_toml.as_bytes())?;
+
+    let provider_secret_path =
+        write_provider_secret(&user_home, &runtime.adapter_type, &arguments.api_key_environment)?;
 
     let llm_provider = build_llm_provider(
         &runtime.adapter_type,
         &arguments.model,
         &arguments.api_key_environment,
-        &secrets_path,
+        &provider_secret_path,
     );
 
     let config_path = base_dir.join("config.toml");
@@ -200,7 +202,8 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     user_home.save_registry(&registry)?;
 
     println!("\nWrote configuration to: {}", config_path.display());
-    println!("Wrote secrets to: {}", secrets_path.display());
+    println!("Wrote instance secrets to: {}", secrets_path.display());
+    println!("Wrote provider secret to: {}", provider_secret_path.display());
     println!("\nNext, install the App on {}:\n{}\n", arguments.repository, install_url(&app.slug));
     println!(
         "Then run:\n  braid doctor --instance {instance_key}\n  braid serve --instance {instance_key} --tunnel\n"
@@ -452,23 +455,47 @@ async fn select_runtime(arguments: &SetupArguments) -> Result<RuntimeEntry> {
         .with_context(|| format!("cannot verify {} runtime", arguments.provider))
 }
 
-fn provider_secret(adapter_type: &str, arguments: &SetupArguments) -> Result<String> {
-    if adapter_type == "pi" {
-        return std::env::var(&arguments.api_key_environment).with_context(|| {
-            format!(
-                "provider API key environment variable {} must be set during setup",
-                arguments.api_key_environment
-            )
-        });
+fn provider_secret_path(user_home: &UserHome, adapter_type: &str) -> PathBuf {
+    let provider_id = if adapter_type == "codex" { "openai" } else { "deepseek" };
+    user_home.secrets_dir().join(format!("{provider_id}.toml"))
+}
+
+#[allow(clippy::collapsible_if)]
+fn write_provider_secret(
+    user_home: &UserHome,
+    adapter_type: &str,
+    api_key_environment: &str,
+) -> Result<PathBuf> {
+    let path = provider_secret_path(user_home, adapter_type);
+    if let Ok(text) = fs::read_to_string(&path) {
+        if let Ok(file) = toml::from_str::<ProviderSecretFile>(&text) {
+            if !file.provider_api_key.is_empty() {
+                return Ok(path);
+            }
+        }
     }
-    Ok(String::new())
+
+    let api_key = if adapter_type == "pi" {
+        std::env::var(api_key_environment).with_context(|| {
+            format!(
+                "provider API key environment variable {api_key_environment} must be set during setup, \
+                 or the user secret file {} must already contain provider_api_key",
+                path.display()
+            )
+        })?
+    } else {
+        std::env::var(api_key_environment).unwrap_or_default()
+    };
+    let toml = format!("provider_api_key = {api_key:?}\n");
+    write_secret(&path, toml.as_bytes())?;
+    Ok(path)
 }
 
 fn build_llm_provider(
     adapter_type: &str,
     model: &str,
     api_key_environment: &str,
-    secrets_file: &Path,
+    provider_secret_file: &Path,
 ) -> LlmProvider {
     let (id, protocol) = if adapter_type == "codex" {
         ("openai".to_owned(), "openai".to_owned())
@@ -479,7 +506,7 @@ fn build_llm_provider(
         id,
         protocol,
         api_key_environment: Some(api_key_environment.to_owned()),
-        api_key_file: Some(secrets_file.to_path_buf()),
+        api_key_file: Some(provider_secret_file.to_path_buf()),
         models: vec![LlmModel {
             model_id: model.to_owned(),
             input_cost: 0.0,
@@ -611,9 +638,11 @@ mod tests {
     fn generated_config_loads_for_pi() {
         let home = PathBuf::from("/tmp/braid-setup-test");
         fs::create_dir_all(&home).unwrap();
-        let secrets_path = home.join("braid-of-xiaoland.secrets.toml");
-        std::fs::write(&secrets_path, "webhook_secret = \"test\"\nprovider_api_key = \"key\"\n")
-            .unwrap();
+        let webhook_secret_path = home.join("secrets.toml");
+        std::fs::write(&webhook_secret_path, "webhook_secret = \"test\"\n").unwrap();
+        let provider_secret_path = home.join("secrets/deepseek.toml");
+        std::fs::create_dir_all(provider_secret_path.parent().unwrap()).unwrap();
+        std::fs::write(&provider_secret_path, "provider_api_key = \"key\"\n").unwrap();
         let runtime = RuntimeEntry {
             adapter_type: "pi".to_owned(),
             version: "0.84.3".to_owned(),
@@ -624,14 +653,14 @@ mod tests {
             experimental_schema_sha256: None,
         };
         let llm_provider =
-            build_llm_provider("pi", "deepseek-chat", "DEEPSEEK_API_KEY", &secrets_path);
+            build_llm_provider("pi", "deepseek-chat", "DEEPSEEK_API_KEY", &provider_secret_path);
         let config = build_config(
             &home,
             123_456,
             "xiaoland",
             &args("xiaoland/braid", "pi", "deepseek-chat"),
             &home.join("key.pem"),
-            &secrets_path,
+            &webhook_secret_path,
             runtime,
             llm_provider,
         )
@@ -649,9 +678,11 @@ mod tests {
     fn generated_config_loads_for_codex() {
         let home = PathBuf::from("/tmp/braid-setup-test");
         fs::create_dir_all(&home).unwrap();
-        let secrets_path = home.join("braid-of-xiaoland.secrets.toml");
-        std::fs::write(&secrets_path, "webhook_secret = \"test\"\nprovider_api_key = \"key\"\n")
-            .unwrap();
+        let webhook_secret_path = home.join("secrets.toml");
+        std::fs::write(&webhook_secret_path, "webhook_secret = \"test\"\n").unwrap();
+        let provider_secret_path = home.join("secrets/openai.toml");
+        std::fs::create_dir_all(provider_secret_path.parent().unwrap()).unwrap();
+        std::fs::write(&provider_secret_path, "provider_api_key = \"key\"\n").unwrap();
         let runtime = RuntimeEntry {
             adapter_type: "codex".to_owned(),
             version: "codex-cli 0.147.0-alpha.6.5".to_owned(),
@@ -665,14 +696,15 @@ mod tests {
                 "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b5364439063a5c8".to_owned(),
             ),
         };
-        let llm_provider = build_llm_provider("codex", "gpt-4o", "OPENAI_API_KEY", &secrets_path);
+        let llm_provider =
+            build_llm_provider("codex", "gpt-4o", "OPENAI_API_KEY", &provider_secret_path);
         let config = build_config(
             &home,
             123_456,
             "xiaoland",
             &args("xiaoland/braid", "codex", "gpt-4o"),
             &home.join("key.pem"),
-            &secrets_path,
+            &webhook_secret_path,
             runtime,
             llm_provider,
         )
