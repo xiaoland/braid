@@ -1,7 +1,8 @@
-use sha2::{Digest, Sha256};
+#![allow(clippy::wildcard_imports)]
 use super::*;
 use crate::runtime::provider::agent_attributions;
 use crate::webhook;
+use sha2::{Digest, Sha256};
 
 pub(crate) async fn lease_worker(
     store: Arc<StoreActor>,

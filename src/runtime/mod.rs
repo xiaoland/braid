@@ -29,9 +29,7 @@ use crate::{
         self, CanonicalContext, CanonicalObservation, ContextError, ContextPressure,
         RenderedContext,
     },
-    github::{
-        CreatedIssueComment, GitHubClient, RepositoryName, WorkItemLocator,
-    },
+    github::{CreatedIssueComment, GitHubClient, RepositoryName, WorkItemLocator},
     provider::{ProviderError, ProviderNotification, connect_provider},
     store::{
         AssignmentCandidate, CanonicalObjectState, ContextResetClaim, IngressEvent, ProfileRecord,
@@ -42,21 +40,20 @@ use crate::{
     worktree::{self, WorktreeRequest},
 };
 
-mod ingress;
-mod issue_agent;
-mod outbox;
-mod pr_agent;
+pub(crate) mod ingress;
+pub(crate) mod issue_agent;
+pub(crate) mod outbox;
+pub(crate) mod pr_agent;
 mod provider;
-mod reconcile;
-mod scheduler;
+pub(crate) mod reconcile;
+pub(crate) mod scheduler;
 pub mod session_manager;
 
-use crate::runtime::ingress::{event_worker, webhook_handler};
-use crate::runtime::issue_agent::issue_agent_worker;
-use crate::runtime::outbox::drain_one_write;
-use crate::runtime::pr_agent::pr_agent_worker;
+use crate::group::{issue_agent_worker, pr_agent_worker};
+use crate::producer::{event_worker, webhook_handler};
+use crate::producer::{lease_worker, reconciliation_worker};
+use crate::queue::drain_one_write;
 use crate::runtime::provider::agent_attributions;
-use crate::runtime::reconcile::{lease_worker, reconciliation_worker};
 use crate::tunnel::{restore_webhook, start_verified_quick_tunnel};
 
 const LEASE_TTL_SECONDS: u64 = 30;
@@ -73,26 +70,26 @@ pub struct HealthSnapshot {
     pub last_error: Option<String>,
 }
 
-struct IngressState {
-    store: Arc<StoreActor>,
-    policy: SchedulerPolicy,
-    repository: String,
-    handle: String,
-    app_actor_node_id: String,
-    app_actor_login: String,
-    agent_actor_node_ids: Vec<String>,
-    agent_attributions: Vec<String>,
-    webhook_secret: Arc<Vec<u8>>,
+pub(crate) struct IngressState {
+    pub(crate) store: Arc<StoreActor>,
+    pub(crate) policy: SchedulerPolicy,
+    pub(crate) repository: String,
+    pub(crate) handle: String,
+    pub(crate) app_actor_node_id: String,
+    pub(crate) app_actor_login: String,
+    pub(crate) agent_actor_node_ids: Vec<String>,
+    pub(crate) agent_attributions: Vec<String>,
+    pub(crate) webhook_secret: Arc<Vec<u8>>,
 }
 
-struct ReconcileScope {
-    work_item_node_id: String,
-    work_item_kind: &'static str,
-    work_item_number: u64,
-    work_item_state: String,
-    previous_work_item_state: String,
-    repository_node_id: String,
-    repository: String,
+pub(crate) struct ReconcileScope {
+    pub(crate) work_item_node_id: String,
+    pub(crate) work_item_kind: &'static str,
+    pub(crate) work_item_number: u64,
+    pub(crate) work_item_state: String,
+    pub(crate) previous_work_item_state: String,
+    pub(crate) repository_node_id: String,
+    pub(crate) repository: String,
 }
 
 struct RuntimeLeaseGuard {
@@ -203,7 +200,7 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     if provider_enabled {
         let provider = connect_provider(&config.default_provider_config()?).await?;
         health.write().await.provider = "connected";
-        let sessions = Arc::new(crate::runtime::session_manager::SessionManager::new());
+        let sessions = Arc::new(crate::group::SessionManager::new());
         workers.spawn(issue_agent_worker(
             Arc::clone(&store),
             Arc::clone(&github),

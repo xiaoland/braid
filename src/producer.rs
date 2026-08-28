@@ -1,7 +1,14 @@
-//! Event Producer: webhook/GraphQL ingress → canonical diff → classified events.
+//! Event Producer: webhook/GraphQL ingress -> canonical diff -> classified events.
 //!
-//! In this release the producer role is still implemented by `crate::webhook`
-//! and `crate::runtime::reconcile`; this module is the boundary placeholder.
-//!
-//! TODO: move classification and explicit routing into this module so the
-//! producer owns the Event Queue writes.
+//! The implementation currently lives in `crate::runtime`; this module provides
+//! the symmetric top-level boundary so callers use `crate::producer::*`.
+
+pub(crate) mod ingress {
+    pub(crate) use crate::runtime::ingress::*;
+}
+pub(crate) mod reconcile {
+    pub(crate) use crate::runtime::reconcile::*;
+}
+
+pub(crate) use ingress::{event_worker, webhook_handler};
+pub(crate) use reconcile::{lease_worker, reconciliation_worker};

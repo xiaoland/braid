@@ -1,10 +1,11 @@
-use sha2::{Digest, Sha256};
+#![allow(clippy::wildcard_imports)]
 use super::*;
 use crate::runtime::provider::{
     materialized_profile, operational_status_unknown_profile, pr_system_prompt,
     provider_error_lifecycle, set_provider_unavailable,
 };
 use crate::runtime::reconcile::RunningAgentTurn;
+use sha2::{Digest, Sha256};
 // pr_agent functions are defined in this module
 use crate::runtime::provider::issue_system_prompt;
 use crate::runtime::scheduler::materialize_next_issue_assignment;

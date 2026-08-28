@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_imports)]
 use super::*;
 
 pub(crate) async fn drain_one_write(store: &StoreActor, github: &GitHubClient) {

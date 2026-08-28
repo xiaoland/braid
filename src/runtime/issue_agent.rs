@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_imports)]
 use super::*;
 use crate::runtime::pr_agent::{drive_issue_agent_connection, resume_issue_provider_sessions};
 use crate::runtime::provider::{materialized_profile, set_provider_unavailable};
