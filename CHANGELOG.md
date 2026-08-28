@@ -7,6 +7,37 @@ Versioning once release artifacts are published.
 
 ### Added
 
+- User/instance namespace: one user root (`~/.braid` or `BRAID_USER_HOME`)
+  holds a `registry.toml`, optional user defaults, shared provider secrets, and
+  per-instance directories under `instances/<key>/`. This replaces the flat
+  per-owner files introduced in 0.2.3.
+- `src/home.rs` resolves the user root, loads the instance registry,
+  validates instance keys, allocates free loopback ingress/health port pairs,
+  and implements the config-path precedence chain.
+- `scripts/tests/05_instances.sh` exercises `--config`/`--instance`/
+  `BRAID_INSTANCE`/`BRAID_INSTANCE_HOME` resolution and the doctor's
+  cross-instance port-conflict check.
+
+### Changed
+
+- **Breaking**: `--worker` and `--home` are removed. Config-loading commands
+  now take `--config <PATH>` or `--instance <KEY>` (or `BRAID_INSTANCE`).
+  `braid setup` takes `--user-home <DIR>` and `--instance <KEY>`.
+- **Breaking**: Secrets are split. The instance `secrets.toml` holds only the
+  webhook secret; provider API keys live in `~/.braid/secrets/<provider>.toml`
+  and are referenced by path.
+- **Breaking**: The runtime default root is now `<config_dir>/state` and the
+  default database file is `state/braid.sqlite3`.
+- **Breaking**: Config schema v2 now requires an `[instance]` section with a
+  `key` and is the only supported config schema.
+- `braid doctor` loads the registry and reports duplicate or colliding
+  ingress/health ports across registered instances.
+- Telemetry now tags `service.instance.id` from the config instance key.
+- `braid status` prints the instance key.
+- Config TOML parse errors now include the dotted path to the offending key
+  via `serde_path_to_error`.
+- Clap `env` integration binds `BRAID_INSTANCE`, `BRAID_USER_HOME`, and the
+  setup `--instance` flag to their environment variables.
 - Worker layout: `braid setup/serve/doctor --worker <name>` resolves config,
   secrets, database, worktrees, and logs under `~/.braid/workers/<name>/`.
 - Config schema version 2 with `[[runtimes]]`, `[[llm_providers]]`, and profile
@@ -24,7 +55,7 @@ Versioning once release artifacts are published.
 ### Changed
 
 - **Breaking**: `schema_version` must be `2`; old v1 configs must be regenerated
-  by re-running `braid setup --worker <name>`.
+  by re-running `braid setup --instance <key>`.
 - `provider.codex` / `provider.pi` are replaced by `[[runtimes]]` entries.
 - `braid setup` discovers local runtimes, prints install instructions when none
   are found, and never auto-installs. Manual flags `--runtime-executable` and
