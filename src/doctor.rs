@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::{TcpStream, ToSocketAddrs},
     path::Path,
     process::Stdio,
@@ -11,6 +12,7 @@ use tokio::{process::Command, time::timeout};
 use crate::{
     config::Config,
     github::{GitHubClient, RepositoryName},
+    home::{self, UserHome},
     protocol::{inspect_codex, verify_identity},
     store::StoreActor,
 };
@@ -36,7 +38,7 @@ pub struct DoctorReport {
     pub checks: Vec<Check>,
 }
 
-pub async fn run(config: &Config) -> DoctorReport {
+pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
     let mut checks = vec![
         path_check("runtime root", config.runtime.root(), true),
         path_check(
@@ -133,6 +135,7 @@ pub async fn run(config: &Config) -> DoctorReport {
     }
     checks.push(github_app_check(config).await);
     checks.push(otlp_check(config));
+    checks.push(cross_instance_port_check(config, user_home));
     let ready = checks.iter().all(|check| check.state == CheckState::Pass);
     DoctorReport { ready, checks }
 }
@@ -168,6 +171,83 @@ async fn github_app_check(config: &Config) -> Check {
             state: if error.is_unavailable() { CheckState::Unavailable } else { CheckState::Fail },
             detail: error.to_string(),
         },
+    }
+}
+
+fn cross_instance_port_check(config: &Config, user_home: &UserHome) -> Check {
+    let registry = match user_home.load_registry() {
+        Ok(registry) => registry,
+        Err(error) => {
+            return Check {
+                name: "instance ports".into(),
+                state: CheckState::Unavailable,
+                detail: format!("cannot load registry: {error}"),
+            };
+        }
+    };
+
+    let current_key = config.instance_key();
+    let mut seen_ports = HashMap::<u16, (String, &'static str)>::new();
+    let mut duplicate_ports = Vec::new();
+    let mut collision_ports = Vec::new();
+
+    for entry in &registry.instances {
+        if entry.key == current_key {
+            continue;
+        }
+        let other_config_path =
+            home::resolve_instance_home(user_home.root(), entry).join("config.toml");
+        let other = match Config::load(&other_config_path) {
+            Ok(config) => config,
+            Err(error) => {
+                return Check {
+                    name: "instance ports".into(),
+                    state: CheckState::Unavailable,
+                    detail: format!(
+                        "cannot load instance {} config {}: {error}",
+                        entry.key,
+                        other_config_path.display()
+                    ),
+                };
+            }
+        };
+        for (name, port) in
+            [("ingress", other.server.ingress.port()), ("health", other.server.health.port())]
+        {
+            if let Some((existing_key, existing_name)) =
+                seen_ports.insert(port, (entry.key.clone(), name))
+            {
+                duplicate_ports.push(format!(
+                    "{port} ({} {} and {} {})",
+                    existing_key, existing_name, entry.key, name
+                ));
+            }
+            if port == config.server.ingress.port() || port == config.server.health.port() {
+                collision_ports.push(format!("{port} on {} {}", entry.key, name));
+            }
+        }
+    }
+
+    if !duplicate_ports.is_empty() || !collision_ports.is_empty() {
+        let mut detail = String::new();
+        if !duplicate_ports.is_empty() {
+            detail.push_str("duplicate ports across instances: ");
+            detail.push_str(&duplicate_ports.join(", "));
+        }
+        if !collision_ports.is_empty() {
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str("port collision with this instance: ");
+            detail.push_str(&collision_ports.join(", "));
+        }
+        return Check { name: "instance ports".into(), state: CheckState::Fail, detail };
+    }
+
+    Check {
+        name: "instance ports".into(),
+        state: CheckState::Pass,
+        detail: "no port conflicts with other registered instances".into(),
     }
 }
 

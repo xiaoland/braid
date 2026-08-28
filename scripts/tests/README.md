@@ -13,11 +13,18 @@ through real GitHub Work Items and a clean packaged installation.
 
 `00_clean_install.sh` is the Rust foundation gate. It unpacks the release
 artifact, scrubs Python/PDM/Cargo from the binary's `PATH`, exercises only the
-public CLI, verifies schema 0→1, schema 1→1 with a no-op re-apply, and
-schema-newer refusal, and uses the adjacent
+public CLI, verifies schema 0→2 migration, schema 2→2 with a no-op re-apply,
+and schema-newer refusal, and uses the adjacent
 bounded OTLP/HTTP capture helper to observe sampling. Its direct SQLite write is
 limited to constructing declared migration-compatibility fixtures; it does not
 inject product events or count as workflow acceptance.
+
+`05_instances.sh` is the multi-instance layout gate. It builds on the packaged
+binary, constructs a temporary `BRAID_USER_HOME` with two registered
+instances, and exercises `--config`/`--instance`/`BRAID_INSTANCE`/
+`BRAID_INSTANCE_HOME` resolution plus the registry-based default instance. It
+also proves `braid doctor` rejects overlapping ingress/health ports across
+registered instances without needing a real GitHub App.
 
 `10_context_projection.sh` is the Slice 1 real-object gate. It requires an
 absolute App-backed config, a controlled Issue and PR, plus explicit fixture

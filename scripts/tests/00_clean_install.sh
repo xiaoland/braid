@@ -35,6 +35,10 @@ write_config() {
     port=$4
     cat > "$config_path" <<EOF
 schema_version = 2
+
+[instance]
+key = "clean-install"
+
 [runtime]
 root = "$runtime"
 database = "$database_path"
@@ -140,8 +144,8 @@ fi
 /usr/bin/grep -q '"ready": false' "$temporary_root/doctor.json"
 /usr/bin/grep -q 'Codex app-server' "$temporary_root/doctor.json"
 
-schema=$(run_clean "$braid" status --config "$config" --json | /usr/bin/sed -n 's/.*"schema_version": \([0-9][0-9]*\).*/\1/p')
-test "$schema" = "1"
+schema=$(run_clean "$braid" status --config "$config" --json | /usr/bin/sed -n 's/.*"config_schema": \([0-9][0-9]*\).*/\1/p')
+test "$schema" = "2"
 
 # v1 fixture: intentionally a v1 DB that must remain compatible after migration
 v1="$runtime/state/v1.sqlite3"
@@ -169,8 +173,8 @@ backup_count_before=$(find "$runtime/state/backups" -type f -name '*.sqlite3' | 
 run_clean "$braid" migrate apply --config "$v1_config"
 backup_count_after=$(find "$runtime/state/backups" -type f -name '*.sqlite3' | wc -l | tr -d ' ')
 test "$backup_count_after" = "$backup_count_before"
-v1_schema=$(run_clean "$braid" status --config "$v1_config" --json | /usr/bin/sed -n 's/.*"schema_version": \([0-9][0-9]*\).*/\1/p')
-test "$v1_schema" = "1"
+v1_schema=$(run_clean "$braid" status --config "$v1_config" --json | /usr/bin/sed -n 's/.*"config_schema": \([0-9][0-9]*\).*/\1/p')
+test "$v1_schema" = "2"
 /usr/bin/sqlite3 "$v1" \
     "SELECT 1 FROM associations WHERE issue_node_id='ISSUE_NODE' AND pr_node_id='PR_NODE' AND active=1;" \
     | /usr/bin/grep -q '^1$'

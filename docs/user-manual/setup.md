@@ -25,8 +25,12 @@ braid --version
 
 ```shell
 export DEEPSEEK_API_KEY=...
-braid setup owner/repository
+braid setup owner/repository --instance <KEY>
 ```
+
+`--instance` defaults to the repository owner. It is the local name for the
+Braid instance and appears in `BRAID_INSTANCE`, the `~/.braid/registry.toml`,
+and the `service.instance.id` telemetry attribute.
 
 Options:
 
@@ -34,30 +38,39 @@ Options:
 - `--model <MODEL>` — defaults to `deepseek-chat`.
 - `--api-key-environment <ENV>` — env var to read the provider API key from
   during setup; defaults to `DEEPSEEK_API_KEY`. The key is then persisted into
-  the per-owner secrets file, so the env var is only needed at setup time.
-- `--home <DIR>` — defaults to `~/.braid`.
+  the user-level secrets file, so the env var is only needed at setup time.
+- `--user-home <DIR>` — defaults to `~/.braid` (or `BRAID_USER_HOME`).
+- `--instance <KEY>` — defaults to the repository owner.
 
 `braid setup` performs these steps:
 
 1. Verifies `gh auth` and reads the acting GitHub login.
-2. Generates a random webhook secret.
-3. Reads the provider API key from the environment variable named by
+2. Resolves the Braid user home (`~/.braid` by default) and instance key
+   (owner by default).
+3. Generates a random webhook secret.
+4. Reads the provider API key from the environment variable named by
    `--api-key-environment`.
-4. Builds a GitHub App Manifest with the permissions Braid needs
+5. Builds a GitHub App Manifest with the permissions Braid needs
    (`contents:write`, `issues:write`, `pull_requests:write`, `metadata:read`).
-5. Starts a temporary local HTTP callback server.
-6. Opens a browser to `github.com/settings/apps/new` (or the organization
+6. Starts a temporary local HTTP callback server.
+7. Opens a browser to `github.com/settings/apps/new` (or the organization
    variant) with the manifest pre-filled.
-7. Captures the browser redirect and exchanges the code for the App's
+8. Captures the browser redirect and exchanges the code for the App's
    private key, slug, and ID.
-8. Writes per-owner files under `~/.braid`:
-   - `~/.braid/braid-of-<owner>.pem` (mode `0600`)
-   - `~/.braid/braid-of-<owner>.secrets.toml` (mode `0600`)
-   - `~/.braid/braid-of-<owner>.toml`
+9. Writes files under `~/.braid`:
+   - `registry.toml` — the instance registry (SSoT for `BRAID_INSTANCE`
+     resolution).
+   - `instances/<key>/config.toml` (schema version 2)
+   - `instances/<key>/github-app.pem` (mode `0600`)
+   - `instances/<key>/secrets.toml` (mode `0600`) — webhook secret only
+   - `secrets/<provider>.toml` (mode `0600`) — provider API key, shared
+     across instances for the same provider
+   - `instances/<key>/state/` directory for the SQLite database, backups,
+     and worktrees.
 
-Using a per-owner secrets file means multiple Braid instances for different
-owners can run on the same machine without colliding on a single environment
-variable. `BRAID_WEBHOOK_SECRET` is no longer required.
+Using per-instance secrets and a shared user-level provider key means multiple
+Braid instances can run on the same machine without colliding on a single
+environment variable. `BRAID_WEBHOOK_SECRET` is no longer required.
 
 After setup:
 
@@ -65,23 +78,17 @@ After setup:
 2. Run diagnostics:
 
    ```shell
-   braid doctor --config ~/.braid/braid-of-<owner>.toml
+   braid doctor --instance <KEY>
    ```
 
 3. Start Braid with a public tunnel:
 
    ```shell
-   braid serve --config ~/.braid/braid-of-<owner>.toml --tunnel
+   braid serve --instance <KEY> --tunnel
    ```
 
    See [`tunnel.md`](tunnel.md) for how the tunnel works and why no
    Cloudflare account is required.
-
-4. `braid setup` also generates a composite App logo at
-   `~/.braid/braid-of-<owner>-logo.png` and opens its upload page in your
-   browser. GitHub App Manifest does not allow pre-setting a logo, so this is
-   a manual upload step for now. The logo combines the owner avatar with the
-   Braid logo at the bottom-right.
 
 The tunnel receives GitHub webhooks and routes them to Braid's local ingress.
 
@@ -111,7 +118,7 @@ automatically.
 
 - The GitHub App Manifest flow is the supported path for creating Apps
   programmatically; GitHub does not expose a headless API for App creation.
-- Secrets never live in the repository; they are stored in
-  `~/.braid/braid-of-<owner>.secrets.toml` with mode `0600`.
-- The starter configuration defaults to the Pi provider. Switch to Codex by
-  passing `--provider codex` if you have a Codex environment ready.
+- The generated App logo is saved as
+  `~/.braid/instances/<key>/braid-of-<owner>-logo.png`.
+- Secrets are split: the webhook secret lives in the instance
+  `secrets.toml`; the provider API key lives in `~/.braid/secrets/<provider>.toml`. Both are mode `0600`.

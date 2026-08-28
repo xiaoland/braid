@@ -41,21 +41,23 @@ because GitHub requires one, but the real public URL is set by
 `braid serve --tunnel` at runtime. You do not need to copy a tunnel URL into
 GitHub settings yourself.
 
-## Multiple owners
+## Multiple instances
 
-Because each owner has a separate `serve` invocation with its own `--config`,
-tunnel state is naturally isolated. You can run:
+Each instance has its own `serve` invocation and `BRAID_INSTANCE` value. You
+can run:
 
 ```shell
-braid serve --config ~/.braid/braid-of-inkcre.toml --tunnel
+BRAID_INSTANCE=inkcre braid serve --tunnel
 ```
 
-in one terminal, and a different owner in another terminal. Each gets its own
-Quick Tunnel and its own GitHub App webhook URL.
+in one terminal, and another instance in another terminal. Each gets its own
+Quick Tunnel and its own GitHub App webhook URL. The `~/.braid/registry.toml`
+maps instance keys to their home directories, so `--instance` (or
+`BRAID_INSTANCE`) is the only selector you normally need.
 
 ## Troubleshooting
 
 - If the tunnel does not converge within 45 seconds, Braid retries up to 3
   tunnel candidates and then fails with `QuickTunnel` error details in the logs.
-- `braid tunnel probe --config <path> --url <public-url>` can verify a
+- `braid tunnel probe --instance <KEY> --url <public-url>` can verify a
   specific URL manually, but normal `serve --tunnel` does this automatically.

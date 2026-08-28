@@ -91,6 +91,7 @@ crates. Modules are deep and align with authority boundaries:
 
 | Module | Owned interface |
 | --- | --- |
+| `home` | User root resolution, instance registry, `~/.braid` layout, port allocation, and config-path precedence. |
 | `config` | Versioned config/Profile loading, validation, effective defaults, and diagnostic projection. |
 | `github::webhook` | Raw-body HMAC verification and typed open-enum webhook admission. |
 | `github::client` | GitHub App auth, bounded typed GraphQL pagination, REST writes, reactions, and canonical rereads. |
@@ -119,7 +120,8 @@ Selected dependency baseline, verified against crates.io on 2026-08-13:
 - Serde 1.0 and serde_json 1.0 for external JSON boundaries;
 - rusqlite 0.40 with bundled SQLite, used only by a dedicated blocking DB
   actor so network awaits never occur inside transactions;
-- Clap 4.6, `thiserror` for boundary errors, and `anyhow` only at CLI/runtime
+- Clap 4.6 (with `env` feature), `serde_path_to_error` for TOML error paths,
+  `thiserror` for boundary errors, and `anyhow` only at CLI/runtime
   composition boundaries;
 - HMAC 0.13/SHA-2 0.11 for webhook verification and context revisions,
   `jsonwebtoken` 11 for GitHub App JWTs;
