@@ -51,7 +51,7 @@ struct CallbackState {
 
 #[allow(clippy::too_many_lines)]
 pub async fn run(arguments: SetupArguments) -> Result<()> {
-    let user_home = UserHome::resolve(Some(&arguments.home))?;
+    let user_home = UserHome::resolve(Some(&arguments.user_home))?;
     user_home.ensure_dirs()?;
 
     let gh_user = gh_user()?;
@@ -60,7 +60,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     let (owner, repo): (&str, &str) =
         arguments.repository.split_once('/').context("repository must be OWNER/REPOSITORY")?;
     println!("Target repository: {owner}/{repo}");
-    let instance_key = arguments.worker.clone().unwrap_or_else(|| owner.to_lowercase());
+    let instance_key = arguments.instance.clone().unwrap_or_else(|| owner.to_lowercase());
     validate_instance_key(&instance_key)?;
 
     let mut registry = user_home.load_registry().unwrap_or_default();
@@ -202,7 +202,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     println!("Wrote secrets to: {}", secrets_path.display());
     println!("\nNext, install the App on {}:\n{}\n", arguments.repository, install_url(&app.slug));
     println!(
-        "Then run:\n  braid doctor --worker {instance_key}\n  braid serve --worker {instance_key} --tunnel\n"
+        "Then run:\n  braid doctor --instance {instance_key}\n  braid serve --instance {instance_key} --tunnel\n"
     );
 
     let logo_path = base_dir.join(format!("braid-of-{owner}-logo.png"));
@@ -255,12 +255,12 @@ fn print_manual_guide(
         "After creating the App:\n\
          - Install it on {repository}: https://github.com/apps/braid-of-{owner}/installations/new\n\
          - Set the App's webhook URL to the public tunnel URL from \
-           `braid serve --worker <NAME> --tunnel` (ends in `/webhook`).\n\
+           `braid serve --instance <NAME> --tunnel` (ends in `/webhook`).\n\
          - The generated webhook secret and provider API key are stored in \
            ~/.braid/instances/<NAME>/secrets.toml; no environment variables are required.\n\n\
          - Download the private key, save it as ~/.braid/instances/<NAME>/github-app.pem, \
            save the secrets as ~/.braid/instances/<NAME>/secrets.toml, \
-           then run `braid setup --worker <NAME>` without `--no-browser` to capture the manifest redirect.\n"
+           then run `braid setup --instance <NAME>` without `--no-browser` to capture the manifest redirect.\n"
     );
     println!(
         "If you already have the App's ID, slug, PEM, and secrets, you can \
@@ -593,8 +593,8 @@ mod tests {
             provider: provider.to_owned(),
             model: model.to_owned(),
             api_key_environment: "DEEPSEEK_API_KEY".to_owned(),
-            worker: None,
-            home: PathBuf::from("/tmp/braid-setup-test"),
+            instance: None,
+            user_home: PathBuf::from("/tmp/braid-setup-test"),
             runtime_executable: None,
             runtime_api_url: None,
             no_browser: false,
