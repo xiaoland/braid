@@ -24,28 +24,30 @@ behavior must not change. Evidence below is compile/unit/shell level.
 
 `src/config.rs`:
 
-6. v3 loads: `[instance] key` required; missing key errors; invalid key
-   errors.
+6. v2 loads with the new required `[instance] key`; missing key errors;
+   invalid key errors.
 7. Runtime defaults resolve to `<config_dir>/state`, `state/braid.sqlite3`,
    `state/backups/`; explicit values still honored.
-8. Schema 2 and 4 files rejected with the unsupported-schema message.
+8. Schema 1 and 3 files rejected with the unsupported-schema message
+   (version stays 2).
 9. Secrets split: webhook file with only `webhook_secret` loads; provider file
    with only `provider_api_key` loads; cross-loaded file (wrong key) errors
    naming the expected key.
-10. `config::tests::example_config_matches_schema` updated to schema v3.
+10. `config::tests::example_config_matches_schema` updated for the new v2
+    shape.
 
 ## Shell Suite
 
 Existing scripts keep passing `--config` (unchanged surface for them):
 
 - `scripts/tests/00_clean_install.sh` — update the generated fixture to the
-  v3 shape (`[instance] key`, `state/` layout); assert `braid status --json`
-  reports schema 3; assert the fixture DB lands at `state/braid.sqlite3`.
+  new v2 shape (`[instance] key`, `state/` layout); assert the fixture DB
+  lands at `state/braid.sqlite3`.
 - `10/20/30/40/50/60` — unchanged except any fixture-config regeneration and
   the schema assertion helper.
 
 New `scripts/tests/05_instances.sh` (hermetic, no GitHub access; hand-writes
-registry + two minimal v3 instance configs under a temp `BRAID_USER_HOME`):
+registry + two minimal v2 instance configs under a temp `BRAID_USER_HOME`):
 
 1. Bare `braid config check` with one instance resolves it.
 2. Two instances + `default_instance` → bare commands use the default;

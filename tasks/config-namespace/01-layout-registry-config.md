@@ -1,4 +1,4 @@
-# 01 — Filesystem Layout, Registry, Config Schema v3, Secrets, Ports
+# 01 — Filesystem Layout, Registry, Config Schema v2, Secrets, Ports
 
 ## Filesystem Layout
 
@@ -11,7 +11,7 @@
   skills/  mcps/  subagents/           # reserved; created only when a Profile field consumes them
   instances/
     <instance-key>/                    # BRAID_INSTANCE_HOME (dir mode 0700)
-      config.toml                      # instance config, schema_version = 3
+      config.toml                      # instance config, schema_version = 2
       github-app.pem                   # mode 0600
       secrets.toml                     # mode 0600; webhook_secret only
       state/                           # runtime.root default
@@ -56,12 +56,13 @@ Rules:
   an instance, at which point resolution rule 4 errors with guidance to run
   `braid setup`.
 
-## Config Schema v3 (instance `config.toml`)
+## Config Schema v2 (continued; no version bump)
 
-Delta from v2, no compatibility aliases:
+Config schema v2 was introduced by PR #141 and has not shipped in any release,
+so this task keeps `CONFIG_SCHEMA_VERSION = 2` and folds its changes in. No
+compatibility aliases, no migration:
 
-1. `schema_version = 3`.
-2. New required section:
+1. New required section:
    ```toml
    [instance]
    key = "inkcre"
@@ -69,23 +70,47 @@ Delta from v2, no compatibility aliases:
    Validated with the instance-key charset rule. Purpose: self-describing
    configs for `--config` bypass, telemetry correlation
    (`service.instance.id`), and registry cross-check.
-3. `runtime` defaults change:
+2. `runtime` defaults change:
    - `root` default: `<config_dir>/state` (was `<config_dir>`);
    - `database` default: `<root>/braid.sqlite3` (was `<root>/braid.db`) —
      this also aligns code with `docs/40-deployment/README.md`, which already
      documents `state/braid.sqlite3`;
    - `backups` default: `<root>/backups` (unchanged relative shape).
-4. Secret file types split (file formats, not config fields):
+3. Secret file types split (file formats, not config fields):
    - `github.webhook_secret_file` → `WebhookSecretFile { webhook_secret }`
    - `[[llm_providers]].api_key_file` → `ProviderSecretFile { provider_api_key }`
    The shared `SecretsFile` carrying both is deleted. Error messages name the
    expected key, e.g. `secrets file <path> must contain webhook_secret`.
-5. Everything else unchanged: `[[runtimes]]`, `[[llm_providers]]`,
+4. Everything else unchanged: `[[runtimes]]`, `[[llm_providers]]`,
    `[[profiles]]`, `profile_selection`, `scheduler`, `server`, `telemetry`,
    `tools`.
 
-`CONFIG_SCHEMA_VERSION = 3`; v2 files are rejected with the standard
-unsupported-schema error (no migration path).
+## Library Reuse (happy paths)
+
+Adopted:
+
+- **clap `env` feature**: `#[arg(long, env = "BRAID_INSTANCE")]` style binding
+  replaces hand-rolled `std::env::var` plumbing in resolution. This is the
+  standard happy path for flag/env equivalence and gives `--help` env
+  documentation for free. Same for `BRAID_USER_HOME` / `BRAID_INSTANCE_HOME`.
+- **`serde_path_to_error`** around TOML deserialization in `Config::load`,
+  registry load, and secrets load: parse errors name the offending dotted
+  path instead of a bare line number. Tiny, mature, serde-native.
+
+Evaluated and deferred/rejected:
+
+- **figment / `config` crate (layered merge)**: deferred. The user-level
+  `~/.braid/config.toml` is documented as optional defaults but nothing
+  consumes it yet; adding a merge framework before a second layer exists is
+  speculative. When user defaults are actually merged into instance config,
+  figment's serde-native provider model is the candidate.
+- **`validator` crate**: rejected. Config validation messages are a CLI
+  product surface (exact wording matters for `doctor` output and docs);
+  hand-rolled `validate()` keeps that control. The boilerplate it saves is
+  small relative to the loss of message control.
+- **`camino` (UTF-8 paths)**: deferred. Would clean up `PathBuf` display
+  handling, but touches every path field in config/store for no
+  user-visible gain in this pass.
 
 ## Port Allocation (setup)
 
@@ -114,7 +139,7 @@ Given `braid setup owner/repo --instance inkcre`:
    existing install-hint style message if the env var is unset and no file
    exists.
 5. Runtime entry home: `instances/inkcre/provider/<adapter_type>`.
-6. `config.toml` (schema v3) with allocated ports and absolute file
+6. `config.toml` (schema v2) with allocated ports and absolute file
    references; register/update the instance in `registry.toml` (unique
    key/app_id/home enforced; first instance becomes `default_instance`).
 7. Printed next steps use `--instance inkcre`; `--no-browser` manual guide
@@ -127,7 +152,8 @@ Given `braid setup owner/repo --instance inkcre`:
   load/save), `Registry`/`InstanceEntry` (schema v1, validation), and
   `resolve_config_path(cli_config, cli_instance, env)` implementing the
   precedence rules from `00`.
-- `src/config.rs`: schema v3 delta above; no other restructuring.
+- `src/config.rs`: schema v2 delta above; no other restructuring.
 - `src/cli/mod.rs`: one shared `ConfigSource { --config, --instance }`
   struct embedded by every config-loading command, replacing `ConfigPath`
-  and the bare `--config` fields.
+  and the bare `--config` fields. Env binding uses clap's `env` feature
+  (`BRAID_INSTANCE` etc.), not manual `std::env::var`.

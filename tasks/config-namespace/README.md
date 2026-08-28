@@ -10,7 +10,7 @@ and the flat `~/.braid/braid-of-<owner>.*` layout are all deleted, not migrated.
 - **00-scope-model.md** — final scope boundaries, env/CLI surface, resolution
   precedence, instance key rule. All questions closed.
 - **01-layout-registry-config.md** — filesystem layout, `registry.toml` schema,
-  config schema v3 delta, secrets split, port allocation rule.
+  config schema v2 delta, secrets split, port allocation rule.
 - **02-acceptance.md** — observable acceptance: unit tests, shell-suite changes,
   and the explicit non-goals relative to `docs/10-prd/acceptance.md`.
 - **03-implementation-plan.md** — branch strategy and commit-by-commit plan with
@@ -31,10 +31,15 @@ and the flat `~/.braid/braid-of-<owner>.*` layout are all deleted, not migrated.
    filesystem root.
 6. GitHub App PEM + webhook secret are instance-local; LLM provider keys are
    user-level secrets referenced by path.
-7. Config schema bumps to v3: required `[instance] key`, runtime defaults move
-   to `<config_dir>/state` with `braid.sqlite3`.
+7. Config stays at schema v2 (introduced by PR #141, not yet released). The
+   `[instance] key` section and the new runtime path defaults fold into v2;
+   no version bump ships.
 8. Setup allocates loopback ports deterministically (18080+2n, skipping
    registry-used and unbindable ports) instead of hard-coding 18080/18081.
+9. Library happy paths are reused where they fit: clap's `env` integration
+   for flag/env binding, `serde_path_to_error` for TOML error locations.
+   Layered-config crates and validate-by-annotation crates were evaluated
+   and deferred/rejected (see 01).
 
 ## Close Condition
 
