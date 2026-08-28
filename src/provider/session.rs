@@ -18,7 +18,6 @@ use crate::{
 /// Adapter-level wrapper that exposes the core `AgentSession` contract over the
 /// lower-level `AgentProvider` primitives.
 pub struct ProviderAgentSession {
-    id: String,
     provider: Arc<dyn AgentProvider>,
     profile: Profile,
     instructions: String,
@@ -42,7 +41,6 @@ struct PendingReset {
 
 impl ProviderAgentSession {
     pub async fn resume(
-        id: String,
         provider: Arc<dyn AgentProvider>,
         profile: Profile,
         instructions: String,
@@ -50,7 +48,6 @@ impl ProviderAgentSession {
     ) -> Result<Arc<Self>, SessionError> {
         let (events, _) = broadcast::channel(512);
         let session = Arc::new(Self {
-            id,
             provider,
             profile,
             instructions,
@@ -81,12 +78,7 @@ impl ProviderAgentSession {
         Ok(session)
     }
 
-    pub fn provider_thread_id(&self) -> Option<String> {
-        self.inner.try_lock().ok().and_then(|inner| inner.thread_id.clone())
-    }
-
     pub async fn start(
-        id: String,
         provider: Arc<dyn AgentProvider>,
         profile: Profile,
         instructions: String,
@@ -94,7 +86,6 @@ impl ProviderAgentSession {
     ) -> Result<Arc<Self>, SessionError> {
         let (events, _) = broadcast::channel(512);
         let session = Arc::new(Self {
-            id,
             provider,
             profile,
             instructions,
@@ -187,16 +178,6 @@ impl ProviderAgentSession {
 
 #[async_trait::async_trait]
 impl AgentSession for ProviderAgentSession {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn status(&self) -> SessionStatus {
-        // Synchronous snapshot is best-effort; the authoritative signal is the
-        // event stream.
-        SessionStatus::Idle
-    }
-
     fn events(&self) -> broadcast::Receiver<SessionEvent> {
         self.events.subscribe()
     }

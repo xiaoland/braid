@@ -27,11 +27,6 @@ impl SessionManager {
         sessions.get(provider_session_id).map(|s| Arc::clone(s) as Arc<dyn AgentSession>)
     }
 
-    pub async fn insert(&self, provider_session_id: String, session: Arc<ProviderAgentSession>) {
-        let mut sessions = self.sessions.lock().await;
-        sessions.insert(provider_session_id, session);
-    }
-
     pub async fn replace(&self, old_provider_session_id: &str, new_provider_session_id: String) {
         let mut sessions = self.sessions.lock().await;
         let session = sessions.remove(old_provider_session_id);
@@ -52,14 +47,8 @@ impl SessionManager {
         if let Some(session) = sessions.get(&provider_session_id) {
             return Ok(Arc::clone(session));
         }
-        let session = ProviderAgentSession::start(
-            provider_session_id.clone(),
-            provider,
-            profile,
-            instructions,
-            initial_context,
-        )
-        .await?;
+        let session =
+            ProviderAgentSession::start(provider, profile, instructions, initial_context).await?;
         sessions.insert(provider_session_id, Arc::clone(&session));
         Ok(session)
     }
@@ -75,21 +64,11 @@ impl SessionManager {
         if let Some(session) = sessions.get(&provider_session_id) {
             return Ok(Arc::clone(session));
         }
-        let session = ProviderAgentSession::resume(
-            provider_session_id.clone(),
-            provider,
-            profile,
-            instructions,
-            &provider_session_id,
-        )
-        .await?;
+        let session =
+            ProviderAgentSession::resume(provider, profile, instructions, &provider_session_id)
+                .await?;
         sessions.insert(provider_session_id, Arc::clone(&session));
         Ok(session)
-    }
-
-    pub async fn remove(&self, provider_session_id: &str) {
-        let mut sessions = self.sessions.lock().await;
-        sessions.remove(provider_session_id);
     }
 }
 

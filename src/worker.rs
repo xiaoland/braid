@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
 
@@ -10,7 +10,6 @@ pub fn braid_home() -> Result<PathBuf> {
 /// A single Braid worker: isolated config, secrets, database, worktrees, and logs.
 #[derive(Debug, Clone)]
 pub struct Worker {
-    pub name: String,
     pub dir: PathBuf,
 }
 
@@ -25,36 +24,15 @@ impl Worker {
             bail!("worker name must not contain path separators");
         }
         let dir = braid_home()?.join("workers").join(trimmed);
-        Ok(Self { name: trimmed.to_owned(), dir })
-    }
-
-    /// Wrap an explicit worker directory (for `--config` low-level override flow).
-    pub fn from_dir(dir: impl AsRef<Path>) -> Self {
-        let dir = dir.as_ref().to_path_buf();
-        let name = dir
-            .file_name()
-            .map_or_else(|| "custom".to_owned(), |n| n.to_string_lossy().into_owned());
-        Self { name, dir }
+        Ok(Self { dir })
     }
 
     pub fn config_path(&self) -> PathBuf {
         self.dir.join("config.toml")
     }
 
-    pub fn secrets_path(&self) -> PathBuf {
-        self.dir.join("secrets.toml")
-    }
-
-    pub fn db_path(&self) -> PathBuf {
-        self.dir.join("braid.db")
-    }
-
     pub fn backups_path(&self) -> PathBuf {
         self.dir.join("backups")
-    }
-
-    pub fn runtime_root(&self) -> &Path {
-        &self.dir
     }
 
     pub fn worktrees_dir(&self) -> PathBuf {
@@ -84,7 +62,5 @@ mod tests {
         let worker = Worker::from_name("test-worker").expect("valid worker name");
         assert!(worker.dir.ends_with(".braid/workers/test-worker"));
         assert_eq!(worker.config_path(), worker.dir.join("config.toml"));
-        assert_eq!(worker.secrets_path(), worker.dir.join("secrets.toml"));
-        assert_eq!(worker.db_path(), worker.dir.join("braid.db"));
     }
 }

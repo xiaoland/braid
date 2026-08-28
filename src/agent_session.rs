@@ -68,14 +68,11 @@ pub enum SessionError {
 
 /// The core-facing Agent Session handle.
 ///
-/// Callers never inspect `status()` before sending; `send_user_msg` returns
-/// as soon as the adapter has accepted the message and the event stream carries
-/// asynchronous lifecycle changes. The adapter internally owns queuing,
-/// steering, and physical session replacement.
+/// `send_user_msg` returns as soon as the adapter has accepted the message;
+/// the event stream carries asynchronous lifecycle changes. The adapter
+/// internally owns queuing, steering, and physical session replacement.
 #[async_trait::async_trait]
 pub trait AgentSession: Send + Sync {
-    fn id(&self) -> &str;
-    fn status(&self) -> SessionStatus;
     fn events(&self) -> broadcast::Receiver<SessionEvent>;
 
     /// Send a user message batch. The caller supplies the latest materialized
