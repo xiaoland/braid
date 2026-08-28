@@ -30,6 +30,7 @@ use crate::config::{
     RuntimeConfig, RuntimeEntry, SchedulerConfig, ServerConfig, TelemetryConfig, ToolConfig,
 };
 use crate::config::{LlmAllowance, LlmModel, LlmProvider};
+use crate::home::{InstanceEntry, UserHome, allocate_server_ports, validate_instance_key};
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -50,15 +51,8 @@ struct CallbackState {
 
 #[allow(clippy::too_many_lines)]
 pub async fn run(arguments: SetupArguments) -> Result<()> {
-    let base_dir = if let Some(name) = &arguments.worker {
-        let worker = crate::worker::Worker::from_name(name)?;
-        worker.ensure_dirs()?;
-        worker.dir
-    } else {
-        let home = expand_home(&arguments.home)?;
-        fs::create_dir_all(&home)?;
-        home
-    };
+    let user_home = UserHome::resolve(Some(&arguments.home))?;
+    user_home.ensure_dirs()?;
 
     let gh_user = gh_user()?;
     println!("Authenticated to GitHub as @{gh_user}");
@@ -66,6 +60,19 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     let (owner, repo): (&str, &str) =
         arguments.repository.split_once('/').context("repository must be OWNER/REPOSITORY")?;
     println!("Target repository: {owner}/{repo}");
+    let instance_key = arguments.worker.clone().unwrap_or_else(|| owner.to_lowercase());
+    validate_instance_key(&instance_key)?;
+
+    let mut registry = user_home.load_registry().unwrap_or_default();
+    let instance_dir = user_home.instance_dir(&instance_key);
+    if instance_dir.exists() {
+        bail!(
+            "instance {instance_key:?} already exists at {}; delete it to re-run setup",
+            instance_dir.display()
+        );
+    }
+    user_home.ensure_instance_dirs(&instance_key)?;
+    let base_dir = instance_dir;
 
     let webhook_secret = random_hex(32);
     let state = random_hex(16);
@@ -145,6 +152,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     println!("Created GitHub App: {} (ID {})", app.html_url, app.id);
 
     let runtime = select_runtime(&arguments).await?;
+    let (ingress, health) = allocate_server_ports(&registry, user_home.root())?;
 
     let pem_path = base_dir.join("github-app.pem");
     write_secret(&pem_path, app.pem.as_bytes())?;
@@ -163,7 +171,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     );
 
     let config_path = base_dir.join("config.toml");
-    let config = build_config(
+    let mut config = build_config(
         &base_dir,
         app.id,
         &arguments,
@@ -172,15 +180,29 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         runtime,
         llm_provider,
     )?;
+    config.server.ingress = ingress;
+    config.server.health = health;
+    if let Some(runtime_entry) = config.runtimes.first_mut() {
+        runtime_entry.home = Some(base_dir.join("provider").join(&runtime_entry.adapter_type));
+    }
+    config.validate().context("generated config failed validation")?;
+
     let config_text = toml::to_string(&config).context("cannot serialize generated config")?;
     write_secret(&config_path, config_text.as_bytes())?;
+
+    registry.insert(InstanceEntry {
+        key: instance_key.clone(),
+        home: base_dir.clone(),
+        github_app_id: app.id,
+        repository: arguments.repository.clone(),
+    })?;
+    user_home.save_registry(&registry)?;
 
     println!("\nWrote configuration to: {}", config_path.display());
     println!("Wrote secrets to: {}", secrets_path.display());
     println!("\nNext, install the App on {}:\n{}\n", arguments.repository, install_url(&app.slug));
-    let worker_hint = arguments.worker.as_deref().unwrap_or("<name>");
     println!(
-        "Then run:\n  braid doctor --worker {worker_hint}\n  braid serve --worker {worker_hint} --tunnel\n"
+        "Then run:\n  braid doctor --worker {instance_key}\n  braid serve --worker {instance_key} --tunnel\n"
     );
 
     let logo_path = base_dir.join(format!("braid-of-{owner}-logo.png"));
@@ -235,14 +257,14 @@ fn print_manual_guide(
          - Set the App's webhook URL to the public tunnel URL from \
            `braid serve --worker <NAME> --tunnel` (ends in `/webhook`).\n\
          - The generated webhook secret and provider API key are stored in \
-           ~/.braid/workers/<NAME>/secrets.toml; no environment variables are required.\n\n\
-         - Download the private key, save it as ~/.braid/workers/<NAME>/github-app.pem, \
-           save the secrets as ~/.braid/workers/<NAME>/secrets.toml, \
+           ~/.braid/instances/<NAME>/secrets.toml; no environment variables are required.\n\n\
+         - Download the private key, save it as ~/.braid/instances/<NAME>/github-app.pem, \
+           save the secrets as ~/.braid/instances/<NAME>/secrets.toml, \
            then run `braid setup --worker <NAME>` without `--no-browser` to capture the manifest redirect.\n"
     );
     println!(
         "If you already have the App's ID, slug, PEM, and secrets, you can \
-         also write ~/.braid/workers/<NAME>/config.toml manually; see docs/user-manual/setup.md.\n"
+         also write ~/.braid/instances/<NAME>/config.toml manually; see docs/user-manual/setup.md.\n"
     );
 }
 
@@ -371,17 +393,6 @@ fn write_secret(path: &Path, contents: &[u8]) -> Result<()> {
         fs::set_permissions(path, perms)?;
     }
     Ok(())
-}
-
-fn expand_home(path: &Path) -> Result<PathBuf> {
-    if let Some(s) = path.to_str()
-        && s.starts_with('~')
-    {
-        let home = dirs::home_dir().context("cannot determine home directory")?;
-        Ok(home.join(&s[2..]))
-    } else {
-        Ok(path.to_owned())
-    }
 }
 
 async fn select_runtime(arguments: &SetupArguments) -> Result<RuntimeEntry> {

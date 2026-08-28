@@ -5,6 +5,7 @@ mod context;
 mod doctor;
 mod github;
 mod group;
+mod home;
 mod producer;
 mod protocol;
 mod provider;
@@ -15,7 +16,6 @@ mod store;
 mod telemetry;
 mod tunnel;
 mod webhook;
-mod worker;
 mod worktree;
 mod writer;
 

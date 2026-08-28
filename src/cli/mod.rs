@@ -156,7 +156,8 @@ impl ConfigPath {
             return Ok(path.clone());
         }
         if let Some(name) = &self.worker {
-            return Ok(crate::worker::Worker::from_name(name)?.config_path());
+            crate::home::validate_instance_key(name)?;
+            return crate::home::resolve_config_path(None, Some(name));
         }
         bail!("either --config <PATH> or --worker <NAME> is required")
     }
@@ -393,7 +394,8 @@ fn resolve_serve_config(arguments: &ServeArguments) -> Result<PathBuf> {
         return Ok(path.clone());
     }
     if let Some(name) = &arguments.worker {
-        return Ok(crate::worker::Worker::from_name(name)?.config_path());
+        crate::home::validate_instance_key(name)?;
+        return crate::home::resolve_config_path(None, Some(name));
     }
     bail!("either --config <PATH> or --worker <NAME> is required")
 }
