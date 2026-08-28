@@ -1,6 +1,4 @@
 use std::{
-    collections::HashSet,
-    env,
     fmt::Write as _,
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
@@ -9,6 +7,8 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
+
+use crate::config::Config;
 
 const BRAID_USER_HOME_ENV: &str = "BRAID_USER_HOME";
 const BRAID_INSTANCE_ENV: &str = "BRAID_INSTANCE";
@@ -80,7 +80,7 @@ impl UserHome {
         if let Some(path) = cli_override {
             return Self::new(expand_home(path)?);
         }
-        if let Some(env) = env::var_os(BRAID_USER_HOME_ENV) {
+        if let Some(env) = std::env::var_os(BRAID_USER_HOME_ENV) {
             return Self::new(PathBuf::from(env));
         }
         Self::new(default_user_home()?)
@@ -200,9 +200,9 @@ impl Registry {
                 Self::SCHEMA_VERSION
             );
         }
-        let mut keys = HashSet::new();
-        let mut app_ids = HashSet::new();
-        let mut homes = HashSet::new();
+        let mut keys = std::collections::HashSet::new();
+        let mut app_ids = std::collections::HashSet::new();
+        let mut homes = std::collections::HashSet::new();
         for entry in &self.instances {
             validate_instance_key(&entry.key)?;
             if !keys.insert(entry.key.clone()) {
@@ -271,7 +271,7 @@ impl Registry {
         if keys.is_empty() {
             message.push_str("none; run `braid setup` first");
         } else {
-            message.push_str(&keys.join(", "));
+            write!(message, "; known: {}", keys.join(", ")).expect("writing to String cannot fail");
         }
         bail!("{message}")
     }
@@ -318,14 +318,14 @@ pub(crate) fn resolve_config_path_with_user_home(
     if let Some(path) = cli_config {
         return Ok(path.to_path_buf());
     }
-    if let Some(env) = env::var_os(BRAID_INSTANCE_HOME_ENV) {
+    if let Some(env) = std::env::var_os(BRAID_INSTANCE_HOME_ENV) {
         return Ok(PathBuf::from(env).join("config.toml"));
     }
     let registry = user.load_registry()?;
 
     let key = if let Some(key) = cli_instance {
         key.to_owned()
-    } else if let Ok(env) = env::var(BRAID_INSTANCE_ENV) {
+    } else if let Ok(env) = std::env::var(BRAID_INSTANCE_ENV) {
         env
     } else {
         registry.default_key()?.to_owned()
@@ -352,10 +352,10 @@ pub fn allocate_server_ports(
     registry: &Registry,
     user_root: &Path,
 ) -> Result<(SocketAddr, SocketAddr)> {
-    let mut used_ports = HashSet::new();
+    let mut used_ports = std::collections::HashSet::new();
     for entry in &registry.instances {
         let config_path = resolve_instance_home(user_root, entry).join("config.toml");
-        if let Ok(config) = crate::config::Config::load(&config_path) {
+        if let Ok(config) = Config::load(&config_path) {
             used_ports.insert(config.server.ingress.port());
             used_ports.insert(config.server.health.port());
         }
@@ -477,7 +477,7 @@ mod tests {
         fs::write(
             &config_path,
             format!(
-                "schema_version = {CONFIG_SCHEMA_VERSION}\n[runtime]\nroot = \"{}\"\n",
+                "schema_version = {CONFIG_SCHEMA_VERSION}\n[instance]\nkey = \"inkcre\"\n[runtime]\nroot = \"{}\"\n",
                 instance_dir.join("state").display()
             ),
         )
@@ -523,6 +523,8 @@ mod tests {
         fs::create_dir_all(instance_dir.join("state")).unwrap();
         let config_text = format!(
             r#"schema_version = {CONFIG_SCHEMA_VERSION}
+[instance]
+key = "inkcre"
 [runtime]
 root = "{}"
 [github]

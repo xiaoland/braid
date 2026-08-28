@@ -9,14 +9,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
+use crate::home::validate_instance_key;
+
 pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("cannot read config {path}: {source}")]
     Read { path: PathBuf, source: std::io::Error },
-    #[error("cannot parse TOML config {path}: {source}")]
-    Parse { path: PathBuf, source: toml::de::Error },
     #[error("unsupported config schema {found}; this binary supports {supported}")]
     Schema { found: u32, supported: u32 },
     #[error("invalid config: {0}")]
@@ -25,8 +25,15 @@ pub enum ConfigError {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct InstanceConfig {
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub schema_version: u32,
+    pub instance: InstanceConfig,
     pub runtime: RuntimeConfig,
     pub github: GitHubConfig,
     pub scheduler: SchedulerConfig,
@@ -46,10 +53,10 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
-    /// Defaults to the directory containing the loaded config file.
+    /// Defaults to `<config_dir>/state`.
     #[serde(default)]
     pub root: Option<PathBuf>,
-    /// Defaults to `<root>/braid.db`.
+    /// Defaults to `<root>/braid.sqlite3`.
     #[serde(default)]
     pub database: Option<PathBuf>,
     /// Defaults to `<root>/backups`.
@@ -64,12 +71,12 @@ impl RuntimeConfig {
     /// loaded config file) and normalize relative paths to absolute paths.
     pub fn resolve(&mut self, base: &Path) {
         if self.root.is_none() {
-            self.root = Some(base.to_path_buf());
+            self.root = Some(base.join("state"));
         }
         let root = self.root.clone().expect("root resolved above");
         let root = resolve_path(base, &root);
         if self.database.is_none() {
-            self.database = Some(root.join("braid.db"));
+            self.database = Some(root.join("braid.sqlite3"));
         }
         if self.backups.is_none() {
             self.backups = Some(root.join("backups"));
@@ -220,7 +227,7 @@ impl PiConfig {
     /// `api_key_environment`.
     pub fn api_key(&self) -> Result<String, ConfigError> {
         if let Some(path) = &self.api_key_file {
-            return Ok(load_secret_file(path)?.provider_api_key);
+            return load_provider_secret_file(path);
         }
         if let Some(env) = &self.api_key_environment {
             return std::env::var(env).map_err(|_| {
@@ -301,6 +308,7 @@ pub struct ProfileSelection {
 #[derive(Debug, Serialize)]
 pub struct ConfigSummary<'a> {
     pub schema_version: u32,
+    pub instance_key: &'a str,
     pub repository: &'a str,
     pub runtime_root: &'a Path,
     pub database: &'a Path,
@@ -311,27 +319,54 @@ pub struct ConfigSummary<'a> {
     pub effective_trace_sample_ratio: f64,
 }
 
-/// Secrets file shape referenced by `github.webhook_secret_file` and runtime
-/// adapter `api_key_file`. A single file can hold both secrets for a worker,
-/// keeping user-scope runtime directories out of the secret lookup path.
+/// Secrets file referenced by `github.webhook_secret_file`.
 #[derive(Debug, Deserialize)]
-pub struct SecretsFile {
+pub struct WebhookSecretFile {
     pub webhook_secret: String,
+}
+
+/// Secrets file referenced by `[[llm_providers]].api_key_file`.
+#[derive(Debug, Deserialize)]
+pub struct ProviderSecretFile {
     pub provider_api_key: String,
 }
 
-fn load_secret_file(path: &Path) -> Result<SecretsFile, ConfigError> {
+fn load_webhook_secret_file(path: &Path) -> Result<String, ConfigError> {
     let text = fs::read_to_string(path)
         .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
-    toml::from_str(&text).map_err(|source| ConfigError::Parse { path: path.to_path_buf(), source })
+    let deserializer = toml::de::Deserializer::parse(&text).map_err(|error| {
+        ConfigError::Invalid(format!("cannot parse secrets file {}: {error}", path.display()))
+    })?;
+    let file: WebhookSecretFile =
+        serde_path_to_error::deserialize(deserializer).map_err(|error| {
+            ConfigError::Invalid(format!("cannot parse secrets file {}: {error}", path.display()))
+        })?;
+    Ok(file.webhook_secret)
+}
+
+fn load_provider_secret_file(path: &Path) -> Result<String, ConfigError> {
+    let text = fs::read_to_string(path)
+        .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
+    let deserializer = toml::de::Deserializer::parse(&text).map_err(|error| {
+        ConfigError::Invalid(format!("cannot parse secrets file {}: {error}", path.display()))
+    })?;
+    let file: ProviderSecretFile =
+        serde_path_to_error::deserialize(deserializer).map_err(|error| {
+            ConfigError::Invalid(format!("cannot parse secrets file {}: {error}", path.display()))
+        })?;
+    Ok(file.provider_api_key)
 }
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = fs::read_to_string(path)
             .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
-        let mut config: Self = toml::from_str(&text)
-            .map_err(|source| ConfigError::Parse { path: path.to_path_buf(), source })?;
+        let deserializer = toml::de::Deserializer::parse(&text).map_err(|error| {
+            ConfigError::Invalid(format!("cannot parse TOML config {}: {error}", path.display()))
+        })?;
+        let mut config: Self = serde_path_to_error::deserialize(deserializer).map_err(|error| {
+            ConfigError::Invalid(format!("cannot parse TOML config {}: {error}", path.display()))
+        })?;
         let base = path.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         let base = if base.is_absolute() {
             base
@@ -341,6 +376,11 @@ impl Config {
         config.runtime.resolve(&base);
         config.validate()?;
         Ok(config)
+    }
+
+    #[allow(dead_code)]
+    pub fn instance_key(&self) -> &str {
+        &self.instance.key
     }
 
     pub fn profile(&self, id: &str) -> Result<&Profile, ConfigError> {
@@ -353,6 +393,7 @@ impl Config {
     pub fn summary(&self) -> ConfigSummary<'_> {
         ConfigSummary {
             schema_version: self.schema_version,
+            instance_key: &self.instance.key,
             repository: &self.github.repository,
             runtime_root: self.runtime.root(),
             database: self.runtime.database(),
@@ -368,7 +409,7 @@ impl Config {
     /// otherwise from `github.webhook_secret_environment`.
     pub fn webhook_secret(&self) -> Result<String, ConfigError> {
         if let Some(path) = &self.github.webhook_secret_file {
-            return Ok(load_secret_file(path)?.webhook_secret);
+            return load_webhook_secret_file(path);
         }
         if let Some(env) = &self.github.webhook_secret_environment {
             return std::env::var(env).map_err(|_| {
@@ -481,6 +522,8 @@ impl Config {
                 supported: CONFIG_SCHEMA_VERSION,
             });
         }
+        validate_instance_key(&self.instance.key)
+            .map_err(|message| ConfigError::Invalid(format!("instance.key: {message}")))?;
 
         for (name, path) in [
             ("runtime.root", self.runtime.root()),

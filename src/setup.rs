@@ -174,6 +174,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     let mut config = build_config(
         &base_dir,
         app.id,
+        &instance_key,
         &arguments,
         &pem_path,
         &secrets_path,
@@ -493,9 +494,11 @@ fn build_llm_provider(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_config(
     base_dir: &Path,
     app_id: u64,
+    instance_key: &str,
     arguments: &SetupArguments,
     private_key_file: &Path,
     secrets_file: &Path,
@@ -504,6 +507,9 @@ fn build_config(
 ) -> anyhow::Result<Config> {
     let mut config = Config {
         schema_version: CONFIG_SCHEMA_VERSION,
+        instance: crate::config::InstanceConfig {
+            key: instance_key.to_owned(),
+        },
         runtime: RuntimeConfig {
             root: None,
             database: None,
@@ -622,6 +628,7 @@ mod tests {
         let config = build_config(
             &home,
             123_456,
+            "xiaoland",
             &args("xiaoland/braid", "pi", "deepseek-chat"),
             &home.join("key.pem"),
             &secrets_path,
@@ -662,6 +669,7 @@ mod tests {
         let config = build_config(
             &home,
             123_456,
+            "xiaoland",
             &args("xiaoland/braid", "codex", "gpt-4o"),
             &home.join("key.pem"),
             &secrets_path,
