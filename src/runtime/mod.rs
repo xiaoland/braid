@@ -1,17 +1,12 @@
 #![allow(clippy::large_futures)]
-use std::{
-    collections::BTreeMap,
-    fmt::Write as _,
-    sync::{Arc, Mutex as StdMutex},
-};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context as _, Result, bail};
 use axum::{
     Router,
-    body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
 };
 use serde::Serialize;
@@ -24,39 +19,22 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    config::{Config, Profile},
-    context::{
-        self, CanonicalContext, CanonicalObservation, ContextError, ContextPressure,
-        RenderedContext,
-    },
-    github::{CreatedIssueComment, GitHubClient, RepositoryName, WorkItemLocator},
-    provider::{ProviderError, ProviderNotification, connect_provider},
-    store::{
-        AssignmentCandidate, CanonicalObjectState, ContextResetClaim, IngressEvent, ProfileRecord,
-        ReactionTarget, RuntimeLease, SchedulerPolicy, StoreActor, TurnClaim,
-        WorkItemLifecycleCandidate,
-    },
-    telemetry::{self, PayloadEvidence, TelemetryGuard},
-    worktree::{self, WorktreeRequest},
+    config::Config,
+    github::{GitHubClient, RepositoryName},
+    provider::connect_provider,
+    store::{RuntimeLease, SchedulerPolicy, StoreActor},
+    telemetry::TelemetryGuard,
 };
 
-pub(crate) mod ingress;
-pub(crate) mod issue_agent;
-pub(crate) mod outbox;
-pub(crate) mod pr_agent;
-mod provider;
-pub(crate) mod reconcile;
-pub(crate) mod scheduler;
-pub mod session_manager;
-
+use crate::group::provider::agent_attributions;
 use crate::group::{issue_agent_worker, pr_agent_worker};
-use crate::producer::{event_worker, webhook_handler};
-use crate::producer::{lease_worker, reconciliation_worker};
+use crate::producer::{
+    IngressState, event_worker, lease_worker, reconciliation_worker, webhook_handler,
+};
 use crate::queue::drain_one_write;
-use crate::runtime::provider::agent_attributions;
 use crate::tunnel::{restore_webhook, start_verified_quick_tunnel};
 
-const LEASE_TTL_SECONDS: u64 = 30;
+pub(crate) const LEASE_TTL_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthSnapshot {
@@ -68,28 +46,6 @@ pub struct HealthSnapshot {
     pub reconciliation: &'static str,
     pub provider: &'static str,
     pub last_error: Option<String>,
-}
-
-pub(crate) struct IngressState {
-    pub(crate) store: Arc<StoreActor>,
-    pub(crate) policy: SchedulerPolicy,
-    pub(crate) repository: String,
-    pub(crate) handle: String,
-    pub(crate) app_actor_node_id: String,
-    pub(crate) app_actor_login: String,
-    pub(crate) agent_actor_node_ids: Vec<String>,
-    pub(crate) agent_attributions: Vec<String>,
-    pub(crate) webhook_secret: Arc<Vec<u8>>,
-}
-
-pub(crate) struct ReconcileScope {
-    pub(crate) work_item_node_id: String,
-    pub(crate) work_item_kind: &'static str,
-    pub(crate) work_item_number: u64,
-    pub(crate) work_item_state: String,
-    pub(crate) previous_work_item_state: String,
-    pub(crate) repository_node_id: String,
-    pub(crate) repository: String,
 }
 
 struct RuntimeLeaseGuard {

@@ -1,18 +1,32 @@
-#![allow(clippy::wildcard_imports)]
-use super::*;
-use crate::runtime::provider::{
-    materialized_profile, operational_status_unknown_profile, pr_system_prompt,
-    provider_error_lifecycle, set_provider_unavailable,
-};
-use crate::runtime::reconcile::RunningAgentTurn;
+#![allow(clippy::large_futures)]
+use std::sync::Arc;
+
+use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
-// pr_agent functions are defined in this module
-use crate::runtime::provider::issue_system_prompt;
-use crate::runtime::scheduler::materialize_next_issue_assignment;
-use crate::runtime::scheduler::{
-    begin_active_context_reset, enqueue_context_pressure_status, forward_urgent_steer,
-    handle_next_work_item_lifecycle, materialize_next_context_reset, policy_from_config,
-    record_context_pressure, start_next_agent_turn,
+use tokio::{
+    sync::{RwLock, watch},
+    time::{Duration, MissedTickBehavior},
+};
+
+use crate::{
+    config::{Config, Profile},
+    context::{self, CanonicalContext, ContextPressure, RenderedContext},
+    github::{GitHubClient, RepositoryName, WorkItemLocator},
+    group::provider::{
+        enqueue_provider_blocked_status, materialized_profile, operational_status_unknown_profile,
+        pr_system_prompt, provider_error_lifecycle, set_provider_unavailable,
+    },
+    group::session_manager::SessionManager,
+    producer::reconcile::RunningAgentTurn,
+    provider::ProviderError,
+    queue::scheduler::{
+        begin_active_context_reset, enqueue_context_pressure_status, forward_urgent_steer,
+        handle_next_work_item_lifecycle, materialize_next_context_reset, policy_from_config,
+        record_context_pressure, start_next_agent_turn,
+    },
+    runtime::HealthSnapshot,
+    store::{AssignmentCandidate, ProfileRecord, StoreActor},
+    worktree::{self, WorktreeRequest},
 };
 
 pub(crate) async fn pr_agent_worker(
@@ -20,7 +34,7 @@ pub(crate) async fn pr_agent_worker(
     github: Arc<GitHubClient>,
     config: Config,
     mut provider: Arc<dyn crate::provider::AgentProvider>,
-    sessions: Arc<crate::runtime::session_manager::SessionManager>,
+    sessions: Arc<SessionManager>,
     health: Arc<RwLock<HealthSnapshot>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -114,7 +128,7 @@ pub(crate) async fn drive_pr_agent_connection(
     github: &GitHubClient,
     config: &Config,
     provider: Arc<dyn crate::provider::AgentProvider>,
-    sessions: Arc<crate::runtime::session_manager::SessionManager>,
+    sessions: Arc<SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
     health: &RwLock<HealthSnapshot>,
@@ -254,7 +268,7 @@ pub(crate) async fn resume_pr_provider_sessions(
     store: &StoreActor,
     config: &Config,
     provider: Arc<dyn crate::provider::AgentProvider>,
-    sessions: Arc<crate::runtime::session_manager::SessionManager>,
+    sessions: Arc<SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
 ) -> Result<()> {
@@ -340,7 +354,7 @@ pub(crate) async fn materialize_next_pr_assignment(
     github: &GitHubClient,
     config: &Config,
     provider: Arc<dyn crate::provider::AgentProvider>,
-    sessions: Arc<crate::runtime::session_manager::SessionManager>,
+    sessions: Arc<SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
 ) {
@@ -451,7 +465,7 @@ pub(crate) async fn materialize_pr_assignment(
     github: &GitHubClient,
     config: &Config,
     provider: Arc<dyn crate::provider::AgentProvider>,
-    sessions: Arc<crate::runtime::session_manager::SessionManager>,
+    sessions: Arc<SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
     candidate: AssignmentCandidate,
@@ -554,241 +568,4 @@ pub(crate) async fn materialize_pr_assignment(
             Err(error.into())
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
-pub(crate) async fn drive_issue_agent_connection(
-    store: &StoreActor,
-    github: &GitHubClient,
-    config: &Config,
-    provider: Arc<dyn crate::provider::AgentProvider>,
-    sessions: Arc<crate::runtime::session_manager::SessionManager>,
-    profile: &Profile,
-    profile_record: &ProfileRecord,
-    health: &RwLock<HealthSnapshot>,
-    shutdown: &mut watch::Receiver<bool>,
-) -> bool {
-    let _ = provider;
-    let mut running: Option<RunningAgentTurn> = None;
-    let mut active_events: Option<
-        tokio::sync::broadcast::Receiver<crate::agent_session::SessionEvent>,
-    > = None;
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
-    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            _ = shutdown.changed() => return false,
-            event = async {
-                if let Some(ref mut rx) = active_events {
-                    rx.recv().await
-                } else {
-                    std::future::pending().await
-                }
-            }, if active_events.is_some() => {
-                match event {
-                    Ok(crate::agent_session::SessionEvent::TurnStarted { provider_turn_id }) => {
-                        tracing::debug!(%provider_turn_id, "Issue AgentSession turn started");
-                    }
-                    Ok(crate::agent_session::SessionEvent::TurnTerminal { provider_turn_id, outcome }) => {
-                        if let Some(active) = running.take()
-                            && active.provider_turn_id == provider_turn_id
-                        {
-                            let lifecycle = outcome.lifecycle();
-                            if let Some(reset_id) = &active.reset_id {
-                                let _ = store.mark_context_reset_turn_terminal(
-                                    reset_id.clone(),
-                                    active.claim.turn_id.clone(),
-                                    lifecycle.into(),
-                                );
-                            } else {
-                                let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), lifecycle.into());
-                                if active.claim.trusted_mention {
-                                    let reaction = if lifecycle == "completed" { "+1" } else { "confused" };
-                                    let _ = store.enqueue_turn_reaction(active.claim.turn_id.clone(), reaction.into());
-                                }
-                            }
-                        }
-                        active_events = None;
-                    }
-                    Ok(crate::agent_session::SessionEvent::SessionReplaced { old_id, new_id }) => {
-                        let _ = store.replace_provider_session(old_id.clone(), new_id.clone());
-                        () = sessions.replace(&old_id, new_id.clone()).await;
-                        if let Some(ref active) = running
-                            && active.claim.provider_session_id == old_id
-                            && let Some(session) = sessions.get(&new_id).await
-                        {
-                            active_events = Some(session.events());
-                        }
-                    }
-                    Ok(crate::agent_session::SessionEvent::Failed { reason }) => {
-                        if let Some(active) = running.take() {
-                            let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
-                            let _ = store.enqueue_operational_status(
-                                active.claim.turn_id.clone(),
-                                operational_status_unknown_profile(&active.claim.profile_id),
-                            );
-                            if let Some(reset_id) = active.reset_id {
-                                let _ = store.fail_context_reset(reset_id, reason.clone());
-                            }
-                        }
-                        set_provider_unavailable(health, &format!("Issue AgentSession failed: {reason}")).await;
-                        return true;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "Issue AgentSession event consumer lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        if let Some(active) = running.take() {
-                            let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
-                            let _ = store.enqueue_operational_status(
-                                active.claim.turn_id,
-                                operational_status_unknown_profile(&active.claim.profile_id),
-                            );
-                        }
-                        set_provider_unavailable(health, "Issue AgentSession event stream closed").await;
-                        return true;
-                    }
-                }
-            }
-            _ = tick.tick() => {
-                if let Some(active) = &mut running {
-                    begin_active_context_reset(store, Arc::clone(&sessions), active).await;
-                    if active.reset_id.is_none() {
-                        forward_urgent_steer(store, Arc::clone(&sessions), active).await;
-                    }
-                    continue;
-                }
-                let (handled_lifecycle, lifecycle_turn) = Box::pin(handle_next_work_item_lifecycle(
-                    store,
-                    github,
-                    config,
-                    Arc::clone(&provider),
-                    Arc::clone(&sessions),
-                    profile,
-                    policy_from_config(config),
-                    "issue",
-                )).await;
-                if handled_lifecycle {
-                    running = lifecycle_turn;
-                    if let Some(ref active) = running
-                        && let Some(session) = sessions.get(&active.claim.provider_session_id).await
-                    {
-                        active_events = Some(session.events());
-                    }
-                    continue;
-                }
-                if Box::pin(materialize_next_context_reset(
-                    store, github, config, Arc::clone(&provider), Arc::clone(&sessions), profile, "issue",
-                ))
-                .await
-                {
-                    continue;
-                }
-                materialize_next_issue_assignment(
-                    store, github, config, Arc::clone(&provider), Arc::clone(&sessions), profile, profile_record,
-                ).await;
-                running = start_next_agent_turn(store, &*provider, Arc::clone(&sessions), profile, "issue").await;
-                if let Some(ref active) = running
-                    && let Some(session) = sessions.get(&active.claim.provider_session_id).await
-                {
-                    active_events = Some(session.events());
-                }
-            }
-        }
-    }
-}
-
-pub(crate) async fn resume_issue_provider_sessions(
-    store: &StoreActor,
-    config: &Config,
-    provider: Arc<dyn crate::provider::AgentProvider>,
-    sessions: Arc<crate::runtime::session_manager::SessionManager>,
-    profile: &Profile,
-    profile_record: &ProfileRecord,
-) -> Result<()> {
-    let candidates = store.provider_resume_candidates(profile.id.clone(), "issue".into())?;
-    for candidate in candidates {
-        let instructions = issue_system_prompt(config, profile, candidate.number);
-        let instruction_revision = hex::encode(Sha256::digest(instructions.as_bytes()));
-        let compatible = candidate.repository == config.github.repository
-            && candidate.profile_id == profile.id
-            && candidate.profile_revision == profile_record.revision
-            && candidate.instruction_revision == instruction_revision
-            && profile.workspace.is_dir();
-        if !compatible {
-            let message = "persisted provider session is incompatible with the effective Profile";
-            store.block_provider_session(candidate.provider_session_id.clone(), message.into())?;
-            enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
-            continue;
-        }
-        if candidate
-            .active_turn_lifecycle
-            .as_deref()
-            .is_some_and(|lifecycle| matches!(lifecycle, "starting" | "running"))
-            && let Some(turn_id) = &candidate.active_turn_id
-        {
-            store.mark_turn_terminal(turn_id.clone(), "unknown".into())?;
-            store.enqueue_operational_status(
-                turn_id.clone(),
-                operational_status_unknown_profile(&profile.id),
-            )?;
-        }
-        match provider.resume_session(&candidate.provider_session_id, profile, &instructions).await
-        {
-            Ok(session) => {
-                store.record_provider_resume(session.thread_id.clone())?;
-                let _ = sessions
-                    .resume(
-                        session.thread_id.clone(),
-                        Arc::clone(&provider),
-                        profile.clone(),
-                        instructions.clone(),
-                    )
-                    .await;
-                tracing::info!(
-                    issue = candidate.number,
-                    provider_session = %session.thread_id,
-                    prior_lifecycle = %candidate.session_lifecycle,
-                    "resumed compatible Issue Agent provider session"
-                );
-            }
-            Err(error) if provider_error_lifecycle(&error) == "unknown" => {
-                return Err(error.into());
-            }
-            Err(error) => {
-                store.block_provider_session(
-                    candidate.provider_session_id.clone(),
-                    error.to_string(),
-                )?;
-                enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
-                tracing::error!(
-                    %error,
-                    issue = candidate.number,
-                    provider_session = %candidate.provider_session_id,
-                    "cannot resume Issue Agent provider session"
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn enqueue_provider_blocked_status(
-    store: &StoreActor,
-    profile: &Profile,
-    assignment_id: &str,
-) -> Result<()> {
-    if !profile.status_surfaces.is_empty() {
-        store.enqueue_assignment_operational_status(
-            assignment_id.into(),
-            format!(
-                "> **Braid Operational Status · `{}`**\n\n\
-                 **Provider session unavailable**\n\n\
-                 Braid could not resume the compatible Coding Agent session. The Agent Group is blocked; no replacement turn or provider side effect was started. Operator repair or a new activation generation is required.",
-                profile.id,
-            ),
-        )?;
-    }
-    Ok(())
 }

@@ -1,8 +1,39 @@
-#![allow(clippy::wildcard_imports)]
-use super::*;
-use crate::runtime::provider::agent_attributions;
-use crate::webhook;
+#![allow(clippy::large_futures)]
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex as StdMutex},
+};
+
+use anyhow::{Context as _, Result};
 use sha2::{Digest, Sha256};
+use tokio::{
+    sync::{RwLock, watch},
+    time::{Duration, MissedTickBehavior},
+};
+
+use crate::{
+    config::Config,
+    context::{self, CanonicalContext, CanonicalObservation},
+    github::{GitHubClient, RepositoryName, WorkItemLocator},
+    group::provider::agent_attributions,
+    runtime::{HealthSnapshot, LEASE_TTL_SECONDS},
+    store::{
+        CanonicalObjectState, IngressEvent, ReactionTarget, RuntimeLease, SchedulerPolicy,
+        StoreActor, TurnClaim,
+    },
+    webhook,
+};
+
+/// The canonical GitHub identity of one reconciled Work Item.
+pub(crate) struct ReconcileScope {
+    pub(crate) work_item_node_id: String,
+    pub(crate) work_item_kind: &'static str,
+    pub(crate) work_item_number: u64,
+    pub(crate) work_item_state: String,
+    pub(crate) previous_work_item_state: String,
+    pub(crate) repository_node_id: String,
+    pub(crate) repository: String,
+}
 
 pub(crate) async fn lease_worker(
     store: Arc<StoreActor>,

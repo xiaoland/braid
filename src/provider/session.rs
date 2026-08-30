@@ -173,7 +173,10 @@ impl ProviderAgentSession {
                     .send(SessionEvent::Failed { reason: "provider disconnected".into() });
                 true
             }
-            _ => false,
+            ProviderNotification::Activity { method, thread_id, turn_id } => {
+                tracing::trace!(%method, ?thread_id, ?turn_id, "provider activity");
+                false
+            }
         }
     }
 

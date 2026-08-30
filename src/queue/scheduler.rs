@@ -1,13 +1,25 @@
-#![allow(clippy::wildcard_imports)]
-use sha2::{Digest, Sha256};
+#![allow(clippy::large_futures)]
 use std::sync::Arc;
 
-use super::*;
-use crate::agent_session::SendResult;
-use crate::runtime::provider::render_event_references;
-use crate::runtime::provider::{issue_system_prompt, pr_system_prompt, provider_error_lifecycle};
-use crate::runtime::reconcile::RunningAgentTurn;
-use crate::runtime::session_manager::SessionManager;
+use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
+
+use crate::{
+    agent_session::SendResult,
+    config::{Config, Profile},
+    context::{self, CanonicalContext, ContextError, ContextPressure, RenderedContext},
+    github::{GitHubClient, RepositoryName, WorkItemLocator},
+    group::provider::{
+        issue_system_prompt, pr_system_prompt, provider_error_lifecycle, render_event_references,
+    },
+    group::session_manager::SessionManager,
+    producer::reconcile::RunningAgentTurn,
+    provider::ProviderError,
+    store::{
+        AssignmentCandidate, ContextResetClaim, ProfileRecord, SchedulerPolicy, StoreActor,
+        WorkItemLifecycleCandidate,
+    },
+};
 
 pub(crate) fn policy_from_config(config: &Config) -> SchedulerPolicy {
     SchedulerPolicy {
@@ -22,7 +34,7 @@ pub(crate) async fn handle_next_work_item_lifecycle(
     github: &GitHubClient,
     config: &Config,
     provider: Arc<dyn crate::provider::AgentProvider>,
-    sessions: Arc<crate::runtime::session_manager::SessionManager>,
+    sessions: Arc<SessionManager>,
     profile: &Profile,
     policy: SchedulerPolicy,
     work_item_kind: &'static str,
@@ -96,7 +108,7 @@ pub(crate) async fn reactivate_work_item_agent(
     github: &GitHubClient,
     config: &Config,
     provider: Arc<dyn crate::provider::AgentProvider>,
-    sessions: Arc<crate::runtime::session_manager::SessionManager>,
+    sessions: Arc<SessionManager>,
     profile: &Profile,
     policy: SchedulerPolicy,
     candidate: WorkItemLifecycleCandidate,
@@ -279,7 +291,7 @@ pub(crate) async fn materialize_next_context_reset(
     github: &GitHubClient,
     config: &Config,
     provider: Arc<dyn crate::provider::AgentProvider>,
-    sessions: Arc<crate::runtime::session_manager::SessionManager>,
+    sessions: Arc<SessionManager>,
     profile: &Profile,
     work_item_kind: &str,
 ) -> bool {
@@ -332,7 +344,7 @@ pub(crate) async fn materialize_context_reset(
     github: &GitHubClient,
     config: &Config,
     provider: Arc<dyn crate::provider::AgentProvider>,
-    sessions: Arc<crate::runtime::session_manager::SessionManager>,
+    sessions: Arc<SessionManager>,
     profile: &Profile,
     reset: ContextResetClaim,
 ) -> Result<()> {
@@ -456,7 +468,7 @@ pub(crate) async fn materialize_next_issue_assignment(
     github: &GitHubClient,
     config: &Config,
     provider: Arc<dyn crate::provider::AgentProvider>,
-    sessions: Arc<crate::runtime::session_manager::SessionManager>,
+    sessions: Arc<SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
 ) {
@@ -553,7 +565,7 @@ pub(crate) async fn materialize_issue_assignment(
     github: &GitHubClient,
     config: &Config,
     provider: Arc<dyn crate::provider::AgentProvider>,
-    sessions: Arc<crate::runtime::session_manager::SessionManager>,
+    sessions: Arc<SessionManager>,
     profile: &Profile,
     profile_record: &ProfileRecord,
     candidate: AssignmentCandidate,
