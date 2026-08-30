@@ -21,7 +21,6 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     github::{GitHubClient, RepositoryName},
-    provider::connect_provider,
     store::{RuntimeLease, SchedulerPolicy, StoreActor},
     telemetry::TelemetryGuard,
 };
@@ -154,22 +153,21 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     workers.spawn(lease_worker(Arc::clone(&store), Arc::clone(&lease), shutdown_receiver.clone()));
 
     if provider_enabled {
-        let provider = connect_provider(&config.default_provider_config()?).await?;
-        health.write().await.provider = "connected";
+        // Boot gate: provider configuration errors are operator errors and
+        // fail startup. Connection epochs (including the first) are owned by
+        // the workers, which retry transient connection failures.
+        let _ = config.default_provider_config()?;
         workers.spawn(issue_agent_worker(
             Arc::clone(&store),
             Arc::clone(&github),
             config.clone(),
-            provider,
             Arc::clone(&health),
             shutdown_receiver.clone(),
         ));
-        let pr_provider = connect_provider(&config.default_provider_config()?).await?;
         workers.spawn(pr_agent_worker(
             Arc::clone(&store),
             Arc::clone(&github),
             config.clone(),
-            pr_provider,
             Arc::clone(&health),
             shutdown_receiver.clone(),
         ));

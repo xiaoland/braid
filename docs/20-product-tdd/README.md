@@ -101,7 +101,7 @@ crates. Modules are deep and align with authority boundaries:
 | `scheduler` | Quiet/count/urgent coalescing and single-flight group turn claims. |
 | `producer` | Webhook/GraphQL ingress → canonical diff → classified events (`ingress`, `reconcile`). |
 | `queue` | Per-work-item per-agent-group quiet window, batch emission, and the Braid GitHub write outbox (`scheduler`, `outbox`). |
-| `group` | Agent Group workers driving `AgentSession`s, provider supervision/prompts/attribution, and the in-process `SessionManager` (`issue_agent`, `pr_agent`, `provider`, `session_manager`). |
+| `group` | Agent Group workers that own every provider connection epoch (connect, resume, drive, reconnect), provider supervision/prompts/attribution, and the per-epoch in-process `SessionManager` (`issue_agent`, `pr_agent`, `provider`, `session_manager`). |
 | `agent_session` | Core `AgentSession` trait and event stream (`TurnStarted`, `TurnTerminal`, `Failed`). Core callers operate sessions only through `send_user_msg`; the event stream is the single authority for lifecycle facts. |
 | `provider::session` | `ProviderAgentSession` adapter that maps `AgentSession` to `AgentProvider` primitives and translates provider notifications into `SessionEvent`s, deduplicating the provider's response-side and notification-side observation of the same fact. |
 | `session_manager` | In-process `SessionManager` keyed by provider thread id; start/resume/get. Ephemeral per connection epoch: it is rebuilt from the durable store on every (re)connect because sessions bind the epoch's provider handle. |
@@ -110,7 +110,7 @@ crates. Modules are deep and align with authority boundaries:
 | `writer` | `braid gh`, attribution, reaction/status desired state, and write-outbox convergence. |
 | `telemetry` | Trace/metric/log creation, payload events, sampling configuration, and OTLP export. |
 | `tunnel` | Wrangler Quick Tunnel supervision and webhook URL handoff. |
-| `runtime` | Owner lease, worker supervision, shutdown ordering, health, and public operator state. |
+| `runtime` | Owner lease, worker supervision, boot-time configuration gates, shutdown ordering, health, and public operator state. Never touches provider connections or sessions directly. |
 | `cli` | `serve`, `config`, `doctor`, `profile`, `gh`, `status`, and migration/version surfaces. |
 
 ### State authority

@@ -14,17 +14,18 @@ translates provider notifications into `SessionEvent`s:
 
 | Core method | Adapter behavior |
 | --- | --- |
-| `send_user_msg(msg, steering, reset_context_to)` | If `reset_context_to` differs from the last known hash, fence any active turn and replace the physical session. Otherwise, if idle, start a new turn with `msg`; if running and `steering`, forward the steer; if running and not steering, drop (caller should debounce). |
-| `events()` | Emits `TurnStarted`, `TurnTerminal`, `SessionReplaced`, and `Failed` translated from provider notifications. |
+| `send_user_msg(msg, steering)` | If idle, start a new turn with `msg`; if running and `steering`, forward the steer to the active turn; if running and not steering, drop the message (the event queue owns redelivery). Returns `Started` or `Acknowledged`; lifecycle facts arrive only via events. |
+| `events()` | Emits exactly one `TurnStarted` per turn, then exactly one terminal (`TurnTerminal` or `Failed`), translated and deduplicated from provider notifications. |
 
 The core never assumes a provider can rewrite arbitrary history or accept a
-custom compaction result. If context injection cannot replace existing model
-history, the adapter fences the old turn, creates a fresh physical session, and
-injects the complete current GitHub Context before another turn.
+custom compaction result. Context replacement is therefore orchestrated by the
+core, not hidden inside the adapter: the store fences the old turn, and the
+group layer starts a fresh physical session with the complete materialized
+GitHub Context before another turn.
 
-Direct provider primitives (`start_session`, `inject_context`, `start_turn`,
-`steer`, `interrupt`) remain available for the adapter implementation but are
-not called by the scheduler or worker loops.
+Direct provider primitives (`start_session`, `resume_session`,
+`inject_context`, `start_turn`, `steer`) remain available for the adapter
+implementation but are never called by the scheduler or worker loops.
 
 ## Codex Version and Wire
 

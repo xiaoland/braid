@@ -90,6 +90,12 @@ Versioning once release artifacts are published.
   pending-reset path.
 - `SendResult::Started` no longer carries the provider turn id;
   `SessionEvent::TurnStarted` is the single authority for turn identity.
+- Provider connection epochs are now owned entirely by the group workers:
+  `serve` validates the provider configuration at boot (fail-fast on
+  misconfiguration) and each worker creates every connection — including the
+  first — and retries transient connection failures. `serve` no longer exits
+  when the provider is unreachable at boot; the worker reports the provider
+  unavailable and keeps retrying, matching the reconnect semantics.
 
 ### Fixed
 

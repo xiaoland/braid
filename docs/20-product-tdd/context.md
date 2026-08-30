@@ -150,13 +150,14 @@ providers expose the same tokenizer or effective window.
 
 ## Context Reset and Resume Compatibility
 
-Context reset and provider session resume compatibility are **adapter-internal**.
-The core contract never includes revision or digest fields in the Profile;
-instead, the caller passes the latest materialized `reset_context_to` content
-when it has one. The adapter (`ProviderAgentSession`) decides whether the
-incoming context differs from the last known hash and, if so, whether to
-replace the physical provider session, inject context into the existing
-session, or fence an active turn and retry after interruption.
+Resume compatibility is decided by the **group layer**, not the adapter: on
+reconnect, the worker compares each persisted provider session against the
+effective Profile (repository, profile id and revision, instruction revision)
+and either resumes the physical session or blocks it with an Operational
+Status update. Context replacement is likewise core-orchestrated: the store
+fences the old turn, and the group layer starts a fresh physical session with
+the latest materialized context. The adapter carries no revision or digest
+state and makes no replace/inject decisions.
 
 This keeps the Profile as plain configuration and avoids coupling the core
 runtime to provider-specific compaction or resume rules.

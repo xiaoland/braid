@@ -32,7 +32,6 @@ pub(crate) async fn pr_agent_worker(
     store: Arc<StoreActor>,
     github: Arc<GitHubClient>,
     config: Config,
-    mut provider: Arc<dyn crate::provider::AgentProvider>,
     health: Arc<RwLock<HealthSnapshot>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -63,10 +62,23 @@ pub(crate) async fn pr_agent_worker(
     }
 
     loop {
-        // The session map is an ephemeral cache scoped to this connection
-        // epoch: sessions bind the epoch's provider handle, so a reconnect
-        // must rebuild the map from the durable store rather than reuse
-        // sessions bound to a dead connection.
+        // The worker owns every provider connection epoch, including the
+        // first: connect, rebuild the ephemeral session map from the durable
+        // store (sessions bind the epoch's provider handle), resume, drive.
+        let provider = loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                result = crate::provider::connect_provider(&provider_config) => {
+                    match result {
+                        Ok(connected) => break connected,
+                        Err(error) => {
+                            set_provider_unavailable(&health, &error.to_string()).await;
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+            }
+        };
         let sessions = Arc::new(SessionManager::new());
         let convergence_failed = if let Err(error) = resume_pr_provider_sessions(
             &store,
@@ -103,24 +115,7 @@ pub(crate) async fn pr_agent_worker(
         if !disconnected || *shutdown.borrow() {
             return;
         }
-        drop(provider);
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => return,
-                result = crate::provider::connect_provider(&provider_config) => {
-                    match result {
-                        Ok(connected) => {
-                            provider = connected;
-                            break;
-                        }
-                        Err(error) => {
-                            set_provider_unavailable(&health, &error.to_string()).await;
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                        }
-                    }
-                }
-            }
-        }
+        health.write().await.provider = "reconnecting";
     }
 }
 

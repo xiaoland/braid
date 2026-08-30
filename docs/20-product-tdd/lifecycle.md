@@ -147,18 +147,30 @@ only after the old turn is terminal or fenced so its later output is ignored.
 
 ## AgentSession Event Stream
 
-The core signal between the adapter and the runtime is the `AgentSession` event
-stream, not raw provider notifications. The runtime receives a
-`broadcast::Receiver<SessionEvent>` from each active session and reacts to:
+The core signal between the adapter and the workers is the `AgentSession`
+event stream, not raw provider notifications. Each active session yields a
+`broadcast::Receiver<SessionEvent>`:
 
-| Event | Meaning | Runtime reaction |
+| Event | Meaning | Core reaction |
 | --- | --- | --- |
-| `TurnStarted { provider_turn_id }` | The adapter accepted a new turn. | Record `provider_turn_id` in store; mark turn `starting`. |
-| `TurnTerminal { provider_turn_id, outcome }` | A turn ended with a known outcome (`Completed`, `Interrupted`, `Failed`, `Unknown`). | Mark turn terminal, update reactions, schedule next batch. |
-| `SessionReplaced { old_id, new_id }` | The adapter created a fresh physical provider session (e.g. after context reset). | Persist the new `provider_session_id` in store; update `SessionManager` key. |
-| `Failed { reason }` | The adapter encountered an unrecoverable error. | Enter failure/recovery path; mark group `blocked` or `unknown`. |
+| `TurnStarted { provider_turn_id }` | A new provider turn began. Exactly one per turn; the single authority for turn identity. | The scheduler records `provider_turn_id` in the store and marks the turn started. |
+| `TurnTerminal { provider_turn_id, outcome }` | A turn ended (`Completed`, `Interrupted`, `Failed`, `Unknown`). | The worker marks the turn terminal, updates reactions, and schedules the next batch. |
+| `Failed { reason }` | The session is unusable (protocol failure or provider disconnect). | The worker fences the active turn as `unknown`, then blocks or reconnects. |
 
-The adapter internally owns queuing, steering, physical session replacement,
-and context-reset compatibility. The caller only dispatches through
-`AgentSession::send_user_msg(msg, steering, reset_context_to)` and consumes
-the event stream for reactions.
+Responsibilities do not overlap:
+
+- The **event queue** (scheduler plus store) decides which messages exist:
+  debounce, batching, urgency, and retry — an unsent batch simply remains
+  runnable.
+- **`AgentSession`** only dispatches: idle, it starts a new turn; running and
+  `steering`, it forwards the steer; running and not steering, it drops the
+  message. It never queues; redelivery is the queue's job.
+- The **group layer** (`SessionManager`) owns the physical session lifecycle
+  for one connection epoch: start/resume keyed by the adapter-created thread
+  id, rebuilt from the durable store on every reconnect. There is no in-place
+  replacement; context replacement fences the old turn in the store and then
+  starts a fresh session with the materialized context.
+- The **adapter** (`ProviderAgentSession`) owns the mechanism only: mapping
+  the contract onto `AgentProvider` RPCs and translating provider
+  notifications into exactly-once `SessionEvent`s. It holds no durable state
+  and makes no scheduling decisions.
