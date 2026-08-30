@@ -124,6 +124,16 @@ impl ProviderAgentSession {
         Ok(session)
     }
 
+    /// The current physical provider thread id, if a session exists.
+    ///
+    /// This is a concrete-type accessor, not part of the core `AgentSession`
+    /// contract: the core persists the id in the durable store right after
+    /// creation, and later replacements are observed through
+    /// `SessionEvent::SessionReplaced`.
+    pub async fn thread_id(&self) -> Option<String> {
+        self.inner.lock().await.thread_id.clone()
+    }
+
     async fn handle_notification(self: &Arc<Self>, notification: ProviderNotification) -> bool {
         let mut inner = self.inner.lock().await;
         match notification {
@@ -301,5 +311,10 @@ impl AgentSession for ProviderAgentSession {
 }
 
 fn map_provider_error(error: ProviderError) -> SessionError {
-    SessionError::Failed(error.to_string())
+    match error {
+        ProviderError::Start(_) | ProviderError::Timeout { .. } | ProviderError::Disconnected => {
+            SessionError::Unavailable
+        }
+        ProviderError::Protocol(message) => SessionError::Failed(message),
+    }
 }

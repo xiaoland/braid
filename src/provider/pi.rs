@@ -221,10 +221,7 @@ impl AgentProvider for PiProvider {
             .ok_or_else(|| ProviderError::Protocol("get_state missing sessionFile".into()))?;
         state.session = Some(session_file.to_owned());
 
-        Ok(ProviderSession {
-            thread_id: session_file.to_owned(),
-            model: profile.model.clone().unwrap_or_else(|| "pi-default".into()),
-        })
+        Ok(ProviderSession { thread_id: session_file.to_owned() })
     }
 
     async fn inject_context(&self, _thread_id: &str, context: &str) -> Result<(), ProviderError> {
@@ -248,10 +245,7 @@ impl AgentProvider for PiProvider {
 
         self.spawn(&mut state, &profile.workspace, Some(thread_id))?;
 
-        Ok(ProviderSession {
-            thread_id: thread_id.to_owned(),
-            model: profile.model.clone().unwrap_or_else(|| "pi-default".into()),
-        })
+        Ok(ProviderSession { thread_id: thread_id.to_owned() })
     }
 
     async fn start_turn(

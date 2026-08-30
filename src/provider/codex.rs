@@ -136,11 +136,6 @@ impl AgentProvider for CodexProvider {
             .ok_or_else(|| ProviderError::Protocol("thread/start omitted result.thread".into()))?;
         Ok(ProviderSession {
             thread_id: required_string(thread, "id", "thread/start result.thread")?,
-            model: result
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("provider-default")
-                .to_owned(),
         })
     }
 
@@ -188,14 +183,7 @@ impl AgentProvider for CodexProvider {
                 "thread/resume returned {resumed_id} for requested thread {thread_id}"
             )));
         }
-        Ok(ProviderSession {
-            thread_id: resumed_id,
-            model: result
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("provider-default")
-                .to_owned(),
-        })
+        Ok(ProviderSession { thread_id: resumed_id })
     }
 
     async fn start_turn(

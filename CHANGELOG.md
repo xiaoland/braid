@@ -22,12 +22,15 @@ Versioning once release artifacts are published.
   lives in profiles.
 - `src/agent_session.rs` defines the core `AgentSession` trait and event stream;
   `ProviderAgentSession` in `src/provider/session.rs` maps it to the existing
-  provider primitives.
-- `SessionManager` in `src/runtime/session_manager.rs` manages per-provider-thread
-  `ProviderAgentSession` handles (start/resume/replace/remove).
-- New architecture boundary modules `src/producer.rs`, `src/queue.rs`, and
-  `src/group.rs` (currently boundary placeholders; implementation moves in
-  future commits).
+  provider primitives and owns physical session creation/replacement/resume.
+- `SessionManager` in `src/group/session_manager.rs` manages per-provider-thread
+  `ProviderAgentSession` handles (start/resume/replace/remove), keyed by the
+  thread id the adapter actually created.
+- New architecture boundary modules `src/producer/`, `src/queue/`, and
+  `src/group/` own the implementation modules (`ingress`/`reconcile`,
+  `scheduler`/`outbox`, `issue_agent`/`pr_agent`/`provider`/`session_manager`);
+  `src/runtime/mod.rs` is the coordinator (owner lease, worker supervision,
+  shutdown ordering, health).
 
 ### Changed
 
@@ -56,8 +59,10 @@ Versioning once release artifacts are published.
 - Clap `env` integration binds `BRAID_INSTANCE`, `BRAID_USER_HOME`, and the
   setup `--instance` flag to their environment variables.
 - All scheduler dispatch paths (`start_next_agent_turn`, `forward_urgent_steer`,
-  `begin_active_context_reset`, `materialize_context_reset`) now route through
-  `AgentSession::send_user_msg` instead of calling provider primitives directly.
+  `begin_active_context_reset`, `materialize_context_reset`) and all
+  assignment/reactivation/resume materialization paths operate sessions only
+  through `AgentSession`/`SessionManager`; no core code calls
+  `provider.start_session`/`inject_context`/`resume_session` directly.
 - Agent group loops (`issue_agent_worker`, `pr_agent_worker`) consume
   `SessionEvent` from the active `AgentSession` rather than raw provider
   notifications.
@@ -70,6 +75,17 @@ Versioning once release artifacts are published.
   `default_provider_config()` or `RuntimeEntry` directly.
 - Direct provider notification subscription removed from worker loops; the
   `AgentSession` event stream is the sole signal boundary.
+- Dead `handle_provider_notification` fallback removed; provider `Activity`
+  notifications are traced inside `ProviderAgentSession`.
+- Unused `ProviderSession.model` field removed.
+
+### Fixed
+
+- Assignment/reactivation/reset materialization no longer creates two physical
+  provider sessions (one raw, one adapter-owned) with the durable store
+  recording the orphaned thread; the adapter-created thread is now the single
+  recorded session, and turn history stays attached to the recorded thread
+  across restarts.
 
 ## [0.2.3] - 2026-08-24
 

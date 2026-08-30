@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
 use crate::{
-    agent_session::AgentSession,
+    agent_session::{AgentSession, SessionError},
     config::Profile,
     provider::{AgentProvider, ProviderAgentSession},
 };
@@ -35,21 +35,29 @@ impl SessionManager {
         }
     }
 
+    /// Start a fresh Agent Session with an initial materialized context.
+    ///
+    /// The adapter owns physical session creation and context injection; the
+    /// manager keys the session by the thread id the adapter actually created.
     pub async fn start(
         &self,
-        provider_session_id: String,
         provider: Arc<dyn AgentProvider>,
         profile: Profile,
         instructions: String,
-        initial_context: Option<String>,
-    ) -> Result<Arc<ProviderAgentSession>, anyhow::Error> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get(&provider_session_id) {
-            return Ok(Arc::clone(session));
-        }
+        initial_context: String,
+    ) -> Result<Arc<ProviderAgentSession>, SessionError> {
         let session =
-            ProviderAgentSession::start(provider, profile, instructions, initial_context).await?;
-        sessions.insert(provider_session_id, Arc::clone(&session));
+            ProviderAgentSession::start(provider, profile, instructions, Some(initial_context))
+                .await?;
+        let thread_id = session
+            .thread_id()
+            .await
+            .ok_or_else(|| SessionError::Failed("AgentSession has no provider thread".into()))?;
+        let mut sessions = self.sessions.lock().await;
+        if let Some(existing) = sessions.get(&thread_id) {
+            return Ok(Arc::clone(existing));
+        }
+        sessions.insert(thread_id, Arc::clone(&session));
         Ok(session)
     }
 
@@ -59,7 +67,7 @@ impl SessionManager {
         provider: Arc<dyn AgentProvider>,
         profile: Profile,
         instructions: String,
-    ) -> Result<Arc<ProviderAgentSession>, anyhow::Error> {
+    ) -> Result<Arc<ProviderAgentSession>, SessionError> {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get(&provider_session_id) {
             return Ok(Arc::clone(session));

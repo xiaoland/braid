@@ -13,7 +13,7 @@ use crate::{
     github::GitHubClient,
     group::provider::{
         enqueue_provider_blocked_status, issue_system_prompt, materialized_profile,
-        operational_status_unknown_profile, provider_error_lifecycle, set_provider_unavailable,
+        operational_status_unknown_profile, set_provider_unavailable,
     },
     group::session_manager::SessionManager,
     producer::reconcile::RunningAgentTurn,
@@ -252,7 +252,7 @@ pub(crate) async fn drive_issue_agent_connection(
                 materialize_next_issue_assignment(
                     store, github, config, Arc::clone(&provider), Arc::clone(&sessions), profile, profile_record,
                 ).await;
-                running = start_next_agent_turn(store, &*provider, Arc::clone(&sessions), profile, "issue").await;
+                running = start_next_agent_turn(store, Arc::clone(&sessions), profile, "issue").await;
                 if let Some(ref active) = running
                     && let Some(session) = sessions.get(&active.claim.provider_session_id).await
                 {
@@ -298,26 +298,25 @@ pub(crate) async fn resume_issue_provider_sessions(
                 operational_status_unknown_profile(&profile.id),
             )?;
         }
-        match provider.resume_session(&candidate.provider_session_id, profile, &instructions).await
+        match sessions
+            .resume(
+                candidate.provider_session_id.clone(),
+                Arc::clone(&provider),
+                profile.clone(),
+                instructions.clone(),
+            )
+            .await
         {
-            Ok(session) => {
-                store.record_provider_resume(session.thread_id.clone())?;
-                let _ = sessions
-                    .resume(
-                        session.thread_id.clone(),
-                        Arc::clone(&provider),
-                        profile.clone(),
-                        instructions.clone(),
-                    )
-                    .await;
+            Ok(_) => {
+                store.record_provider_resume(candidate.provider_session_id.clone())?;
                 tracing::info!(
                     issue = candidate.number,
-                    provider_session = %session.thread_id,
+                    provider_session = %candidate.provider_session_id,
                     prior_lifecycle = %candidate.session_lifecycle,
                     "resumed compatible Issue Agent provider session"
                 );
             }
-            Err(error) if provider_error_lifecycle(&error) == "unknown" => {
+            Err(error @ crate::agent_session::SessionError::Unavailable) => {
                 return Err(error.into());
             }
             Err(error) => {

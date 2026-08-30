@@ -49,7 +49,6 @@ pub enum ProviderNotification {
 #[derive(Debug, Clone)]
 pub struct ProviderSession {
     pub thread_id: String,
-    pub model: String,
 }
 
 #[derive(Debug, Clone)]

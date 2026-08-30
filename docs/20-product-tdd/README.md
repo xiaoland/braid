@@ -99,10 +99,10 @@ crates. Modules are deep and align with authority boundaries:
 | `events` | Canonical diff classification and compact Event Reference rendering. |
 | `store` | One dedicated SQLite actor, transactions, migrations, leases, ledgers, sessions, batches, and outbox. |
 | `scheduler` | Quiet/count/urgent coalescing and single-flight group turn claims. |
-| `producer` | Webhook/GraphQL ingress → canonical diff → classified events (boundary placeholder; currently implemented by `webhook` and `reconcile`). |
-| `queue` | Per-work-item per-agent-group quiet window and batch emission (boundary placeholder; currently implemented by `scheduler_batches` in `store`). |
-| `group` | Thin forwarder from the Event Queue to an `AgentSession` (boundary placeholder; currently implemented by `issue_agent` and `pr_agent`). |
-| `agent_session` | Core `AgentSession` trait and event stream (`TurnStarted`, `TurnTerminal`, `SessionReplaced`, `Failed`). |
+| `producer` | Webhook/GraphQL ingress → canonical diff → classified events (`ingress`, `reconcile`). |
+| `queue` | Per-work-item per-agent-group quiet window, batch emission, and the Braid GitHub write outbox (`scheduler`, `outbox`). |
+| `group` | Agent Group workers driving `AgentSession`s, provider supervision/prompts/attribution, and the in-process `SessionManager` (`issue_agent`, `pr_agent`, `provider`, `session_manager`). |
+| `agent_session` | Core `AgentSession` trait and event stream (`TurnStarted`, `TurnTerminal`, `SessionReplaced`, `Failed`). Core callers operate sessions only through `send_user_msg`; the adapter owns physical session creation/replacement. |
 | `provider::session` | `ProviderAgentSession` adapter that maps `AgentSession` to `AgentProvider` primitives and translates provider notifications into `SessionEvent`s. |
 | `session_manager` | In-process `SessionManager` keyed by provider thread id; start/resume/replace/remove. |
 | `provider` | Provider-neutral capability contract and Codex NDJSON implementation. |
@@ -110,7 +110,7 @@ crates. Modules are deep and align with authority boundaries:
 | `writer` | `braid gh`, attribution, reaction/status desired state, and write-outbox convergence. |
 | `telemetry` | Trace/metric/log creation, payload events, sampling configuration, and OTLP export. |
 | `tunnel` | Wrangler Quick Tunnel supervision and webhook URL handoff. |
-| `runtime` | Owner lease, supervisors, shutdown ordering, health, and public operator state. |
+| `runtime` | Owner lease, worker supervision, shutdown ordering, health, and public operator state. |
 | `cli` | `serve`, `config`, `doctor`, `profile`, `gh`, `status`, and migration/version surfaces. |
 
 Selected dependency baseline, verified against crates.io on 2026-08-13:
