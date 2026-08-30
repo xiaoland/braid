@@ -13,8 +13,8 @@ through real GitHub Work Items and a clean packaged installation.
 
 `00_clean_install.sh` is the Rust foundation gate. It unpacks the release
 artifact, scrubs Python/PDM/Cargo from the binary's `PATH`, exercises only the
-public CLI, verifies schema 0→2 migration, schema 2→2 with a no-op re-apply,
-and schema-newer refusal, and uses the adjacent
+public CLI, verifies schema 0→1, schema 1→1 with a no-op re-apply, and
+schema-newer refusal, and uses the adjacent
 bounded OTLP/HTTP capture helper to observe sampling. Its direct SQLite write is
 limited to constructing declared migration-compatibility fixtures; it does not
 inject product events or count as workflow acceptance.

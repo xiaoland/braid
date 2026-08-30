@@ -64,7 +64,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     let instance_key = arguments.instance.clone().unwrap_or_else(|| owner.to_lowercase());
     validate_instance_key(&instance_key)?;
 
-    let mut registry = user_home.load_registry().unwrap_or_default();
+    let mut registry = user_home.load_registry()?;
     let instance_dir = user_home.instance_dir(&instance_key);
     if instance_dir.exists() {
         bail!(
@@ -72,10 +72,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
             instance_dir.display()
         );
     }
-    user_home.ensure_instance_dirs(&instance_key)?;
-    let base_dir = instance_dir;
 
-    let webhook_secret = random_hex(32);
     let state = random_hex(16);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -119,6 +116,8 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         print_manual_guide(
             &arguments.repository,
             owner,
+            &instance_key,
+            user_home.root(),
             &form_action,
             html_path.as_os_str().to_str().unwrap_or(""),
             &manifest_json,
@@ -154,6 +153,18 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
 
     let runtime = select_runtime(&arguments).await?;
     let (ingress, health) = allocate_server_ports(&registry, user_home.root())?;
+
+    // Register the instance in memory first so a duplicate App fails before any
+    // file is written; the registry is only persisted after all files exist.
+    registry.insert(InstanceEntry {
+        key: instance_key.clone(),
+        home: instance_dir.clone(),
+        github_app_id: app.id,
+        repository: arguments.repository.clone(),
+    })?;
+    user_home.ensure_instance_dirs(&instance_key)?;
+    let base_dir = instance_dir;
+    let webhook_secret = random_hex(32);
 
     let pem_path = base_dir.join("github-app.pem");
     write_secret(&pem_path, app.pem.as_bytes())?;
@@ -193,12 +204,6 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     let config_text = toml::to_string(&config).context("cannot serialize generated config")?;
     write_secret(&config_path, config_text.as_bytes())?;
 
-    registry.insert(InstanceEntry {
-        key: instance_key.clone(),
-        home: base_dir.clone(),
-        github_app_id: app.id,
-        repository: arguments.repository.clone(),
-    })?;
     user_home.save_registry(&registry)?;
 
     println!("\nWrote configuration to: {}", config_path.display());
@@ -235,40 +240,59 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
 fn print_manual_guide(
     repository: &str,
     owner: &str,
+    instance_key: &str,
+    user_home: &Path,
     form_action: &str,
     html_path: &str,
     manifest_json: &str,
 ) {
     let manifest_shell = manifest_json.replace('\'', "'\\''");
+    let instance_dir = user_home.join("instances").join(instance_key);
     println!("\n=== Manual GitHub App creation guide ===\n");
     println!("Repository: {repository}");
-    println!("App owner:  {owner}\n");
+    println!("App owner:  {owner}");
+    println!("Instance:   {instance_key}\n");
     println!(
         "GitHub requires the manifest to be submitted as a POST request.\n\
          The easiest option is to open this generated HTML file in a browser:\n   {html_path}\n\n\
          It will auto-submit the manifest to:\n   {form_action}\n\n\
          If you cannot transfer the HTML file, you can POST manually with curl:\n\n\
             curl -X POST '{form_action}' \\\n\
-              -d 'manifest={manifest_shell}'\n\n\
-         Or create the App manually at https://github.com/settings/apps/new \
-            (or https://github.com/organizations/{owner}/settings/apps/new for an org) \
-            with the manifest JSON below.\n"
+              -d 'manifest={manifest_shell}'\n"
     );
     println!("Manifest JSON:\n{manifest_json}\n");
     println!(
-        "After creating the App:\n\
-         - Install it on {repository}: https://github.com/apps/braid-of-{owner}/installations/new\n\
-         - Set the App's webhook URL to the public tunnel URL from \
-           `braid serve --instance <NAME> --tunnel` (ends in `/webhook`).\n\
-         - The generated webhook secret and provider API key are stored in \
-           ~/.braid/instances/<NAME>/secrets.toml; no environment variables are required.\n\n\
-         - Download the private key, save it as ~/.braid/instances/<NAME>/github-app.pem, \
-           save the secrets as ~/.braid/instances/<NAME>/secrets.toml, \
-           then run `braid setup --instance <NAME>` without `--no-browser` to capture the manifest redirect.\n"
+        "Because `--no-browser` runs no local callback server, the browser redirect\n\
+         to the manifest's redirect_url will fail to load. That is expected: copy the\n\
+         `code` query parameter from the failing address bar, then exchange it:\n\n\
+            gh api -X POST app-manifests/<code>/conversions\n\n\
+         The JSON response contains the App's `id`, `slug`, and `pem` (private key).\n"
     );
     println!(
-        "If you already have the App's ID, slug, PEM, and secrets, you can \
-         also write ~/.braid/instances/<NAME>/config.toml manually; see docs/user-manual/setup.md.\n"
+        "Then finish the instance manually:\n\
+         - `mkdir -p {instance}/state`\n\
+         - Save the `pem` value as {instance}/github-app.pem (chmod 0600).\n\
+         - Generate a webhook secret (`openssl rand -hex 32`) and store it as\n\
+           `webhook_secret = \"...\"` in {instance}/secrets.toml (chmod 0600).\n\
+         - Copy config.example.toml to {instance}/config.toml and fill in the\n\
+           absolute paths, the App `id`, and `[instance] key = \"{instance_key}\"`.\n\
+         - Register the instance in {home}/registry.toml:\n\n\
+           schema_version = 1\n\
+           default_instance = \"{instance_key}\"\n\n\
+           [[instances]]\n\
+           key = \"{instance_key}\"\n\
+           home = \"{instance}\"\n\
+           github_app_id = <ID>\n\
+           repository = \"{repository}\"\n",
+        instance = instance_dir.display(),
+        home = user_home.display(),
+    );
+    println!(
+        "\nFinally, install the App on {repository}:\n\
+           https://github.com/apps/braid-of-{owner}/installations/new\n\n\
+         Then run `braid doctor --instance {instance_key}` and\n\
+         `braid serve --instance {instance_key} --tunnel` (the tunnel step pushes\n\
+         the webhook URL and secret to the App).\n"
     );
 }
 

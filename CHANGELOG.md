@@ -17,29 +17,6 @@ Versioning once release artifacts are published.
 - `scripts/tests/05_instances.sh` exercises `--config`/`--instance`/
   `BRAID_INSTANCE`/`BRAID_INSTANCE_HOME` resolution and the doctor's
   cross-instance port-conflict check.
-
-### Changed
-
-- **Breaking**: `--worker` and `--home` are removed. Config-loading commands
-  now take `--config <PATH>` or `--instance <KEY>` (or `BRAID_INSTANCE`).
-  `braid setup` takes `--user-home <DIR>` and `--instance <KEY>`.
-- **Breaking**: Secrets are split. The instance `secrets.toml` holds only the
-  webhook secret; provider API keys live in `~/.braid/secrets/<provider>.toml`
-  and are referenced by path.
-- **Breaking**: The runtime default root is now `<config_dir>/state` and the
-  default database file is `state/braid.sqlite3`.
-- **Breaking**: Config schema v2 now requires an `[instance]` section with a
-  `key` and is the only supported config schema.
-- `braid doctor` loads the registry and reports duplicate or colliding
-  ingress/health ports across registered instances.
-- Telemetry now tags `service.instance.id` from the config instance key.
-- `braid status` prints the instance key.
-- Config TOML parse errors now include the dotted path to the offending key
-  via `serde_path_to_error`.
-- Clap `env` integration binds `BRAID_INSTANCE`, `BRAID_USER_HOME`, and the
-  setup `--instance` flag to their environment variables.
-- Worker layout: `braid setup/serve/doctor --worker <name>` resolves config,
-  secrets, database, worktrees, and logs under `~/.braid/workers/<name>/`.
 - Config schema version 2 with `[[runtimes]]`, `[[llm_providers]]`, and profile
   `adapter_type` / `adapter_version` references. Runtime connectivity no longer
   lives in profiles.
@@ -56,15 +33,34 @@ Versioning once release artifacts are published.
 
 - **Breaking**: `schema_version` must be `2`; old v1 configs must be regenerated
   by re-running `braid setup --instance <key>`.
+- **Breaking**: `--worker` and `--home` are removed. Config-loading commands
+  now take `--config <PATH>` or `--instance <KEY>` (or `BRAID_INSTANCE`).
+  `braid setup` takes `--user-home <DIR>` and `--instance <KEY>`.
+- **Breaking**: Secrets are split. The instance `secrets.toml` holds only the
+  webhook secret; provider API keys live in `~/.braid/secrets/<provider>.toml`
+  and are referenced by path.
+- **Breaking**: The runtime default root is now `<config_dir>/state` and the
+  default database file is `state/braid.sqlite3`.
+- **Breaking**: Config schema v2 now requires an `[instance]` section with a
+  `key` and is the only supported config schema.
 - `provider.codex` / `provider.pi` are replaced by `[[runtimes]]` entries.
 - `braid setup` discovers local runtimes, prints install instructions when none
   are found, and never auto-installs. Manual flags `--runtime-executable` and
   `--runtime-api-url` bypass discovery.
+- `braid doctor` loads the registry and reports duplicate or colliding
+  ingress/health ports across registered instances.
+- Telemetry now tags `service.instance.id` from the config instance key.
+- `braid status` prints the instance key.
+- Config TOML parse errors now include the dotted path to the offending key
+  via `serde_path_to_error`.
+- Clap `env` integration binds `BRAID_INSTANCE`, `BRAID_USER_HOME`, and the
+  setup `--instance` flag to their environment variables.
 - All scheduler dispatch paths (`start_next_agent_turn`, `forward_urgent_steer`,
   `begin_active_context_reset`, `materialize_context_reset`) now route through
   `AgentSession::send_user_msg` instead of calling provider primitives directly.
-- Worker loops (`issue_agent_worker`, `pr_agent_worker`) consume `SessionEvent`
-  from the active `AgentSession` rather than raw provider notifications.
+- Agent group loops (`issue_agent_worker`, `pr_agent_worker`) consume
+  `SessionEvent` from the active `AgentSession` rather than raw provider
+  notifications.
 - `connect_provider` returns `Arc<dyn AgentProvider>` so the adapter and
   `SessionManager` share ownership.
 

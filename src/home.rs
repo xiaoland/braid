@@ -27,13 +27,15 @@ pub fn default_user_home() -> Result<PathBuf> {
 /// Expand a leading `~` in a path to the current user's home directory.
 pub fn expand_home(path: &Path) -> Result<PathBuf> {
     if let Some(s) = path.to_str()
-        && s.starts_with('~')
+        && (s == "~" || s.starts_with("~/"))
     {
         let home = dirs::home_dir().context("cannot determine home directory")?;
-        Ok(home.join(&s[2..]))
-    } else {
-        Ok(path.to_path_buf())
+        if s == "~" {
+            return Ok(home);
+        }
+        return Ok(home.join(&s[2..]));
     }
+    Ok(path.to_path_buf())
 }
 
 /// Validate a local instance key used for filesystem paths and registry lookup.
@@ -175,7 +177,7 @@ pub fn resolve_instance_home(user_root: &Path, entry: &InstanceEntry) -> PathBuf
     if entry.home.is_absolute() { entry.home.clone() } else { user_root.join(&entry.home) }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Registry {
     pub schema_version: u32,
@@ -266,14 +268,14 @@ impl Registry {
         if self.instances.len() == 1 {
             return Ok(&self.instances[0].key);
         }
-        let mut message = String::from("no default instance selected; known instances: ");
         let keys = self.known_keys();
         if keys.is_empty() {
-            message.push_str("none; run `braid setup` first");
-        } else {
-            write!(message, "; known: {}", keys.join(", ")).expect("writing to String cannot fail");
+            bail!("no instances registered; run `braid setup` first");
         }
-        bail!("{message}")
+        bail!(
+            "no default instance selected; known instances: {}; pass --instance <KEY>",
+            keys.join(", ")
+        )
     }
 }
 
@@ -398,6 +400,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("braid-home-test-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&dir).expect("create temp home");
         dir
+    }
+
+    #[test]
+    fn expand_home_handles_tilde_forms() {
+        let home = dirs::home_dir().expect("home directory");
+        assert_eq!(expand_home(Path::new("~")).unwrap(), home);
+        assert_eq!(expand_home(Path::new("~/x")).unwrap(), home.join("x"));
+        assert_eq!(
+            expand_home(Path::new("~other")).unwrap(),
+            PathBuf::from("~other"),
+            "only bare ~ and ~/ expand; ~name is left untouched"
+        );
     }
 
     #[test]

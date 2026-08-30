@@ -9,7 +9,7 @@ network configuration on your side.
 When you run:
 
 ```shell
-braid serve --config ~/.braid/braid-of-<owner>.toml --tunnel
+braid serve --instance <KEY> --tunnel
 ```
 
 Braid performs these steps automatically:

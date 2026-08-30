@@ -22,15 +22,18 @@ release notes generated from `CHANGELOG.md` under SemVer.
 
 ## Configuration
 
-`braid.toml` is versioned independently from binary and database schema. It
+The instance `config.toml` is versioned independently from binary and
+database schema. It
 contains no secret values; secrets use file references or environment-variable
 names. The main sections are:
 
 - GitHub App/repository/handle, API version, webhook and reconciliation;
+- the instance key under `[instance]`;
 - Profile definitions/tags/default PR Profile/context byte budgets/status
   surfaces/provider/workspace/resources;
 - scheduler quiet/count settings;
-- Codex path/version/schema pins and provider home;
+- `[[runtimes]]` adapter executables/version pins and provider home;
+- `[[llm_providers]]` provider credentials (file references, not values);
 - SQLite/runtime/worktree directories;
 - loopback ingress/health ports and Wrangler path;
 - OTLP endpoint/protocol, trace sample ratio, and incident override;
