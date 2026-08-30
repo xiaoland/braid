@@ -12,11 +12,11 @@ use crate::{
     config::{Config, Profile},
     context::{self, CanonicalContext, ContextPressure, RenderedContext},
     github::{GitHubClient, RepositoryName, WorkItemLocator},
+    group::SessionManager,
     group::provider::{
         enqueue_provider_blocked_status, materialized_profile, operational_status_unknown_profile,
         pr_system_prompt, set_provider_unavailable,
     },
-    group::session_manager::SessionManager,
     producer::reconcile::RunningAgentTurn,
     queue::scheduler::{
         begin_active_context_reset, enqueue_context_pressure_status, forward_urgent_steer,
@@ -33,7 +33,6 @@ pub(crate) async fn pr_agent_worker(
     github: Arc<GitHubClient>,
     config: Config,
     mut provider: Arc<dyn crate::provider::AgentProvider>,
-    sessions: Arc<SessionManager>,
     health: Arc<RwLock<HealthSnapshot>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -64,6 +63,11 @@ pub(crate) async fn pr_agent_worker(
     }
 
     loop {
+        // The session map is an ephemeral cache scoped to this connection
+        // epoch: sessions bind the epoch's provider handle, so a reconnect
+        // must rebuild the map from the durable store rather than reuse
+        // sessions bound to a dead connection.
+        let sessions = Arc::new(SessionManager::new());
         let convergence_failed = if let Err(error) = resume_pr_provider_sessions(
             &store,
             &config,
@@ -175,16 +179,6 @@ pub(crate) async fn drive_pr_agent_connection(
                         }
                         active_events = None;
                     }
-                    Ok(crate::agent_session::SessionEvent::SessionReplaced { old_id, new_id }) => {
-                        let _ = store.replace_provider_session(old_id.clone(), new_id.clone());
-                        () = sessions.replace(&old_id, new_id.clone()).await;
-                        if let Some(ref active) = running
-                            && active.claim.provider_session_id == old_id
-                            && let Some(session) = sessions.get(&new_id).await
-                        {
-                            active_events = Some(session.events());
-                        }
-                    }
                     Ok(crate::agent_session::SessionEvent::Failed { reason }) => {
                         if let Some(active) = running.take() {
                             let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
@@ -217,7 +211,7 @@ pub(crate) async fn drive_pr_agent_connection(
             }
             _ = tick.tick() => {
                 if let Some(active) = &mut running {
-                    begin_active_context_reset(store, Arc::clone(&sessions), active).await;
+                    begin_active_context_reset(store, active).await;
                     if active.reset_id.is_none() {
                         forward_urgent_steer(store, Arc::clone(&sessions), active).await;
                     }

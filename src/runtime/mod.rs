@@ -156,13 +156,11 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     if provider_enabled {
         let provider = connect_provider(&config.default_provider_config()?).await?;
         health.write().await.provider = "connected";
-        let sessions = Arc::new(crate::group::SessionManager::new());
         workers.spawn(issue_agent_worker(
             Arc::clone(&store),
             Arc::clone(&github),
             config.clone(),
             provider,
-            Arc::clone(&sessions),
             Arc::clone(&health),
             shutdown_receiver.clone(),
         ));
@@ -172,7 +170,6 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
             Arc::clone(&github),
             config.clone(),
             pr_provider,
-            Arc::clone(&sessions),
             Arc::clone(&health),
             shutdown_receiver.clone(),
         ));

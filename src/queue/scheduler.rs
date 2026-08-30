@@ -9,10 +9,10 @@ use crate::{
     config::{Config, Profile},
     context::{self, CanonicalContext, ContextError, ContextPressure, RenderedContext},
     github::{GitHubClient, RepositoryName, WorkItemLocator},
+    group::SessionManager,
     group::provider::{
         issue_system_prompt, pr_system_prompt, provider_error_lifecycle, render_event_references,
     },
-    group::session_manager::SessionManager,
     producer::reconcile::RunningAgentTurn,
     store::{
         AssignmentCandidate, ContextResetClaim, ProfileRecord, SchedulerPolicy, StoreActor,
@@ -228,11 +228,7 @@ pub(crate) async fn reactivate_work_item_agent(
     }
 }
 
-pub(crate) async fn begin_active_context_reset(
-    store: &StoreActor,
-    sessions: Arc<SessionManager>,
-    active: &mut RunningAgentTurn,
-) {
+pub(crate) async fn begin_active_context_reset(store: &StoreActor, active: &mut RunningAgentTurn) {
     if active.reset_id.is_some() {
         return;
     }
@@ -257,24 +253,11 @@ pub(crate) async fn begin_active_context_reset(
         return;
     }
     active.reset_id = Some(reset.reset_id.clone());
-    // The DB reset claim fences the active turn: its terminal is attributed to
-    // the reset (no success/failure) and the stale session is replaced by
-    // `materialize_context_reset`. A physical interrupt is not expressible
-    // through `AgentSession::send_user_msg` before the replacement context is
-    // materialized, so the fenced turn runs to its terminal.
-    match sessions.get(&reset.old_provider_session_id).await {
-        Some(session) => {
-            if let Err(error) = session.send_user_msg(String::new(), false, None).await {
-                tracing::warn!(%error, reset = %reset.reset_id, "active Context reset notification via AgentSession failed");
-            }
-        }
-        None => {
-            tracing::warn!(
-                provider_session = %reset.old_provider_session_id,
-                "no AgentSession for active reset"
-            );
-        }
-    }
+    // The DB reset claim is the fence: the turn runs to its terminal, the
+    // terminal is attributed to the reset (no success/failure), and
+    // `materialize_context_reset` then starts a fresh session with the rebuilt
+    // context. The contract intentionally has no in-place reset or
+    // interrupt-only message, so there is nothing to send to the old session.
 }
 
 pub(crate) async fn materialize_next_context_reset(
@@ -438,7 +421,7 @@ pub(crate) async fn forward_urgent_steer(
         );
         return;
     };
-    if let Err(error) = session.send_user_msg(reference, true, None).await {
+    if let Err(error) = session.send_user_msg(reference, true).await {
         tracing::warn!(%error, "active turn did not accept urgent steer; batch remains runnable");
         return;
     }
@@ -506,8 +489,11 @@ pub(crate) async fn start_next_agent_turn(
         let _ = store.mark_turn_terminal(claim.turn_id.clone(), "failed".into());
         return None;
     };
-    let provider_turn_id = match session.send_user_msg(reference, false, None).await {
-        Ok(SendResult::Started { provider_turn_id }) => provider_turn_id,
+    // Subscribe before sending so the `TurnStarted` event — the single
+    // authority for provider turn identity — cannot be missed.
+    let mut events = session.events();
+    match session.send_user_msg(reference, false).await {
+        Ok(SendResult::Started) => {}
         Ok(SendResult::Acknowledged) => {
             tracing::error!(turn = %claim.turn_id, "AgentSession did not start a turn");
             let _ = store.mark_turn_terminal(claim.turn_id.clone(), "failed".into());
@@ -526,6 +512,18 @@ pub(crate) async fn start_next_agent_turn(
                 let _ = store.enqueue_turn_reaction(claim.turn_id, "confused".into());
             }
             tracing::error!(%error, "cannot send user message through AgentSession");
+            return None;
+        }
+    }
+    // The adapter emits exactly one `TurnStarted` before `Started` returns, so
+    // this receive cannot hang on a healthy adapter.
+    let provider_turn_id = match events.recv().await {
+        Ok(crate::agent_session::SessionEvent::TurnStarted { provider_turn_id }) => {
+            provider_turn_id
+        }
+        other => {
+            tracing::error!(?other, turn = %claim.turn_id, "AgentSession stream did not begin with TurnStarted");
+            let _ = store.mark_turn_terminal(claim.turn_id.clone(), "failed".into());
             return None;
         }
     };

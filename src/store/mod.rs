@@ -292,7 +292,6 @@ pub struct ContextResetClaim {
     pub work_item_kind: String,
     pub number: u64,
     pub profile_id: String,
-    pub old_provider_session_id: String,
     pub active_turn_id: Option<String>,
     pub provider_turn_id: Option<String>,
     pub references: Vec<String>,
@@ -1043,18 +1042,6 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub fn replace_provider_session(
-        &self,
-        old_id: String,
-        new_id: String,
-    ) -> Result<(), StoreError> {
-        let (reply, receiver) = mpsc::channel();
-        self.sender
-            .send(Command::ReplaceProviderSession(old_id, new_id, reply))
-            .map_err(|_| StoreError::ActorUnavailable)?;
-        receiver.recv().map_err(|_| StoreError::ActorStopped)?
-    }
-
     pub fn claim_urgent_steer(&self, turn_id: String) -> Result<Option<TurnClaim>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
@@ -1292,7 +1279,6 @@ enum Command {
     ),
     MarkTurnStarted(String, String, Sender<Result<(), StoreError>>),
     MarkTurnTerminal(String, String, Sender<Result<(), StoreError>>),
-    ReplaceProviderSession(String, String, Sender<Result<(), StoreError>>),
     ClaimUrgentSteer(String, Sender<Result<Option<TurnClaim>, StoreError>>),
     ConsumeSteerBatch(String, Sender<Result<(), StoreError>>),
     EnqueueTurnReaction(String, String, Sender<Result<(), StoreError>>),
@@ -1598,9 +1584,6 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             }
             Command::MarkTurnTerminal(turn_id, lifecycle, reply) => {
                 let _ = reply.send(mark_turn_terminal(database, &turn_id, &lifecycle));
-            }
-            Command::ReplaceProviderSession(old_id, new_id, reply) => {
-                let _ = reply.send(replace_provider_session(database, &old_id, &new_id));
             }
             Command::ClaimUrgentSteer(turn_id, reply) => {
                 let _ = reply.send(claim_urgent_steer(database, &turn_id));
@@ -4100,14 +4083,13 @@ fn load_context_reset_claim(
 ) -> Result<ContextResetClaim, StoreError> {
     let mut claim = connection.query_row(
         "SELECT cr.reset_id,a.assignment_id,r.name_with_owner,w.kind,w.number,ai.profile_id,
-                ps.provider_session_id,cr.active_turn_id,t.provider_turn_id,cr.continuation,
+                cr.active_turn_id,t.provider_turn_id,cr.continuation,
                 wt.path,wt.head_ref
          FROM context_resets cr
          JOIN agent_instances ai ON ai.agent_id=cr.agent_id
          JOIN assignments a ON a.assignment_id=ai.assignment_id
          JOIN work_items w ON w.node_id=a.work_item_node_id
          JOIN repositories r ON r.node_id=w.repository_node_id
-         JOIN provider_sessions ps ON ps.session_id=cr.old_session_id
          LEFT JOIN worktrees wt ON wt.agent_id=ai.agent_id AND wt.lifecycle='active'
          LEFT JOIN turns t ON t.turn_id=cr.active_turn_id
          WHERE cr.reset_id=?1",
@@ -4120,13 +4102,12 @@ fn load_context_reset_claim(
                 work_item_kind: row.get(3)?,
                 number: sqlite_i64_to_u64(row.get(4)?, "context reset Work Item number")?,
                 profile_id: row.get(5)?,
-                old_provider_session_id: row.get(6)?,
-                active_turn_id: row.get(7)?,
-                provider_turn_id: row.get(8)?,
+                active_turn_id: row.get(6)?,
+                provider_turn_id: row.get(7)?,
                 references: Vec::new(),
-                continuation: row.get::<_, i64>(9)? != 0,
-                worktree_path: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
-                worktree_head_ref: row.get(11)?,
+                continuation: row.get::<_, i64>(8)? != 0,
+                worktree_path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
+                worktree_head_ref: row.get(10)?,
             })
         },
     )?;
@@ -4568,27 +4549,6 @@ fn mark_turn_terminal(database: &Path, turn_id: &str, lifecycle: &str) -> Result
             params![work_item_node_id, now],
         )?;
     }
-    transaction.commit()?;
-    Ok(())
-}
-
-fn replace_provider_session(database: &Path, old_id: &str, new_id: &str) -> Result<(), StoreError> {
-    require_current_schema(database)?;
-    let now = now_rfc3339();
-    let mut connection = open_read_write(database)?;
-    configure_connection(&connection)?;
-    let transaction = connection.transaction()?;
-    // provider_sessions: update the row that currently carries old_id
-    transaction.execute(
-        "UPDATE provider_sessions SET provider_session_id=?2,updated_at=?3
-         WHERE provider_session_id=?1",
-        params![old_id, new_id, now],
-    )?;
-    // turns: update any turn whose provider_turn_id matches old_id
-    transaction.execute(
-        "UPDATE turns SET provider_turn_id=?2 WHERE provider_turn_id=?1",
-        params![old_id, new_id],
-    )?;
     transaction.commit()?;
     Ok(())
 }

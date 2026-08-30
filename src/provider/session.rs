@@ -1,9 +1,5 @@
 #![allow(clippy::all, clippy::pedantic)]
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use tokio::sync::{Mutex, broadcast};
 
@@ -37,23 +33,32 @@ struct SessionInner {
     status: SessionStatus,
     thread_id: Option<String>,
     current_turn_id: Option<String>,
-    pending_reset: Option<PendingReset>,
-    last_context_hash: Option<u64>,
 }
 
-struct PendingReset {
-    new_context: String,
-    msg: String,
-    steering: bool,
+impl SessionInner {
+    /// Record a turn start and report whether it is new. The provider reports
+    /// one fact ("turn X started on this thread") through two observations —
+    /// the `turn/start` response and the async notification — and the adapter
+    /// must project exactly one `TurnStarted` event per turn.
+    fn note_turn_started(&mut self, turn_id: &str) -> bool {
+        if self.current_turn_id.as_deref() == Some(turn_id) {
+            return false;
+        }
+        self.current_turn_id = Some(turn_id.to_owned());
+        self.status = SessionStatus::Running;
+        true
+    }
 }
 
 impl ProviderAgentSession {
-    pub async fn resume(
+    /// Wrap the provider handle and spawn the notification listener that
+    /// translates provider notifications into core `SessionEvent`s.
+    fn spawn(
         provider: Arc<dyn AgentProvider>,
         profile: Profile,
         instructions: String,
-        thread_id: &str,
-    ) -> Result<Arc<Self>, SessionError> {
+        thread_id: Option<String>,
+    ) -> Arc<Self> {
         let (events, _) = broadcast::channel(512);
         let session = Arc::new(Self {
             provider,
@@ -61,15 +66,13 @@ impl ProviderAgentSession {
             instructions,
             inner: Mutex::new(SessionInner {
                 status: SessionStatus::Idle,
-                thread_id: Some(thread_id.to_owned()),
+                thread_id,
                 current_turn_id: None,
-                pending_reset: None,
-                last_context_hash: None,
             }),
             events,
         });
-        let mut notifications = session.provider.subscribe();
         let listener = Arc::downgrade(&session);
+        let mut notifications = session.provider.subscribe();
         tokio::spawn(async move {
             while let Ok(notification) = notifications.recv().await {
                 let Some(session) = listener.upgrade() else { break };
@@ -79,11 +82,6 @@ impl ProviderAgentSession {
             }
         });
         session
-            .provider
-            .resume_session(thread_id, &session.profile, &session.instructions)
-            .await
-            .map_err(map_provider_error)?;
-        Ok(session)
     }
 
     pub async fn start(
@@ -92,35 +90,35 @@ impl ProviderAgentSession {
         instructions: String,
         initial_context: Option<String>,
     ) -> Result<Arc<Self>, SessionError> {
-        let (events, _) = broadcast::channel(512);
-        let session = Arc::new(Self {
-            provider,
-            profile,
-            instructions,
-            inner: Mutex::new(SessionInner {
-                status: SessionStatus::Idle,
-                thread_id: None,
-                current_turn_id: None,
-                pending_reset: None,
-                last_context_hash: None,
-            }),
-            events,
-        });
-        // Translate provider notifications into core SessionEvents.
-        let listener = Arc::downgrade(&session);
-        let mut notifications = session.provider.subscribe();
-        tokio::spawn(async move {
-            while let Ok(notification) = notifications.recv().await {
-                let Some(session) = listener.upgrade() else { break };
-                if session.handle_notification(notification).await {
-                    break;
-                }
-            }
-        });
-
+        let session = Self::spawn(provider, profile, instructions, None);
+        let provider_session = session
+            .provider
+            .start_session(&session.profile, &session.instructions)
+            .await
+            .map_err(map_provider_error)?;
         if let Some(context) = initial_context {
-            session.send_user_msg(String::new(), false, Some(context)).await.map(|_| ())?;
+            session
+                .provider
+                .inject_context(&provider_session.thread_id, &context)
+                .await
+                .map_err(map_provider_error)?;
         }
+        session.inner.lock().await.thread_id = Some(provider_session.thread_id);
+        Ok(session)
+    }
+
+    pub async fn resume(
+        provider: Arc<dyn AgentProvider>,
+        profile: Profile,
+        instructions: String,
+        thread_id: &str,
+    ) -> Result<Arc<Self>, SessionError> {
+        let session = Self::spawn(provider, profile, instructions, Some(thread_id.to_owned()));
+        session
+            .provider
+            .resume_session(thread_id, &session.profile, &session.instructions)
+            .await
+            .map_err(map_provider_error)?;
         Ok(session)
     }
 
@@ -128,8 +126,7 @@ impl ProviderAgentSession {
     ///
     /// This is a concrete-type accessor, not part of the core `AgentSession`
     /// contract: the core persists the id in the durable store right after
-    /// creation, and later replacements are observed through
-    /// `SessionEvent::SessionReplaced`.
+    /// creation, and the store remains the authority from then on.
     pub async fn thread_id(&self) -> Option<String> {
         self.inner.lock().await.thread_id.clone()
     }
@@ -138,9 +135,8 @@ impl ProviderAgentSession {
         let mut inner = self.inner.lock().await;
         match notification {
             ProviderNotification::TurnStarted { thread_id, turn_id } => {
-                if inner.thread_id.as_ref() == Some(&thread_id) {
-                    inner.current_turn_id = Some(turn_id.clone());
-                    inner.status = SessionStatus::Running;
+                if inner.thread_id.as_ref() == Some(&thread_id) && inner.note_turn_started(&turn_id)
+                {
                     let _ =
                         self.events.send(SessionEvent::TurnStarted { provider_turn_id: turn_id });
                 }
@@ -154,7 +150,6 @@ impl ProviderAgentSession {
                         "failed" => TurnOutcome::Failed,
                         _ => TurnOutcome::Unknown,
                     };
-                    let is_current = inner.current_turn_id.as_ref() == Some(&turn_id);
                     inner.current_turn_id = None;
                     inner.status = SessionStatus::Idle;
                     let _ = self.events.send(SessionEvent::TurnTerminal {
@@ -163,15 +158,6 @@ impl ProviderAgentSession {
                     });
                     if let Some(reason) = error {
                         let _ = self.events.send(SessionEvent::Failed { reason });
-                    }
-                    if is_current {
-                        if let Some(pending) = inner.pending_reset.take() {
-                            drop(inner);
-                            let context = pending.new_context;
-                            let msg = pending.msg;
-                            let steering = pending.steering;
-                            let _ = self.send_user_msg(msg, steering, Some(context)).await;
-                        }
                     }
                 }
                 false
@@ -189,12 +175,6 @@ impl ProviderAgentSession {
             }
         }
     }
-
-    fn context_hash(text: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
-        hasher.finish()
-    }
 }
 
 #[async_trait::async_trait]
@@ -203,71 +183,14 @@ impl AgentSession for ProviderAgentSession {
         self.events.subscribe()
     }
 
-    async fn send_user_msg(
-        &self,
-        msg: String,
-        steering: bool,
-        reset_context_to: Option<String>,
-    ) -> Result<SendResult, SessionError> {
+    async fn send_user_msg(&self, msg: String, steering: bool) -> Result<SendResult, SessionError> {
         let mut inner = self.inner.lock().await;
 
         if inner.status == SessionStatus::Failed {
             return Err(SessionError::Unavailable);
         }
-
-        let context_changed = reset_context_to.as_ref().map_or(false, |context| {
-            let hash = Self::context_hash(context);
-            inner.last_context_hash != Some(hash)
-        });
-
-        // If a turn is running and we need to replace context, fence the turn.
-        if context_changed && inner.status == SessionStatus::Running {
-            let context = reset_context_to.expect("context_changed implies Some");
-            inner.pending_reset = Some(PendingReset { new_context: context, msg, steering });
-            if let (Some(thread_id), Some(turn_id)) =
-                (inner.thread_id.clone(), inner.current_turn_id.clone())
-            {
-                let _ = self.provider.interrupt(&thread_id, &turn_id).await;
-            }
+        if msg.is_empty() {
             return Ok(SendResult::Acknowledged);
-        }
-
-        // If context changed while idle, replace the physical session.
-        let need_new_session =
-            inner.thread_id.is_none() || (context_changed && inner.status == SessionStatus::Idle);
-
-        if need_new_session {
-            let context = reset_context_to.as_ref();
-            let provider_session = self
-                .provider
-                .start_session(&self.profile, &self.instructions)
-                .await
-                .map_err(map_provider_error)?;
-            if let Some(context) = context {
-                self.provider
-                    .inject_context(&provider_session.thread_id, context)
-                    .await
-                    .map_err(map_provider_error)?;
-                inner.last_context_hash = Some(Self::context_hash(context));
-            }
-            let old_id = inner.thread_id.replace(provider_session.thread_id.clone());
-            if let Some(old_id) = old_id {
-                let _ = self.events.send(SessionEvent::SessionReplaced {
-                    old_id,
-                    new_id: provider_session.thread_id.clone(),
-                });
-            }
-        } else if context_changed {
-            // Should have been handled above, but guard anyway.
-            if let Some(context) = reset_context_to {
-                if let Some(thread_id) = inner.thread_id.as_ref() {
-                    self.provider
-                        .inject_context(thread_id, &context)
-                        .await
-                        .map_err(map_provider_error)?;
-                    inner.last_context_hash = Some(Self::context_hash(&context));
-                }
-            }
         }
 
         let thread_id = inner
@@ -285,15 +208,10 @@ impl AgentSession for ProviderAgentSession {
                     .steer(&thread_id, &turn_id, &msg)
                     .await
                     .map_err(map_provider_error)?;
-                return Ok(SendResult::Acknowledged);
             }
             // Non-steering messages while running are dropped; the caller is
-            // expected to emit them through the event queue debounce path so
-            // they arrive when the session is idle.
-            return Ok(SendResult::Acknowledged);
-        }
-
-        if msg.is_empty() {
+            // expected to route them through the event queue debounce so they
+            // arrive when the session is idle.
             return Ok(SendResult::Acknowledged);
         }
 
@@ -302,11 +220,10 @@ impl AgentSession for ProviderAgentSession {
             .start_turn(&thread_id, &self.profile, &msg)
             .await
             .map_err(map_provider_error)?;
-        inner.current_turn_id = Some(turn.turn_id.clone());
-        inner.status = SessionStatus::Running;
-        let _ =
-            self.events.send(SessionEvent::TurnStarted { provider_turn_id: turn.turn_id.clone() });
-        Ok(SendResult::Started { provider_turn_id: turn.turn_id })
+        if inner.note_turn_started(&turn.turn_id) {
+            let _ = self.events.send(SessionEvent::TurnStarted { provider_turn_id: turn.turn_id });
+        }
+        Ok(SendResult::Started)
     }
 }
 

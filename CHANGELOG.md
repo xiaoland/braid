@@ -24,8 +24,9 @@ Versioning once release artifacts are published.
   `ProviderAgentSession` in `src/provider/session.rs` maps it to the existing
   provider primitives and owns physical session creation/replacement/resume.
 - `SessionManager` in `src/group/session_manager.rs` manages per-provider-thread
-  `ProviderAgentSession` handles (start/resume/replace/remove), keyed by the
-  thread id the adapter actually created.
+  `ProviderAgentSession` handles (start/resume/get), keyed by the thread id the
+  adapter actually created. It is ephemeral per connection epoch and rebuilt
+  from the durable store on reconnect.
 - New architecture boundary modules `src/producer/`, `src/queue/`, and
   `src/group/` own the implementation modules (`ingress`/`reconcile`,
   `scheduler`/`outbox`, `issue_agent`/`pr_agent`/`provider`/`session_manager`);
@@ -78,8 +79,27 @@ Versioning once release artifacts are published.
 - Dead `handle_provider_notification` fallback removed; provider `Activity`
   notifications are traced inside `ProviderAgentSession`.
 - Unused `ProviderSession.model` field removed.
+- Dead in-place reset surface removed: `send_user_msg`'s `reset_context_to`
+  parameter, the adapter's `pending_reset`/`last_context_hash` bookkeeping,
+  `SessionEvent::SessionReplaced`, `SessionManager::replace`, and
+  `Store::replace_provider_session` were unreachable from every production
+  path. Context replacement is orchestrated by the core through
+  `SessionManager::start` with materialized context, matching the tested
+  reset state machine.
+- `AgentProvider::interrupt` removed; its only caller was the dead
+  pending-reset path.
+- `SendResult::Started` no longer carries the provider turn id;
+  `SessionEvent::TurnStarted` is the single authority for turn identity.
 
 ### Fixed
+
+- The adapter no longer emits two `TurnStarted` events per turn (the
+  `turn/start` response and the async notification are two observations of
+  one fact and are now deduplicated).
+- `SessionManager` is now scoped to one worker and one connection epoch.
+  Previously it survived reconnects while its sessions kept the dead
+  epoch's provider handle, so `resume` cache hits returned sessions that
+  could never send again (including sessions marked failed on disconnect).
 
 - Assignment/reactivation/reset materialization no longer creates two physical
   provider sessions (one raw, one adapter-owned) with the durable store

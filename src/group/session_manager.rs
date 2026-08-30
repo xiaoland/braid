@@ -8,11 +8,12 @@ use crate::{
     provider::{AgentProvider, ProviderAgentSession},
 };
 
-/// In-process manager for the active Agent Sessions of this worker.
+/// In-process manager for the active Agent Sessions of one connection epoch.
 ///
-/// MVP: one session per physical provider thread id. The key is the current
-/// `provider_session_id` (a.k.a. provider thread id). When a context reset
-/// replaces the physical session, `replace` updates the key atomically.
+/// The durable store is the authority for session identity; this map is an
+/// ephemeral cache keyed by the current provider thread id. Because sessions
+/// bind the epoch's provider handle, workers build a fresh manager per
+/// connection epoch and repopulate it from the store via `resume`.
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Arc<ProviderAgentSession>>>,
 }
@@ -25,14 +26,6 @@ impl SessionManager {
     pub async fn get(&self, provider_session_id: &str) -> Option<Arc<dyn AgentSession>> {
         let sessions = self.sessions.lock().await;
         sessions.get(provider_session_id).map(|s| Arc::clone(s) as Arc<dyn AgentSession>)
-    }
-
-    pub async fn replace(&self, old_provider_session_id: &str, new_provider_session_id: String) {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions.remove(old_provider_session_id);
-        if let Some(session) = session {
-            sessions.insert(new_provider_session_id, session);
-        }
     }
 
     /// Start a fresh Agent Session with an initial materialized context.

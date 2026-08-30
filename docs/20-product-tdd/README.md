@@ -102,9 +102,9 @@ crates. Modules are deep and align with authority boundaries:
 | `producer` | Webhook/GraphQL ingress → canonical diff → classified events (`ingress`, `reconcile`). |
 | `queue` | Per-work-item per-agent-group quiet window, batch emission, and the Braid GitHub write outbox (`scheduler`, `outbox`). |
 | `group` | Agent Group workers driving `AgentSession`s, provider supervision/prompts/attribution, and the in-process `SessionManager` (`issue_agent`, `pr_agent`, `provider`, `session_manager`). |
-| `agent_session` | Core `AgentSession` trait and event stream (`TurnStarted`, `TurnTerminal`, `SessionReplaced`, `Failed`). Core callers operate sessions only through `send_user_msg`; the adapter owns physical session creation/replacement. |
-| `provider::session` | `ProviderAgentSession` adapter that maps `AgentSession` to `AgentProvider` primitives and translates provider notifications into `SessionEvent`s. |
-| `session_manager` | In-process `SessionManager` keyed by provider thread id; start/resume/replace/remove. |
+| `agent_session` | Core `AgentSession` trait and event stream (`TurnStarted`, `TurnTerminal`, `Failed`). Core callers operate sessions only through `send_user_msg`; the event stream is the single authority for lifecycle facts. |
+| `provider::session` | `ProviderAgentSession` adapter that maps `AgentSession` to `AgentProvider` primitives and translates provider notifications into `SessionEvent`s, deduplicating the provider's response-side and notification-side observation of the same fact. |
+| `session_manager` | In-process `SessionManager` keyed by provider thread id; start/resume/get. Ephemeral per connection epoch: it is rebuilt from the durable store on every (re)connect because sessions bind the epoch's provider handle. |
 | `provider` | Provider-neutral capability contract and Codex NDJSON implementation. |
 | `worktree` | Validate a Profile source checkout, fetch the bound PR head, provision one generation-scoped worktree per Implementation Agent, and expose recovery diagnostics; no Git-operation sandbox. |
 | `writer` | `braid gh`, attribution, reaction/status desired state, and write-outbox convergence. |
@@ -112,6 +112,20 @@ crates. Modules are deep and align with authority boundaries:
 | `tunnel` | Wrangler Quick Tunnel supervision and webhook URL handoff. |
 | `runtime` | Owner lease, worker supervision, shutdown ordering, health, and public operator state. |
 | `cli` | `serve`, `config`, `doctor`, `profile`, `gh`, `status`, and migration/version surfaces. |
+
+### State authority
+
+Every piece of state has exactly one authority; everything else is a
+best-effort one-way projection from it. Nonessential state is not persisted.
+
+| State | Authority | Projections |
+| --- | --- | --- |
+| Work Items, assignments, turns, context ledger/resets, queue/batches, outbox, owner lease | Durable store (SQLite) | In-memory `RunningAgentTurn` (claim cache for the in-flight turn), health snapshot |
+| GitHub canonical state | GitHub | `canonical_objects` / `sync_cursors` snapshots for diffing |
+| Physical session identity (`provider_session_id`) | Durable store (`provider_sessions`) | `SessionManager` map key + adapter `thread_id` (both ephemeral, rebuilt per epoch) |
+| Current provider turn | Provider process | `SessionEvent` stream (exactly one `TurnStarted` per turn) → durable store |
+| Provider connectivity | Provider connection | Worker observation → health snapshot + blocked-session records |
+| Worktree presence | Filesystem + git | `worktrees` table (refreshed by inspection at prepare time) |
 
 Selected dependency baseline, verified against crates.io on 2026-08-13:
 

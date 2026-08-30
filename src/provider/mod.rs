@@ -89,8 +89,6 @@ pub trait AgentProvider: Send + Sync {
         expected_turn_id: &str,
         event_references: &str,
     ) -> Result<(), ProviderError>;
-
-    async fn interrupt(&self, thread_id: &str, turn_id: &str) -> Result<(), ProviderError>;
 }
 
 mod codex;
