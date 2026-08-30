@@ -8,12 +8,20 @@ use std::{
 use tokio::sync::{Mutex, broadcast};
 
 use crate::{
-    agent_session::{
-        AgentSession, SendResult, SessionError, SessionEvent, SessionStatus, TurnOutcome,
-    },
+    agent_session::{AgentSession, SendResult, SessionError, SessionEvent, TurnOutcome},
     config::Profile,
     provider::{AgentProvider, ProviderError, ProviderNotification},
 };
+
+/// Adapter-internal dispatch state. Not part of the core contract: the core
+/// reacts to the `SessionEvent` stream, and operator-visible status is owned
+/// by the durable store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionStatus {
+    Idle,
+    Running,
+    Failed,
+}
 
 /// Adapter-level wrapper that exposes the core `AgentSession` contract over the
 /// lower-level `AgentProvider` primitives.

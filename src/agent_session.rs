@@ -1,24 +1,4 @@
-use std::fmt;
-
 use tokio::sync::broadcast;
-
-/// Snapshot returned synchronously by `status()`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionStatus {
-    Idle,
-    Running,
-    Failed,
-}
-
-impl fmt::Display for SessionStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Idle => write!(f, "idle"),
-            Self::Running => write!(f, "running"),
-            Self::Failed => write!(f, "failed"),
-        }
-    }
-}
 
 /// Terminal outcome of a provider turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
