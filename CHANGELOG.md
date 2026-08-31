@@ -22,6 +22,13 @@ Versioning once release artifacts are published.
 - `braid doctor` gained a "Codex credentials" check for provider-home
   authentication, so the gap is caught before serving.
 
+### Added
+
+- Setup output and the user manual now state the Issue activation contract:
+  a trusted `@braid` mention from a MAINTAIN/ADMIN actor. Native Issue
+  assignment is GitHub-side Agent App provisioning that ordinary
+  manifest-created Apps cannot obtain; Braid detects the mode at runtime.
+
 ## [0.3.0] - 2026-08-31
 
 ### Added

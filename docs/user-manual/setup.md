@@ -92,6 +92,20 @@ After setup:
 
 The tunnel receives GitHub webhooks and routes them to Braid's local ingress.
 
+## Activating Braid on an Issue
+
+Braid activates through a **trusted `@braid` mention**: a visible `@braid` in
+an issue comment from a repository MAINTAIN/ADMIN actor wakes the Issue Agent
+(after the Quiet Window). Braid acknowledges the mention with an `eyes`
+reaction.
+
+Native Issue assignment is a GitHub-side *Agent App* provisioning (the same
+capability that makes Copilot assignable), not a permission an ordinary
+GitHub App can hold — an App created through the manifest flow does not
+appear in the assignee picker, and assigning it via the API is rejected. If
+GitHub ever provisions your App as an Agent App, assignment works without any
+configuration change; Braid detects the mode at runtime.
+
 ## Provider credentials and workspace
 
 `braid setup` also prepares the instance-scoped provider home

@@ -221,6 +221,11 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     println!(
         "Then run:\n  braid doctor --instance {instance_key}\n  braid serve --instance {instance_key} --tunnel\n"
     );
+    println!(
+        "Once serving, activate Braid on an issue with a visible @braid comment from a \
+         repository admin/maintainer. (Native Issue assignment requires GitHub-side Agent \
+         App provisioning and is not available to ordinary Apps.)"
+    );
 
     let logo_path = base_dir.join(format!("braid-of-{owner}-logo.png"));
     match logo::generate(owner, &logo_path) {
