@@ -27,6 +27,10 @@ pub struct WorktreeRequest<'a> {
     pub target: &'a Path,
     pub repository: &'a str,
     pub remote: &'a str,
+    /// System `git` executable used for the network fetch: it honors the
+    /// operator's credential helpers and proxy configuration, which libgit2
+    /// does not.
+    pub git: &'a Path,
     pub head_ref: &'a str,
     pub local_branch: &'a str,
 }
@@ -62,13 +66,23 @@ pub fn provision(request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, W
             .map_err(|source| WorktreeError::Io { path: parent.to_path_buf(), source })?;
     }
     tokio::task::block_in_place(|| {
+        let refspec =
+            format!("+refs/heads/{0}:refs/remotes/{1}/{0}", request.head_ref, request.remote);
+        let output = std::process::Command::new(request.git)
+            .arg("-C")
+            .arg(&source)
+            .arg("fetch")
+            .arg(request.remote)
+            .arg(&refspec)
+            .output()
+            .map_err(|source_err| WorktreeError::Io { path: source.clone(), source: source_err })?;
+        if !output.status.success() {
+            return Err(WorktreeError::Git(format!(
+                "git fetch {refspec} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
         let repo = Repository::open(&source)?;
-        let mut remote = repo.find_remote(request.remote)?;
-        remote.fetch(
-            &[&format!("refs/heads/{0}:refs/remotes/{1}/{0}", request.head_ref, request.remote)],
-            None,
-            None,
-        )?;
         let reference = repo
             .find_reference(&format!("refs/remotes/{}/{}", request.remote, request.head_ref))
             .map_err(|error| {

@@ -440,6 +440,7 @@ pub(crate) fn provision_pr_agent_worktree(
         target: &target,
         repository: &config.github.repository,
         remote: "origin",
+        git: &config.tools.git,
         head_ref: &prepared.head_ref,
         local_branch: &local_branch,
     })?;

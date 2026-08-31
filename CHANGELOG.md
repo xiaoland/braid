@@ -37,6 +37,12 @@ Versioning once release artifacts are published.
 - Mention-authority resolution now backs off exponentially (2s to 60s) on
   persistent GitHub errors instead of retrying every 250ms scheduler tick.
 
+- PR worktree provisioning fetched through libgit2, which ignores the
+  operator's credential helpers and proxy configuration and failed on real
+  networks ("no TLS stream available"). The fetch now uses the configured
+  system `git` executable; libgit2 remains for local reference/worktree
+  operations.
+
 
 ## [0.3.0] - 2026-08-31
 
