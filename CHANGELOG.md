@@ -3,7 +3,7 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
-## [0.3.0] - unreleased
+## [0.3.0] - 2026-08-31
 
 ### Added
 
