@@ -3,6 +3,16 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
+## [0.3.1] - unreleased
+
+### Fixed
+
+- PR worktree provisioning fetched through libgit2, which ignores the
+  operator's credential helpers and proxy configuration and failed on real
+  networks ("no TLS stream available"). The fetch now uses the configured
+  system `git` executable; libgit2 remains for local reference/worktree
+  operations.
+
 ## [0.3.0] - 2026-08-31
 
 ### Added
