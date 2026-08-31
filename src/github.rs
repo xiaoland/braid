@@ -168,13 +168,16 @@ impl GitHubClient {
         }
         let installation =
             app.apps().get_repository_installation(&repository.owner, &repository.name).await?;
-        let installation_id = installation.id.into_inner();
+        // Keep the raw id for the auto-refreshing installation client; a
+        // fixed personal_token client would die permanently when the token
+        // expires after one hour.
+        let installation_raw_id = installation.id;
+        let installation_id = installation_raw_id.into_inner();
         let access: AccessTokenResponse = app
             .post(&format!("/app/installations/{installation_id}/access_tokens"), None::<&()>)
             .await?;
-        let installation_client = Octocrab::builder()
-            .personal_token(access.token.clone())
-            .build()
+        let installation_client = app
+            .installation(installation_raw_id)
             .map_err(|error| GitHubError::Client(error.to_string()))?;
         let repository_info = repository_identity(&installation_client, repository).await?;
         let actor = viewer_identity(&installation_client).await?;
@@ -600,7 +603,6 @@ struct GraphQlError {
 
 #[derive(Deserialize)]
 struct AccessTokenResponse {
-    token: String,
     expires_at: String,
     #[serde(default)]
     permissions: BTreeMap<String, String>,
