@@ -33,15 +33,21 @@ struct SessionInner {
     status: SessionStatus,
     thread_id: Option<String>,
     current_turn_id: Option<String>,
+    /// The most recently terminated turn. Guards against a provider
+    /// re-emitting `TurnStarted` for a turn that already has its terminal,
+    /// which would otherwise resurrect it (Started after Terminal).
+    last_terminal_turn_id: Option<String>,
 }
 
 impl SessionInner {
     /// Record a turn start and report whether it is new. The provider reports
     /// one fact ("turn X started on this thread") through two observations —
     /// the `turn/start` response and the async notification — and the adapter
-    /// must project exactly one `TurnStarted` event per turn.
+    /// must project exactly one `TurnStarted` per turn.
     fn note_turn_started(&mut self, turn_id: &str) -> bool {
-        if self.current_turn_id.as_deref() == Some(turn_id) {
+        if self.current_turn_id.as_deref() == Some(turn_id)
+            || self.last_terminal_turn_id.as_deref() == Some(turn_id)
+        {
             return false;
         }
         self.current_turn_id = Some(turn_id.to_owned());
@@ -68,6 +74,7 @@ impl ProviderAgentSession {
                 status: SessionStatus::Idle,
                 thread_id,
                 current_turn_id: None,
+                last_terminal_turn_id: None,
             }),
             events,
         });
@@ -144,19 +151,32 @@ impl ProviderAgentSession {
             }
             ProviderNotification::TurnCompleted { thread_id, turn_id, status, error } => {
                 if inner.thread_id.as_ref() == Some(&thread_id) {
-                    let outcome = match status.as_str() {
-                        "completed" => TurnOutcome::Completed,
-                        "interrupted" => TurnOutcome::Interrupted,
-                        "failed" => TurnOutcome::Failed,
-                        _ => TurnOutcome::Unknown,
-                    };
-                    inner.current_turn_id = None;
-                    inner.status = SessionStatus::Idle;
-                    let _ = self.events.send(SessionEvent::TurnTerminal {
-                        provider_turn_id: turn_id,
-                        outcome,
-                        error,
-                    });
+                    if inner.current_turn_id.as_deref() == Some(turn_id.as_str()) {
+                        let outcome = match status.as_str() {
+                            "completed" => TurnOutcome::Completed,
+                            "interrupted" => TurnOutcome::Interrupted,
+                            "failed" => TurnOutcome::Failed,
+                            _ => TurnOutcome::Unknown,
+                        };
+                        inner.current_turn_id = None;
+                        inner.last_terminal_turn_id = Some(turn_id.clone());
+                        inner.status = SessionStatus::Idle;
+                        let _ = self.events.send(SessionEvent::TurnTerminal {
+                            provider_turn_id: turn_id,
+                            outcome,
+                            error,
+                        });
+                    } else {
+                        // Duplicate or stale terminal (e.g. replayed after
+                        // resume): accepting it would double-emit the
+                        // terminal and, worse, clear the tracking of a
+                        // different turn that is currently running.
+                        tracing::warn!(
+                            %turn_id,
+                            current = ?inner.current_turn_id,
+                            "ignoring duplicate or stale TurnCompleted"
+                        );
+                    }
                 }
                 false
             }
@@ -166,6 +186,7 @@ impl ProviderAgentSession {
                 // session. Connection death itself is observed by the worker
                 // through `AgentProvider::closed()`, not through events.
                 if let Some(turn_id) = inner.current_turn_id.take() {
+                    inner.last_terminal_turn_id = Some(turn_id.clone());
                     let _ = self.events.send(SessionEvent::TurnTerminal {
                         provider_turn_id: turn_id,
                         outcome: TurnOutcome::Unknown,

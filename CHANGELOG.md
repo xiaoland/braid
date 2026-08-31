@@ -130,6 +130,12 @@ Versioning once release artifacts are published.
   `AgentProvider::closed()` regardless of turn state.
 - A provider turn failure produced two terminal-ish signals (`TurnTerminal`
   and `Failed`); there is now exactly one `TurnTerminal` per started turn.
+- The adapter now enforces the exactly-once terminal contract at its own
+  boundary: `TurnCompleted` is accepted only for the currently tracked turn,
+  so a duplicate or stale terminal (e.g. replayed after resume) is logged and
+  ignored instead of double-emitting or — worse — clearing the tracking of a
+  different in-flight turn and allowing a concurrent turn to be dispatched. A
+  `TurnStarted` re-emitted after its terminal is likewise ignored.
 - `SessionManager` is now scoped to one worker and one connection epoch.
   Previously it survived reconnects while its sessions kept the dead
   epoch's provider handle, so `resume` cache hits returned sessions that
