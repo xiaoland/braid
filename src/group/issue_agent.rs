@@ -12,17 +12,16 @@ use crate::{
     config::{Config, Profile},
     github::GitHubClient,
     group::SessionManager,
+    group::dispatch::{
+        forward_urgent_steer, handle_next_work_item_lifecycle, materialize_next_context_reset,
+        materialize_next_issue_assignment, start_next_agent_turn,
+    },
     group::provider::{
         enqueue_provider_blocked_status, issue_system_prompt, materialized_profile,
         operational_status_unknown_profile, set_provider_unavailable,
     },
-    producer::reconcile::RunningAgentTurn,
-    queue::scheduler::{
-        begin_active_context_reset, forward_urgent_steer, handle_next_work_item_lifecycle,
-        materialize_next_context_reset, materialize_next_issue_assignment, policy_from_config,
-        start_next_agent_turn,
-    },
-    runtime::HealthSnapshot,
+    health::HealthSnapshot,
+    queue::scheduler::{RunningAgentTurn, begin_active_context_reset, policy_from_config},
     store::{ProfileRecord, StoreActor},
 };
 

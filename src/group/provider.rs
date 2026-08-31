@@ -6,8 +6,8 @@ use tokio::sync::RwLock;
 
 use crate::{
     config::{Config, Profile},
+    health::HealthSnapshot,
     provider::ProviderError,
-    runtime::HealthSnapshot,
     store::{ProfileRecord, StoreActor, TurnClaim},
 };
 
@@ -81,23 +81,6 @@ pub(crate) fn pr_system_prompt(
         profile.display_name,
         profile.user_instructions,
     )
-}
-
-pub(crate) fn agent_attributions(config: &Config) -> Vec<String> {
-    let mut attributions = Vec::new();
-    for profile in &config.profiles {
-        if profile.has_tag("issue") {
-            attributions
-                .push(format!("> **Braid Agent · {}**\n> Issue Agent", profile.display_name));
-        }
-        if profile.has_tag("pr") {
-            attributions.push(format!(
-                "> **Braid Agent · {}**\n> PR Implementation Agent",
-                profile.display_name
-            ));
-        }
-    }
-    attributions
 }
 
 pub(crate) fn render_event_references(claim: &TurnClaim) -> String {

@@ -9,7 +9,6 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use serde::Serialize;
 use tokio::{
     net::TcpListener,
     sync::{RwLock, watch},
@@ -25,27 +24,15 @@ use crate::{
     telemetry::TelemetryGuard,
 };
 
-use crate::group::provider::agent_attributions;
+use crate::config::agent_attributions;
 use crate::group::{issue_agent_worker, pr_agent_worker};
+use crate::health::HealthSnapshot;
+use crate::outbox::drain_one_write;
+use crate::producer::LEASE_TTL_SECONDS;
 use crate::producer::{
     IngressState, event_worker, lease_worker, reconciliation_worker, webhook_handler,
 };
-use crate::queue::drain_one_write;
 use crate::tunnel::{restore_webhook, start_verified_quick_tunnel};
-
-pub(crate) const LEASE_TTL_SECONDS: u64 = 30;
-
-#[derive(Debug, Clone, Serialize)]
-pub struct HealthSnapshot {
-    pub ready: bool,
-    pub ingress: String,
-    pub repository: String,
-    pub tunnel: &'static str,
-    pub webhook_url: Option<String>,
-    pub reconciliation: &'static str,
-    pub provider: &'static str,
-    pub last_error: Option<String>,
-}
 
 struct RuntimeLeaseGuard {
     store: Arc<StoreActor>,

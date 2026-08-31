@@ -13,7 +13,7 @@ use tokio::{
 
 use crate::{
     github::GitHubClient,
-    queue::drain_one_write,
+    outbox::drain_one_write,
     store::{SchedulerPolicy, StoreActor},
     telemetry::{self, PayloadEvidence},
     webhook::{self, WebhookHeaders},

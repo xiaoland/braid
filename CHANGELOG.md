@@ -96,6 +96,16 @@ Versioning once release artifacts are published.
   first — and retries transient connection failures. `serve` no longer exits
   when the provider is unreachable at boot; the worker reports the provider
   unavailable and keeps retrying, matching the reconnect semantics.
+- The module graph is now acyclic with one-way layering (`runtime` → `group`
+  → `queue`; `runtime` → `producer` → `outbox`/`health`). Dispatch and
+  materialization moved from `queue::scheduler` to `group::dispatch` (they
+  execute queue decisions against sessions, a group concern); the in-memory
+  `RunningAgentTurn` claim cache moved from `producer::reconcile` to `queue`;
+  `HealthSnapshot` moved to a new leaf `health` module; `LEASE_TTL_SECONDS`
+  moved to `producer` (lease protocol home); `agent_attributions` moved to
+  `config` (pure profile derivation); and the GitHub write outbox moved from
+  `queue::outbox` to a leaf `outbox` module (it only needs `store` +
+  `github`).
 
 ### Fixed
 

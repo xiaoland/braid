@@ -13,17 +13,19 @@ use crate::{
     context::{self, CanonicalContext, ContextPressure, RenderedContext},
     github::{GitHubClient, RepositoryName, WorkItemLocator},
     group::SessionManager,
+    group::dispatch::{
+        forward_urgent_steer, handle_next_work_item_lifecycle, materialize_next_context_reset,
+        start_next_agent_turn,
+    },
     group::provider::{
         enqueue_provider_blocked_status, materialized_profile, operational_status_unknown_profile,
         pr_system_prompt, set_provider_unavailable,
     },
-    producer::reconcile::RunningAgentTurn,
+    health::HealthSnapshot,
     queue::scheduler::{
-        begin_active_context_reset, enqueue_context_pressure_status, forward_urgent_steer,
-        handle_next_work_item_lifecycle, materialize_next_context_reset, policy_from_config,
-        record_context_pressure, start_next_agent_turn,
+        RunningAgentTurn, begin_active_context_reset, enqueue_context_pressure_status,
+        policy_from_config, record_context_pressure,
     },
-    runtime::HealthSnapshot,
     store::{AssignmentCandidate, ProfileRecord, StoreActor},
     worktree::{self, WorktreeRequest},
 };

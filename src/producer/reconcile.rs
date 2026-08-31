@@ -11,15 +11,17 @@ use tokio::{
     time::{Duration, MissedTickBehavior},
 };
 
+pub(crate) const LEASE_TTL_SECONDS: u64 = 30;
+
 use crate::{
     config::Config,
+    config::agent_attributions,
     context::{self, CanonicalContext, CanonicalObservation},
     github::{GitHubClient, RepositoryName, WorkItemLocator},
-    group::provider::agent_attributions,
-    runtime::{HealthSnapshot, LEASE_TTL_SECONDS},
+    health::HealthSnapshot,
     store::{
         CanonicalObjectState, IngressEvent, ReactionTarget, RuntimeLease, SchedulerPolicy,
-        StoreActor, TurnClaim,
+        StoreActor,
     },
     webhook,
 };
@@ -453,10 +455,4 @@ pub(crate) fn reconciled_event(
         known: true,
         raw_payload: raw,
     }
-}
-
-pub(crate) struct RunningAgentTurn {
-    pub(crate) claim: TurnClaim,
-    pub(crate) provider_turn_id: String,
-    pub(crate) reset_id: Option<String>,
 }
