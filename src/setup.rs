@@ -556,6 +556,7 @@ fn build_config(
     runtime: RuntimeEntry,
     llm_provider: LlmProvider,
 ) -> anyhow::Result<Config> {
+    let runtime_version = runtime.version.clone();
     let mut config = Config {
         schema_version: CONFIG_SCHEMA_VERSION,
         instance: crate::config::InstanceConfig {
@@ -606,11 +607,11 @@ fn build_config(
             display_name: "Braid Agent".to_owned(),
             tags: vec!["issue".to_owned(), "pr".to_owned()],
             adapter_type: arguments.provider.clone(),
-            adapter_version: if arguments.provider == "codex" {
-                "codex-cli 0.147.0-alpha.6.5".to_owned()
-            } else {
-                "0.84.3".to_owned()
-            },
+            // Pin the profile to the runtime that setup actually discovered:
+            // config validation requires adapter_version == runtime.version,
+            // so a hardcoded string breaks the moment the local runtime
+            // upgrades.
+            adapter_version: runtime_version,
             provider: if arguments.provider == "codex" {
                 "openai".to_owned()
             } else {
