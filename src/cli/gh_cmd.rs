@@ -4,7 +4,8 @@ use super::*;
 pub async fn gh(command: GhCommand) -> Result<()> {
     match command {
         GhCommand::Comment { command: GhCommentCommand::Create(arguments) } => {
-            let config = helpers::load(&arguments.config)?;
+            let config_path = arguments.source.resolve_config_path()?;
+            let config = helpers::load(&config_path)?;
             let target = arguments.target.parse::<WorkItemLocator>()?;
             let body = match (arguments.body, arguments.body_file) {
                 (Some(body), None) => body,
@@ -29,7 +30,8 @@ pub async fn gh(command: GhCommand) -> Result<()> {
             print_gh_receipt(&receipt, arguments.json)
         }
         GhCommand::Pr { command: GhPrCommand::Ensure(arguments) } => {
-            let config = helpers::load(&arguments.config)?;
+            let config_path = arguments.source.resolve_config_path()?;
+            let config = helpers::load(&config_path)?;
             let actor = helpers::store(&config)?;
             let receipt = writer::ensure_pull_request(
                 &config,

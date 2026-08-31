@@ -20,6 +20,7 @@ pub struct CodexProvider {
     writer: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<PendingRequests>>,
     notifications: broadcast::Sender<ProviderNotification>,
+    closed: watch::Sender<bool>,
     next_request_id: Arc<AtomicI64>,
     _process: Arc<ProcessGuard>,
 }
@@ -48,12 +49,14 @@ impl CodexProvider {
             .ok_or_else(|| ProviderError::Protocol("app-server stderr was not piped".into()))?;
         let pending = Arc::new(Mutex::new(BTreeMap::new()));
         let (notifications, _) = broadcast::channel(512);
-        spawn_codex_stdout(stdout, Arc::clone(&pending), notifications.clone());
+        let (closed, _) = watch::channel(false);
+        spawn_codex_stdout(stdout, Arc::clone(&pending), notifications.clone(), closed.clone());
         spawn_codex_stderr(stderr);
         let client = Self {
             writer: Arc::new(Mutex::new(writer)),
             pending,
             notifications,
+            closed,
             next_request_id: Arc::new(AtomicI64::new(1)),
             _process: Arc::new(ProcessGuard { child: StdMutex::new(Some(child)) }),
         };
@@ -112,6 +115,11 @@ impl AgentProvider for CodexProvider {
         self.notifications.subscribe()
     }
 
+    async fn closed(&self) {
+        let mut closed = self.closed.subscribe();
+        while !*closed.borrow() && closed.changed().await.is_ok() {}
+    }
+
     async fn start_session(
         &self,
         profile: &Profile,
@@ -136,11 +144,6 @@ impl AgentProvider for CodexProvider {
             .ok_or_else(|| ProviderError::Protocol("thread/start omitted result.thread".into()))?;
         Ok(ProviderSession {
             thread_id: required_string(thread, "id", "thread/start result.thread")?,
-            model: result
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("provider-default")
-                .to_owned(),
         })
     }
 
@@ -188,14 +191,7 @@ impl AgentProvider for CodexProvider {
                 "thread/resume returned {resumed_id} for requested thread {thread_id}"
             )));
         }
-        Ok(ProviderSession {
-            thread_id: resumed_id,
-            model: result
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("provider-default")
-                .to_owned(),
-        })
+        Ok(ProviderSession { thread_id: resumed_id })
     }
 
     async fn start_turn(
@@ -249,6 +245,7 @@ fn spawn_codex_stdout(
     stdout: tokio::process::ChildStdout,
     pending: Arc<Mutex<PendingRequests>>,
     notifications: broadcast::Sender<ProviderNotification>,
+    closed: watch::Sender<bool>,
 ) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
@@ -291,6 +288,7 @@ fn spawn_codex_stdout(
             let _ = sender.send(Err(ProviderError::Disconnected));
         }
         let _ = notifications.send(ProviderNotification::Disconnected);
+        let _ = closed.send(true);
     });
 }
 

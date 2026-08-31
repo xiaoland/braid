@@ -1,5 +1,41 @@
-use super::*;
-use crate::runtime::provider::agent_attributions;
+#![allow(clippy::large_futures)]
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex as StdMutex},
+};
+
+use anyhow::{Context as _, Result};
+use sha2::{Digest, Sha256};
+use tokio::{
+    sync::{RwLock, watch},
+    time::{Duration, MissedTickBehavior},
+};
+
+pub(crate) const LEASE_TTL_SECONDS: u64 = 30;
+
+use crate::{
+    config::Config,
+    config::agent_attributions,
+    context::{self, CanonicalContext, CanonicalObservation},
+    github::{GitHubClient, RepositoryName, WorkItemLocator},
+    health::HealthSnapshot,
+    store::{
+        CanonicalObjectState, IngressEvent, ReactionTarget, RuntimeLease, SchedulerPolicy,
+        StoreActor,
+    },
+    webhook,
+};
+
+/// The canonical GitHub identity of one reconciled Work Item.
+pub(crate) struct ReconcileScope {
+    pub(crate) work_item_node_id: String,
+    pub(crate) work_item_kind: &'static str,
+    pub(crate) work_item_number: u64,
+    pub(crate) work_item_state: String,
+    pub(crate) previous_work_item_state: String,
+    pub(crate) repository_node_id: String,
+    pub(crate) repository: String,
+}
 
 pub(crate) async fn lease_worker(
     store: Arc<StoreActor>,
@@ -419,10 +455,4 @@ pub(crate) fn reconciled_event(
         known: true,
         raw_payload: raw,
     }
-}
-
-pub(crate) struct RunningAgentTurn {
-    pub(crate) claim: TurnClaim,
-    pub(crate) provider_turn_id: String,
-    pub(crate) reset_id: Option<String>,
 }

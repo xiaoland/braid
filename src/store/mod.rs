@@ -292,7 +292,6 @@ pub struct ContextResetClaim {
     pub work_item_kind: String,
     pub number: u64,
     pub profile_id: String,
-    pub old_provider_session_id: String,
     pub active_turn_id: Option<String>,
     pub provider_turn_id: Option<String>,
     pub references: Vec<String>,
@@ -4084,14 +4083,13 @@ fn load_context_reset_claim(
 ) -> Result<ContextResetClaim, StoreError> {
     let mut claim = connection.query_row(
         "SELECT cr.reset_id,a.assignment_id,r.name_with_owner,w.kind,w.number,ai.profile_id,
-                ps.provider_session_id,cr.active_turn_id,t.provider_turn_id,cr.continuation,
+                cr.active_turn_id,t.provider_turn_id,cr.continuation,
                 wt.path,wt.head_ref
          FROM context_resets cr
          JOIN agent_instances ai ON ai.agent_id=cr.agent_id
          JOIN assignments a ON a.assignment_id=ai.assignment_id
          JOIN work_items w ON w.node_id=a.work_item_node_id
          JOIN repositories r ON r.node_id=w.repository_node_id
-         JOIN provider_sessions ps ON ps.session_id=cr.old_session_id
          LEFT JOIN worktrees wt ON wt.agent_id=ai.agent_id AND wt.lifecycle='active'
          LEFT JOIN turns t ON t.turn_id=cr.active_turn_id
          WHERE cr.reset_id=?1",
@@ -4104,13 +4102,12 @@ fn load_context_reset_claim(
                 work_item_kind: row.get(3)?,
                 number: sqlite_i64_to_u64(row.get(4)?, "context reset Work Item number")?,
                 profile_id: row.get(5)?,
-                old_provider_session_id: row.get(6)?,
-                active_turn_id: row.get(7)?,
-                provider_turn_id: row.get(8)?,
+                active_turn_id: row.get(6)?,
+                provider_turn_id: row.get(7)?,
                 references: Vec::new(),
-                continuation: row.get::<_, i64>(9)? != 0,
-                worktree_path: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
-                worktree_head_ref: row.get(11)?,
+                continuation: row.get::<_, i64>(8)? != 0,
+                worktree_path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
+                worktree_head_ref: row.get(10)?,
             })
         },
     )?;

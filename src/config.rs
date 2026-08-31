@@ -9,14 +9,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+use crate::home::validate_instance_key;
+
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("cannot read config {path}: {source}")]
     Read { path: PathBuf, source: std::io::Error },
-    #[error("cannot parse TOML config {path}: {source}")]
-    Parse { path: PathBuf, source: toml::de::Error },
     #[error("unsupported config schema {found}; this binary supports {supported}")]
     Schema { found: u32, supported: u32 },
     #[error("invalid config: {0}")]
@@ -25,12 +25,24 @@ pub enum ConfigError {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct InstanceConfig {
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub schema_version: u32,
+    pub instance: InstanceConfig,
     pub runtime: RuntimeConfig,
     pub github: GitHubConfig,
     pub scheduler: SchedulerConfig,
-    pub provider: ProviderConfig,
+    /// Adapter connectivity, keyed by `adapter_type`. One entry per `adapter_type`
+    /// per worker; the profile's `adapter_type` locates the runtime entry.
+    pub runtimes: Vec<RuntimeEntry>,
+    /// LLM provider catalogue. Profiles reference an entry by id; enforcement is
+    /// outside the scope of this pass.
+    pub llm_providers: Vec<LlmProvider>,
     pub tools: ToolConfig,
     pub server: ServerConfig,
     pub telemetry: TelemetryConfig,
@@ -41,11 +53,117 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
-    pub root: PathBuf,
-    pub database: PathBuf,
-    pub backups: PathBuf,
+    /// Defaults to `<config_dir>/state`.
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+    /// Defaults to `<root>/braid.sqlite3`.
+    #[serde(default)]
+    pub database: Option<PathBuf>,
+    /// Defaults to `<root>/backups`.
+    #[serde(default)]
+    pub backups: Option<PathBuf>,
     #[serde(default)]
     pub auto_migrate: bool,
+}
+
+impl RuntimeConfig {
+    /// Fill omitted/relative paths using `base` (the directory containing the
+    /// loaded config file) and normalize relative paths to absolute paths.
+    pub fn resolve(&mut self, base: &Path) {
+        if self.root.is_none() {
+            self.root = Some(base.join("state"));
+        }
+        let root = self.root.clone().expect("root resolved above");
+        let root = resolve_path(base, &root);
+        if self.database.is_none() {
+            self.database = Some(root.join("braid.sqlite3"));
+        }
+        if self.backups.is_none() {
+            self.backups = Some(root.join("backups"));
+        }
+        self.root = Some(root);
+        self.database =
+            Some(resolve_path(base, self.database.as_ref().expect("database resolved")));
+        self.backups = Some(resolve_path(base, self.backups.as_ref().expect("backups resolved")));
+    }
+
+    fn require_resolved(&self) {
+        assert!(
+            self.root.is_some() && self.database.is_some() && self.backups.is_some(),
+            "RuntimeConfig paths must be resolved before use"
+        );
+    }
+
+    pub fn root(&self) -> &Path {
+        self.require_resolved();
+        self.root.as_ref().expect("resolved")
+    }
+
+    pub fn database(&self) -> &Path {
+        self.require_resolved();
+        self.database.as_ref().expect("resolved")
+    }
+
+    pub fn backups(&self) -> &Path {
+        self.require_resolved();
+        self.backups.as_ref().expect("resolved")
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeEntry {
+    pub adapter_type: String,
+    /// Contract version checked at setup and serve time.
+    pub version: String,
+    /// Adapter-defined connectivity. Examples: local executable path, HTTP
+    /// runtime API URL, runtime home directory.
+    pub executable: PathBuf,
+    #[serde(default)]
+    pub api_url: Option<String>,
+    #[serde(default)]
+    pub home: Option<PathBuf>,
+    /// Codex-specific schema pins, produced by the adapter verifier.
+    #[serde(default)]
+    pub stable_schema_sha256: Option<String>,
+    #[serde(default)]
+    pub experimental_schema_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmProvider {
+    pub id: String,
+    pub protocol: String,
+    #[serde(default)]
+    pub api_key_environment: Option<String>,
+    #[serde(default)]
+    pub api_key_file: Option<PathBuf>,
+    #[serde(default)]
+    pub models: Vec<LlmModel>,
+    #[serde(default)]
+    pub allowances: Vec<LlmAllowance>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmModel {
+    pub model_id: String,
+    #[serde(default)]
+    pub input_cost: f64,
+    #[serde(default)]
+    pub output_cost: f64,
+    #[serde(default)]
+    pub cache_input_cost: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmAllowance {
+    pub since: String,
+    pub until: String,
+    #[serde(default)]
+    pub amount: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -71,6 +189,8 @@ pub struct SchedulerConfig {
     pub reconciliation_seconds: u64,
 }
 
+/// Legacy connectivity shape, preserved as the adapter-internal contract while
+/// the config surface moves to [[`runtimes`]] + [[`llm_providers`]].
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
@@ -107,7 +227,7 @@ impl PiConfig {
     /// `api_key_environment`.
     pub fn api_key(&self) -> Result<String, ConfigError> {
         if let Some(path) = &self.api_key_file {
-            return Ok(load_secret_file(path)?.provider_api_key);
+            return load_provider_secret_file(path);
         }
         if let Some(env) = &self.api_key_environment {
             return std::env::var(env).map_err(|_| {
@@ -163,6 +283,11 @@ pub struct Profile {
     pub id: String,
     pub display_name: String,
     pub tags: Vec<String>,
+    /// Locates the runtime entry that implements this profile's adapter.
+    pub adapter_type: String,
+    /// Contract pin checked against the runtime entry's version.
+    pub adapter_version: String,
+    /// References an entry in `llm_providers` for adapters that need an LLM.
     pub provider: String,
     pub model: Option<String>,
     pub reasoning: Option<String>,
@@ -183,6 +308,7 @@ pub struct ProfileSelection {
 #[derive(Debug, Serialize)]
 pub struct ConfigSummary<'a> {
     pub schema_version: u32,
+    pub instance_key: &'a str,
     pub repository: &'a str,
     pub runtime_root: &'a Path,
     pub database: &'a Path,
@@ -193,29 +319,68 @@ pub struct ConfigSummary<'a> {
     pub effective_trace_sample_ratio: f64,
 }
 
-/// Secrets file shape referenced by `github.webhook_secret_file` and
-/// `provider.pi.api_key_file`. A single file can hold both secrets for an
-/// owner, keeping user-scope runtime directories out of the secret lookup path.
+/// Secrets file referenced by `github.webhook_secret_file`.
 #[derive(Debug, Deserialize)]
-pub struct SecretsFile {
+pub struct WebhookSecretFile {
     pub webhook_secret: String,
+}
+
+/// Secrets file referenced by `[[llm_providers]].api_key_file`.
+#[derive(Debug, Deserialize)]
+pub struct ProviderSecretFile {
     pub provider_api_key: String,
 }
 
-fn load_secret_file(path: &Path) -> Result<SecretsFile, ConfigError> {
+fn load_webhook_secret_file(path: &Path) -> Result<String, ConfigError> {
     let text = fs::read_to_string(path)
         .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
-    toml::from_str(&text).map_err(|source| ConfigError::Parse { path: path.to_path_buf(), source })
+    let deserializer = toml::de::Deserializer::parse(&text).map_err(|error| {
+        ConfigError::Invalid(format!("cannot parse secrets file {}: {error}", path.display()))
+    })?;
+    let file: WebhookSecretFile =
+        serde_path_to_error::deserialize(deserializer).map_err(|error| {
+            ConfigError::Invalid(format!("cannot parse secrets file {}: {error}", path.display()))
+        })?;
+    Ok(file.webhook_secret)
+}
+
+fn load_provider_secret_file(path: &Path) -> Result<String, ConfigError> {
+    let text = fs::read_to_string(path)
+        .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
+    let deserializer = toml::de::Deserializer::parse(&text).map_err(|error| {
+        ConfigError::Invalid(format!("cannot parse secrets file {}: {error}", path.display()))
+    })?;
+    let file: ProviderSecretFile =
+        serde_path_to_error::deserialize(deserializer).map_err(|error| {
+            ConfigError::Invalid(format!("cannot parse secrets file {}: {error}", path.display()))
+        })?;
+    Ok(file.provider_api_key)
 }
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = fs::read_to_string(path)
             .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
-        let config: Self = toml::from_str(&text)
-            .map_err(|source| ConfigError::Parse { path: path.to_path_buf(), source })?;
+        let deserializer = toml::de::Deserializer::parse(&text).map_err(|error| {
+            ConfigError::Invalid(format!("cannot parse TOML config {}: {error}", path.display()))
+        })?;
+        let mut config: Self = serde_path_to_error::deserialize(deserializer).map_err(|error| {
+            ConfigError::Invalid(format!("cannot parse TOML config {}: {error}", path.display()))
+        })?;
+        let base = path.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let base = if base.is_absolute() {
+            base
+        } else {
+            std::env::current_dir().map(|cwd| cwd.join(&base)).unwrap_or(base)
+        };
+        config.runtime.resolve(&base);
         config.validate()?;
         Ok(config)
+    }
+
+    #[allow(dead_code)]
+    pub fn instance_key(&self) -> &str {
+        &self.instance.key
     }
 
     pub fn profile(&self, id: &str) -> Result<&Profile, ConfigError> {
@@ -228,9 +393,10 @@ impl Config {
     pub fn summary(&self) -> ConfigSummary<'_> {
         ConfigSummary {
             schema_version: self.schema_version,
+            instance_key: &self.instance.key,
             repository: &self.github.repository,
-            runtime_root: &self.runtime.root,
-            database: &self.runtime.database,
+            runtime_root: self.runtime.root(),
+            database: self.runtime.database(),
             profile_ids: self.profiles.iter().map(|profile| profile.id.as_str()).collect(),
             default_pr_profile: &self.profile_selection.default_pr_profile,
             trace_sample_ratio: self.telemetry.sample_ratio,
@@ -243,7 +409,7 @@ impl Config {
     /// otherwise from `github.webhook_secret_environment`.
     pub fn webhook_secret(&self) -> Result<String, ConfigError> {
         if let Some(path) = &self.github.webhook_secret_file {
-            return Ok(load_secret_file(path)?.webhook_secret);
+            return load_webhook_secret_file(path);
         }
         if let Some(env) = &self.github.webhook_secret_environment {
             return std::env::var(env).map_err(|_| {
@@ -258,25 +424,94 @@ impl Config {
         ))
     }
 
-    /// Load the Pi provider API key from `provider.pi.api_key_file` if set,
-    /// otherwise from `provider.pi.api_key_environment`.
-    pub fn pi_api_key(&self) -> Result<String, ConfigError> {
-        let pi = self.provider.pi.as_ref().ok_or_else(|| {
-            ConfigError::Invalid("provider.pi must be configured to read its API key".into())
-        })?;
-        if let Some(path) = &pi.api_key_file {
-            return Ok(load_secret_file(path)?.provider_api_key);
-        }
-        if let Some(env) = &pi.api_key_environment {
-            return std::env::var(env).map_err(|_| {
+    pub fn runtime_for(&self, profile: &Profile) -> Result<&RuntimeEntry, ConfigError> {
+        self.runtimes
+            .iter()
+            .find(|runtime| runtime.adapter_type == profile.adapter_type)
+            .ok_or_else(|| {
                 ConfigError::Invalid(format!(
-                    "environment variable {env:?} for provider.pi.api_key_environment is not set"
+                    "profile {:?} references unknown adapter_type {:?}",
+                    profile.id, profile.adapter_type
                 ))
+            })
+    }
+
+    pub fn llm_provider_for(&self, profile: &Profile) -> Result<&LlmProvider, ConfigError> {
+        self.llm_providers.iter().find(|provider| provider.id == profile.provider).ok_or_else(
+            || {
+                ConfigError::Invalid(format!(
+                    "profile {:?} references unknown provider {:?}",
+                    profile.id, profile.provider
+                ))
+            },
+        )
+    }
+
+    /// Temporary MVP bridge: synthesize a legacy `ProviderConfig` from the
+    /// first `[[runtimes]]` entry so `connect_provider` can still be called
+    /// from `runtime::serve`.
+    pub fn default_provider_config(&self) -> Result<ProviderConfig, ConfigError> {
+        let runtime = self
+            .runtimes
+            .first()
+            .ok_or_else(|| ConfigError::Invalid("no runtimes configured".into()))?;
+        self.provider_config_for_runtime(runtime)
+    }
+
+    fn provider_config_for_runtime(
+        &self,
+        runtime: &RuntimeEntry,
+    ) -> Result<ProviderConfig, ConfigError> {
+        if runtime.adapter_type == "codex" {
+            let home = runtime.home.clone().ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "runtime {:?} requires home for codex adapter",
+                    runtime.adapter_type
+                ))
+            })?;
+            let stable = runtime.stable_schema_sha256.clone().ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "runtime {:?} requires stable_schema_sha256",
+                    runtime.adapter_type
+                ))
+            })?;
+            let experimental = runtime.experimental_schema_sha256.clone().ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "runtime {:?} requires experimental_schema_sha256",
+                    runtime.adapter_type
+                ))
+            })?;
+            return Ok(ProviderConfig {
+                codex: Some(CodexConfig {
+                    executable: runtime.executable.clone(),
+                    home,
+                    version: runtime.version.clone(),
+                    stable_schema_sha256: stable,
+                    experimental_schema_sha256: experimental,
+                }),
+                pi: None,
             });
         }
-        Err(ConfigError::Invalid(
-            "one of provider.pi.api_key_environment or provider.pi.api_key_file must be set".into(),
-        ))
+
+        if runtime.adapter_type == "pi" {
+            // Pi needs an LLM provider entry for its API key and model info.
+            let default_profile = self.profile(&self.profile_selection.default_pr_profile)?;
+            let llm = self.llm_provider_for(default_profile)?;
+            return Ok(ProviderConfig {
+                codex: None,
+                pi: Some(PiConfig {
+                    executable: runtime.executable.clone(),
+                    provider: Some(llm.id.clone()),
+                    model: default_profile.model.clone(),
+                    api_key_environment: llm.api_key_environment.clone(),
+                    api_key_file: llm.api_key_file.clone(),
+                    thinking: default_profile.reasoning.clone(),
+                    home: runtime.home.clone(),
+                }),
+            });
+        }
+
+        Err(ConfigError::Invalid(format!("unsupported adapter_type {:?}", runtime.adapter_type)))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -287,11 +522,13 @@ impl Config {
                 supported: CONFIG_SCHEMA_VERSION,
             });
         }
+        validate_instance_key(&self.instance.key)
+            .map_err(|message| ConfigError::Invalid(format!("instance.key: {message}")))?;
 
         for (name, path) in [
-            ("runtime.root", &self.runtime.root),
-            ("runtime.database", &self.runtime.database),
-            ("runtime.backups", &self.runtime.backups),
+            ("runtime.root", self.runtime.root()),
+            ("runtime.database", self.runtime.database()),
+            ("runtime.backups", self.runtime.backups()),
             ("github.private_key_file", &self.github.private_key_file),
             ("tools.git", &self.tools.git),
             ("tools.gh", &self.tools.gh),
@@ -302,19 +539,12 @@ impl Config {
             self.github
                 .webhook_secret_file
                 .as_ref()
-                .map(|path| ("github.webhook_secret_file", path)),
-        )
-        .chain(
-            self.provider
-                .pi
-                .as_ref()
-                .and_then(|pi| pi.api_key_file.as_ref())
-                .map(|path| ("provider.pi.api_key_file", path)),
+                .map(|path| ("github.webhook_secret_file", path.as_path())),
         ) {
             require_absolute(name, path)?;
         }
-        if !self.runtime.database.starts_with(&self.runtime.root)
-            || !self.runtime.backups.starts_with(&self.runtime.root)
+        if !self.runtime.database().starts_with(self.runtime.root())
+            || !self.runtime.backups().starts_with(self.runtime.root())
         {
             return Err(ConfigError::Invalid(
                 "runtime database and backups must be inside runtime.root".into(),
@@ -356,46 +586,89 @@ impl Config {
             ));
         }
         self.telemetry.validate()?;
-        if let Some(codex) = &self.provider.codex {
-            for (name, path) in [
-                ("provider.codex.executable", &codex.executable),
-                ("provider.codex.home", &codex.home),
-            ] {
-                require_absolute(name, path)?;
-            }
-            validate_sha256("provider.codex.stable_schema_sha256", &codex.stable_schema_sha256)?;
-            validate_sha256(
-                "provider.codex.experimental_schema_sha256",
-                &codex.experimental_schema_sha256,
+
+        if self.runtimes.is_empty() {
+            return Err(ConfigError::Invalid("at least one runtime is required".into()));
+        }
+        let mut runtime_types = HashSet::new();
+        for runtime in &self.runtimes {
+            validate_token("runtime.adapter_type", &runtime.adapter_type)?;
+            require_absolute(
+                &format!("runtime.{}.executable", runtime.adapter_type),
+                &runtime.executable,
             )?;
-        }
-        if let Some(pi) = &self.provider.pi {
-            require_absolute("provider.pi.executable", &pi.executable)?;
-            if pi.api_key_environment.is_none() && pi.api_key_file.is_none() {
-                return Err(ConfigError::Invalid(
-                    "one of provider.pi.api_key_environment or provider.pi.api_key_file must be set".into(),
-                ));
+            if !runtime_types.insert(runtime.adapter_type.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate runtime adapter_type {:?}",
+                    runtime.adapter_type
+                )));
             }
-            if pi.api_key_file.is_some() && pi.api_key_environment.is_none() {
-                return Err(ConfigError::Invalid(
-                    "provider.pi.api_key_environment must be set when provider.pi.api_key_file is used".into(),
-                ));
+            if runtime.adapter_type == "codex" {
+                if runtime.home.is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "runtime {:?} requires home",
+                        runtime.adapter_type
+                    )));
+                }
+                if let Some(home) = &runtime.home {
+                    require_absolute(&format!("runtime.{}.home", runtime.adapter_type), home)?;
+                }
+                if runtime.stable_schema_sha256.is_none()
+                    || runtime.experimental_schema_sha256.is_none()
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "runtime {:?} requires stable_schema_sha256 and experimental_schema_sha256",
+                        runtime.adapter_type
+                    )));
+                }
             }
-            if let Some(env) = &pi.api_key_environment {
-                validate_token("provider.pi.api_key_environment", env)?;
+            if runtime.adapter_type == "pi"
+                && let Some(home) = &runtime.home
+            {
+                require_absolute(&format!("runtime.{}.home", runtime.adapter_type), home)?;
             }
         }
-        if self.provider.codex.is_none() && self.provider.pi.is_none() {
-            return Err(ConfigError::Invalid(
-                "at least one provider (codex or pi) must be configured".into(),
-            ));
+
+        let mut provider_ids = HashSet::new();
+        for provider in &self.llm_providers {
+            validate_token("llm_providers.id", &provider.id)?;
+            validate_token("llm_providers.protocol", &provider.protocol)?;
+            if provider.api_key_environment.is_none() && provider.api_key_file.is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "llm_providers {:?} requires api_key_environment or api_key_file",
+                    provider.id
+                )));
+            }
+            if let Some(file) = &provider.api_key_file {
+                require_absolute(&format!("llm_providers.{}.api_key_file", provider.id), file)?;
+            }
+            if !provider_ids.insert(provider.id.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate llm_providers id {:?}",
+                    provider.id
+                )));
+            }
+            let mut model_ids = HashSet::new();
+            for model in &provider.models {
+                validate_token(
+                    &format!("llm_providers.{}.model_id", provider.id),
+                    &model.model_id,
+                )?;
+                if !model_ids.insert(model.model_id.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "duplicate model {:?} in llm_providers {:?}",
+                        model.model_id, provider.id
+                    )));
+                }
+            }
         }
+
         if self.profiles.is_empty() {
             return Err(ConfigError::Invalid("at least one profile is required".into()));
         }
         let mut ids = HashSet::new();
         for profile in &self.profiles {
-            profile.validate()?;
+            profile.validate(self)?;
             if !ids.insert(profile.id.as_str()) {
                 return Err(ConfigError::Invalid(format!(
                     "profile id {:?} is duplicated",
@@ -409,6 +682,15 @@ impl Config {
                 "profile_selection.default_pr_profile must reference a profile tagged pr".into(),
             ));
         }
+
+        // Temporary MVP bridge: all profiles share one adapter_type.
+        let first_adapter = default_pr.adapter_type.clone();
+        if self.profiles.iter().any(|profile| profile.adapter_type != first_adapter) {
+            return Err(ConfigError::Invalid(
+                "this release requires all profiles to use the same adapter_type".into(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -441,7 +723,7 @@ impl Profile {
         self.tags.iter().any(|candidate| candidate == tag)
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    fn validate(&self, config: &Config) -> Result<(), ConfigError> {
         validate_token("profile.id", &self.id)?;
         if self.display_name.trim().is_empty() || self.user_instructions.trim().is_empty() {
             return Err(ConfigError::Invalid(format!(
@@ -449,12 +731,14 @@ impl Profile {
                 self.id
             )));
         }
-        if self.provider != "codex" && self.provider != "pi" {
+        validate_token("profile.adapter_type", &self.adapter_type)?;
+        if self.adapter_version.trim().is_empty() {
             return Err(ConfigError::Invalid(format!(
-                "profile {:?} uses unsupported provider {:?}; supported: codex, pi",
-                self.id, self.provider
+                "profile {:?} adapter_version must be non-empty",
+                self.id
             )));
         }
+        validate_token("profile.provider", &self.provider)?;
         require_absolute(&format!("profile {:?}.workspace", self.id), &self.workspace)?;
         if self.tags.is_empty() || (!self.has_tag("issue") && !self.has_tag("pr")) {
             return Err(ConfigError::Invalid(format!(
@@ -489,8 +773,31 @@ impl Profile {
                 self.id
             )));
         }
+
+        // Resolve references.
+        let runtime = config.runtime_for(self)?;
+        if runtime.version != self.adapter_version {
+            return Err(ConfigError::Invalid(format!(
+                "profile {:?} adapter_version {:?} does not match runtime {:?} version {:?}",
+                self.id, self.adapter_version, runtime.adapter_type, runtime.version
+            )));
+        }
+        let llm = config.llm_provider_for(self)?;
+        if let Some(model_id) = &self.model
+            && !llm.models.iter().any(|model| model.model_id == *model_id)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "profile {:?} model {:?} not found in llm_providers {:?}",
+                self.id, model_id, llm.id
+            )));
+        }
+
         Ok(())
     }
+}
+
+fn resolve_path(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() { path.to_path_buf() } else { base.join(path) }
 }
 
 fn require_absolute(name: &str, path: &Path) -> Result<(), ConfigError> {
@@ -520,16 +827,28 @@ fn validate_token(name: &str, value: &str) -> Result<(), ConfigError> {
     }
 }
 
-fn validate_sha256(name: &str, value: &str) -> Result<(), ConfigError> {
-    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        Ok(())
-    } else {
-        Err(ConfigError::Invalid(format!("{name} must be a 64-character SHA-256")))
-    }
-}
-
 const fn default_log_format() -> LogFormat {
     LogFormat::Text
+}
+
+/// Attribution markers identifying Braid-authored Agent text, derived
+/// from the configured Profiles. Used by ingress/reconcile to classify
+/// authorship; a pure derivation with no state of its own.
+pub fn agent_attributions(config: &Config) -> Vec<String> {
+    let mut attributions = Vec::new();
+    for profile in &config.profiles {
+        if profile.has_tag("issue") {
+            attributions
+                .push(format!("> **Braid Agent · {}**\n> Issue Agent", profile.display_name));
+        }
+        if profile.has_tag("pr") {
+            attributions.push(format!(
+                "> **Braid Agent · {}**\n> PR Implementation Agent",
+                profile.display_name
+            ));
+        }
+    }
+    attributions
 }
 
 #[cfg(test)]

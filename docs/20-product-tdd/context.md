@@ -147,3 +147,17 @@ Provider instructions, tool schemas, Event References, and response reserve are
 not included in this byte count; the operator chooses the Profile limit with
 those costs in mind. This explicit contract is more honest than pretending all
 providers expose the same tokenizer or effective window.
+
+## Context Reset and Resume Compatibility
+
+Resume compatibility is decided by the **group layer**, not the adapter: on
+reconnect, the worker compares each persisted provider session against the
+effective Profile (repository, profile id and revision, instruction revision)
+and either resumes the physical session or blocks it with an Operational
+Status update. Context replacement is likewise core-orchestrated: the store
+fences the old turn, and the group layer starts a fresh physical session with
+the latest materialized context. The adapter carries no revision or digest
+state and makes no replace/inject decisions.
+
+This keeps the Profile as plain configuration and avoids coupling the core
+runtime to provider-specific compaction or resume rules.

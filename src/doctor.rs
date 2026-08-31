@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::{TcpStream, ToSocketAddrs},
     path::Path,
     process::Stdio,
@@ -11,6 +12,7 @@ use tokio::{process::Command, time::timeout};
 use crate::{
     config::Config,
     github::{GitHubClient, RepositoryName},
+    home::{self, UserHome},
     protocol::{inspect_codex, verify_identity},
     store::StoreActor,
 };
@@ -36,20 +38,23 @@ pub struct DoctorReport {
     pub checks: Vec<Check>,
 }
 
-pub async fn run(config: &Config) -> DoctorReport {
+pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
     let mut checks = vec![
-        path_check("runtime root", &config.runtime.root, true),
+        path_check("runtime root", config.runtime.root(), true),
         path_check(
             "database parent",
-            config.runtime.database.parent().unwrap_or(Path::new("/")),
+            config.runtime.database().parent().unwrap_or(Path::new("/")),
             true,
         ),
-        path_check("backup directory", &config.runtime.backups, true),
+        path_check("backup directory", config.runtime.backups(), true),
         path_check("GitHub App private key", &config.github.private_key_file, false),
         secret_check("GitHub webhook secret", || config.webhook_secret()),
     ];
 
-    let store = StoreActor::start(config.runtime.database.clone(), config.runtime.backups.clone());
+    let store = StoreActor::start(
+        config.runtime.database().to_path_buf(),
+        config.runtime.backups().to_path_buf(),
+    );
     checks.push(match store.and_then(|actor| actor.status()) {
         Ok(status) => Check {
             name: "SQLite".into(),
@@ -64,54 +69,61 @@ pub async fn run(config: &Config) -> DoctorReport {
         }
     });
 
-    checks.push(match config.provider.codex.as_ref() {
-        Some(codex) => match inspect_codex(codex).await {
-            Ok(identity) => match verify_identity(&identity, codex) {
-                Ok(()) => Check {
-                    name: "Codex app-server".into(),
-                    state: CheckState::Pass,
-                    detail: identity.version,
-                },
-                Err(error) => Check {
-                    name: "Codex app-server".into(),
-                    state: CheckState::Fail,
-                    detail: format!(
-                        "{error}; actual version={}, stable={}, experimental={}",
-                        identity.version,
-                        identity.stable_schema_sha256,
-                        identity.experimental_schema_sha256
-                    ),
-                },
-            },
-            Err(error) => Check {
-                name: "Codex app-server".into(),
-                state: CheckState::Fail,
-                detail: error.to_string(),
-            },
-        },
-        None => Check {
-            name: "Codex app-server".into(),
-            state: CheckState::Pass,
-            detail: "not configured".into(),
-        },
-    });
-
-    if let Some(pi) = config.provider.pi.as_ref() {
-        checks.push(match command_version("Pi CLI", &pi.executable).await {
-            check if check.state == CheckState::Pass => match config.pi_api_key() {
-                Ok(_) => Check {
-                    name: "Pi provider".into(),
-                    state: CheckState::Pass,
-                    detail: format!("{} (API key present)", check.detail),
-                },
-                Err(error) => Check {
-                    name: "Pi provider".into(),
-                    state: CheckState::Fail,
-                    detail: format!("{}; {}", check.detail, error),
-                },
-            },
-            check => Check { name: "Pi provider".into(), state: check.state, detail: check.detail },
-        });
+    match config.default_provider_config() {
+        Ok(provider_config) => {
+            if let Some(codex) = provider_config.codex {
+                checks.push(match inspect_codex(&codex).await {
+                    Ok(identity) => match verify_identity(&identity, &codex) {
+                        Ok(()) => Check {
+                            name: "Codex app-server".into(),
+                            state: CheckState::Pass,
+                            detail: identity.version,
+                        },
+                        Err(error) => Check {
+                            name: "Codex app-server".into(),
+                            state: CheckState::Fail,
+                            detail: format!(
+                                "{error}; actual version={}, stable={}, experimental={}",
+                                identity.version,
+                                identity.stable_schema_sha256,
+                                identity.experimental_schema_sha256
+                            ),
+                        },
+                    },
+                    Err(error) => Check {
+                        name: "Codex app-server".into(),
+                        state: CheckState::Fail,
+                        detail: error.to_string(),
+                    },
+                });
+            }
+            if let Some(pi) = provider_config.pi {
+                checks.push(match command_version("Pi CLI", &pi.executable).await {
+                    check if check.state == CheckState::Pass => match pi.api_key() {
+                        Ok(_) => Check {
+                            name: "Pi provider".into(),
+                            state: CheckState::Pass,
+                            detail: format!("{} (API key present)", check.detail),
+                        },
+                        Err(error) => Check {
+                            name: "Pi provider".into(),
+                            state: CheckState::Fail,
+                            detail: format!("{}; {}", check.detail, error),
+                        },
+                    },
+                    check => Check {
+                        name: "Pi provider".into(),
+                        state: check.state,
+                        detail: check.detail,
+                    },
+                });
+            }
+        }
+        Err(error) => checks.push(Check {
+            name: "runtime configuration".into(),
+            state: CheckState::Fail,
+            detail: error.to_string(),
+        }),
     }
 
     for (name, executable) in [
@@ -123,6 +135,7 @@ pub async fn run(config: &Config) -> DoctorReport {
     }
     checks.push(github_app_check(config).await);
     checks.push(otlp_check(config));
+    checks.push(cross_instance_port_check(config, user_home));
     let ready = checks.iter().all(|check| check.state == CheckState::Pass);
     DoctorReport { ready, checks }
 }
@@ -158,6 +171,83 @@ async fn github_app_check(config: &Config) -> Check {
             state: if error.is_unavailable() { CheckState::Unavailable } else { CheckState::Fail },
             detail: error.to_string(),
         },
+    }
+}
+
+fn cross_instance_port_check(config: &Config, user_home: &UserHome) -> Check {
+    let registry = match user_home.load_registry() {
+        Ok(registry) => registry,
+        Err(error) => {
+            return Check {
+                name: "instance ports".into(),
+                state: CheckState::Unavailable,
+                detail: format!("cannot load registry: {error}"),
+            };
+        }
+    };
+
+    let current_key = config.instance_key();
+    let mut seen_ports = HashMap::<u16, (String, &'static str)>::new();
+    let mut duplicate_ports = Vec::new();
+    let mut collision_ports = Vec::new();
+
+    for entry in &registry.instances {
+        if entry.key == current_key {
+            continue;
+        }
+        let other_config_path =
+            home::resolve_instance_home(user_home.root(), entry).join("config.toml");
+        let other = match Config::load(&other_config_path) {
+            Ok(config) => config,
+            Err(error) => {
+                return Check {
+                    name: "instance ports".into(),
+                    state: CheckState::Unavailable,
+                    detail: format!(
+                        "cannot load instance {} config {}: {error}",
+                        entry.key,
+                        other_config_path.display()
+                    ),
+                };
+            }
+        };
+        for (name, port) in
+            [("ingress", other.server.ingress.port()), ("health", other.server.health.port())]
+        {
+            if let Some((existing_key, existing_name)) =
+                seen_ports.insert(port, (entry.key.clone(), name))
+            {
+                duplicate_ports.push(format!(
+                    "{port} ({} {} and {} {})",
+                    existing_key, existing_name, entry.key, name
+                ));
+            }
+            if port == config.server.ingress.port() || port == config.server.health.port() {
+                collision_ports.push(format!("{port} on {} {}", entry.key, name));
+            }
+        }
+    }
+
+    if !duplicate_ports.is_empty() || !collision_ports.is_empty() {
+        let mut detail = String::new();
+        if !duplicate_ports.is_empty() {
+            detail.push_str("duplicate ports across instances: ");
+            detail.push_str(&duplicate_ports.join(", "));
+        }
+        if !collision_ports.is_empty() {
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str("port collision with this instance: ");
+            detail.push_str(&collision_ports.join(", "));
+        }
+        return Check { name: "instance ports".into(), state: CheckState::Fail, detail };
+    }
+
+    Check {
+        name: "instance ports".into(),
+        state: CheckState::Pass,
+        detail: "no port conflicts with other registered instances".into(),
     }
 }
 

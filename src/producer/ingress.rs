@@ -1,5 +1,36 @@
-use super::*;
-use crate::runtime::outbox::drain_one_write;
+use std::sync::Arc;
+
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+};
+use tokio::{
+    sync::watch,
+    time::{Duration, MissedTickBehavior},
+};
+
+use crate::{
+    github::GitHubClient,
+    outbox::drain_one_write,
+    store::{SchedulerPolicy, StoreActor},
+    telemetry::{self, PayloadEvidence},
+    webhook::{self, WebhookHeaders},
+};
+
+/// Axum state shared by the webhook ingress handlers.
+pub(crate) struct IngressState {
+    pub(crate) store: Arc<StoreActor>,
+    pub(crate) policy: SchedulerPolicy,
+    pub(crate) repository: String,
+    pub(crate) handle: String,
+    pub(crate) app_actor_node_id: String,
+    pub(crate) app_actor_login: String,
+    pub(crate) agent_actor_node_ids: Vec<String>,
+    pub(crate) agent_attributions: Vec<String>,
+    pub(crate) webhook_secret: Arc<Vec<u8>>,
+}
 
 pub(crate) async fn webhook_handler(
     State(state): State<Arc<IngressState>>,

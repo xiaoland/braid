@@ -1,4 +1,9 @@
-use super::*;
+use anyhow::Result;
+
+use crate::{
+    github::{CreatedIssueComment, GitHubClient},
+    store::StoreActor,
+};
 
 pub(crate) async fn drain_one_write(store: &StoreActor, github: &GitHubClient) {
     let write = match store.claim_github_write() {

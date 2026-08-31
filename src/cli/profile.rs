@@ -2,7 +2,8 @@
 use super::*;
 
 pub fn profile_inspect(arguments: &ProfileInspect) -> Result<()> {
-    let config = helpers::load(&arguments.config)?;
+    let config_path = arguments.source.resolve_config_path()?;
+    let config = helpers::load(&config_path)?;
     let profile = config.profile(&arguments.profile)?;
     if arguments.json {
         helpers::print_json(profile)?;

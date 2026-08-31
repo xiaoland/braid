@@ -144,3 +144,53 @@ side effects. It reconnects/resumes the same physical session when compatible;
 if the provider proves it unavailable, the group becomes `blocked` and Braid
 updates Operational Status. Context replacement may create a fresh session
 only after the old turn is terminal or fenced so its later output is ignored.
+
+## AgentSession Event Stream
+
+The core signal between the adapter and the workers is the `AgentSession`
+event stream, not raw provider notifications. Each active session yields a
+`broadcast::Receiver<SessionEvent>`:
+
+| Event | Meaning | Core reaction |
+| --- | --- | --- |
+| `TurnStarted { provider_turn_id }` | A new provider turn began. Exactly one per turn; the single authority for turn identity. | The dispatcher records `provider_turn_id` in the store and marks the turn started. |
+| `TurnTerminal { provider_turn_id, outcome, error }` | A turn ended (`Completed`, `Interrupted`, `Failed`, `Unknown`). Exactly one per started turn; `error` carries the provider reason for `Failed`/`Unknown`. | The worker marks the turn terminal, updates reactions/status, and schedules the next batch. |
+
+Delivery semantics are part of the contract:
+
+- **Exactly-once per fact.** One `TurnStarted`, then exactly one
+  `TurnTerminal` — including session death, where the adapter synthesizes
+  `Unknown` for the in-flight turn before going quiet. There is no second
+  terminal-ish signal: provider turn errors travel inside `TurnTerminal`, and
+  connection death is not an event at all (see below).
+- **No subscription-timing gap.** The dispatcher subscribes *before* sending
+  and hands the receiver to the drive loop inside `RunningAgentTurn`; the
+  consumer never re-subscribes mid-turn.
+- **Connection death is connection-scoped**, observed through
+  `AgentProvider::closed()` — a future, not a channel — so it cannot be lost
+  while idle. The worker marks any in-flight turn `unknown` and starts a new
+  epoch.
+- **Cross-epoch backstop.** On every (re)connect, resume fencing marks
+  orphaned `starting`/`running` turns `unknown`. If in-epoch delivery ever
+  failed, the store still converges at the next epoch boundary.
+
+Responsibilities do not overlap:
+
+- The **event queue** (scheduler plus store) decides which messages exist:
+  debounce, batching, urgency, and retry — an unsent batch simply remains
+  runnable.
+- **`AgentSession`** only dispatches: idle, it starts a new turn; running and
+  `steering`, it forwards the steer; running and not steering, it drops the
+  message. It never queues; redelivery is the queue's job. `interrupt()` is
+  the control-plane sibling of steering — an immediate operation on the
+  observed in-flight turn that carries termination rather than input; the
+  terminal still arrives via the event stream.
+- The **group layer** (`SessionManager`) owns the physical session lifecycle
+  for one connection epoch: start/resume keyed by the adapter-created thread
+  id, rebuilt from the durable store on every reconnect. There is no in-place
+  replacement; context replacement fences the old turn in the store and then
+  starts a fresh session with the materialized context.
+- The **adapter** (`ProviderAgentSession`) owns the mechanism only: mapping
+  the contract onto `AgentProvider` RPCs and translating provider
+  notifications into exactly-once `SessionEvent`s. It holds no durable state
+  and makes no scheduling decisions.

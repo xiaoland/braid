@@ -6,7 +6,8 @@ pub async fn context(command: ContextCommand) -> Result<()> {
         ContextCommand::Issue(arguments) => (arguments, "issue"),
         ContextCommand::Pr(arguments) => (arguments, "pr"),
     };
-    let config = helpers::load(&arguments.config)?;
+    let config_path = arguments.source.resolve_config_path()?;
+    let config = helpers::load(&config_path)?;
     let locator = arguments.target.parse::<WorkItemLocator>()?;
     let profile = match arguments.profile.as_deref() {
         Some(profile) => config.profile(profile)?,

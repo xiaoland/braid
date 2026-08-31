@@ -3,6 +3,156 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
+## [0.3.0] - unreleased
+
+### Added
+
+- User/instance namespace: one user root (`~/.braid` or `BRAID_USER_HOME`)
+  holds a `registry.toml`, optional user defaults, shared provider secrets, and
+  per-instance directories under `instances/<key>/`. This replaces the flat
+  per-owner files introduced in 0.2.3.
+- `src/home.rs` resolves the user root, loads the instance registry,
+  validates instance keys, allocates free loopback ingress/health port pairs,
+  and implements the config-path precedence chain.
+- `scripts/tests/05_instances.sh` exercises `--config`/`--instance`/
+  `BRAID_INSTANCE`/`BRAID_INSTANCE_HOME` resolution and the doctor's
+  cross-instance port-conflict check.
+- Config schema version 2 with `[[runtimes]]`, `[[llm_providers]]`, and profile
+  `adapter_type` / `adapter_version` references. Runtime connectivity no longer
+  lives in profiles.
+- `src/agent_session.rs` defines the core `AgentSession` trait and event stream;
+  `ProviderAgentSession` in `src/provider/session.rs` maps it to the existing
+  provider primitives and owns physical session creation/replacement/resume.
+- `SessionManager` in `src/group/session_manager.rs` manages per-provider-thread
+  `ProviderAgentSession` handles (start/resume/get), keyed by the thread id the
+  adapter actually created. It is ephemeral per connection epoch and rebuilt
+  from the durable store on reconnect.
+- New architecture boundary modules `src/producer/`, `src/queue/`, and
+  `src/group/` own the implementation modules (`ingress`/`reconcile`,
+  `scheduler`/`outbox`, `issue_agent`/`pr_agent`/`provider`/`session_manager`);
+  `src/runtime/mod.rs` is the coordinator (owner lease, worker supervision,
+  shutdown ordering, health).
+
+### Changed
+
+- **Breaking**: `schema_version` must be `2`; old v1 configs must be regenerated
+  by re-running `braid setup --instance <key>`.
+- **Breaking**: `--worker` and `--home` are removed. Config-loading commands
+  now take `--config <PATH>` or `--instance <KEY>` (or `BRAID_INSTANCE`).
+  `braid setup` takes `--user-home <DIR>` and `--instance <KEY>`.
+- **Breaking**: Secrets are split. The instance `secrets.toml` holds only the
+  webhook secret; provider API keys live in `~/.braid/secrets/<provider>.toml`
+  and are referenced by path.
+- **Breaking**: The runtime default root is now `<config_dir>/state` and the
+  default database file is `state/braid.sqlite3`.
+- **Breaking**: Config schema v2 now requires an `[instance]` section with a
+  `key` and is the only supported config schema.
+- `provider.codex` / `provider.pi` are replaced by `[[runtimes]]` entries.
+- `braid setup` discovers local runtimes, prints install instructions when none
+  are found, and never auto-installs. Manual flags `--runtime-executable` and
+  `--runtime-api-url` bypass discovery.
+- `braid doctor` loads the registry and reports duplicate or colliding
+  ingress/health ports across registered instances.
+- Telemetry now tags `service.instance.id` from the config instance key.
+- `braid status` prints the instance key.
+- Config TOML parse errors now include the dotted path to the offending key
+  via `serde_path_to_error`.
+- Clap `env` integration binds `BRAID_INSTANCE`, `BRAID_USER_HOME`, and the
+  setup `--instance` flag to their environment variables.
+- All scheduler dispatch paths (`start_next_agent_turn`, `forward_urgent_steer`,
+  `begin_active_context_reset`, `materialize_context_reset`) and all
+  assignment/reactivation/resume materialization paths operate sessions only
+  through `AgentSession`/`SessionManager`; no core code calls
+  `provider.start_session`/`inject_context`/`resume_session` directly.
+- Agent group loops (`issue_agent_worker`, `pr_agent_worker`) consume
+  `SessionEvent` from the active `AgentSession` rather than raw provider
+  notifications.
+- `connect_provider` returns `Arc<dyn AgentProvider>` so the adapter and
+  `SessionManager` share ownership.
+- `SendResult::Started` no longer carries the provider turn id;
+  `SessionEvent::TurnStarted` is the single authority for turn identity.
+- `AgentSession::interrupt()` restores physical turn termination as a
+  first-class contract operation — the control-plane sibling of steering
+  (immediate, addressed to the observed in-flight turn, carrying control
+  rather than input). `begin_active_context_reset` now fences the active turn
+  in the store AND best-effort interrupts it (Codex `turn/interrupt`, Pi
+  `abort`), matching the Hard Invalidation Sequence; the fence remains the
+  correctness mechanism if the interrupt fails. The function moved to
+  `group::dispatch` since it now touches sessions.
+- The event protocol is now exactly-once: `TurnTerminal` carries the
+  provider's error reason and `SessionEvent::Failed` is removed, so a turn
+  has exactly one `TurnStarted` and exactly one `TurnTerminal` (synthesized
+  as `Unknown` on session death). Connection death is connection-scoped and
+  observed through the new `AgentProvider::closed()` future. The dispatcher's
+  event receiver is handed to the drive loop inside `RunningAgentTurn`, so
+  lifecycle facts cannot be lost to a subscription-timing gap.
+- Provider connection epochs are now owned entirely by the group workers:
+  `serve` validates the provider configuration at boot (fail-fast on
+  misconfiguration) and each worker creates every connection — including the
+  first — and retries transient connection failures. `serve` no longer exits
+  when the provider is unreachable at boot; the worker reports the provider
+  unavailable and keeps retrying, matching the reconnect semantics.
+- The module graph is now acyclic with one-way layering (`runtime` → `group`
+  → `queue`; `runtime` → `producer` → `outbox`/`health`). Dispatch and
+  materialization moved from `queue::scheduler` to `group::dispatch` (they
+  execute queue decisions against sessions, a group concern); the in-memory
+  `RunningAgentTurn` claim cache moved from `producer::reconcile` to `queue`;
+  `HealthSnapshot` moved to a new leaf `health` module; `LEASE_TTL_SECONDS`
+  moved to `producer` (lease protocol home); `agent_attributions` moved to
+  `config` (pure profile derivation); and the GitHub write outbox moved from
+  `queue::outbox` to a leaf `outbox` module (it only needs `store` +
+  `github`).
+
+### Removed
+
+- Deprecated `Config::provider_config()` bridge removed; callers use
+  `default_provider_config()` or `RuntimeEntry` directly.
+- Direct provider notification subscription removed from worker loops; the
+  `AgentSession` event stream is the sole signal boundary.
+- Dead `handle_provider_notification` fallback removed; provider `Activity`
+  notifications are traced inside `ProviderAgentSession`.
+- Unused `ProviderSession.model` field removed.
+- Dead in-place reset surface removed: `send_user_msg`'s `reset_context_to`
+  parameter, the adapter's `pending_reset`/`last_context_hash` bookkeeping,
+  `SessionEvent::SessionReplaced`, `SessionManager::replace`, and
+  `Store::replace_provider_session` were unreachable from every production
+  path. Context replacement is orchestrated by the core through
+  `SessionManager::start` with materialized context, matching the tested
+  reset state machine.
+- `SessionEvent::Failed` removed; connection death is connection-scoped and
+  observed via `AgentProvider::closed()`.
+### Fixed
+
+- The adapter no longer emits two `TurnStarted` events per turn (the
+  `turn/start` response and the async notification are two observations of
+  one fact and are now deduplicated).
+- A turn terminal emitted between dispatch and the drive loop's
+  re-subscription was silently lost, leaving the store turn stuck in
+  `running`; the dispatcher's receiver is now handed off inside
+  `RunningAgentTurn`, so the consumer never re-subscribes mid-turn.
+- An idle provider disconnect was never observed (the drive loop only
+  listened while a turn was active), so every later dispatch failed into
+  `unknown` forever without a reconnect; the worker now awaits
+  `AgentProvider::closed()` regardless of turn state.
+- A provider turn failure produced two terminal-ish signals (`TurnTerminal`
+  and `Failed`); there is now exactly one `TurnTerminal` per started turn.
+- The adapter now enforces the exactly-once terminal contract at its own
+  boundary: `TurnCompleted` is accepted only for the currently tracked turn,
+  so a duplicate or stale terminal (e.g. replayed after resume) is logged and
+  ignored instead of double-emitting or — worse — clearing the tracking of a
+  different in-flight turn and allowing a concurrent turn to be dispatched. A
+  `TurnStarted` re-emitted after its terminal is likewise ignored.
+- `SessionManager` is now scoped to one worker and one connection epoch.
+  Previously it survived reconnects while its sessions kept the dead
+  epoch's provider handle, so `resume` cache hits returned sessions that
+  could never send again (including sessions marked failed on disconnect).
+
+- Assignment/reactivation/reset materialization no longer creates two physical
+  provider sessions (one raw, one adapter-owned) with the durable store
+  recording the orphaned thread; the adapter-created thread is now the single
+  recorded session, and turn history stays attached to the recorded thread
+  across restarts.
+
 ## [0.2.3] - 2026-08-24
 
 ### Added

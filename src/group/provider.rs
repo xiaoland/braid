@@ -1,96 +1,15 @@
-use super::*;
-use crate::runtime::reconcile::RunningAgentTurn;
+use std::fmt::Write as _;
 
-pub(crate) async fn handle_provider_notification(
-    store: &StoreActor,
-    health: &RwLock<HealthSnapshot>,
-    running: &mut Option<RunningAgentTurn>,
-    notification: ProviderNotification,
-) -> bool {
-    match notification {
-        ProviderNotification::TurnCompleted { thread_id, turn_id, status, error } => {
-            let Some(active) = running.as_ref() else {
-                tracing::debug!(%thread_id, %turn_id, %status, "terminal notification has no local active turn");
-                return false;
-            };
-            if active.claim.provider_session_id != thread_id || active.provider_turn_id != turn_id {
-                tracing::debug!(%thread_id, %turn_id, "terminal notification is for another turn");
-                return false;
-            }
-            let lifecycle = match status.as_str() {
-                "completed" => "completed",
-                "interrupted" => "interrupted",
-                "failed" => "failed",
-                _ => "unknown",
-            };
-            if let Some(reset_id) = &active.reset_id {
-                if let Err(store_error) = store.mark_context_reset_turn_terminal(
-                    reset_id.clone(),
-                    active.claim.turn_id.clone(),
-                    lifecycle.into(),
-                ) {
-                    tracing::error!(%store_error, "cannot advance Context reset after provider terminal");
-                }
-            } else {
-                if let Err(store_error) =
-                    store.mark_turn_terminal(active.claim.turn_id.clone(), lifecycle.into())
-                {
-                    tracing::error!(%store_error, "cannot record provider terminal");
-                }
-                if active.claim.trusted_mention {
-                    let reaction = if lifecycle == "completed" { "+1" } else { "confused" };
-                    if let Err(store_error) =
-                        store.enqueue_turn_reaction(active.claim.turn_id.clone(), reaction.into())
-                    {
-                        tracing::error!(%store_error, "cannot enqueue trusted-mention terminal reaction");
-                    }
-                }
-            }
-            if let Some(error) = error {
-                tracing::warn!(%error, %turn_id, "provider turn terminal included an error");
-            }
-            *running = None;
-            false
-        }
-        ProviderNotification::TurnStarted { thread_id, turn_id } => {
-            tracing::debug!(%thread_id, %turn_id, "provider turn started");
-            false
-        }
-        ProviderNotification::Activity { method, thread_id, turn_id } => {
-            tracing::trace!(%method, ?thread_id, ?turn_id, "provider activity");
-            false
-        }
-        ProviderNotification::Disconnected => {
-            if let Some(active) = running.take() {
-                if let Err(error) =
-                    store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into())
-                {
-                    tracing::error!(%error, "cannot record unknown turn after provider disconnect");
-                }
-                let body = operational_status_unknown(&active.claim);
-                if let Err(error) =
-                    store.enqueue_operational_status(active.claim.turn_id.clone(), body)
-                {
-                    tracing::error!(%error, "cannot enqueue provider-unknown Operational Status");
-                }
-                if let Some(reset_id) = active.reset_id
-                    && let Err(error) = store.fail_context_reset(
-                        reset_id,
-                        "provider disconnected before the fenced turn reached terminal".into(),
-                    )
-                {
-                    tracing::error!(%error, "cannot block disconnected Context reset");
-                }
-            }
-            set_provider_unavailable(health, "Codex app-server disconnected").await;
-            true
-        }
-    }
-}
+use anyhow::Result;
+use sha2::{Digest, Sha256};
+use tokio::sync::RwLock;
 
-fn operational_status_unknown(claim: &TurnClaim) -> String {
-    operational_status_unknown_profile(&claim.profile_id)
-}
+use crate::{
+    config::{Config, Profile},
+    health::HealthSnapshot,
+    provider::ProviderError,
+    store::{ProfileRecord, StoreActor, TurnClaim},
+};
 
 pub(crate) fn operational_status_unknown_profile(profile_id: &str) -> String {
     format!(
@@ -108,7 +27,7 @@ pub(crate) fn materialized_profile(profile: &Profile) -> Result<ProfileRecord> {
         profile_id: profile.id.clone(),
         revision,
         effective_digest: digest,
-        provider_kind: profile.provider.clone(),
+        provider_kind: profile.adapter_type.clone(),
         tags: serde_json::to_string(&profile.tags)?,
     })
 }
@@ -164,23 +83,6 @@ pub(crate) fn pr_system_prompt(
     )
 }
 
-pub(crate) fn agent_attributions(config: &Config) -> Vec<String> {
-    let mut attributions = Vec::new();
-    for profile in &config.profiles {
-        if profile.has_tag("issue") {
-            attributions
-                .push(format!("> **Braid Agent · {}**\n> Issue Agent", profile.display_name));
-        }
-        if profile.has_tag("pr") {
-            attributions.push(format!(
-                "> **Braid Agent · {}**\n> PR Implementation Agent",
-                profile.display_name
-            ));
-        }
-    }
-    attributions
-}
-
 pub(crate) fn render_event_references(claim: &TurnClaim) -> String {
     let label = if claim.work_item_kind == "pr" { "PR" } else { "Issue" };
     let mut output = format!(
@@ -220,4 +122,23 @@ pub(crate) async fn set_provider_unavailable(health: &RwLock<HealthSnapshot>, er
     let mut current = health.write().await;
     current.provider = "unavailable";
     current.last_error = Some(error.into());
+}
+
+pub(crate) fn enqueue_provider_blocked_status(
+    store: &StoreActor,
+    profile: &Profile,
+    assignment_id: &str,
+) -> Result<()> {
+    if !profile.status_surfaces.is_empty() {
+        store.enqueue_assignment_operational_status(
+            assignment_id.into(),
+            format!(
+                "> **Braid Operational Status · `{}`**\n\n\
+                 **Provider session unavailable**\n\n\
+                 Braid could not resume the compatible Coding Agent session. The Agent Group is blocked; no replacement turn or provider side effect was started. Operator repair or a new activation generation is required.",
+                profile.id,
+            ),
+        )?;
+    }
+    Ok(())
 }

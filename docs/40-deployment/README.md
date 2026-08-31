@@ -22,15 +22,18 @@ release notes generated from `CHANGELOG.md` under SemVer.
 
 ## Configuration
 
-`braid.toml` is versioned independently from binary and database schema. It
+The instance `config.toml` is versioned independently from binary and
+database schema. It
 contains no secret values; secrets use file references or environment-variable
 names. The main sections are:
 
 - GitHub App/repository/handle, API version, webhook and reconciliation;
+- the instance key under `[instance]`;
 - Profile definitions/tags/default PR Profile/context byte budgets/status
   surfaces/provider/workspace/resources;
 - scheduler quiet/count settings;
-- Codex path/version/schema pins and provider home;
+- `[[runtimes]]` adapter executables/version pins and provider home;
+- `[[llm_providers]]` provider credentials (file references, not values);
 - SQLite/runtime/worktree directories;
 - loopback ingress/health ports and Wrangler path;
 - OTLP endpoint/protocol, trace sample ratio, and incident override;
@@ -43,21 +46,29 @@ their effective mapped provider settings through `braid profile inspect`.
 
 ## Filesystem Layout
 
-One private runtime root outside repository worktrees contains:
+Braid keeps one user root outside repository worktrees, default `~/.braid`.
+Everything below is scoped by trust boundary:
 
 ```text
-state/braid.sqlite3
-state/backups/
-provider/
-worktrees/<repository>/<pr-number>-<assignment-generation>/
-logs/                         # only when local sampled-log export is configured
+~/.braid/
+  registry.toml                 # instance registry (SSoT)
+  config.toml                   # optional user defaults (future)
+  secrets/                      # user-level provider API keys
+  instances/<key>/
+    config.toml                 # instance config, schema version 2
+    github-app.pem              # GitHub App private key
+    secrets.toml                # webhook secret
+    state/
+      braid.sqlite3
+      backups/
+      worktrees/<repository>/<pr-number>-<assignment-generation>/
+    provider/                   # adapter home (e.g. Codex provider state)
+    logs/                       # optional sampled-log export
 ```
 
-Issue Profiles use their configured repository checkout/workspace policy. PR
-activation provisions one default worktree for the single v1 Implementation
-Agent from the selected Development/requested/deterministic branch. Braid
-records identity and diagnoses drift but does not intercept or restrict the
-Agent's subsequent Git operations.
+The default `runtime.root` is `<config_dir>/state`. `braid setup` writes
+`instances/<key>` explicitly with the layout above. Multiple instances share
+the same user root but have isolated databases, webhooks, and worktrees.
 
 ## Database Lifecycle
 
@@ -165,11 +176,11 @@ root, configure the dedicated App/Profiles/OTLP endpoint, and run:
 
 ```shell
 braid --version
-braid config check --config /absolute/path/braid.toml
-braid doctor --config /absolute/path/braid.toml
-braid migrate plan --config /absolute/path/braid.toml
-braid migrate apply --config /absolute/path/braid.toml
-braid serve --config /absolute/path/braid.toml --tunnel
+braid config check --instance <KEY>
+braid doctor --instance <KEY>
+braid migrate plan --instance <KEY>
+braid migrate apply --instance <KEY>
+braid serve --instance <KEY> --tunnel
 ```
 
 Then drive only the real campaign in

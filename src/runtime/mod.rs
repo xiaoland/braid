@@ -1,22 +1,14 @@
 #![allow(clippy::large_futures)]
-use std::{
-    collections::BTreeMap,
-    fmt::Write as _,
-    sync::{Arc, Mutex as StdMutex},
-};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context as _, Result, bail};
 use axum::{
     Router,
-    body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
 };
-use hmac::{Hmac, KeyInit as _, Mac as _};
-use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tokio::{
     net::TcpListener,
     sync::{RwLock, watch},
@@ -26,81 +18,21 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    config::{Config, Profile},
-    context::{
-        self, CanonicalContext, CanonicalObservation, ContextError, ContextPressure,
-        RenderedContext,
-    },
-    github::{
-        AppWebhookConfig, CreatedIssueComment, GitHubClient, RepositoryName, WorkItemLocator,
-    },
-    provider::{ProviderError, ProviderNotification, connect_provider},
-    store::{
-        AssignmentCandidate, CanonicalObjectState, ContextResetClaim, IngressEvent, ProfileRecord,
-        ReactionTarget, RuntimeLease, SchedulerPolicy, StoreActor, TurnClaim,
-        WorkItemLifecycleCandidate,
-    },
-    telemetry::{self, PayloadEvidence, TelemetryGuard},
-    tunnel::QuickTunnel,
-    webhook::{self, WebhookHeaders},
-    worktree::{self, WorktreeRequest},
+    config::Config,
+    github::{GitHubClient, RepositoryName},
+    store::{RuntimeLease, SchedulerPolicy, StoreActor},
+    telemetry::TelemetryGuard,
 };
 
-mod ingress;
-mod issue_agent;
-mod outbox;
-mod pr_agent;
-mod provider;
-mod reconcile;
-mod scheduler;
-mod tunnel;
-
-pub use tunnel::probe_public_webhook;
-
-use crate::runtime::ingress::{event_worker, webhook_handler};
-use crate::runtime::issue_agent::issue_agent_worker;
-use crate::runtime::outbox::drain_one_write;
-use crate::runtime::pr_agent::pr_agent_worker;
-use crate::runtime::provider::agent_attributions;
-use crate::runtime::reconcile::{lease_worker, reconciliation_worker};
-use crate::runtime::tunnel::{restore_webhook, start_verified_quick_tunnel};
-
-type HmacSha256 = Hmac<Sha256>;
-const LEASE_TTL_SECONDS: u64 = 30;
-
-#[derive(Debug, Clone, Serialize)]
-pub struct HealthSnapshot {
-    pub ready: bool,
-    pub ingress: String,
-    pub repository: String,
-    pub tunnel: &'static str,
-    pub webhook_url: Option<String>,
-    pub reconciliation: &'static str,
-    pub provider: &'static str,
-    pub last_error: Option<String>,
-}
-
-struct IngressState {
-    store: Arc<StoreActor>,
-    policy: SchedulerPolicy,
-    repository: String,
-    handle: String,
-    app_actor_node_id: String,
-    app_actor_login: String,
-    agent_actor_node_ids: Vec<String>,
-    agent_attributions: Vec<String>,
-    webhook_secret: Arc<Vec<u8>>,
-}
-
-struct ReconcileScope {
-    work_item_node_id: String,
-    work_item_kind: &'static str,
-    work_item_number: u64,
-    work_item_state: String,
-    previous_work_item_state: String,
-    repository_node_id: String,
-    repository: String,
-}
+use crate::config::agent_attributions;
+use crate::group::{issue_agent_worker, pr_agent_worker};
+use crate::health::HealthSnapshot;
+use crate::outbox::drain_one_write;
+use crate::producer::LEASE_TTL_SECONDS;
+use crate::producer::{
+    IngressState, event_worker, lease_worker, reconciliation_worker, webhook_handler,
+};
+use crate::tunnel::{restore_webhook, start_verified_quick_tunnel};
 
 struct RuntimeLeaseGuard {
     store: Arc<StoreActor>,
@@ -118,10 +50,10 @@ impl Drop for RuntimeLeaseGuard {
 
 #[allow(clippy::too_many_lines)]
 pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -> Result<()> {
-    let telemetry = TelemetryGuard::install(&config.telemetry)?;
+    let telemetry = TelemetryGuard::install(&config.telemetry, config.instance_key())?;
     let store = Arc::new(StoreActor::start(
-        config.runtime.database.clone(),
-        config.runtime.backups.clone(),
+        config.runtime.database().to_path_buf(),
+        config.runtime.backups().to_path_buf(),
     )?);
     let plan = store.plan()?;
     if !plan.pending.is_empty() {
@@ -208,22 +140,21 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     workers.spawn(lease_worker(Arc::clone(&store), Arc::clone(&lease), shutdown_receiver.clone()));
 
     if provider_enabled {
-        let provider = connect_provider(&config.provider).await?;
-        health.write().await.provider = "connected";
+        // Boot gate: provider configuration errors are operator errors and
+        // fail startup. Connection epochs (including the first) are owned by
+        // the workers, which retry transient connection failures.
+        let _ = config.default_provider_config()?;
         workers.spawn(issue_agent_worker(
             Arc::clone(&store),
             Arc::clone(&github),
             config.clone(),
-            provider,
             Arc::clone(&health),
             shutdown_receiver.clone(),
         ));
-        let pr_provider = connect_provider(&config.provider).await?;
         workers.spawn(pr_agent_worker(
             Arc::clone(&store),
             Arc::clone(&github),
             config.clone(),
-            pr_provider,
             Arc::clone(&health),
             shutdown_receiver.clone(),
         ));

@@ -14,7 +14,7 @@ use thiserror::Error;
 pub use tokio::{
     io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
     process::{Child, ChildStdin, Command},
-    sync::{Mutex, broadcast, oneshot},
+    sync::{Mutex, broadcast, oneshot, watch},
     time::{Duration, timeout},
 };
 
@@ -49,7 +49,6 @@ pub enum ProviderNotification {
 #[derive(Debug, Clone)]
 pub struct ProviderSession {
     pub thread_id: String,
-    pub model: String,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +60,13 @@ pub struct ProviderTurn {
 #[async_trait::async_trait]
 pub trait AgentProvider: Send + Sync {
     fn subscribe(&self) -> broadcast::Receiver<ProviderNotification>;
+
+    /// Resolves when the provider connection is permanently closed (process
+    /// exit, stdio EOF, fatal protocol error). Connection death is a
+    /// connection-scoped fact: the worker that owns the epoch awaits this
+    /// instead of relying on per-session event subscriptions, so it cannot
+    /// be missed while idle.
+    async fn closed(&self);
 
     async fn start_session(
         &self,
@@ -91,14 +97,19 @@ pub trait AgentProvider: Send + Sync {
         event_references: &str,
     ) -> Result<(), ProviderError>;
 
+    /// Best-effort termination of the observed active turn. Idempotent at the
+    /// Braid state-machine boundary: the provider may report "no active turn"
+    /// after convergence, and the terminal still arrives via notifications.
     async fn interrupt(&self, thread_id: &str, turn_id: &str) -> Result<(), ProviderError>;
 }
 
 mod codex;
 mod pi;
+mod session;
 mod util;
 
 pub use codex::CodexProvider;
 pub use pi::PiProvider;
+pub use session::ProviderAgentSession;
 pub use util::connect_provider;
 pub(crate) use util::{path_text, required_string};

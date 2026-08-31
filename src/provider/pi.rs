@@ -25,6 +25,7 @@ struct PiState {
 pub struct PiProvider {
     state: Arc<Mutex<PiState>>,
     notifications: broadcast::Sender<ProviderNotification>,
+    closed: watch::Sender<bool>,
     thread_id: Arc<Mutex<String>>,
     turn_id: Arc<Mutex<String>>,
 }
@@ -32,6 +33,7 @@ pub struct PiProvider {
 impl PiProvider {
     pub fn connect(config: &PiConfig) -> Self {
         let (notifications, _) = broadcast::channel(512);
+        let (closed, _) = watch::channel(false);
         let state = PiState {
             config: config.clone(),
             pending: Arc::new(Mutex::new(BTreeMap::new())),
@@ -45,6 +47,7 @@ impl PiProvider {
         Self {
             state: Arc::new(Mutex::new(state)),
             notifications,
+            closed,
             thread_id: Arc::new(Mutex::new(String::new())),
             turn_id: Arc::new(Mutex::new(String::new())),
         }
@@ -127,6 +130,7 @@ impl PiProvider {
             stdout,
             Arc::clone(&state.pending),
             self.notifications.clone(),
+            self.closed.clone(),
             Arc::clone(&self.thread_id),
             Arc::clone(&self.turn_id),
         );
@@ -194,6 +198,11 @@ impl AgentProvider for PiProvider {
         self.notifications.subscribe()
     }
 
+    async fn closed(&self) {
+        let mut closed = self.closed.subscribe();
+        while !*closed.borrow() && closed.changed().await.is_ok() {}
+    }
+
     async fn start_session(
         &self,
         profile: &Profile,
@@ -221,10 +230,7 @@ impl AgentProvider for PiProvider {
             .ok_or_else(|| ProviderError::Protocol("get_state missing sessionFile".into()))?;
         state.session = Some(session_file.to_owned());
 
-        Ok(ProviderSession {
-            thread_id: session_file.to_owned(),
-            model: profile.model.clone().unwrap_or_else(|| "pi-default".into()),
-        })
+        Ok(ProviderSession { thread_id: session_file.to_owned() })
     }
 
     async fn inject_context(&self, _thread_id: &str, context: &str) -> Result<(), ProviderError> {
@@ -248,10 +254,7 @@ impl AgentProvider for PiProvider {
 
         self.spawn(&mut state, &profile.workspace, Some(thread_id))?;
 
-        Ok(ProviderSession {
-            thread_id: thread_id.to_owned(),
-            model: profile.model.clone().unwrap_or_else(|| "pi-default".into()),
-        })
+        Ok(ProviderSession { thread_id: thread_id.to_owned() })
     }
 
     async fn start_turn(
@@ -311,10 +314,12 @@ impl AgentProvider for PiProvider {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_pi_stdout(
     stdout: tokio::process::ChildStdout,
     pending: Arc<Mutex<PendingRequests>>,
     notifications: broadcast::Sender<ProviderNotification>,
+    closed: watch::Sender<bool>,
     thread_id: Arc<Mutex<String>>,
     turn_id: Arc<Mutex<String>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -360,6 +365,7 @@ fn spawn_pi_stdout(
             let _ = sender.send(Err(ProviderError::Disconnected));
         }
         let _ = notifications.send(ProviderNotification::Disconnected);
+        let _ = closed.send(true);
     })
 }
 

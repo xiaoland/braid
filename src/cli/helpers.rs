@@ -9,8 +9,11 @@ pub fn load(path: &Path) -> Result<Config> {
 }
 
 pub fn store(config: &Config) -> Result<StoreActor> {
-    StoreActor::start(config.runtime.database.clone(), config.runtime.backups.clone())
-        .context("cannot start SQLite actor")
+    StoreActor::start(
+        config.runtime.database().to_path_buf(),
+        config.runtime.backups().to_path_buf(),
+    )
+    .context("cannot start SQLite actor")
 }
 
 pub fn print_json(value: &impl Serialize) -> Result<()> {
@@ -42,8 +45,9 @@ pub fn print_migration_result(result: &MigrationResult) {
 }
 
 pub async fn tunnel_probe(arguments: TunnelProbe) -> Result<()> {
-    let config = load(&arguments.config)?;
-    crate::runtime::probe_public_webhook(&config, &arguments.url).await?;
+    let config_path = arguments.source.resolve_config_path()?;
+    let config = load(&config_path)?;
+    crate::tunnel::probe_public_webhook(&config, &arguments.url).await?;
     println!("public webhook probe: accepted");
     Ok(())
 }

@@ -5,7 +5,7 @@ pub async fn github(command: GitHubCommand) -> Result<()> {
     match command {
         GitHubCommand::Probe(arguments) => github_probe(arguments).await,
         GitHubCommand::Webhook(arguments) => {
-            let config = helpers::load(&arguments.config)?;
+            let config = helpers::load(&arguments.resolve_config_path()?)?;
             let repository = config.github.repository.parse::<RepositoryName>()?;
             let client = GitHubClient::connect(&config.github, &repository).await?;
             let webhook = client.app_webhook_config().await?;
@@ -19,7 +19,7 @@ pub async fn github(command: GitHubCommand) -> Result<()> {
             Ok(())
         }
         GitHubCommand::Deliveries(arguments) => {
-            let config = helpers::load(&arguments.config)?;
+            let config = helpers::load(&arguments.resolve_config_path()?)?;
             let repository = config.github.repository.parse::<RepositoryName>()?;
             let client = GitHubClient::connect(&config.github, &repository).await?;
             let deliveries = client.app_deliveries().await?;
@@ -40,7 +40,8 @@ pub async fn github(command: GitHubCommand) -> Result<()> {
             Ok(())
         }
         GitHubCommand::Redeliver(arguments) => {
-            let config = helpers::load(&arguments.config)?;
+            let config_path = arguments.source.resolve_config_path()?;
+            let config = helpers::load(&config_path)?;
             let repository = config.github.repository.parse::<RepositoryName>()?;
             let client = GitHubClient::connect(&config.github, &repository).await?;
             client.redeliver(arguments.delivery_id).await?;
@@ -51,7 +52,8 @@ pub async fn github(command: GitHubCommand) -> Result<()> {
 }
 
 async fn github_probe(arguments: GitHubProbe) -> Result<()> {
-    let config = helpers::load(&arguments.config)?;
+    let config_path = arguments.source.resolve_config_path()?;
+    let config = helpers::load(&config_path)?;
     let repository = arguments.repository.parse::<RepositoryName>()?;
     let client =
         GitHubClient::connect(&config.github, &repository).await.context("GitHub probe failed")?;

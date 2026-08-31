@@ -22,21 +22,22 @@ brew install xiaoland/braid/braid
 ## Bootstrap
 
 `braid setup` creates your own GitHub App, persists credentials outside the
-repository, and writes a starter `braid.toml`. The full setup guide is in
+repository, and writes a starter instance config. The full setup guide is in
 [`docs/user-manual/setup.md`](docs/user-manual/setup.md).
 
 ```shell
 braid setup owner/repository --provider pi --model deepseek-chat --api-key-environment DEEPSEEK_API_KEY
 ```
 
-The command opens a browser for GitHub's App Manifest flow, receives the redirect
-locally, and saves the private key and webhook secret to `~/.braid`. After the
-browser installs the App on your repository, export the secret and run Braid:
+The command opens a browser for GitHub's App Manifest flow, receives the
+redirect locally, and saves the App private key and webhook secret under
+`~/.braid/instances/<key>/` (the instance key defaults to the repository
+owner). After the browser installs the App on your repository, run Braid
+against that instance:
 
 ```shell
-export BRAID_WEBHOOK_SECRET=$(cat ~/.braid/braid-of-owner.webhook_secret)
-braid doctor --config ~/.braid/braid.toml
-braid serve --config ~/.braid/braid.toml --tunnel
+braid doctor --instance <KEY>
+braid serve --instance <KEY> --tunnel
 ```
 
 The active product and implementation contracts are:
@@ -57,15 +58,15 @@ x86_64 follows. Build and inspect the public operator surface with:
 ```shell
 cargo build --locked
 cargo run --locked -- --version
-cargo run --locked -- config check --config /absolute/path/to/braid.toml
-cargo run --locked -- migrate plan --config /absolute/path/to/braid.toml
-cargo run --locked -- github probe --config /absolute/path/to/braid.toml --repository owner/repository
-cargo run --locked -- context issue owner/repository#123 --config /absolute/path/to/braid.toml
-cargo run --locked -- gh comment create owner/repository#123 --config /absolute/path/to/braid.toml --profile issue-codex --body 'Concise update'
-cargo run --locked -- gh pr ensure --comment 123456789 --config /absolute/path/to/braid.toml
-cargo run --locked -- serve --config /absolute/path/to/braid.toml --tunnel
-cargo run --locked -- serve --config /absolute/path/to/braid.toml --transport-only
-cargo run --locked -- status --config /absolute/path/to/braid.toml --json
+cargo run --locked -- config check --config /absolute/path/to/config.toml
+cargo run --locked -- migrate plan --config /absolute/path/to/config.toml
+cargo run --locked -- github probe --config /absolute/path/to/config.toml --repository owner/repository
+cargo run --locked -- context issue owner/repository#123 --config /absolute/path/to/config.toml
+cargo run --locked -- gh comment create owner/repository#123 --config /absolute/path/to/config.toml --profile issue-codex --body 'Concise update'
+cargo run --locked -- gh pr ensure --comment 123456789 --config /absolute/path/to/config.toml
+cargo run --locked -- serve --config /absolute/path/to/config.toml --tunnel
+cargo run --locked -- serve --config /absolute/path/to/config.toml --transport-only
+cargo run --locked -- status --config /absolute/path/to/config.toml --json
 ```
 
 Apply all pending migrations before `context`; the local canonical ledger keeps
@@ -83,7 +84,8 @@ the configured public Profile/role attribution and returns a durable receipt;
 Implementation Request key.
 
 Copy [`config.example.toml`](config.example.toml) outside the checkout and
-replace every placeholder path before running diagnostics. A packaged release
+replace every placeholder path before running diagnostics, or let `braid setup`
+generate an instance config for you. A packaged release
 does not require Python, PDM, Cargo, or a source checkout.
 
 Braid deliberately avoids a large internal fake/unit-test surface while the

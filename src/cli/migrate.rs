@@ -6,7 +6,7 @@ pub fn migrate(command: MigrateCommand) -> Result<()> {
         MigrateCommand::Plan(arguments) => (arguments, false),
         MigrateCommand::Apply(arguments) => (arguments, true),
     };
-    let config = helpers::load(&arguments.config)?;
+    let config = helpers::load(&arguments.resolve_config_path()?)?;
     let actor = helpers::store(&config)?;
     if apply {
         let result = actor.apply()?;

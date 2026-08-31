@@ -7,28 +7,26 @@ machine.
 
 ## Provider-Neutral Interface
 
-An adapter reports a versioned capability snapshot and implements:
+The core runtime uses the `AgentSession` trait and `SessionManager` rather than
+calling provider primitives directly. The adapter (`ProviderAgentSession`)
+implements `AgentSession` over the lower-level `AgentProvider` contract and
+translates provider notifications into `SessionEvent`s:
 
-```text
-start_session(profile, effective_instructions) -> opaque_session
-inject_context(opaque_session, complete_markdown, context_revision)
-resume_session(opaque_session, effective_profile_revision)
-start_turn(opaque_session, event_references) -> opaque_turn
-steer(opaque_session, expected_turn, event_references)       [optional]
-interrupt(opaque_session, opaque_turn)                       [optional]
-observe() -> item/turn/session notifications
-archive_session(opaque_session)                              [optional]
-```
+| Core method | Adapter behavior |
+| --- | --- |
+| `send_user_msg(msg, steering)` | If idle, start a new turn with `msg`; if running and `steering`, forward the steer to the active turn; if running and not steering, drop the message (the event queue owns redelivery). Returns `Started` or `Acknowledged`; lifecycle facts arrive only via events. |
+| `interrupt()` | Best-effort termination of the observed in-flight turn (Codex `turn/interrupt`, Pi `abort`); idempotent at the state-machine boundary, terminal still arrives via the event stream. Used by hard invalidation after the DB fence. |
+| `events()` | Emits exactly one `TurnStarted` per turn, then exactly one `TurnTerminal` (carrying the provider error when the outcome is `Failed`/`Unknown`), translated and deduplicated from provider notifications. The receiver created before dispatch is handed to the consumer with the turn — never re-subscribed. Connection death is observed via `AgentProvider::closed()`, not this stream. |
 
 The core never assumes a provider can rewrite arbitrary history or accept a
-custom compaction result. If `inject_context` cannot replace existing model
-history, Braid fences the old turn, creates a fresh physical session, and
-injects the complete current GitHub Context before another turn.
+custom compaction result. Context replacement is therefore orchestrated by the
+core, not hidden inside the adapter: the store fences the old turn, and the
+group layer starts a fresh physical session with the complete materialized
+GitHub Context before another turn.
 
-Profiles are Braid-owned immutable snapshots, not provider-native objects. An
-adapter maps model, reasoning, approval/sandbox, cwd, tools, skills, MCP, and
-other resources, then reports the effective result. Missing required resources
-block activation rather than silently changing the Profile.
+Direct provider primitives (`start_session`, `resume_session`,
+`inject_context`, `start_turn`, `steer`, `interrupt`) remain available for the adapter
+implementation but are never called by the scheduler or worker loops.
 
 ## Codex Version and Wire
 

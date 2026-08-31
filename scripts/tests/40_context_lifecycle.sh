@@ -124,7 +124,7 @@ awk \
 
 $binary migrate apply --config "$test_config" >/dev/null
 $binary status --config "$test_config" --json | \
-    jq -e '.database.schema_version == 1 and .database.supported_schema == 1' >/dev/null || \
+    jq -e '.database.schema_version == 2 and .database.supported_schema == 2' >/dev/null || \
     fail "candidate does not expose the expected current schema 1"
 
 if [[ -n "$tunnel_url" ]]; then

@@ -1,10 +1,17 @@
+mod agent_session;
 mod cli;
 mod config;
 mod context;
 mod doctor;
 mod github;
+mod group;
+mod health;
+mod home;
+mod outbox;
+mod producer;
 mod protocol;
 mod provider;
+mod queue;
 mod runtime;
 mod setup;
 mod store;

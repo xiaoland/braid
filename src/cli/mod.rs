@@ -140,18 +140,47 @@ enum GhPrCommand {
     Ensure(GhPrEnsure),
 }
 
+/// Shared config source: exact `--config <PATH>` or registry lookup via
+/// `--instance <KEY>` / `BRAID_INSTANCE`. All config-loading commands embed
+/// this struct.
+#[derive(Debug, Args)]
+struct ConfigSource {
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    #[arg(long, value_name = "KEY", env = "BRAID_INSTANCE")]
+    instance: Option<String>,
+}
+
+impl ConfigSource {
+    fn resolve_config_path(&self) -> Result<PathBuf> {
+        if let Some(path) = &self.config {
+            return Ok(path.clone());
+        }
+        if let Some(key) = &self.instance {
+            crate::home::validate_instance_key(key)?;
+        }
+        crate::home::resolve_config_path(self.config.as_deref(), self.instance.as_deref())
+    }
+}
+
 #[derive(Debug, Args)]
 struct ConfigPath {
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    #[command(flatten)]
+    source: ConfigSource,
     #[arg(long)]
     json: bool,
 }
 
+impl ConfigPath {
+    fn resolve_config_path(&self) -> Result<PathBuf> {
+        self.source.resolve_config_path()
+    }
+}
+
 #[derive(Debug, Args)]
 struct ProfileInspect {
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    #[command(flatten)]
+    source: ConfigSource,
     #[arg(long)]
     profile: String,
     #[arg(long)]
@@ -160,8 +189,8 @@ struct ProfileInspect {
 
 #[derive(Debug, Args)]
 struct TelemetryProbe {
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    #[command(flatten)]
+    source: ConfigSource,
     #[arg(long, default_value = "BRAID_OTEL_FULL_PAYLOAD_PROBE")]
     marker: String,
     #[arg(long)]
@@ -170,8 +199,8 @@ struct TelemetryProbe {
 
 #[derive(Debug, Args)]
 struct TunnelProbe {
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    #[command(flatten)]
+    source: ConfigSource,
     #[arg(long, value_name = "HTTPS_URL")]
     url: String,
 }
@@ -180,8 +209,8 @@ struct TunnelProbe {
 struct ContextArguments {
     #[arg(value_name = "OWNER/REPOSITORY#NUMBER")]
     target: String,
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    #[command(flatten)]
+    source: ConfigSource,
     #[arg(long)]
     profile: Option<String>,
     #[arg(long)]
@@ -198,8 +227,8 @@ struct ContextArguments {
 
 #[derive(Debug, Args)]
 struct GitHubProbe {
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    #[command(flatten)]
+    source: ConfigSource,
     #[arg(long, value_name = "OWNER/REPOSITORY")]
     repository: String,
     #[arg(long)]
@@ -210,16 +239,16 @@ struct GitHubProbe {
 struct GitHubRedeliver {
     #[arg(value_name = "DELIVERY_ID")]
     delivery_id: u64,
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    #[command(flatten)]
+    source: ConfigSource,
 }
 
 #[derive(Debug, Args)]
 struct GhCommentCreate {
     #[arg(value_name = "OWNER/REPOSITORY#NUMBER")]
     target: String,
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    #[command(flatten)]
+    source: ConfigSource,
     #[arg(long)]
     profile: String,
     #[arg(long, conflicts_with = "body_file")]
@@ -236,8 +265,8 @@ struct GhCommentCreate {
 struct GhPrEnsure {
     #[arg(long, value_name = "ISSUE_COMMENT_ID")]
     comment: u64,
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    #[command(flatten)]
+    source: ConfigSource,
     #[arg(long, value_name = "BRANCH")]
     head: Option<String>,
     #[arg(long)]
@@ -254,8 +283,14 @@ pub(crate) struct SetupArguments {
     pub(crate) model: String,
     #[arg(long, value_name = "ENV", default_value = "DEEPSEEK_API_KEY")]
     pub(crate) api_key_environment: String,
-    #[arg(long, value_name = "DIR", default_value = "~/.braid")]
-    pub(crate) home: PathBuf,
+    #[arg(long, value_name = "KEY", env = "BRAID_INSTANCE")]
+    pub(crate) instance: Option<String>,
+    #[arg(long, value_name = "DIR", env = "BRAID_USER_HOME", default_value = "~/.braid")]
+    pub(crate) user_home: PathBuf,
+    #[arg(long, value_name = "PATH", conflicts_with = "runtime_api_url")]
+    pub(crate) runtime_executable: Option<PathBuf>,
+    #[arg(long, value_name = "URL", conflicts_with = "runtime_executable")]
+    pub(crate) runtime_api_url: Option<String>,
     #[arg(
         long,
         help = "Skip opening a browser; print manifest values and manual instructions instead"
@@ -265,8 +300,8 @@ pub(crate) struct SetupArguments {
 
 #[derive(Debug, Args)]
 struct ServeArguments {
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    #[command(flatten)]
+    source: ConfigSource,
     #[arg(
         long,
         help = "Expose ingress through a free Wrangler Quick Tunnel and own the App webhook while running"
@@ -313,6 +348,7 @@ struct PullRequestEnsureResult<'a> {
 struct LocalStatus<'a> {
     binary_version: &'static str,
     config_schema: u32,
+    instance_key: &'a str,
     repository: &'a str,
     default_pr_profile: &'a str,
     database: StoreStatus,
@@ -347,7 +383,8 @@ pub async fn run() -> Result<()> {
             helpers::tunnel_probe(arguments).await?;
         }
         Command::Serve(arguments) => {
-            let config = helpers::load(&arguments.config)?;
+            let config_path = arguments.source.resolve_config_path()?;
+            let config = helpers::load(&config_path)?;
             crate::runtime::serve(config, arguments.tunnel, !arguments.transport_only).await?;
         }
         Command::Setup(arguments) => {

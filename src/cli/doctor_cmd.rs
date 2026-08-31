@@ -2,8 +2,10 @@
 use super::*;
 
 pub async fn doctor(arguments: &ConfigPath) -> Result<()> {
-    let config = helpers::load(&arguments.config)?;
-    let report = doctor::run(&config).await;
+    let config_path = arguments.resolve_config_path()?;
+    let user_home = crate::home::UserHome::resolve(None)?;
+    let config = helpers::load(&config_path)?;
+    let report = doctor::run(&config, &user_home).await;
     if arguments.json {
         helpers::print_json(&report)?;
     } else {

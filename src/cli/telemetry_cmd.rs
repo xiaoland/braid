@@ -2,7 +2,8 @@
 use super::*;
 
 pub async fn telemetry_probe(arguments: TelemetryProbe) -> Result<()> {
-    let config = helpers::load(&arguments.config)?;
+    let config_path = arguments.source.resolve_config_path()?;
+    let config = helpers::load(&config_path)?;
     let telemetry_config = config.telemetry;
     let marker = arguments.marker;
     let result =

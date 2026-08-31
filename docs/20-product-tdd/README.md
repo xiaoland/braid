@@ -91,6 +91,7 @@ crates. Modules are deep and align with authority boundaries:
 
 | Module | Owned interface |
 | --- | --- |
+| `home` | User root resolution, instance registry, `~/.braid` layout, port allocation, and config-path precedence. |
 | `config` | Versioned config/Profile loading, validation, effective defaults, and diagnostic projection. |
 | `github::webhook` | Raw-body HMAC verification and typed open-enum webhook admission. |
 | `github::client` | GitHub App auth, bounded typed GraphQL pagination, REST writes, reactions, and canonical rereads. |
@@ -98,14 +99,39 @@ crates. Modules are deep and align with authority boundaries:
 | `events` | Canonical diff classification and compact Event Reference rendering. |
 | `store` | One dedicated SQLite actor, transactions, migrations, leases, ledgers, sessions, batches, and outbox. |
 | `scheduler` | Quiet/count/urgent coalescing and single-flight group turn claims. |
-| `sessions` | Assignment generation, Context generation, invalidation fencing, finalization, and provider/worktree handles. |
+| `producer` | Webhook/GraphQL ingress → canonical diff → classified events (`ingress`, `reconcile`). |
+| `queue` | Per-work-item per-agent-group quiet window, batch emission, claim decisions, context-pressure policy, and store-side reset fencing (`scheduler`). Never touches provider sessions or connections. |
+| `outbox` | Drain the GitHub write outbox (reactions, comments, statuses) with uncertain-write recovery. Leaf over `store` + `github`, called by ingress and the runtime drain loop. |
+| `group` | Agent Group workers that own every provider connection epoch (connect, resume, drive, reconnect), the dispatch/materialization half that executes queue decisions against `AgentSession`s, provider supervision/prompts/attribution, and the per-epoch in-process `SessionManager` (`issue_agent`, `pr_agent`, `dispatch`, `provider`, `session_manager`). |
+| `agent_session` | Core `AgentSession` trait and event stream (`TurnStarted`, `TurnTerminal`, `Failed`). Core callers operate sessions only through `send_user_msg`; the event stream is the single authority for lifecycle facts. |
+| `provider::session` | `ProviderAgentSession` adapter that maps `AgentSession` to `AgentProvider` primitives and translates provider notifications into `SessionEvent`s, deduplicating the provider's response-side and notification-side observation of the same fact. |
+| `session_manager` | In-process `SessionManager` keyed by provider thread id; start/resume/get. Ephemeral per connection epoch: it is rebuilt from the durable store on every (re)connect because sessions bind the epoch's provider handle. |
 | `provider` | Provider-neutral capability contract and Codex NDJSON implementation. |
 | `worktree` | Validate a Profile source checkout, fetch the bound PR head, provision one generation-scoped worktree per Implementation Agent, and expose recovery diagnostics; no Git-operation sandbox. |
 | `writer` | `braid gh`, attribution, reaction/status desired state, and write-outbox convergence. |
 | `telemetry` | Trace/metric/log creation, payload events, sampling configuration, and OTLP export. |
 | `tunnel` | Wrangler Quick Tunnel supervision and webhook URL handoff. |
-| `runtime` | Owner lease, supervisors, shutdown ordering, health, and public operator state. |
+| `runtime` | Owner lease, worker supervision, boot-time configuration gates, shutdown ordering, health, and public operator state. Never touches provider connections or sessions directly. |
 | `cli` | `serve`, `config`, `doctor`, `profile`, `gh`, `status`, and migration/version surfaces. |
+
+Module dependencies point one way only: `runtime` → `group` → `queue`, and
+`runtime` → `producer` → `outbox`/`health`; `queue`, `outbox`, and `health`
+sit above the leaf modules (`store`, `context`, `github`, `config`,
+`provider`, `worktree`, `telemetry`) and no lower layer imports an upper one.
+
+### State authority
+
+Every piece of state has exactly one authority; everything else is a
+best-effort one-way projection from it. Nonessential state is not persisted.
+
+| State | Authority | Projections |
+| --- | --- | --- |
+| Work Items, assignments, turns, context ledger/resets, queue/batches, outbox, owner lease | Durable store (SQLite) | In-memory `RunningAgentTurn` (claim cache for the in-flight turn), health snapshot |
+| GitHub canonical state | GitHub | `canonical_objects` / `sync_cursors` snapshots for diffing |
+| Physical session identity (`provider_session_id`) | Durable store (`provider_sessions`) | `SessionManager` map key + adapter `thread_id` (both ephemeral, rebuilt per epoch) |
+| Current provider turn | Provider process | `SessionEvent` stream (exactly one `TurnStarted`/`TurnTerminal` per turn; receiver handed off with the turn, never re-subscribed) → durable store; resume fencing as the cross-epoch backstop |
+| Provider connectivity | Provider connection | `AgentProvider::closed()` future → worker epoch loop → health snapshot + blocked-session records |
+| Worktree presence | Filesystem + git | `worktrees` table (refreshed by inspection at prepare time) |
 
 Selected dependency baseline, verified against crates.io on 2026-08-13:
 
@@ -114,7 +140,8 @@ Selected dependency baseline, verified against crates.io on 2026-08-13:
 - Serde 1.0 and serde_json 1.0 for external JSON boundaries;
 - rusqlite 0.40 with bundled SQLite, used only by a dedicated blocking DB
   actor so network awaits never occur inside transactions;
-- Clap 4.6, `thiserror` for boundary errors, and `anyhow` only at CLI/runtime
+- Clap 4.6 (with `env` feature), `serde_path_to_error` for TOML error paths,
+  `thiserror` for boundary errors, and `anyhow` only at CLI/runtime
   composition boundaries;
 - HMAC 0.13/SHA-2 0.11 for webhook verification and context revisions,
   `jsonwebtoken` 11 for GitHub App JWTs;
