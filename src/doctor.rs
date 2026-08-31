@@ -72,6 +72,7 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
     match config.default_provider_config() {
         Ok(provider_config) => {
             if let Some(codex) = provider_config.codex {
+                checks.push(codex_credentials_check(&codex));
                 checks.push(match inspect_codex(&codex).await {
                     Ok(identity) => match verify_identity(&identity, &codex) {
                         Ok(()) => Check {
@@ -138,6 +139,27 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
     checks.push(cross_instance_port_check(config, user_home));
     let ready = checks.iter().all(|check| check.state == CheckState::Pass);
     DoctorReport { ready, checks }
+}
+
+fn codex_credentials_check(codex: &crate::config::CodexConfig) -> Check {
+    let auth = codex.home.join("auth.json");
+    if auth.is_file() {
+        Check {
+            name: "Codex credentials".into(),
+            state: CheckState::Pass,
+            detail: format!("provider home {} is authenticated", codex.home.display()),
+        }
+    } else {
+        Check {
+            name: "Codex credentials".into(),
+            state: CheckState::Fail,
+            detail: format!(
+                "{} is missing; authenticate with `CODEX_HOME={} codex login`                  (or copy auth.json from your global Codex home)",
+                auth.display(),
+                codex.home.display()
+            ),
+        }
+    }
 }
 
 async fn github_app_check(config: &Config) -> Check {

@@ -3,6 +3,25 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
+## [0.3.1] - unreleased
+
+### Fixed
+
+- `braid setup` pinned a hardcoded profile `adapter_version`, so config
+  validation rejected the generated config whenever the discovered runtime
+  version differed (e.g. codex-cli 0.151.0). The profile now pins the
+  discovered runtime version.
+- `braid setup` now creates the Profile workspace directory it writes into
+  the config; previously a fresh setup left the workspace missing and the
+  first Agent turn materialization failed with the Assignment parked in
+  `blocked`.
+- `braid setup` now bootstraps the instance-scoped Codex provider home:
+  it imports `~/.codex/auth.json` when present and otherwise prints explicit
+  `CODEX_HOME=... codex login` instructions. Previously `braid serve` ran
+  with the provider perpetually disconnected and no guidance.
+- `braid doctor` gained a "Codex credentials" check for provider-home
+  authentication, so the gap is caught before serving.
+
 ## [0.3.0] - 2026-08-31
 
 ### Added

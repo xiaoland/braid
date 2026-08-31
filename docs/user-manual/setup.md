@@ -92,6 +92,24 @@ After setup:
 
 The tunnel receives GitHub webhooks and routes them to Braid's local ingress.
 
+## Provider credentials and workspace
+
+`braid setup` also prepares the instance-scoped provider home
+(`~/.braid/instances/<KEY>/provider/codex`) and the Profile workspace
+(`~/.braid/instances/<KEY>/workspace/default`).
+
+Codex authenticates per `CODEX_HOME`, and Braid isolates it per instance, so
+your global `~/.codex` credentials do not automatically apply. Setup imports
+`~/.codex/auth.json` into the instance provider home when it exists; otherwise
+authenticate it before serving:
+
+```shell
+CODEX_HOME=~/.braid/instances/<KEY>/provider/codex codex login
+```
+
+`braid doctor` reports this as the "Codex credentials" check. The Pi provider
+needs no home bootstrap: it authenticates with the API key persisted at setup.
+
 ## Headless / manual App creation
 
 If you cannot or do not want to open a browser from the terminal, run:

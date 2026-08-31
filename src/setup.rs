@@ -201,6 +201,14 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     }
     config.validate().context("generated config failed validation")?;
 
+    for profile in &config.profiles {
+        fs::create_dir_all(&profile.workspace).with_context(|| {
+            format!("cannot create profile workspace {}", profile.workspace.display())
+        })?;
+    }
+    let runtime_home = base_dir.join("provider").join(&arguments.provider);
+    bootstrap_provider_home(&runtime_home, &arguments.provider)?;
+
     let config_text = toml::to_string(&config).context("cannot serialize generated config")?;
     write_secret(&config_path, config_text.as_bytes())?;
 
@@ -635,6 +643,43 @@ fn build_config(
     Ok(config)
 }
 
+/// Prepare the instance-scoped provider home so the runtime can actually
+/// authenticate. Codex isolates `CODEX_HOME` per instance, so its global
+/// credentials do not apply: import `~/.codex/auth.json` when present,
+/// otherwise print explicit login instructions. Pi authenticates through the
+/// persisted provider API key and needs no home bootstrap.
+fn bootstrap_provider_home(home: &Path, adapter_type: &str) -> Result<()> {
+    fs::create_dir_all(home)
+        .with_context(|| format!("cannot create provider home {}", home.display()))?;
+    if adapter_type != "codex" {
+        return Ok(());
+    }
+    let auth = home.join("auth.json");
+    if auth.is_file() {
+        return Ok(());
+    }
+    let global = dirs::home_dir().map(|dir| dir.join(".codex").join("auth.json"));
+    if let Some(global) = global
+        && global.is_file()
+    {
+        fs::copy(&global, &auth).with_context(|| {
+            format!("cannot import Codex credentials from {}", global.display())
+        })?;
+        write_secret(&auth, &fs::read(&auth)?)?; // enforce 0600
+        println!(
+            "Imported Codex credentials from {} into the instance provider home.",
+            global.display()
+        );
+    } else {
+        println!(
+            "Codex provider home is not authenticated yet. Before `braid serve`, run:\n  \
+             CODEX_HOME={} codex login",
+            home.display()
+        );
+    }
+    Ok(())
+}
+
 fn tool_path(name: &str, fallback: &str) -> String {
     which::which(name).map_or_else(|_| fallback.to_owned(), |p| p.to_string_lossy().into_owned())
 }
@@ -657,6 +702,40 @@ mod tests {
             runtime_api_url: None,
             no_browser: false,
         }
+    }
+
+    #[test]
+    fn bootstrap_provider_home_is_noop_for_pi() {
+        let dir = std::env::temp_dir().join(format!("braid-pi-home-{:?}", std::process::id()));
+        let dir = dir.with_file_name(format!(
+            "braid-pi-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        bootstrap_provider_home(&dir, "pi").expect("pi bootstrap");
+        assert!(dir.is_dir());
+        assert!(!dir.join("auth.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bootstrap_provider_home_respects_existing_codex_auth() {
+        let dir = std::env::temp_dir().join(format!(
+            "braid-codex-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("auth.json"), "{}").expect("seed auth");
+        bootstrap_provider_home(&dir, "codex").expect("codex bootstrap");
+        assert_eq!(std::fs::read_to_string(dir.join("auth.json")).expect("read"), "{}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
