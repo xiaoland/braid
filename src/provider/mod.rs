@@ -14,7 +14,7 @@ use thiserror::Error;
 pub use tokio::{
     io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
     process::{Child, ChildStdin, Command},
-    sync::{Mutex, broadcast, oneshot},
+    sync::{Mutex, broadcast, oneshot, watch},
     time::{Duration, timeout},
 };
 
@@ -60,6 +60,13 @@ pub struct ProviderTurn {
 #[async_trait::async_trait]
 pub trait AgentProvider: Send + Sync {
     fn subscribe(&self) -> broadcast::Receiver<ProviderNotification>;
+
+    /// Resolves when the provider connection is permanently closed (process
+    /// exit, stdio EOF, fatal protocol error). Connection death is a
+    /// connection-scoped fact: the worker that owns the epoch awaits this
+    /// instead of relying on per-session event subscriptions, so it cannot
+    /// be missed while idle.
+    async fn closed(&self);
 
     async fn start_session(
         &self,

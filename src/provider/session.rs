@@ -153,20 +153,26 @@ impl ProviderAgentSession {
                     inner.current_turn_id = None;
                     inner.status = SessionStatus::Idle;
                     let _ = self.events.send(SessionEvent::TurnTerminal {
-                        provider_turn_id: turn_id.clone(),
+                        provider_turn_id: turn_id,
                         outcome,
+                        error,
                     });
-                    if let Some(reason) = error {
-                        let _ = self.events.send(SessionEvent::Failed { reason });
-                    }
                 }
                 false
             }
             ProviderNotification::Disconnected => {
+                // A started turn must never be left without a terminal:
+                // synthesize Unknown for the in-flight turn, then fail the
+                // session. Connection death itself is observed by the worker
+                // through `AgentProvider::closed()`, not through events.
+                if let Some(turn_id) = inner.current_turn_id.take() {
+                    let _ = self.events.send(SessionEvent::TurnTerminal {
+                        provider_turn_id: turn_id,
+                        outcome: TurnOutcome::Unknown,
+                        error: Some("provider disconnected".into()),
+                    });
+                }
                 inner.status = SessionStatus::Failed;
-                let _ = self
-                    .events
-                    .send(SessionEvent::Failed { reason: "provider disconnected".into() });
                 true
             }
             ProviderNotification::Activity { method, thread_id, turn_id } => {

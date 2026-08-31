@@ -36,14 +36,32 @@ pub enum SendResult {
 
 /// Lifecycle events that the core needs to react to.
 ///
-/// Exactly one `TurnStarted` is emitted per turn, exactly one terminal signal
-/// (`TurnTerminal` or `Failed`) follows it, and no events are emitted for
-/// messages that only return `Acknowledged`.
+/// Delivery guarantees, enforced by the adapter:
+///
+/// - Exactly one `TurnStarted` per accepted turn (the provider reports the
+///   fact twice — response and notification — and the adapter deduplicates).
+/// - Exactly one `TurnTerminal` per started turn, always following its
+///   `TurnStarted`. Session death is no exception: the adapter synthesizes
+///   `TurnTerminal { outcome: Unknown, .. }` for the in-flight turn before
+///   going quiet, so a started turn is never left without a terminal.
+/// - No events for messages that only return `Acknowledged`.
+/// - There is no session-scoped event kind. Connection death is a
+///   connection-scoped fact observed through `AgentProvider::closed()` by the
+///   worker that owns the epoch, not through this per-session stream.
+///
+/// Delivery reliability is the consumer's side of the contract: the receiver
+/// that observed `TurnStarted` (created before the send) is handed to the
+/// drive loop inside `RunningAgentTurn`, so no fact can be lost to a
+/// subscription-timing gap. Across restarts, resume-time fencing of orphaned
+/// `starting`/`running` turns is the second authoritative path.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
+    /// A provider turn accepted and started; the single authority for the
+    /// provider turn id.
     TurnStarted { provider_turn_id: String },
-    TurnTerminal { provider_turn_id: String, outcome: TurnOutcome },
-    Failed { reason: String },
+    /// The turn reached a terminal outcome. `error` carries the provider's
+    /// reason when the outcome is `Failed` or `Unknown`.
+    TurnTerminal { provider_turn_id: String, outcome: TurnOutcome, error: Option<String> },
 }
 
 #[derive(Debug, thiserror::Error)]

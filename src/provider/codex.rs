@@ -20,6 +20,7 @@ pub struct CodexProvider {
     writer: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<PendingRequests>>,
     notifications: broadcast::Sender<ProviderNotification>,
+    closed: watch::Sender<bool>,
     next_request_id: Arc<AtomicI64>,
     _process: Arc<ProcessGuard>,
 }
@@ -48,12 +49,14 @@ impl CodexProvider {
             .ok_or_else(|| ProviderError::Protocol("app-server stderr was not piped".into()))?;
         let pending = Arc::new(Mutex::new(BTreeMap::new()));
         let (notifications, _) = broadcast::channel(512);
-        spawn_codex_stdout(stdout, Arc::clone(&pending), notifications.clone());
+        let (closed, _) = watch::channel(false);
+        spawn_codex_stdout(stdout, Arc::clone(&pending), notifications.clone(), closed.clone());
         spawn_codex_stderr(stderr);
         let client = Self {
             writer: Arc::new(Mutex::new(writer)),
             pending,
             notifications,
+            closed,
             next_request_id: Arc::new(AtomicI64::new(1)),
             _process: Arc::new(ProcessGuard { child: StdMutex::new(Some(child)) }),
         };
@@ -110,6 +113,11 @@ impl CodexProvider {
 impl AgentProvider for CodexProvider {
     fn subscribe(&self) -> broadcast::Receiver<ProviderNotification> {
         self.notifications.subscribe()
+    }
+
+    async fn closed(&self) {
+        let mut closed = self.closed.subscribe();
+        while !*closed.borrow() && closed.changed().await.is_ok() {}
     }
 
     async fn start_session(
@@ -232,6 +240,7 @@ fn spawn_codex_stdout(
     stdout: tokio::process::ChildStdout,
     pending: Arc<Mutex<PendingRequests>>,
     notifications: broadcast::Sender<ProviderNotification>,
+    closed: watch::Sender<bool>,
 ) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
@@ -274,6 +283,7 @@ fn spawn_codex_stdout(
             let _ = sender.send(Err(ProviderError::Disconnected));
         }
         let _ = notifications.send(ProviderNotification::Disconnected);
+        let _ = closed.send(true);
     });
 }
 

@@ -129,8 +129,8 @@ best-effort one-way projection from it. Nonessential state is not persisted.
 | Work Items, assignments, turns, context ledger/resets, queue/batches, outbox, owner lease | Durable store (SQLite) | In-memory `RunningAgentTurn` (claim cache for the in-flight turn), health snapshot |
 | GitHub canonical state | GitHub | `canonical_objects` / `sync_cursors` snapshots for diffing |
 | Physical session identity (`provider_session_id`) | Durable store (`provider_sessions`) | `SessionManager` map key + adapter `thread_id` (both ephemeral, rebuilt per epoch) |
-| Current provider turn | Provider process | `SessionEvent` stream (exactly one `TurnStarted` per turn) → durable store |
-| Provider connectivity | Provider connection | Worker observation → health snapshot + blocked-session records |
+| Current provider turn | Provider process | `SessionEvent` stream (exactly one `TurnStarted`/`TurnTerminal` per turn; receiver handed off with the turn, never re-subscribed) → durable store; resume fencing as the cross-epoch backstop |
+| Provider connectivity | Provider connection | `AgentProvider::closed()` future → worker epoch loop → health snapshot + blocked-session records |
 | Worktree presence | Filesystem + git | `worktrees` table (refreshed by inspection at prepare time) |
 
 Selected dependency baseline, verified against crates.io on 2026-08-13:

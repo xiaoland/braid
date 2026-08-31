@@ -16,6 +16,10 @@ pub(crate) struct RunningAgentTurn {
     pub(crate) claim: TurnClaim,
     pub(crate) provider_turn_id: String,
     pub(crate) reset_id: Option<String>,
+    /// The receiver that observed this turn's `TurnStarted`, created before
+    /// the send and handed off with the turn, so the drive loop consumes the
+    /// terminal with no subscription-timing gap.
+    pub(crate) events: tokio::sync::broadcast::Receiver<crate::agent_session::SessionEvent>,
 }
 
 pub(crate) fn policy_from_config(config: &Config) -> SchedulerPolicy {

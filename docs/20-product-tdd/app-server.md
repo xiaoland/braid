@@ -15,7 +15,7 @@ translates provider notifications into `SessionEvent`s:
 | Core method | Adapter behavior |
 | --- | --- |
 | `send_user_msg(msg, steering)` | If idle, start a new turn with `msg`; if running and `steering`, forward the steer to the active turn; if running and not steering, drop the message (the event queue owns redelivery). Returns `Started` or `Acknowledged`; lifecycle facts arrive only via events. |
-| `events()` | Emits exactly one `TurnStarted` per turn, then exactly one terminal (`TurnTerminal` or `Failed`), translated and deduplicated from provider notifications. |
+| `events()` | Emits exactly one `TurnStarted` per turn, then exactly one `TurnTerminal` (carrying the provider error when the outcome is `Failed`/`Unknown`), translated and deduplicated from provider notifications. The receiver created before dispatch is handed to the consumer with the turn — never re-subscribed. Connection death is observed via `AgentProvider::closed()`, not this stream. |
 
 The core never assumes a provider can rewrite arbitrary history or accept a
 custom compaction result. Context replacement is therefore orchestrated by the

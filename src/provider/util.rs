@@ -27,6 +27,10 @@ impl AgentProvider for Arc<dyn AgentProvider> {
         self.as_ref().subscribe()
     }
 
+    async fn closed(&self) {
+        self.as_ref().closed().await;
+    }
+
     async fn start_session(
         &self,
         profile: &Profile,
@@ -71,6 +75,10 @@ impl AgentProvider for Arc<dyn AgentProvider> {
 impl AgentProvider for Box<dyn AgentProvider> {
     fn subscribe(&self) -> broadcast::Receiver<ProviderNotification> {
         self.as_ref().subscribe()
+    }
+
+    async fn closed(&self) {
+        self.as_ref().closed().await;
     }
 
     async fn start_session(

@@ -130,30 +130,46 @@ pub(crate) async fn drive_issue_agent_connection(
     health: &RwLock<HealthSnapshot>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
-    let _ = provider;
     let mut running: Option<RunningAgentTurn> = None;
-    let mut active_events: Option<
-        tokio::sync::broadcast::Receiver<crate::agent_session::SessionEvent>,
-    > = None;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = shutdown.changed() => return false,
+            () = provider.closed() => {
+                // Connection death is connection-scoped: observed here whether
+                // or not a turn is running, so an idle disconnect can never
+                // wedge the worker. A reset claim, if any, survives and is
+                // materialized on the next epoch.
+                if let Some(active) = running.take() {
+                    let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
+                    let _ = store.enqueue_operational_status(
+                        active.claim.turn_id.clone(),
+                        operational_status_unknown_profile(&active.claim.profile_id),
+                    );
+                }
+                set_provider_unavailable(health, "Issue provider connection closed").await;
+                return true;
+            }
             event = async {
-                if let Some(ref mut rx) = active_events {
-                    rx.recv().await
+                if let Some(ref mut active) = running {
+                    active.events.recv().await
                 } else {
                     std::future::pending().await
                 }
-            }, if active_events.is_some() => {
+            }, if running.is_some() => {
                 match event {
                     Ok(crate::agent_session::SessionEvent::TurnStarted { provider_turn_id }) => {
                         tracing::debug!(%provider_turn_id, "Issue AgentSession turn started");
                     }
-                    Ok(crate::agent_session::SessionEvent::TurnTerminal { provider_turn_id, outcome }) => {
-                        if let Some(active) = running.take()
-                            && active.provider_turn_id == provider_turn_id
+                    Ok(crate::agent_session::SessionEvent::TurnTerminal { provider_turn_id, outcome, error }) => {
+                        if let Some(error) = &error {
+                            tracing::warn!(%provider_turn_id, %error, "Issue AgentSession turn terminal with error");
+                        }
+                        if running
+                            .as_ref()
+                            .is_some_and(|active| active.provider_turn_id == provider_turn_id)
+                            && let Some(active) = running.take()
                         {
                             let lifecycle = outcome.lifecycle();
                             if let Some(reset_id) = &active.reset_id {
@@ -164,30 +180,34 @@ pub(crate) async fn drive_issue_agent_connection(
                                 );
                             } else {
                                 let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), lifecycle.into());
+                                if lifecycle == "unknown" {
+                                    let _ = store.enqueue_operational_status(
+                                        active.claim.turn_id.clone(),
+                                        operational_status_unknown_profile(&active.claim.profile_id),
+                                    );
+                                }
                                 if active.claim.trusted_mention {
                                     let reaction = if lifecycle == "completed" { "+1" } else { "confused" };
                                     let _ = store.enqueue_turn_reaction(active.claim.turn_id.clone(), reaction.into());
                                 }
                             }
                         }
-                        active_events = None;
                     }
-                    Ok(crate::agent_session::SessionEvent::Failed { reason }) => {
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Events were lost; this may have been the terminal.
+                        // The epoch can no longer be trusted: fence the turn
+                        // and reconnect, where resume-time fencing is the
+                        // second authoritative path.
+                        tracing::warn!(skipped, "Issue AgentSession event consumer lagged");
                         if let Some(active) = running.take() {
                             let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
                             let _ = store.enqueue_operational_status(
                                 active.claim.turn_id.clone(),
                                 operational_status_unknown_profile(&active.claim.profile_id),
                             );
-                            if let Some(reset_id) = active.reset_id {
-                                let _ = store.fail_context_reset(reset_id, reason.clone());
-                            }
                         }
-                        set_provider_unavailable(health, &format!("Issue AgentSession failed: {reason}")).await;
+                        set_provider_unavailable(health, "Issue AgentSession event stream lagged").await;
                         return true;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "Issue AgentSession event consumer lagged");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         if let Some(active) = running.take() {
@@ -222,11 +242,6 @@ pub(crate) async fn drive_issue_agent_connection(
                 )).await;
                 if handled_lifecycle {
                     running = lifecycle_turn;
-                    if let Some(ref active) = running
-                        && let Some(session) = sessions.get(&active.claim.provider_session_id).await
-                    {
-                        active_events = Some(session.events());
-                    }
                     continue;
                 }
                 if Box::pin(materialize_next_context_reset(
@@ -240,11 +255,6 @@ pub(crate) async fn drive_issue_agent_connection(
                     store, github, config, Arc::clone(&provider), Arc::clone(&sessions), profile, profile_record,
                 ).await;
                 running = start_next_agent_turn(store, Arc::clone(&sessions), profile, "issue").await;
-                if let Some(ref active) = running
-                    && let Some(session) = sessions.get(&active.claim.provider_session_id).await
-                {
-                    active_events = Some(session.events());
-                }
             }
         }
     }

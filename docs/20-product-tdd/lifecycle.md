@@ -153,9 +153,26 @@ event stream, not raw provider notifications. Each active session yields a
 
 | Event | Meaning | Core reaction |
 | --- | --- | --- |
-| `TurnStarted { provider_turn_id }` | A new provider turn began. Exactly one per turn; the single authority for turn identity. | The scheduler records `provider_turn_id` in the store and marks the turn started. |
-| `TurnTerminal { provider_turn_id, outcome }` | A turn ended (`Completed`, `Interrupted`, `Failed`, `Unknown`). | The worker marks the turn terminal, updates reactions, and schedules the next batch. |
-| `Failed { reason }` | The session is unusable (protocol failure or provider disconnect). | The worker fences the active turn as `unknown`, then blocks or reconnects. |
+| `TurnStarted { provider_turn_id }` | A new provider turn began. Exactly one per turn; the single authority for turn identity. | The dispatcher records `provider_turn_id` in the store and marks the turn started. |
+| `TurnTerminal { provider_turn_id, outcome, error }` | A turn ended (`Completed`, `Interrupted`, `Failed`, `Unknown`). Exactly one per started turn; `error` carries the provider reason for `Failed`/`Unknown`. | The worker marks the turn terminal, updates reactions/status, and schedules the next batch. |
+
+Delivery semantics are part of the contract:
+
+- **Exactly-once per fact.** One `TurnStarted`, then exactly one
+  `TurnTerminal` — including session death, where the adapter synthesizes
+  `Unknown` for the in-flight turn before going quiet. There is no second
+  terminal-ish signal: provider turn errors travel inside `TurnTerminal`, and
+  connection death is not an event at all (see below).
+- **No subscription-timing gap.** The dispatcher subscribes *before* sending
+  and hands the receiver to the drive loop inside `RunningAgentTurn`; the
+  consumer never re-subscribes mid-turn.
+- **Connection death is connection-scoped**, observed through
+  `AgentProvider::closed()` — a future, not a channel — so it cannot be lost
+  while idle. The worker marks any in-flight turn `unknown` and starts a new
+  epoch.
+- **Cross-epoch backstop.** On every (re)connect, resume fencing marks
+  orphaned `starting`/`running` turns `unknown`. If in-epoch delivery ever
+  failed, the store still converges at the next epoch boundary.
 
 Responsibilities do not overlap:
 

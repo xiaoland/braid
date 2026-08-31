@@ -508,7 +508,7 @@ pub(crate) async fn start_next_agent_turn(
     {
         tracing::error!(%error, "cannot enqueue trusted-mention start reaction");
     }
-    Some(RunningAgentTurn { claim, provider_turn_id, reset_id: None })
+    Some(RunningAgentTurn { claim, provider_turn_id, reset_id: None, events })
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

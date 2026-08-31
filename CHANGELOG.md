@@ -69,6 +69,31 @@ Versioning once release artifacts are published.
   notifications.
 - `connect_provider` returns `Arc<dyn AgentProvider>` so the adapter and
   `SessionManager` share ownership.
+- `SendResult::Started` no longer carries the provider turn id;
+  `SessionEvent::TurnStarted` is the single authority for turn identity.
+- The event protocol is now exactly-once: `TurnTerminal` carries the
+  provider's error reason and `SessionEvent::Failed` is removed, so a turn
+  has exactly one `TurnStarted` and exactly one `TurnTerminal` (synthesized
+  as `Unknown` on session death). Connection death is connection-scoped and
+  observed through the new `AgentProvider::closed()` future. The dispatcher's
+  event receiver is handed to the drive loop inside `RunningAgentTurn`, so
+  lifecycle facts cannot be lost to a subscription-timing gap.
+- Provider connection epochs are now owned entirely by the group workers:
+  `serve` validates the provider configuration at boot (fail-fast on
+  misconfiguration) and each worker creates every connection — including the
+  first — and retries transient connection failures. `serve` no longer exits
+  when the provider is unreachable at boot; the worker reports the provider
+  unavailable and keeps retrying, matching the reconnect semantics.
+- The module graph is now acyclic with one-way layering (`runtime` → `group`
+  → `queue`; `runtime` → `producer` → `outbox`/`health`). Dispatch and
+  materialization moved from `queue::scheduler` to `group::dispatch` (they
+  execute queue decisions against sessions, a group concern); the in-memory
+  `RunningAgentTurn` claim cache moved from `producer::reconcile` to `queue`;
+  `HealthSnapshot` moved to a new leaf `health` module; `LEASE_TTL_SECONDS`
+  moved to `producer` (lease protocol home); `agent_attributions` moved to
+  `config` (pure profile derivation); and the GitHub write outbox moved from
+  `queue::outbox` to a leaf `outbox` module (it only needs `store` +
+  `github`).
 
 ### Removed
 
@@ -88,30 +113,23 @@ Versioning once release artifacts are published.
   reset state machine.
 - `AgentProvider::interrupt` removed; its only caller was the dead
   pending-reset path.
-- `SendResult::Started` no longer carries the provider turn id;
-  `SessionEvent::TurnStarted` is the single authority for turn identity.
-- Provider connection epochs are now owned entirely by the group workers:
-  `serve` validates the provider configuration at boot (fail-fast on
-  misconfiguration) and each worker creates every connection — including the
-  first — and retries transient connection failures. `serve` no longer exits
-  when the provider is unreachable at boot; the worker reports the provider
-  unavailable and keeps retrying, matching the reconnect semantics.
-- The module graph is now acyclic with one-way layering (`runtime` → `group`
-  → `queue`; `runtime` → `producer` → `outbox`/`health`). Dispatch and
-  materialization moved from `queue::scheduler` to `group::dispatch` (they
-  execute queue decisions against sessions, a group concern); the in-memory
-  `RunningAgentTurn` claim cache moved from `producer::reconcile` to `queue`;
-  `HealthSnapshot` moved to a new leaf `health` module; `LEASE_TTL_SECONDS`
-  moved to `producer` (lease protocol home); `agent_attributions` moved to
-  `config` (pure profile derivation); and the GitHub write outbox moved from
-  `queue::outbox` to a leaf `outbox` module (it only needs `store` +
-  `github`).
-
+- `SessionEvent::Failed` removed; connection death is connection-scoped and
+  observed via `AgentProvider::closed()`.
 ### Fixed
 
 - The adapter no longer emits two `TurnStarted` events per turn (the
   `turn/start` response and the async notification are two observations of
   one fact and are now deduplicated).
+- A turn terminal emitted between dispatch and the drive loop's
+  re-subscription was silently lost, leaving the store turn stuck in
+  `running`; the dispatcher's receiver is now handed off inside
+  `RunningAgentTurn`, so the consumer never re-subscribes mid-turn.
+- An idle provider disconnect was never observed (the drive loop only
+  listened while a turn was active), so every later dispatch failed into
+  `unknown` forever without a reconnect; the worker now awaits
+  `AgentProvider::closed()` regardless of turn state.
+- A provider turn failure produced two terminal-ish signals (`TurnTerminal`
+  and `Failed`); there is now exactly one `TurnTerminal` per started turn.
 - `SessionManager` is now scoped to one worker and one connection epoch.
   Previously it survived reconnects while its sessions kept the dead
   epoch's provider handle, so `resume` cache hits returned sessions that
