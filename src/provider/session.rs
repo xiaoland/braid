@@ -252,6 +252,17 @@ impl AgentSession for ProviderAgentSession {
         }
         Ok(SendResult::Started)
     }
+
+    async fn interrupt(&self) -> Result<(), SessionError> {
+        let inner = self.inner.lock().await;
+        let (Some(thread_id), Some(turn_id)) =
+            (inner.thread_id.clone(), inner.current_turn_id.clone())
+        else {
+            // No in-flight turn: termination is already the state.
+            return Ok(());
+        };
+        self.provider.interrupt(&thread_id, &turn_id).await.map_err(map_provider_error)
+    }
 }
 
 fn map_provider_error(error: ProviderError) -> SessionError {

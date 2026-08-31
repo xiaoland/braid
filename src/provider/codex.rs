@@ -234,6 +234,11 @@ impl AgentProvider for CodexProvider {
         .await?;
         Ok(())
     }
+
+    async fn interrupt(&self, thread_id: &str, turn_id: &str) -> Result<(), ProviderError> {
+        self.request("turn/interrupt", json!({"threadId":thread_id,"turnId":turn_id})).await?;
+        Ok(())
+    }
 }
 
 fn spawn_codex_stdout(

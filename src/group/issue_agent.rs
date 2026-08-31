@@ -13,15 +13,15 @@ use crate::{
     github::GitHubClient,
     group::SessionManager,
     group::dispatch::{
-        forward_urgent_steer, handle_next_work_item_lifecycle, materialize_next_context_reset,
-        materialize_next_issue_assignment, start_next_agent_turn,
+        begin_active_context_reset, forward_urgent_steer, handle_next_work_item_lifecycle,
+        materialize_next_context_reset, materialize_next_issue_assignment, start_next_agent_turn,
     },
     group::provider::{
         enqueue_provider_blocked_status, issue_system_prompt, materialized_profile,
         operational_status_unknown_profile, set_provider_unavailable,
     },
     health::HealthSnapshot,
-    queue::scheduler::{RunningAgentTurn, begin_active_context_reset, policy_from_config},
+    queue::scheduler::{RunningAgentTurn, policy_from_config},
     store::{ProfileRecord, StoreActor},
 };
 
@@ -224,7 +224,7 @@ pub(crate) async fn drive_issue_agent_connection(
             }
             _ = tick.tick() => {
                 if let Some(active) = &mut running {
-                    begin_active_context_reset(store, active).await;
+                    begin_active_context_reset(store, Arc::clone(&sessions), active).await;
                     if active.reset_id.is_none() {
                         forward_urgent_steer(store, Arc::clone(&sessions), active).await;
                     }

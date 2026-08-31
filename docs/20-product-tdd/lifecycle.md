@@ -181,7 +181,10 @@ Responsibilities do not overlap:
   runnable.
 - **`AgentSession`** only dispatches: idle, it starts a new turn; running and
   `steering`, it forwards the steer; running and not steering, it drops the
-  message. It never queues; redelivery is the queue's job.
+  message. It never queues; redelivery is the queue's job. `interrupt()` is
+  the control-plane sibling of steering — an immediate operation on the
+  observed in-flight turn that carries termination rather than input; the
+  terminal still arrives via the event stream.
 - The **group layer** (`SessionManager`) owns the physical session lifecycle
   for one connection epoch: start/resume keyed by the adapter-created thread
   id, rebuilt from the durable store on every reconnect. There is no in-place

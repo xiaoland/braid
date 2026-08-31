@@ -305,6 +305,13 @@ impl AgentProvider for PiProvider {
         Self::success_or_protocol(&result, "steer")?;
         Ok(())
     }
+
+    async fn interrupt(&self, _thread_id: &str, _turn_id: &str) -> Result<(), ProviderError> {
+        let mut state = self.state.lock().await;
+        let result = Self::request(&mut state, json!({"type": "abort"})).await?;
+        Self::success_or_protocol(&result, "abort")?;
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

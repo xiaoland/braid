@@ -673,3 +673,55 @@ pub(crate) fn record_context_unavailable(
     }
     Ok(())
 }
+
+/// Fence the active turn with a DB reset claim, then best-effort interrupt it.
+///
+/// The fence is the correctness mechanism: the turn's terminal is attributed
+/// to the reset (no success/failure) and `materialize_context_reset` starts a
+/// fresh session with the rebuilt context. The interrupt is the documented
+/// latency/resource optimization on top of the fence — the turn stops now
+/// instead of running stale work to its natural terminal; if it fails, the
+/// fence alone still guarantees correctness.
+pub(crate) async fn begin_active_context_reset(
+    store: &StoreActor,
+    sessions: Arc<SessionManager>,
+    active: &mut RunningAgentTurn,
+) {
+    if active.reset_id.is_some() {
+        return;
+    }
+    let reset = match store.begin_context_reset(
+        Some(active.claim.turn_id.clone()),
+        active.claim.work_item_kind.clone(),
+        active.claim.profile_id.clone(),
+    ) {
+        Ok(reset) => reset,
+        Err(error) => {
+            tracing::error!(%error, "cannot begin active Context reset");
+            return;
+        }
+    };
+    let Some(reset) = reset else { return };
+    if reset.active_turn_id.as_deref() != Some(active.claim.turn_id.as_str())
+        || reset.provider_turn_id.as_deref() != Some(active.provider_turn_id.as_str())
+    {
+        let message = "Context reset returned a different active provider turn";
+        let _ = store.fail_context_reset(reset.reset_id, message.into());
+        tracing::error!(message);
+        return;
+    }
+    active.reset_id = Some(reset.reset_id.clone());
+    match sessions.get(&active.claim.provider_session_id).await {
+        Some(session) => {
+            if let Err(error) = session.interrupt().await {
+                tracing::warn!(%error, reset = %reset.reset_id, "active Context reset interrupt failed; fence still applies");
+            }
+        }
+        None => {
+            tracing::warn!(
+                provider_session = %active.claim.provider_session_id,
+                "no AgentSession for active reset interrupt"
+            );
+        }
+    }
+}

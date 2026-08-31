@@ -14,8 +14,8 @@ use crate::{
     github::{GitHubClient, RepositoryName, WorkItemLocator},
     group::SessionManager,
     group::dispatch::{
-        forward_urgent_steer, handle_next_work_item_lifecycle, materialize_next_context_reset,
-        start_next_agent_turn,
+        begin_active_context_reset, forward_urgent_steer, handle_next_work_item_lifecycle,
+        materialize_next_context_reset, start_next_agent_turn,
     },
     group::provider::{
         enqueue_provider_blocked_status, materialized_profile, operational_status_unknown_profile,
@@ -23,8 +23,8 @@ use crate::{
     },
     health::HealthSnapshot,
     queue::scheduler::{
-        RunningAgentTurn, begin_active_context_reset, enqueue_context_pressure_status,
-        policy_from_config, record_context_pressure,
+        RunningAgentTurn, enqueue_context_pressure_status, policy_from_config,
+        record_context_pressure,
     },
     store::{AssignmentCandidate, ProfileRecord, StoreActor},
     worktree::{self, WorktreeRequest},
@@ -228,7 +228,7 @@ pub(crate) async fn drive_pr_agent_connection(
             }
             _ = tick.tick() => {
                 if let Some(active) = &mut running {
-                    begin_active_context_reset(store, active).await;
+                    begin_active_context_reset(store, Arc::clone(&sessions), active).await;
                     if active.reset_id.is_none() {
                         forward_urgent_steer(store, Arc::clone(&sessions), active).await;
                     }

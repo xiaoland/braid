@@ -71,6 +71,14 @@ Versioning once release artifacts are published.
   `SessionManager` share ownership.
 - `SendResult::Started` no longer carries the provider turn id;
   `SessionEvent::TurnStarted` is the single authority for turn identity.
+- `AgentSession::interrupt()` restores physical turn termination as a
+  first-class contract operation — the control-plane sibling of steering
+  (immediate, addressed to the observed in-flight turn, carrying control
+  rather than input). `begin_active_context_reset` now fences the active turn
+  in the store AND best-effort interrupts it (Codex `turn/interrupt`, Pi
+  `abort`), matching the Hard Invalidation Sequence; the fence remains the
+  correctness mechanism if the interrupt fails. The function moved to
+  `group::dispatch` since it now touches sessions.
 - The event protocol is now exactly-once: `TurnTerminal` carries the
   provider's error reason and `SessionEvent::Failed` is removed, so a turn
   has exactly one `TurnStarted` and exactly one `TurnTerminal` (synthesized
@@ -111,8 +119,6 @@ Versioning once release artifacts are published.
   path. Context replacement is orchestrated by the core through
   `SessionManager::start` with materialized context, matching the tested
   reset state machine.
-- `AgentProvider::interrupt` removed; its only caller was the dead
-  pending-reset path.
 - `SessionEvent::Failed` removed; connection death is connection-scoped and
   observed via `AgentProvider::closed()`.
 ### Fixed

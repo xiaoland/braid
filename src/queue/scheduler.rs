@@ -29,38 +29,6 @@ pub(crate) fn policy_from_config(config: &Config) -> SchedulerPolicy {
     }
 }
 
-pub(crate) async fn begin_active_context_reset(store: &StoreActor, active: &mut RunningAgentTurn) {
-    if active.reset_id.is_some() {
-        return;
-    }
-    let reset = match store.begin_context_reset(
-        Some(active.claim.turn_id.clone()),
-        active.claim.work_item_kind.clone(),
-        active.claim.profile_id.clone(),
-    ) {
-        Ok(reset) => reset,
-        Err(error) => {
-            tracing::error!(%error, "cannot begin active Context reset");
-            return;
-        }
-    };
-    let Some(reset) = reset else { return };
-    if reset.active_turn_id.as_deref() != Some(active.claim.turn_id.as_str())
-        || reset.provider_turn_id.as_deref() != Some(active.provider_turn_id.as_str())
-    {
-        let message = "Context reset returned a different active provider turn";
-        let _ = store.fail_context_reset(reset.reset_id, message.into());
-        tracing::error!(message);
-        return;
-    }
-    active.reset_id = Some(reset.reset_id.clone());
-    // The DB reset claim is the fence: the turn runs to its terminal, the
-    // terminal is attributed to the reset (no success/failure), and
-    // `materialize_context_reset` then starts a fresh session with the rebuilt
-    // context. The contract intentionally has no in-place reset or
-    // interrupt-only message, so there is nothing to send to the old session.
-}
-
 pub(crate) fn record_context_pressure(
     store: &StoreActor,
     assignment_id: &str,

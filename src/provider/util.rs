@@ -69,6 +69,10 @@ impl AgentProvider for Arc<dyn AgentProvider> {
     ) -> Result<(), ProviderError> {
         self.as_ref().steer(thread_id, expected_turn_id, event_references).await
     }
+
+    async fn interrupt(&self, thread_id: &str, turn_id: &str) -> Result<(), ProviderError> {
+        self.as_ref().interrupt(thread_id, turn_id).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -118,6 +122,10 @@ impl AgentProvider for Box<dyn AgentProvider> {
         event_references: &str,
     ) -> Result<(), ProviderError> {
         self.as_ref().steer(thread_id, expected_turn_id, event_references).await
+    }
+
+    async fn interrupt(&self, thread_id: &str, turn_id: &str) -> Result<(), ProviderError> {
+        self.as_ref().interrupt(thread_id, turn_id).await
     }
 }
 

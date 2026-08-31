@@ -96,6 +96,11 @@ pub trait AgentProvider: Send + Sync {
         expected_turn_id: &str,
         event_references: &str,
     ) -> Result<(), ProviderError>;
+
+    /// Best-effort termination of the observed active turn. Idempotent at the
+    /// Braid state-machine boundary: the provider may report "no active turn"
+    /// after convergence, and the terminal still arrives via notifications.
+    async fn interrupt(&self, thread_id: &str, turn_id: &str) -> Result<(), ProviderError>;
 }
 
 mod codex;

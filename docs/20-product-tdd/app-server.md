@@ -15,6 +15,7 @@ translates provider notifications into `SessionEvent`s:
 | Core method | Adapter behavior |
 | --- | --- |
 | `send_user_msg(msg, steering)` | If idle, start a new turn with `msg`; if running and `steering`, forward the steer to the active turn; if running and not steering, drop the message (the event queue owns redelivery). Returns `Started` or `Acknowledged`; lifecycle facts arrive only via events. |
+| `interrupt()` | Best-effort termination of the observed in-flight turn (Codex `turn/interrupt`, Pi `abort`); idempotent at the state-machine boundary, terminal still arrives via the event stream. Used by hard invalidation after the DB fence. |
 | `events()` | Emits exactly one `TurnStarted` per turn, then exactly one `TurnTerminal` (carrying the provider error when the outcome is `Failed`/`Unknown`), translated and deduplicated from provider notifications. The receiver created before dispatch is handed to the consumer with the turn — never re-subscribed. Connection death is observed via `AgentProvider::closed()`, not this stream. |
 
 The core never assumes a provider can rewrite arbitrary history or accept a
@@ -24,7 +25,7 @@ group layer starts a fresh physical session with the complete materialized
 GitHub Context before another turn.
 
 Direct provider primitives (`start_session`, `resume_session`,
-`inject_context`, `start_turn`, `steer`) remain available for the adapter
+`inject_context`, `start_turn`, `steer`, `interrupt`) remain available for the adapter
 implementation but are never called by the scheduler or worker loops.
 
 ## Codex Version and Wire
