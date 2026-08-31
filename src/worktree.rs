@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use git2::{ErrorClass, ErrorCode, Repository, WorktreeAddOptions};
+use git2::{ErrorClass, ErrorCode, Repository};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -66,41 +66,45 @@ pub fn provision(request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, W
             .map_err(|source| WorktreeError::Io { path: parent.to_path_buf(), source })?;
     }
     tokio::task::block_in_place(|| {
-        let refspec =
-            format!("+refs/heads/{0}:refs/remotes/{1}/{0}", request.head_ref, request.remote);
-        let output = std::process::Command::new(request.git)
-            .arg("-C")
-            .arg(&source)
-            .arg("fetch")
-            .arg(request.remote)
-            .arg(&refspec)
-            .output()
-            .map_err(|source_err| WorktreeError::Io { path: source.clone(), source: source_err })?;
-        if !output.status.success() {
-            return Err(WorktreeError::Git(format!(
-                "git fetch {refspec} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        let repo = Repository::open(&source)?;
-        let reference = repo
-            .find_reference(&format!("refs/remotes/{}/{}", request.remote, request.head_ref))
-            .map_err(|error| {
-                WorktreeError::Git(format!(
-                    "fetched ref refs/remotes/{}/{} not found: {error}",
-                    request.remote, request.head_ref
-                ))
-            })?;
-        let mut options = WorktreeAddOptions::new();
-        options.reference(Some(&reference));
-        let _worktree = repo
-            .worktree(request.local_branch, request.target, Some(&options))
-            .map_err(|error| {
-                WorktreeError::Git(format!(
-                    "cannot add worktree at {}: {error}",
-                    request.target.display()
-                ))
-            })?;
+        let git = |args: &[&str]| -> Result<(), WorktreeError> {
+            let output = std::process::Command::new(request.git)
+                .arg("-C")
+                .arg(&source)
+                .args(args)
+                .output()
+                .map_err(|source_err| WorktreeError::Io {
+                    path: source.clone(),
+                    source: source_err,
+                })?;
+            if !output.status.success() {
+                return Err(WorktreeError::Git(format!(
+                    "git {} failed: {}",
+                    args.first().unwrap_or(&""),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            Ok(())
+        };
+        let remote_ref = format!("refs/remotes/{}/{}", request.remote, request.head_ref);
+        git(&[
+            "fetch",
+            request.remote,
+            &format!("+refs/heads/{0}:{1}", request.head_ref, remote_ref),
+        ])?;
+        // libgit2's worktree add rejects remote-tracking references
+        // ("reference is not a branch"); the system git creates the
+        // generation-scoped local branch and the worktree in one step.
+        git(&[
+            "worktree",
+            "add",
+            request
+                .target
+                .to_str()
+                .ok_or_else(|| WorktreeError::Git("worktree target path is not UTF-8".into()))?,
+            "-B",
+            request.local_branch,
+            &remote_ref,
+        ])?;
         Ok::<(), WorktreeError>(())
     })?;
     verify_existing(request, &source)
