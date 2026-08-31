@@ -29,6 +29,15 @@ Versioning once release artifacts are published.
   assignment is GitHub-side Agent App provisioning that ordinary
   manifest-created Apps cannot obtain; Braid detects the mode at runtime.
 
+- The GitHub installation client no longer pins the initial installation
+  token: it is built via octocrab's installation auth state, which caches and
+  auto-refreshes the token. Previously every API call began failing with 401
+  "Bad credentials" one hour after `serve` started (token expiry), silently
+  wedging mention resolution, reactions, and the write outbox until restart.
+- Mention-authority resolution now backs off exponentially (2s to 60s) on
+  persistent GitHub errors instead of retrying every 250ms scheduler tick.
+
+
 ## [0.3.0] - 2026-08-31
 
 ### Added
