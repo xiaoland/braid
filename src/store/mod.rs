@@ -4765,6 +4765,7 @@ fn fence_session_and_request_reset(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn mark_turn_terminal(database: &Path, turn_id: &str, lifecycle: &str) -> Result<(), StoreError> {
     require_current_schema(database)?;
     if !matches!(lifecycle, "completed" | "interrupted" | "failed" | "unknown") {
@@ -4782,10 +4783,11 @@ fn mark_turn_terminal(database: &Path, turn_id: &str, lifecycle: &str) -> Result
         work_item_node_id,
         work_item_kind,
         work_item_state,
+        turn_batch_id,
     ) = transaction
         .query_row(
             "SELECT t.session_id,t.trigger_kind,ps.agent_id,ai.assignment_id,
-                    a.work_item_node_id,w.kind,w.state
+                    a.work_item_node_id,w.kind,w.state,t.batch_id
              FROM turns t
              JOIN provider_sessions ps ON ps.session_id=t.session_id
              JOIN agent_instances ai ON ai.agent_id=ps.agent_id
@@ -4802,6 +4804,7 @@ fn mark_turn_terminal(database: &Path, turn_id: &str, lifecycle: &str) -> Result
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             },
         )
@@ -4831,6 +4834,36 @@ fn mark_turn_terminal(database: &Path, turn_id: &str, lifecycle: &str) -> Result
     )?;
     if lifecycle == "unknown" {
         fence_session_and_request_reset(&transaction, &session_id, &agent_id, &now)?;
+        // At-least-once replay: the fenced turn's inputs return to pending and
+        // are re-batched, so the replacement session re-drives them after the
+        // reset lands. The turn may have completed provider-side unseen;
+        // GitHub-write idempotency absorbs a rare duplicate, while silently
+        // dropping a delivered Human request is the worse failure.
+        if let Some(batch_id) = turn_batch_id {
+            transaction.execute(
+                "UPDATE events SET lifecycle='pending'
+                 WHERE lifecycle='consumed' AND event_id IN (
+                   SELECT event_id FROM wake_batch_events WHERE batch_id=?1)",
+                [&batch_id],
+            )?;
+            let mut statement = transaction.prepare(
+                "SELECT event_id FROM wake_batch_events WHERE batch_id=?1 ORDER BY ordinal",
+            )?;
+            let replayed = statement
+                .query_map([&batch_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            for event_id in replayed {
+                schedule_event(
+                    &transaction,
+                    &work_item_node_id,
+                    &event_id,
+                    SchedulerPolicy { quiet_seconds: 5, event_threshold: 1 },
+                    false,
+                    &now,
+                )?;
+            }
+        }
     }
     if finalization && lifecycle != "unknown" {
         transaction.execute(

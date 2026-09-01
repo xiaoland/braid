@@ -279,7 +279,18 @@ pub(crate) fn reconcile_observations(
             cross_surface_invalidation,
             config,
         );
-        if store.ingest_event(event, policy)?.event_id.is_some() {
+        let ingested = store.ingest_event(event, policy)?;
+        tracing::debug!(
+            object = %observation.object_node_id,
+            object_kind = observation.object_kind,
+            action,
+            ?kind,
+            external,
+            event_id = ?ingested.event_id,
+            event_lifecycle = ?ingested.event_lifecycle,
+            "reconcile observation ingested"
+        );
+        if ingested.event_id.is_some() {
             changes += 1;
         }
     }
