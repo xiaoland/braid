@@ -27,6 +27,18 @@ Versioning once release artifacts are published.
 
 ### Fixed
 
+- Live smoke (0.3.1 candidate, reconcile-only mode): Issue Agent worktree
+  provisioning no longer fails on the PR-only worktree record guard;
+  opening-body mentions now activate (scanned alongside comment/review
+  bodies, promoted from noop to pending mention); reconcile no longer skips
+  close/reopen transitions whose body digest survived, nor wedges close
+  events on dormant groups; reopen reactivation provisions a fresh worktree
+  for pre-worktree (v0.3.0) generations, replaces every stale session of the
+  agent, and never wedges the event pending on unselectable generations;
+  fenced-unknown turns replay their wake inputs at-least-once after the
+  reset lands; restart resume fences crashed in-flight turns before any
+  compatibility verdict and logs the exact incompatibility reason.
+
 - `braid setup` pinned a hardcoded profile `adapter_version`, so config
   validation rejected the generated config whenever the discovered runtime
   version differed (e.g. codex-cli 0.151.0). The profile now pins the
