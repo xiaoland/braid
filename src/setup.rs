@@ -201,10 +201,14 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     }
     config.validate().context("generated config failed validation")?;
 
-    for profile in &config.profiles {
-        fs::create_dir_all(&profile.workspace).with_context(|| {
-            format!("cannot create profile workspace {}", profile.workspace.display())
-        })?;
+    let source = base_dir.join("source");
+    if let Err(error) = ensure_source_checkout(&source, &arguments.repository, &config.tools.git) {
+        println!("\nWarning: {error:#}");
+        println!(
+            "Clone the repository manually and re-run doctor:\n  git clone https://github.com/{} {}",
+            arguments.repository,
+            source.display()
+        );
     }
     let runtime_home = base_dir.join("provider").join(&arguments.provider);
     bootstrap_provider_home(&runtime_home, &arguments.provider)?;
@@ -633,7 +637,7 @@ fn build_config(
             model: Some(arguments.model.clone()),
             reasoning: Some("high".to_owned()),
             user_instructions: "You are Braid, a helpful coding assistant. Work from the supplied GitHub Context, publish concise public comments, and keep descriptions and implementation state current.".to_owned(),
-            workspace: base_dir.join("workspace/default"),
+            workspace: None,
             github_actor_node_id: None,
             status_surfaces: vec!["issue".to_owned(), "pr".to_owned()],
             github_context_soft_ratio: 0.80,
@@ -653,6 +657,32 @@ fn build_config(
 /// credentials do not apply: import `~/.codex/auth.json` when present,
 /// otherwise print explicit login instructions. Pi authenticates through the
 /// persisted provider API key and needs no home bootstrap.
+/// The instance source checkout: one Git clone of the configured repository,
+/// shared by all Profiles as the worktree provisioning source. Clone when
+/// missing or empty; never overwrite a non-Git directory.
+fn ensure_source_checkout(source: &Path, repository: &str, git: &Path) -> Result<()> {
+    if source.join(".git").exists() {
+        println!("Source checkout already present: {}", source.display());
+        return Ok(());
+    }
+    if source.exists() && fs::read_dir(source).ok().is_some_and(|mut d| d.next().is_some()) {
+        anyhow::bail!(
+            "source path {} exists but is not a Git checkout; move it aside or clone into it",
+            source.display()
+        );
+    }
+    println!("Cloning {} into {} ...", repository, source.display());
+    let status = std::process::Command::new(git)
+        .args(["clone", &format!("https://github.com/{repository}.git")])
+        .arg(source)
+        .status()
+        .with_context(|| format!("cannot launch git clone for {}", source.display()))?;
+    if !status.success() {
+        anyhow::bail!("git clone exited with {status}");
+    }
+    Ok(())
+}
+
 fn bootstrap_provider_home(home: &Path, adapter_type: &str) -> Result<()> {
     fs::create_dir_all(home)
         .with_context(|| format!("cannot create provider home {}", home.display()))?;

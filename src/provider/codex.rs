@@ -129,7 +129,7 @@ impl AgentProvider for CodexProvider {
             .request(
                 "thread/start",
                 json!({
-                    "cwd":path_text(&profile.workspace)?,
+                    "cwd":path_text(profile.workspace())?,
                     "model":profile.model,
                     "developerInstructions":developer_instructions,
                     "approvalPolicy":"never",
@@ -174,7 +174,7 @@ impl AgentProvider for CodexProvider {
                 "thread/resume",
                 json!({
                     "threadId":thread_id,
-                    "cwd":path_text(&profile.workspace)?,
+                    "cwd":path_text(profile.workspace())?,
                     "model":profile.model,
                     "developerInstructions":developer_instructions,
                     "approvalPolicy":"never",

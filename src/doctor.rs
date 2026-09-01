@@ -50,6 +50,7 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
         path_check("GitHub App private key", &config.github.private_key_file, false),
         secret_check("GitHub webhook secret", || config.webhook_secret()),
     ];
+    checks.push(source_checkout_check(config));
 
     let store = StoreActor::start(
         config.runtime.database().to_path_buf(),
@@ -139,6 +140,61 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
     checks.push(cross_instance_port_check(config, user_home));
     let ready = checks.iter().all(|check| check.state == CheckState::Pass);
     DoctorReport { ready, checks }
+}
+
+/// The instance source checkout must be a Git clone of the configured
+/// repository; it is the provisioning source for every Agent worktree.
+fn source_checkout_check(config: &Config) -> Check {
+    let name = "Source checkout";
+    let Some(profile) = config.profiles.first() else {
+        return Check { name: name.into(), state: CheckState::Fail, detail: "no profiles".into() };
+    };
+    let source = profile.workspace();
+    if !source.join(".git").exists() {
+        return Check {
+            name: name.into(),
+            state: CheckState::Fail,
+            detail: format!(
+                "{} is not a Git checkout; clone with `git clone https://github.com/{} {}`",
+                source.display(),
+                config.github.repository,
+                source.display()
+            ),
+        };
+    }
+    let remote = std::process::Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(["remote", "get-url", "origin"])
+        .output();
+    match remote {
+        Ok(output) if output.status.success() => {
+            let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if url.to_ascii_lowercase().contains(&config.github.repository.to_ascii_lowercase()) {
+                Check {
+                    name: name.into(),
+                    state: CheckState::Pass,
+                    detail: format!("{} ({})", source.display(), url),
+                }
+            } else {
+                Check {
+                    name: name.into(),
+                    state: CheckState::Fail,
+                    detail: format!(
+                        "{} remote origin is {}, not {}",
+                        source.display(),
+                        url,
+                        config.github.repository
+                    ),
+                }
+            }
+        }
+        _ => Check {
+            name: name.into(),
+            state: CheckState::Fail,
+            detail: format!("cannot inspect git remote in {}", source.display()),
+        },
+    }
 }
 
 fn codex_credentials_check(codex: &crate::config::CodexConfig) -> Check {

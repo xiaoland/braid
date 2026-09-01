@@ -7,6 +7,11 @@ Versioning once release artifacts are published.
 
 ### Added
 
+- `braid setup` clones the configured repository into the instance source
+  checkout (`<instance>/source`): one clone per repository, shared by all
+  Profiles as the worktree provisioning source. `profile.workspace` is now
+  optional and defaults to this source checkout; `braid doctor` validates it
+  ("Source checkout" check).
 - Braid System Prompt v2: Publication Discretion (a delivered comment or
   mention never obligates a public reply; silence is a valid outcome) and the
   private persistent workspace (`.braid/` files in the generation worktree,

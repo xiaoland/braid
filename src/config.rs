@@ -292,11 +292,30 @@ pub struct Profile {
     pub model: Option<String>,
     pub reasoning: Option<String>,
     pub user_instructions: String,
-    pub workspace: PathBuf,
+    /// The source Git checkout for this instance's repository, shared by all
+    /// Profiles as the worktree provisioning source (one repository = one
+    /// source checkout). Defaults to `<config_dir>/source`; Agent sessions
+    /// never edit it directly — they run in provisioned worktrees.
+    #[serde(default)]
+    pub workspace: Option<PathBuf>,
     pub github_actor_node_id: Option<String>,
     pub status_surfaces: Vec<String>,
     pub github_context_soft_ratio: f64,
     pub github_context_hard_bytes: usize,
+}
+
+impl Profile {
+    /// Fill an omitted workspace with the instance source checkout and
+    /// normalize a relative override against the config directory.
+    pub fn resolve_workspace(&mut self, base: &Path) {
+        let workspace = self.workspace.take().unwrap_or_else(|| base.join("source"));
+        self.workspace = Some(resolve_path(base, &workspace));
+    }
+
+    /// The resolved source checkout path (valid after `Config::load`).
+    pub fn workspace(&self) -> &Path {
+        self.workspace.as_deref().expect("Profile workspace resolved before use")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -374,6 +393,9 @@ impl Config {
             std::env::current_dir().map(|cwd| cwd.join(&base)).unwrap_or(base)
         };
         config.runtime.resolve(&base);
+        for profile in &mut config.profiles {
+            profile.resolve_workspace(&base);
+        }
         config.validate()?;
         Ok(config)
     }
@@ -739,7 +761,9 @@ impl Profile {
             )));
         }
         validate_token("profile.provider", &self.provider)?;
-        require_absolute(&format!("profile {:?}.workspace", self.id), &self.workspace)?;
+        if let Some(workspace) = &self.workspace {
+            require_absolute(&format!("profile {:?}.workspace", self.id), workspace)?;
+        }
         if self.tags.is_empty() || (!self.has_tag("issue") && !self.has_tag("pr")) {
             return Err(ConfigError::Invalid(format!(
                 "profile {:?} must have issue or pr capability tag",

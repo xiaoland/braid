@@ -140,10 +140,12 @@ pub(crate) async fn reactivate_work_item_agent(
                 .clone()
                 .unwrap_or_else(|| pull_request.head_ref.clone());
             let mut effective_profile = profile.clone();
-            effective_profile.workspace = materialization
-                .worktree_path
-                .clone()
-                .context("reopened PR Agent has no preserved worktree")?;
+            effective_profile.workspace = Some(
+                materialization
+                    .worktree_path
+                    .clone()
+                    .context("reopened PR Agent has no preserved worktree")?,
+            );
             (
                 CanonicalContext::PullRequest(pull_request),
                 pr_system_prompt(config, profile, candidate.number, &head_ref),
@@ -151,10 +153,12 @@ pub(crate) async fn reactivate_work_item_agent(
             )
         } else {
             let mut effective_profile = profile.clone();
-            effective_profile.workspace = materialization
-                .worktree_path
-                .clone()
-                .context("reopened Issue Agent has no preserved worktree")?;
+            effective_profile.workspace = Some(
+                materialization
+                    .worktree_path
+                    .clone()
+                    .context("reopened Issue Agent has no preserved worktree")?,
+            );
             (
                 CanonicalContext::Issue(context::materialize_issue(github, &locator, 100).await?),
                 issue_system_prompt(config, profile, candidate.number),
@@ -339,12 +343,12 @@ pub(crate) async fn materialize_context_reset(
             .worktree_head_ref
             .as_deref()
             .context("PR Context reset has no remote head reference")?;
-        effective_profile.workspace = worktree.clone();
+        effective_profile.workspace = Some(worktree.clone());
         pr_system_prompt(config, profile, reset.number, head_ref)
     } else {
         let worktree =
             reset.worktree_path.as_ref().context("Issue Context reset has no active worktree")?;
-        effective_profile.workspace = worktree.clone();
+        effective_profile.workspace = Some(worktree.clone());
         issue_system_prompt(config, profile, reset.number)
     };
     let instruction_revision = hex::encode(Sha256::digest(instructions.as_bytes()));
@@ -645,8 +649,9 @@ pub(crate) async fn materialize_issue_assignment(
         enqueue_context_pressure_status(store, profile, &materialization.assignment_id, &rendered)?;
         return Ok(());
     }
-    if !profile.workspace.is_dir() {
-        let message = format!("Profile workspace does not exist: {}", profile.workspace.display());
+    if !profile.workspace().is_dir() {
+        let message =
+            format!("Profile workspace does not exist: {}", profile.workspace().display());
         store.fail_agent_assignment(materialization.assignment_id, message.clone())?;
         anyhow::bail!(message);
     }

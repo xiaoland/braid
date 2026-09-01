@@ -89,7 +89,11 @@ provider = "openai"
 model = "gpt-5.6-sol"
 reasoning = "high"
 user_instructions = "Keep design discussion concise and maintain the Issue description as working memory."
-workspace = "/absolute/path/to/issue-workspace"
+# Optional. The source Git checkout of the configured repository, shared by
+# all profiles as the worktree provisioning source (one repository = one
+# source checkout). Defaults to <config_dir>/source. Agent sessions never edit
+# it directly; they run in provisioned generation-scoped worktrees.
+# workspace = "/absolute/path/to/repository-source-checkout"
 github_actor_node_id = "MDQ6VXNlcjEyMzQ1"
 status_surfaces = ["issue"]
 github_context_soft_ratio = 0.80
@@ -105,9 +109,8 @@ provider = "openai"
 model = "gpt-5.6-sol"
 reasoning = "high"
 user_instructions = "Implement from linked Issue working memory and keep GitHub comments brief."
-# A clean source checkout for the configured repository. Braid fetches from its
-# origin and provisions generation-scoped PR worktrees below runtime.root.
-workspace = "/absolute/path/to/repository-source-checkout"
+# workspace: see the issue profile above; omit it to share the default
+# instance source checkout.
 github_actor_node_id = "MDQ6VXNlcjEyMzQ1"
 status_surfaces = ["pr"]
 github_context_soft_ratio = 0.80

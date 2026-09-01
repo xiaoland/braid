@@ -215,7 +215,7 @@ impl AgentProvider for PiProvider {
         state.current_turn_id = None;
         state.process = None;
 
-        self.spawn(&mut state, &profile.workspace, None)?;
+        self.spawn(&mut state, profile.workspace(), None)?;
 
         let result =
             Self::request(&mut state, json!({"type": "new_session", "name": "braid-session"}))
@@ -252,7 +252,7 @@ impl AgentProvider for PiProvider {
         state.current_turn_id = None;
         state.process = None;
 
-        self.spawn(&mut state, &profile.workspace, Some(thread_id))?;
+        self.spawn(&mut state, profile.workspace(), Some(thread_id))?;
 
         Ok(ProviderSession { thread_id: thread_id.to_owned() })
     }
@@ -266,7 +266,7 @@ impl AgentProvider for PiProvider {
         let mut state = self.state.lock().await;
         if state.process.is_none() {
             let session = state.session.clone();
-            self.spawn(&mut state, &profile.workspace, session.as_deref())?;
+            self.spawn(&mut state, profile.workspace(), session.as_deref())?;
         }
 
         let mut message = String::new();

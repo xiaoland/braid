@@ -106,11 +106,17 @@ appear in the assignee picker, and assigning it via the API is rejected. If
 GitHub ever provisions your App as an Agent App, assignment works without any
 configuration change; Braid detects the mode at runtime.
 
-## Provider credentials and workspace
+## Provider credentials and source checkout
 
 `braid setup` also prepares the instance-scoped provider home
-(`~/.braid/instances/<KEY>/provider/codex`) and the Profile workspace
-(`~/.braid/instances/<KEY>/workspace/default`).
+(`~/.braid/instances/<KEY>/provider/codex`) and the instance source checkout
+(`~/.braid/instances/<KEY>/source`): one Git clone of the configured
+repository shared by all Profiles. Braid never edits it directly — Agent
+sessions run in dedicated generation-scoped worktrees provisioned from it
+(`state/worktrees/...`), and each worktree's `.braid/` directory is the
+Agent's private, git-excluded workspace for notes and drafts. Setup clones
+the repository automatically; if the clone cannot run, it prints the manual
+`git clone` command and `braid doctor` reports the missing checkout.
 
 Codex authenticates per `CODEX_HOME`, and Braid isolates it per instance, so
 your global `~/.codex` credentials do not automatically apply. Setup imports

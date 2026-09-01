@@ -313,7 +313,7 @@ pub(crate) async fn resume_pr_provider_sessions(
             )?;
         }
         let mut effective_profile = profile.clone();
-        effective_profile.workspace = worktree_path;
+        effective_profile.workspace = Some(worktree_path);
         match sessions
             .resume(
                 candidate.provider_session_id.clone(),
@@ -436,7 +436,7 @@ pub(crate) fn provision_pr_agent_worktree(
         candidate.number, profile.id, materialization.generation
     );
     let provisioned = worktree::provision(&WorktreeRequest {
-        source: &profile.workspace,
+        source: profile.workspace(),
         target: &target,
         repository: &config.github.repository,
         remote: "origin",
@@ -453,7 +453,7 @@ pub(crate) fn provision_pr_agent_worktree(
         provisioned.local_branch,
     )?;
     let mut effective_profile = profile.clone();
-    effective_profile.workspace = provisioned.path;
+    effective_profile.workspace = Some(provisioned.path);
     Ok(effective_profile)
 }
 
@@ -546,7 +546,7 @@ pub(crate) async fn materialize_pr_assignment(
             }
             tracing::info!(
                 pr = candidate.number,
-                worktree = %effective_profile.workspace.display(),
+                worktree = %effective_profile.workspace().display(),
                 model = ?profile.model,
                 "PR Implementation Agent session has current Context"
             );

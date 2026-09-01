@@ -49,7 +49,7 @@ pub(crate) fn provision_issue_agent_worktree(
     let local_branch =
         format!("braid-agent/issue-{issue_number}/{}-g{}", profile.id, materialization.generation);
     let provisioned = worktree::provision(&WorktreeRequest {
-        source: &profile.workspace,
+        source: profile.workspace(),
         target: &target,
         repository: &config.github.repository,
         remote: "origin",
@@ -66,7 +66,7 @@ pub(crate) fn provision_issue_agent_worktree(
         provisioned.local_branch,
     )?;
     let mut effective_profile = profile.clone();
-    effective_profile.workspace = provisioned.path;
+    effective_profile.workspace = Some(provisioned.path);
     Ok(effective_profile)
 }
 
@@ -327,7 +327,7 @@ pub(crate) async fn resume_issue_provider_sessions(
             && candidate.profile_id == profile.id
             && candidate.profile_revision == profile_record.revision
             && candidate.instruction_revision == instruction_revision
-            && profile.workspace.is_dir()
+            && profile.workspace().is_dir()
             && worktree_path.is_dir();
         if !compatible {
             let message = "persisted provider session is incompatible with the effective Profile";
@@ -348,7 +348,7 @@ pub(crate) async fn resume_issue_provider_sessions(
             )?;
         }
         let mut effective_profile = profile.clone();
-        effective_profile.workspace = worktree_path;
+        effective_profile.workspace = Some(worktree_path);
         match sessions
             .resume(
                 candidate.provider_session_id.clone(),
