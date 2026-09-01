@@ -3597,7 +3597,7 @@ fn complete_work_item_reactivation(
     let session_id = Uuid::now_v7().to_string();
     transaction.execute(
         "UPDATE provider_sessions SET lifecycle='replaced'
-         WHERE agent_id=?1 AND lifecycle='sleeping'",
+         WHERE agent_id=?1 AND lifecycle IN ('sleeping','idle','unknown')",
         [&materialization.agent_id],
     )?;
     transaction.execute(
