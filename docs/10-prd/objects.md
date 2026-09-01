@@ -29,7 +29,10 @@ An Agent Profile is a versioned Braid configuration containing a provider,
 model, reasoning setting, Profile User Instructions, cwd/workspace policy,
 sandbox/approval settings, and optional tools, skills, MCP, or other
 provider-specific resources. Tags declare whether it can serve `issue`, `pr`,
-or both.
+or both. The Profile `workspace` names a clean source checkout, never the
+Agent's cwd: every Agent Group session runs in a dedicated generation-scoped
+Braid worktree (the Issue's sole Development branch when unambiguous,
+otherwise the default branch; the PR head for a PR Agent).
 
 Braid adds its own versioned System Prompt when materializing a Provider
 Session. It explains GitHub Working Memory, Braid and `braid gh`, concise public
@@ -41,7 +44,7 @@ sub-agent roles. MVP acceptance deliberately uses:
 
 - one active Issue Agent per Issue Agent Group;
 - one Implementation Agent per PR Agent Group;
-- one dedicated worktree provisioned for that PR Implementation Agent.
+- one dedicated generation-scoped worktree per Agent Group session.
 
 Multi-Agent fan-out is not rejected, but cross-peer ordering, semantic merge,
 arbitration, and convergence are outside the MVP correctness claim.
