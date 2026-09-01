@@ -107,7 +107,7 @@ crates. Modules are deep and align with authority boundaries:
 | `provider::session` | `ProviderAgentSession` adapter that maps `AgentSession` to `AgentProvider` primitives and translates provider notifications into `SessionEvent`s, deduplicating the provider's response-side and notification-side observation of the same fact. |
 | `session_manager` | In-process `SessionManager` keyed by provider thread id; start/resume/get. Ephemeral per connection epoch: it is rebuilt from the durable store on every (re)connect because sessions bind the epoch's provider handle. |
 | `provider` | Provider-neutral capability contract and Codex NDJSON implementation. |
-| `worktree` | Validate a Profile source checkout, fetch the bound PR head, provision one generation-scoped worktree per Implementation Agent, and expose recovery diagnostics; no Git-operation sandbox. |
+| `worktree` | Validate a Profile source checkout, resolve the bound ref (PR head, sole Development branch, or default origin branch), provision one generation-scoped worktree per Agent Group, and expose recovery diagnostics; no Git-operation sandbox. |
 | `writer` | `braid gh`, attribution, reaction/status desired state, and write-outbox convergence. |
 | `telemetry` | Trace/metric/log creation, payload events, sampling configuration, and OTLP export. |
 | `tunnel` | Wrangler Quick Tunnel supervision and webhook URL handoff. |
@@ -221,14 +221,24 @@ newer than the binary. Compatible application rollback is declared per release;
 an incompatible schema rollback restores the pre-migration backup rather than
 running a down migration.
 
-For a PR-capable Profile, `workspace` names a clean source Git checkout of the
-configured repository, not the directory in which the Agent edits. Braid
-fetches the PR head from that checkout and provisions the actual Agent cwd under
-`runtime.root/worktrees/pr-<number>/<profile>-g<generation>`. SQLite records the
-resolved source, worktree, remote head, and local branch as operational facts.
-The provider session is started and later resumed only against that worktree.
-This provides isolation and recovery identity without turning Braid into a Git
-policy engine.
+For any Agent-serving Profile, `workspace` names a clean source Git checkout of
+the configured repository, not the directory in which the Agent edits. Every
+Agent Group session runs in a dedicated generation-scoped worktree that Braid
+provisions from that checkout:
+
+- PR Agent Group: `runtime.root/worktrees/pr-<number>/<profile>-g<generation>`,
+  bound to the fetched PR head;
+- Issue Agent Group: `runtime.root/worktrees/issue-<number>/<profile>-g<generation>`,
+  bound to the Issue's sole same-repository Development linked branch when
+  exactly one exists, otherwise to the repository default branch
+  (`refs/remotes/origin/<default>`). Several Development branches are ambiguous
+  and block materialization with an operator diagnostic, mirroring `pr ensure`
+  disambiguation.
+
+SQLite records the resolved source, worktree, bound ref, and local branch as
+operational facts. The provider session is started and later resumed only
+against that worktree. This provides isolation and recovery identity without
+turning Braid into a Git policy engine.
 
 ## Error and Concurrency Model
 

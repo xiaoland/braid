@@ -34,6 +34,7 @@
 | PR Agent | 一个带 `pr` Profile Tag、运行在某个 PR 上的 Agent 实例。v1 只有 Implementation Agent；未来可增加 reviewer、advisor 等角色。 |
 | PR Agent Group | 同一 PR 上的 Agent 集合。v1 恰好包含一个 Implementation Agent；架构保留未来增加非实现角色的路径。 |
 | Implementation Agent | PR Agent Group 中负责修改代码的 Agent。v1 每个 PR 恰好一个，并独占一个专用 worktree。 |
+| Agent Worktree | Braid 为每个 Agent Group session 供给的按 assignment 代际隔离的专用 worktree，即 Agent 的实际 cwd。PR Agent 绑定 PR head；Issue Agent 绑定该 Issue 唯一的同仓 Development 链接分支（无则绑定默认 origin 分支，多个则视为歧义并阻塞物化）。 |
 | Implementation Request | Issue Agent 根据某条 Issue comment 发起的一次实现请求。该 GitHub comment ID 是 `braid pr ensure` 的幂等键；同一 comment 只得到一个 PR，不同 comment 可得到不同 PR。 |
 | PR Activation | 启动一个 PR Agent Group 的机械事实。产品上等价于把 PR 交给 Braid；具体 GitHub signal 由 adapter 提供，不能在未验证前假定为原生 PR assignee。 |
 | PR Agent Lease | 将一个 PR、一个专用 worktree 和一个 `pr`-capable Profile 原子绑定给唯一 Implementation Agent 的独占租约。 |
