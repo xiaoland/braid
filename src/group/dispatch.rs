@@ -342,6 +342,9 @@ pub(crate) async fn materialize_context_reset(
         effective_profile.workspace = worktree.clone();
         pr_system_prompt(config, profile, reset.number, head_ref)
     } else {
+        let worktree =
+            reset.worktree_path.as_ref().context("Issue Context reset has no active worktree")?;
+        effective_profile.workspace = worktree.clone();
         issue_system_prompt(config, profile, reset.number)
     };
     let instruction_revision = hex::encode(Sha256::digest(instructions.as_bytes()));

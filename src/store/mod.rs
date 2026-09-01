@@ -4603,6 +4603,39 @@ fn mark_turn_started(
     }
 }
 
+/// A session whose turn ended with an uncertain outcome is never reused:
+/// fence it and request a context reset so the existing reset machinery lazily
+/// replaces it with a fresh physical session on the next group tick. Without
+/// this the group wedges: every progress path joins an idle session, and an
+/// unknown session never becomes one again.
+fn fence_session_and_request_reset(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    agent_id: &str,
+    now: &str,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO context_resets(
+           reset_id,agent_id,old_session_id,active_turn_id,context_revision_before,
+           continuation,lifecycle,created_at,updated_at
+         )
+         SELECT ?1,?2,?3,NULL,ps.context_revision,0,'materializing',?4,?4
+         FROM provider_sessions ps
+         WHERE ps.session_id=?3
+           AND EXISTS (
+             SELECT 1 FROM agent_instances ai
+             JOIN assignments a ON a.assignment_id=ai.assignment_id
+             WHERE ai.agent_id=?2 AND a.lifecycle='active'
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM context_resets cr
+             WHERE cr.agent_id=?2 AND cr.lifecycle IN ('interrupting','materializing')
+           )",
+        params![Uuid::now_v7().to_string(), agent_id, session_id, now],
+    )?;
+    Ok(())
+}
+
 fn mark_turn_terminal(database: &Path, turn_id: &str, lifecycle: &str) -> Result<(), StoreError> {
     require_current_schema(database)?;
     if !matches!(lifecycle, "completed" | "interrupted" | "failed" | "unknown") {
@@ -4667,6 +4700,9 @@ fn mark_turn_terminal(database: &Path, turn_id: &str, lifecycle: &str) -> Result
         "UPDATE provider_sessions SET lifecycle=?2 WHERE session_id=?1",
         params![session_id, session_lifecycle],
     )?;
+    if lifecycle == "unknown" {
+        fence_session_and_request_reset(&transaction, &session_id, &agent_id, &now)?;
+    }
     if finalization && lifecycle != "unknown" {
         transaction.execute(
             "UPDATE assignments SET lifecycle=?2,retired_at=CASE WHEN ?2='retired' THEN ?3 ELSE retired_at END
