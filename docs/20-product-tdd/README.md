@@ -221,10 +221,14 @@ newer than the binary. Compatible application rollback is declared per release;
 an incompatible schema rollback restores the pre-migration backup rather than
 running a down migration.
 
-For any Agent-serving Profile, `workspace` names a clean source Git checkout of
-the configured repository, not the directory in which the Agent edits. Every
-Agent Group session runs in a dedicated generation-scoped worktree that Braid
-provisions from that checkout:
+For any Agent-serving Profile, `workspace` names the instance source Git
+checkout of the configured repository (one repository = one source checkout,
+defaulting to `<instance>/source`), not the directory in which the Agent
+edits. Every Agent Group session runs in a dedicated generation-scoped
+worktree that Braid provisions from that checkout under the configurable
+`[runtime] worktrees` directory (default `<state>/worktrees`; only new
+generations use a changed location — SQLite records each worktree's actual
+path):
 
 - PR Agent Group: `runtime.root/worktrees/pr-<number>/<profile>-g<generation>`,
   bound to the fetched PR head;

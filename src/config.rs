@@ -62,6 +62,11 @@ pub struct RuntimeConfig {
     /// Defaults to `<root>/backups`.
     #[serde(default)]
     pub backups: Option<PathBuf>,
+    /// Where generation-scoped Agent worktrees are provisioned. Defaults to
+    /// `<root>/worktrees`. Only new provisioning uses it; existing
+    /// generations keep the worktree paths recorded in `SQLite`.
+    #[serde(default)]
+    pub worktrees: Option<PathBuf>,
     #[serde(default)]
     pub auto_migrate: bool,
 }
@@ -81,15 +86,23 @@ impl RuntimeConfig {
         if self.backups.is_none() {
             self.backups = Some(root.join("backups"));
         }
+        if self.worktrees.is_none() {
+            self.worktrees = Some(root.join("worktrees"));
+        }
         self.root = Some(root);
         self.database =
             Some(resolve_path(base, self.database.as_ref().expect("database resolved")));
         self.backups = Some(resolve_path(base, self.backups.as_ref().expect("backups resolved")));
+        self.worktrees =
+            Some(resolve_path(base, self.worktrees.as_ref().expect("worktrees resolved")));
     }
 
     fn require_resolved(&self) {
         assert!(
-            self.root.is_some() && self.database.is_some() && self.backups.is_some(),
+            self.root.is_some()
+                && self.database.is_some()
+                && self.backups.is_some()
+                && self.worktrees.is_some(),
             "RuntimeConfig paths must be resolved before use"
         );
     }
@@ -107,6 +120,11 @@ impl RuntimeConfig {
     pub fn backups(&self) -> &Path {
         self.require_resolved();
         self.backups.as_ref().expect("resolved")
+    }
+
+    pub fn worktrees(&self) -> &Path {
+        self.require_resolved();
+        self.worktrees.as_ref().expect("resolved")
     }
 }
 

@@ -42,8 +42,7 @@ pub(crate) fn provision_issue_agent_worktree(
 ) -> Result<Profile> {
     let target = config
         .runtime
-        .root()
-        .join("worktrees")
+        .worktrees()
         .join(format!("issue-{issue_number}"))
         .join(format!("{}-g{}", profile.id, materialization.generation));
     let local_branch =

@@ -7,6 +7,9 @@ Versioning once release artifacts are published.
 
 ### Added
 
+- `[runtime] worktrees` overrides where generation-scoped Agent worktrees are
+  provisioned (default `<state>/worktrees`). Only new generations use a
+  changed location; existing generations keep the paths recorded in SQLite.
 - `braid setup` clones the configured repository into the instance source
   checkout (`<instance>/source`): one clone per repository, shared by all
   Profiles as the worktree provisioning source. `profile.workspace` is now

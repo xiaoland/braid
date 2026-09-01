@@ -583,6 +583,7 @@ fn build_config(
             root: None,
             database: None,
             backups: None,
+            worktrees: None,
             auto_migrate: false,
         },
         github: GitHubConfig {
