@@ -3521,25 +3521,24 @@ fn begin_work_item_reactivation(
         )
         .optional()?;
     let Some(materialization) = selected else {
-        let has_group = transaction
+        // No revivable generation. Consume the reopen rather than wedge the
+        // event as pending forever (which silently spins the dispatch loop):
+        // either there is no group, the group is already active, or a
+        // sleeping assignment exists whose generation is not selectable
+        // (inconsistent durable state, e.g. from operator surgery — the
+        // finalization transaction transitions assignment and agent
+        // atomically, so real data cannot diverge). A later trusted mention
+        // can still activate a fresh generation.
+        let consumable = transaction
             .query_row(
-                "SELECT 1 FROM assignments WHERE work_item_node_id=?1 LIMIT 1",
+                "SELECT NOT EXISTS(SELECT 1 FROM assignments WHERE work_item_node_id=?1)
+                   OR EXISTS(SELECT 1 FROM assignments
+                             WHERE work_item_node_id=?1 AND lifecycle IN ('active','sleeping'))",
                 [&work_item_node_id],
-                |_| Ok(()),
+                |row| row.get::<_, i64>(0),
             )
-            .optional()?
-            .is_some();
-        if !has_group
-            || transaction
-                .query_row(
-                    "SELECT 1 FROM assignments
-                     WHERE work_item_node_id=?1 AND lifecycle='active' LIMIT 1",
-                    [&work_item_node_id],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some()
-        {
+            .map(|value| value != 0)?;
+        if consumable {
             transaction.execute(
                 "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
                 [event_id],

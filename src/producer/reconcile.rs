@@ -204,6 +204,7 @@ pub(crate) async fn reconcile_work_items(
     Ok((tracked.len(), changes))
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn reconcile_observations(
     store: &StoreActor,
     github: &GitHubClient,
@@ -224,7 +225,15 @@ pub(crate) fn reconcile_observations(
     let mut changes = 0;
     for observation in current {
         let previous = prior.get(&observation.object_node_id);
-        if previous.is_some_and(|previous| observation_unchanged(previous, observation)) {
+        // A work-item state transition (close/reopen/merge) must never be
+        // skipped: the body digest often survives it, and the issue/pr
+        // unchanged rule intentionally treats digest-equal as unchanged for
+        // ordinary comment-bump noise.
+        let state_transition = matches!(observation.object_kind, "issue" | "pr")
+            && !scope.previous_work_item_state.eq_ignore_ascii_case(&observation.work_item_state);
+        if !state_transition
+            && previous.is_some_and(|previous| observation_unchanged(previous, observation))
+        {
             continue;
         }
         let (mut action, mut kind) = reconciled_change(previous, observation);
