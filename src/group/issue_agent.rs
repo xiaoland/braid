@@ -23,7 +23,52 @@ use crate::{
     health::HealthSnapshot,
     queue::scheduler::{RunningAgentTurn, policy_from_config},
     store::{ProfileRecord, StoreActor},
+    worktree::{self, WorktreeRequest},
 };
+
+/// Provision the Issue Agent's dedicated generation-scoped worktree: the
+/// issue's sole same-repository Development linked branch when exactly one
+/// exists, otherwise the repository default branch. The Profile workspace
+/// remains the clean source checkout; the returned effective Profile carries
+/// the worktree as the Agent's cwd.
+pub(crate) fn provision_issue_agent_worktree(
+    store: &StoreActor,
+    config: &Config,
+    profile: &Profile,
+    issue_number: u64,
+    materialization: &crate::store::AgentMaterialization,
+    head_ref: &str,
+    repository_node_id: String,
+) -> Result<Profile> {
+    let target = config
+        .runtime
+        .root()
+        .join("worktrees")
+        .join(format!("issue-{issue_number}"))
+        .join(format!("{}-g{}", profile.id, materialization.generation));
+    let local_branch =
+        format!("braid-agent/issue-{issue_number}/{}-g{}", profile.id, materialization.generation);
+    let provisioned = worktree::provision(&WorktreeRequest {
+        source: &profile.workspace,
+        target: &target,
+        repository: &config.github.repository,
+        remote: "origin",
+        git: &config.tools.git,
+        head_ref,
+        local_branch: &local_branch,
+    })?;
+    store.record_agent_worktree(
+        materialization.clone(),
+        repository_node_id,
+        provisioned.path.clone(),
+        provisioned.source,
+        provisioned.head_ref,
+        provisioned.local_branch,
+    )?;
+    let mut effective_profile = profile.clone();
+    effective_profile.workspace = provisioned.path;
+    Ok(effective_profile)
+}
 
 pub(crate) async fn issue_agent_worker(
     store: Arc<StoreActor>,
@@ -272,11 +317,18 @@ pub(crate) async fn resume_issue_provider_sessions(
     for candidate in candidates {
         let instructions = issue_system_prompt(config, profile, candidate.number);
         let instruction_revision = hex::encode(Sha256::digest(instructions.as_bytes()));
+        let Some(worktree_path) = candidate.worktree_path.clone() else {
+            let message = "persisted Issue provider session has no active worktree";
+            store.block_provider_session(candidate.provider_session_id.clone(), message.into())?;
+            enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
+            continue;
+        };
         let compatible = candidate.repository == config.github.repository
             && candidate.profile_id == profile.id
             && candidate.profile_revision == profile_record.revision
             && candidate.instruction_revision == instruction_revision
-            && profile.workspace.is_dir();
+            && profile.workspace.is_dir()
+            && worktree_path.is_dir();
         if !compatible {
             let message = "persisted provider session is incompatible with the effective Profile";
             store.block_provider_session(candidate.provider_session_id.clone(), message.into())?;
@@ -295,11 +347,13 @@ pub(crate) async fn resume_issue_provider_sessions(
                 operational_status_unknown_profile(&profile.id),
             )?;
         }
+        let mut effective_profile = profile.clone();
+        effective_profile.workspace = worktree_path;
         match sessions
             .resume(
                 candidate.provider_session_id.clone(),
                 Arc::clone(&provider),
-                profile.clone(),
+                effective_profile.clone(),
                 instructions.clone(),
             )
             .await

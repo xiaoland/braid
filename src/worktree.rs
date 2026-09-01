@@ -58,6 +58,7 @@ pub fn provision(request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, W
             request.remote, request.repository
         )));
     }
+    exclude_private_notes(request, &source)?;
     if request.target.exists() {
         return verify_existing(request, &source);
     }
@@ -108,6 +109,47 @@ pub fn provision(request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, W
         Ok::<(), WorktreeError>(())
     })?;
     verify_existing(request, &source)
+}
+
+/// `.braid/` inside a worktree is the Agent's private persistent workspace
+/// (working notes, drafts, scratch state). Excluding it through the common
+/// git dir's `info/exclude` keeps it out of `git status`, commits, and GitHub
+/// for the source checkout and every worktree.
+fn exclude_private_notes(
+    request: &WorktreeRequest<'_>,
+    source: &Path,
+) -> Result<(), WorktreeError> {
+    let output = std::process::Command::new(request.git)
+        .arg("-C")
+        .arg(source)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .map_err(|source_err| WorktreeError::Io {
+            path: source.to_path_buf(),
+            source: source_err,
+        })?;
+    if !output.status.success() {
+        return Err(WorktreeError::Git(format!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let common_dir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let common_dir = Path::new(&common_dir);
+    let common_dir =
+        if common_dir.is_absolute() { common_dir.to_path_buf() } else { source.join(common_dir) };
+    let exclude = common_dir.join("info").join("exclude");
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == ".braid/") {
+        return Ok(());
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(".braid/\n");
+    std::fs::write(&exclude, updated)
+        .map_err(|source_err| WorktreeError::Io { path: exclude.clone(), source: source_err })
 }
 
 fn verify_existing(
