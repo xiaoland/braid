@@ -119,6 +119,18 @@ Module dependencies point one way only: `runtime` → `group` → `queue`, and
 sit above the leaf modules (`store`, `context`, `github`, `config`,
 `provider`, `worktree`, `telemetry`) and no lower layer imports an upper one.
 
+### Internal Event Model
+
+`protocol.rs` owns the typed, platform-neutral event contract `EventKind`
+(`assign`, `unassign`, `mention`, `wake`, `invalidate`, `lifecycle`,
+`origin_echo`, `noop`). A producer translates platform deliveries into
+`EventKind` at ingress and records only the internal kind plus the per-platform
+opaque Event Reference; `queue` and `group` consume `EventKind` exclusively
+and never branch on platform event names or actions. This is the seam at
+which a future non-GitHub platform plugs in: it adds a producer mapping, not
+new consumer logic. The current GitHub mapping is owned by
+[`github.md`](github.md).
+
 ### State authority
 
 Every piece of state has exactly one authority; everything else is a

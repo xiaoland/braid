@@ -51,6 +51,26 @@ external activity.
 - Unknown event/action/union variants are durably recorded and trigger
   reconciliation. They are never serialized generically into Agent input.
 
+### GitHub → EventKind Mapping
+
+The GitHub producer maps deliveries onto the platform-neutral `EventKind`
+contract; consumers never see GitHub event names or actions:
+
+| GitHub delivery | Internal `EventKind` |
+| --- | --- |
+| `issues.assigned` / PR assignment to the App (canonical-reread confirmed) | `assign` |
+| First Trusted Braid Mention on a dormant Work Item | `assign` (same internal event as native assignment) |
+| `issues.unassigned` (canonical-reread confirmed) | `unassign` |
+| Comment/review created, `pull_request.synchronize`, review requested; Trusted Braid Mention on an already-active Work Item | `mention` / `wake` |
+| Body/description/comment edits or deletions, review dismissed, review thread resolved | `invalidate` |
+| `closed` / `reopened` / `merged` | `lifecycle` |
+| Correlated Braid App or Profile-actor writes | `origin_echo` (recorded, never wakes or invalidates the same Agent) |
+| `ping`, unknown variants | `noop` (recorded as reconciliation evidence) |
+
+A Trusted Braid Mention on a Work Item whose group sleeps because the Work
+Item is closed is a `mention`, not an `assign`: closed groups do not wake;
+reopen is the designed re-entry.
+
 Subscribe to:
 
 - `issues` and `issue_comment`;
@@ -81,6 +101,10 @@ activation modes:
 2. otherwise, the first Trusted Braid Mention on a dormant Issue produces one
    `ActivationIntent` and preserves that same comment as an urgent Wake Event,
    so materialization is followed by the first turn.
+
+Both modes converge on the same internal `assign` event; the activation paths
+differ only in how the platform expresses the signal, never in consumer
+behavior.
 
 Native unassignment is likewise available only in the first mode and must be
 confirmed from canonical assignees before entering debounce. The fallback is
