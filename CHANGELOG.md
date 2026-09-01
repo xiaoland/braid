@@ -5,6 +5,18 @@ Versioning once release artifacts are published.
 
 ## [0.3.1] - unreleased
 
+### Added
+
+- Braid System Prompt v2: Publication Discretion (a delivered comment or
+  mention never obligates a public reply; silence is a valid outcome) and the
+  private persistent workspace (`.braid/` files in the generation worktree,
+  git-excluded, surviving provider session replacement).
+- Issue Agent sessions run in a dedicated generation-scoped worktree
+  (`worktrees/issue-<number>/<profile>-g<generation>`) bound to the issue's
+  sole same-repository Development linked branch, or the repository default
+  branch when zero or several exist; resume, reopen-reactivation, and Context
+  resets all restore the worktree as the session cwd.
+
 ### Fixed
 
 - `braid setup` pinned a hardcoded profile `adapter_version`, so config
