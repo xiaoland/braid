@@ -3380,17 +3380,22 @@ fn prepare_work_item_finalization(database: &Path, event_id: &str) -> Result<boo
         )
         .optional()?;
     let Some((assignment_id, agent_id, _session_id)) = selected else {
-        let has_group = transaction
+        // Nothing idle to finalize. Keep the event pending while a group is
+        // still materializing/finalizing (it becomes selectable shortly);
+        // consume it when no group exists or the group is already dormant
+        // (sleeping/blocked/retired), where a close has nothing to do and
+        // would otherwise spin the dispatch loop forever.
+        let busy = transaction
             .query_row(
                 "SELECT 1 FROM assignments
                  WHERE work_item_node_id=?1
-                   AND lifecycle IN ('materializing','active','finalizing','sleeping') LIMIT 1",
+                   AND lifecycle IN ('materializing','finalizing') LIMIT 1",
                 [&work_item_node_id],
                 |_| Ok(()),
             )
             .optional()?
             .is_some();
-        if !has_group {
+        if !busy {
             transaction.execute(
                 "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
                 [event_id],
