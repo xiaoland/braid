@@ -27,6 +27,7 @@
 | Profile Tag | Agent Profile 声明适用面的 tag-like 类型，例如 `issue`、`pr`；同一 Profile 可同时拥有多个 tag，也可以只适用于 Issue。 |
 | Braid System Prompt | Braid 在创建 Provider Session 时注入的高优先级、版本化指令，包括 Braid/CLI 的存在、GitHub Working Memory 协议，以及按 Issue/PR surface 选择的角色与任务说明。它帮助 Agent 使用产品能力，而不是把 Braid 变成限制 Agent 的权限沙箱。 |
 | Effective Agent Instructions | Provider 实际收到的指令组合：Braid System Prompt 加 Profile User Instructions。GitHub Context 是带来源边界的不可信工作数据，Event Reference 是 user message，两者都不是系统指令。 |
+| Publication Discretion | 收到评论、review 或提及从不构成公开发表的义务。Agent 自行决定什么内容 Human-relevant；沉默是合法结果。私有推理只存活在物理 Provider Session 内，Context Reset 后即被丢弃。 |
 | Issue Agent | 一个带 `issue` Profile Tag、运行在某个 Issue 上的 Agent 实例。 |
 | Issue Agent Group | 同一 Issue 上所有平行 Issue Agents；没有 primary/sub-agent，收到相同 Context 与 Event Reference batch。 |
 | Issue Group Turn | 同一 Context Revision 和 Event Reference batch 并行扇出给一个 Issue Agent Group 的一次 turn。 |
