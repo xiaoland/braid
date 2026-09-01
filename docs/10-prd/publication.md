@@ -10,12 +10,12 @@ Agent alone decides what is Human-relevant; a silent turn that only reads,
 thinks, or edits local files is a valid outcome. Event References report
 changes; they are not commands.
 
-The Agent may keep private working reasoning inside its Provider Session and
-publish conclusions when they are ready. Braid never publishes private
-reasoning. Private reasoning lives only in the physical Provider Session: a
-Context Reset replaces that session and discards it, so durable conclusions
-must be published to GitHub (a comment, a description update, or a commit)
-before they are needed again.
+The Agent may keep private working reasoning, drafts, and scratch state as
+files in its own worktree — its private, persistent workspace (the SVC task
+packet idea). The worktree survives Provider Session replacement within the
+same assignment generation, so a fresh session after a Context Reset picks up
+where the previous one left off. Braid never publishes private working state.
+GitHub receives only Human-relevant conclusions.
 
 ## Attribution and Writes
 

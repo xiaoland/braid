@@ -231,9 +231,16 @@ provisions from that checkout:
 - Issue Agent Group: `runtime.root/worktrees/issue-<number>/<profile>-g<generation>`,
   bound to the Issue's sole same-repository Development linked branch when
   exactly one exists, otherwise to the repository default branch
-  (`refs/remotes/origin/<default>`). Several Development branches are ambiguous
-  and block materialization with an operator diagnostic, mirroring `pr ensure`
-  disambiguation.
+  (`refs/remotes/origin/<default>`). Several Development branches are not an
+  error: the worktree still starts on the default branch, and the Braid
+  System Prompt tells the Agent it may switch or create branches in its
+  worktree as the work requires (Context lists the Development branches).
+
+Every worktree gets `.braid/` added to its `.git/info/exclude` at provision
+time. That directory is the Agent's private persistent workspace (working
+notes, drafts, scratch state): it survives Provider Session replacement within
+the same assignment generation and stays out of `git status`, commits, and
+GitHub.
 
 SQLite records the resolved source, worktree, bound ref, and local branch as
 operational facts. The provider session is started and later resumed only

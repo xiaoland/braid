@@ -59,7 +59,7 @@ contract; consumers never see GitHub event names or actions:
 | GitHub delivery | Internal `EventKind` |
 | --- | --- |
 | `issues.assigned` / PR assignment to the App (canonical-reread confirmed) | `assign` |
-| First Trusted Braid Mention on a dormant Work Item | `assign` (same internal event as native assignment) |
+| First Trusted Braid Mention on a dormant Work Item | `mention`, consumed as `assign` (activates the group, exactly like native assignment) |
 | `issues.unassigned` (canonical-reread confirmed) | `unassign` |
 | Comment/review created, `pull_request.synchronize`, review requested; Trusted Braid Mention on an already-active Work Item | `mention` / `wake` |
 | Body/description/comment edits or deletions, review dismissed, review thread resolved | `invalidate` |
@@ -102,9 +102,11 @@ activation modes:
    `ActivationIntent` and preserves that same comment as an urgent Wake Event,
    so materialization is followed by the first turn.
 
-Both modes converge on the same internal `assign` event; the activation paths
-differ only in how the platform expresses the signal, never in consumer
-behavior.
+Both modes converge on the same activation: native assignment arrives as an
+internal `assign` event, while the first trusted mention on a dormant Work
+Item is a `mention` event that the consumer activates the dormant group for;
+the paths differ only in how the platform expresses the signal, never in
+consumer behavior.
 
 Native unassignment is likewise available only in the first mode and must be
 confirmed from canonical assignees before entering debounce. The fallback is
