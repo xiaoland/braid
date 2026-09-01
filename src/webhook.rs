@@ -74,7 +74,9 @@ pub fn parse_verified(
         .comment
         .as_ref()
         .and_then(|comment| comment.body.as_deref())
-        .or_else(|| payload.review.as_ref().and_then(|review| review.body.as_deref()));
+        .or_else(|| payload.review.as_ref().and_then(|review| review.body.as_deref()))
+        .or_else(|| payload.issue.as_ref().and_then(|issue| issue.body.as_deref()))
+        .or_else(|| payload.pull_request.as_ref().and_then(|pr| pr.body.as_deref()));
     let agent_origin = actor_node_id.as_deref() == Some(actors.app_node_id)
         || actor_login.as_deref() == Some(actors.app_login)
         || actor_node_id.as_ref().is_some_and(|node_id| actors.agent_node_ids.contains(node_id))
@@ -84,8 +86,16 @@ pub fn parse_verified(
     let (mapped_kind, detail) = classify(event_name, action.as_deref());
     let kind = if agent_origin { EventKind::OriginEcho } else { mapped_kind };
     let mention_candidate = !agent_origin
-        && matches!(action.as_deref(), Some("created" | "edited"))
+        && matches!(action.as_deref(), Some("created" | "edited" | "opened"))
         && body_text.is_some_and(|body| has_visible_mention(body, configured_handle));
+    // An opening-body mention would otherwise classify as a consumed-at-ingest
+    // noop and vanish before trusted-mention resolution can run; keep it
+    // pending as a mention candidate (kind is truthful: it IS a mention).
+    let kind = if !agent_origin && mention_candidate && kind == EventKind::Noop {
+        EventKind::Mention
+    } else {
+        kind
+    };
     let reaction_target = if !agent_origin && action.as_deref() == Some("created") {
         match event_name {
             "issue_comment" => payload.comment.as_ref().map(|comment| ReactionTarget {
@@ -180,6 +190,8 @@ fn classify(event_name: &str, action: Option<&str>) -> (EventKind, Option<&'stat
         ("pull_request", Some("review_requested")) => (EventKind::Wake, Some("review_requested")),
         ("issues", Some("assigned")) => (EventKind::Assign, None),
         ("issues", Some("unassigned")) => (EventKind::Unassign, None),
+        // `opened` stays a consumed-at-ingest noop unless a visible mention
+        // promotes it (see the mention override at classification time).
         ("issues" | "pull_request", Some("closed")) => (EventKind::Lifecycle, Some("closed")),
         ("issues" | "pull_request", Some("reopened")) => (EventKind::Lifecycle, Some("reopened")),
         (

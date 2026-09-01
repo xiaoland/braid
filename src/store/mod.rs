@@ -4010,7 +4010,7 @@ fn record_agent_worktree(
          JOIN work_items w ON w.node_id=a.work_item_node_id
          WHERE ai.agent_id=?2 AND ai.lifecycle='materializing'
            AND a.assignment_id=?9 AND a.lifecycle='materializing'
-           AND w.kind='pr' AND w.repository_node_id=?4",
+           AND w.repository_node_id=?4",
         params![
             Uuid::now_v7().to_string(),
             materialization.agent_id,
@@ -4027,7 +4027,7 @@ fn record_agent_worktree(
         Ok(())
     } else {
         Err(StoreError::InvalidData(format!(
-            "PR Agent {} is not awaiting a worktree",
+            "Agent {} is not awaiting a worktree",
             materialization.agent_id
         )))
     }
