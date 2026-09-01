@@ -3521,29 +3521,19 @@ fn begin_work_item_reactivation(
         )
         .optional()?;
     let Some(materialization) = selected else {
-        // No revivable generation. Consume the reopen rather than wedge the
-        // event as pending forever (which silently spins the dispatch loop):
-        // either there is no group, the group is already active, or a
-        // sleeping assignment exists whose generation is not selectable
-        // (inconsistent durable state, e.g. from operator surgery — the
-        // finalization transaction transitions assignment and agent
-        // atomically, so real data cannot diverge). A later trusted mention
-        // can still activate a fresh generation.
-        let consumable = transaction
-            .query_row(
-                "SELECT NOT EXISTS(SELECT 1 FROM assignments WHERE work_item_node_id=?1)
-                   OR EXISTS(SELECT 1 FROM assignments
-                             WHERE work_item_node_id=?1 AND lifecycle IN ('active','sleeping'))",
-                [&work_item_node_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|value| value != 0)?;
-        if consumable {
-            transaction.execute(
-                "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
-                [event_id],
-            )?;
-        }
+        // No revivable generation: either there is no group, the group is
+        // busy (handled above) or active, or every generation is in a
+        // terminal/unselectable state (blocked, retired, or diverged through
+        // operator surgery — the finalization transaction transitions
+        // assignment and agent atomically, so real data cannot diverge).
+        // Selection is deterministic on durable state, so retrying would
+        // wedge the event as pending forever; consume it as a no-op. A later
+        // trusted mention can still activate a fresh generation (the unique
+        // active-assignment index only excludes materializing/active).
+        transaction.execute(
+            "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
+            [event_id],
+        )?;
         transaction.commit()?;
         return Ok(None);
     };

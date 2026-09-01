@@ -152,18 +152,31 @@ pub(crate) async fn reactivate_work_item_agent(
                 effective_profile,
             )
         } else {
-            let mut effective_profile = profile.clone();
-            effective_profile.workspace = Some(
-                materialization
-                    .worktree_path
-                    .clone()
-                    .context("reopened Issue Agent has no preserved worktree")?,
-            );
-            (
-                CanonicalContext::Issue(context::materialize_issue(github, &locator, 100).await?),
-                issue_system_prompt(config, profile, candidate.number),
-                effective_profile,
-            )
+            let issue = context::materialize_issue(github, &locator, 100).await?;
+            let repository_node_id = issue.repository_node_id.clone();
+            let canonical = CanonicalContext::Issue(issue);
+            let effective_profile = if let Some(preserved) = materialization.worktree_path.clone() {
+                let mut effective_profile = profile.clone();
+                effective_profile.workspace = Some(preserved);
+                effective_profile
+            } else {
+                // Pre-worktree generations (v0.3.0 data) preserved no
+                // worktree; provision a fresh one on the current head ref
+                // instead of parking the group blocked.
+                let head_ref =
+                    resolve_issue_worktree_ref(&canonical, &config.github.repository, github)
+                        .await?;
+                provision_issue_agent_worktree(
+                    store,
+                    config,
+                    profile,
+                    candidate.number,
+                    &materialization,
+                    &head_ref,
+                    repository_node_id,
+                )?
+            };
+            (canonical, issue_system_prompt(config, profile, candidate.number), effective_profile)
         };
         context::reconcile_local_state(&mut canonical, store)?;
         let rendered = context::render_complete(
