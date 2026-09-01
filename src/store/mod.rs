@@ -26,10 +26,14 @@ use gh_writes::{
     prepare_gh_write, prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 1;
+pub const DATABASE_SCHEMA_VERSION: u32 = 2;
 
 const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
-const MIGRATIONS: &[Migration] = &[Migration { version: 1, name: "initial", sql: INITIAL_SQL }];
+const EVENT_KINDS_SQL: &str = include_str!("../../migrations/0002_event_kinds.sql");
+const MIGRATIONS: &[Migration] = &[
+    Migration { version: 1, name: "initial", sql: INITIAL_SQL },
+    Migration { version: 2, name: "event_kinds", sql: EVENT_KINDS_SQL },
+];
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -97,6 +101,77 @@ pub struct StoreStatus {
     pub journal_mode: Option<String>,
 }
 
+/// Platform-neutral internal event semantics. Producers translate platform
+/// deliveries into `EventKind` at ingress; queue and group consumers branch on
+/// these kinds (and the semantic `detail`) only, never on platform event names
+/// or actions. Adding a platform means adding a producer mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    /// Activate the dormant Agent Group (native platform assignment, or an
+    /// internal activation such as `braid gh pr ensure`).
+    Assign,
+    /// Native platform unassignment; retires the group after debounce.
+    Unassign,
+    /// A trusted Human addressed the Agent (permission resolved at delivery).
+    /// Urgent wake; on a dormant open Work Item it is consumed as `Assign`.
+    Mention,
+    /// Ordinary wake signal (new comment, head sync, review request, ...).
+    Wake,
+    /// Content became stale: edit/delete/dismiss/resolve, including a
+    /// cross-surface Associated Issue description change (`detail =
+    /// "cross_surface"`). Replaces the group Agent Context.
+    Invalidate,
+    /// Work Item lifecycle transition; `detail` is `closed`, `reopened`, or
+    /// `merged`.
+    Lifecycle,
+    /// Correlated Agent-origin write. Evidence only; never wakes or
+    /// invalidates the same Agent and is consumed at ingest.
+    OriginEcho,
+    /// Ping, first observation, or unknown variant. Evidence only; consumed
+    /// at ingest.
+    Noop,
+}
+
+impl EventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Assign => "assign",
+            Self::Unassign => "unassign",
+            Self::Mention => "mention",
+            Self::Wake => "wake",
+            Self::Invalidate => "invalidate",
+            Self::Lifecycle => "lifecycle",
+            Self::OriginEcho => "origin_echo",
+            Self::Noop => "noop",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "assign" => Self::Assign,
+            "unassign" => Self::Unassign,
+            "mention" => Self::Mention,
+            "wake" => Self::Wake,
+            "invalidate" => Self::Invalidate,
+            "lifecycle" => Self::Lifecycle,
+            "origin_echo" => Self::OriginEcho,
+            "noop" => Self::Noop,
+            _ => return None,
+        })
+    }
+
+    /// Evidence-only kinds never wait in the pending ledger.
+    pub fn consumed_at_ingest(self) -> bool {
+        matches!(self, Self::OriginEcho | Self::Noop)
+    }
+}
+
+impl std::fmt::Display for EventKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IngressEvent {
     pub delivery_guid: String,
@@ -114,7 +189,8 @@ pub struct IngressEvent {
     pub visible_body: Option<String>,
     pub actor_node_id: Option<String>,
     pub actor_login: Option<String>,
-    pub classification: &'static str,
+    pub kind: EventKind,
+    pub detail: Option<&'static str>,
     pub cross_surface_invalidation: bool,
     pub origin: &'static str,
     pub reference: String,
@@ -2124,20 +2200,27 @@ fn ingest_event(
             }),
         _ => false,
     };
-    let lifecycle = if stale { "superseded" } else { "pending" };
+    let lifecycle = if stale {
+        "superseded"
+    } else if event.kind.consumed_at_ingest() {
+        "consumed"
+    } else {
+        "pending"
+    };
     let inserted = transaction.execute(
         "INSERT OR IGNORE INTO events(
            event_id,delivery_guid,work_item_node_id,object_node_id,object_version,
-           classification,origin,reference,lifecycle,observed_at,dedupe_key,
+           kind,detail,origin,reference,lifecycle,observed_at,dedupe_key,
            mention_candidate,trusted_mention,body_digest
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,?13)",
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,NULL,?14)",
         params![
             event_id,
             event.delivery_guid,
             event.work_item_node_id,
             event.object_node_id,
             event.object_version,
-            event.classification,
+            event.kind.as_str(),
+            event.detail,
             event.origin,
             event.reference,
             lifecycle,
@@ -2211,19 +2294,21 @@ fn ingest_event(
 
     let mut batch = None;
     if lifecycle == "pending"
-        && event.classification == "wake"
         && let Some(work_item_node_id) = event.work_item_node_id.as_deref()
     {
-        let activation =
-            event.event_name == "braid" && event.action.as_deref() == Some("pr_ensure");
-        batch = Some(schedule_event(
-            &transaction,
-            work_item_node_id,
-            &event_id,
-            policy,
-            activation,
-            &now,
-        )?);
+        // PR activation (`braid gh pr ensure`) wakes the new group urgently;
+        // native Issue assignment creates an idle session and no turn.
+        let activation = event.kind == EventKind::Assign;
+        if event.kind == EventKind::Wake || activation {
+            batch = Some(schedule_event(
+                &transaction,
+                work_item_node_id,
+                &event_id,
+                policy,
+                activation,
+                &now,
+            )?);
+        }
     }
     if lifecycle == "pending"
         && let Some(target) = &event.reaction_target
@@ -2304,9 +2389,9 @@ fn schedule_cross_surface_invalidations(
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO events(
                event_id,delivery_guid,work_item_node_id,object_node_id,object_version,
-               classification,origin,reference,lifecycle,observed_at,dedupe_key,
+               kind,detail,origin,reference,lifecycle,observed_at,dedupe_key,
                mention_candidate,trusted_mention,body_digest
-             ) VALUES (?1,?2,?3,?4,?5,'cross_surface_invalidation',?6,?7,'pending',?8,?9,0,0,?10)",
+             ) VALUES (?1,?2,?3,?4,?5,'invalidate','cross_surface',?6,?7,'pending',?8,?9,0,0,?10)",
             params![
                 event_id,
                 source.delivery_guid,
@@ -2356,7 +2441,7 @@ fn event_dedupe_key(event: &IngressEvent) -> String {
         event.object_version.as_deref().unwrap_or(""),
         event.object_digest.as_deref().unwrap_or(""),
         event.action.as_deref().unwrap_or(""),
-        event.classification,
+        event.kind.as_str(),
     ] {
         digest.update(value.as_bytes());
         digest.update([0]);
@@ -2496,8 +2581,10 @@ fn resolve_mention(
         return Ok(());
     }
     transaction.execute(
-        "UPDATE events SET trusted_mention=?2 WHERE event_id=?1",
-        params![event_id, i64::from(trusted)],
+        "UPDATE events SET trusted_mention=?2,
+           kind=CASE WHEN ?2=1 THEN ?3 ELSE kind END
+         WHERE event_id=?1",
+        params![event_id, i64::from(trusted), EventKind::Mention.as_str()],
     )?;
     if trusted && let Some(work_item_node_id) = work_item_node_id {
         schedule_event(&transaction, &work_item_node_id, event_id, policy, true, &now)?;
@@ -3164,18 +3251,12 @@ fn assignment_candidates(
     let limit = i64::try_from(limit)
         .map_err(|_| StoreError::InvalidData("assignment candidate limit exceeds i64".into()))?;
     let mut statement = connection.prepare(
-        "SELECT e.event_id,
-                CASE WHEN e.trusted_mention=1 THEN 'trusted_mention' ELSE d.action END,
-                r.name_with_owner,w.kind,w.number
+        "SELECT e.event_id,e.kind,r.name_with_owner,w.kind,w.number
          FROM events e
-         JOIN deliveries d ON d.delivery_guid=e.delivery_guid
          JOIN work_items w ON w.node_id=e.work_item_node_id
          JOIN repositories r ON r.node_id=w.repository_node_id
          WHERE e.lifecycle='pending' AND w.kind=?1
-           AND ((?1='issue' AND e.classification='lifecycle' AND d.event_name='issues'
-                 AND d.action IN ('assigned','unassigned'))
-                OR (?1='pr' AND d.event_name='braid' AND d.action='pr_ensure')
-                OR e.trusted_mention=1)
+           AND e.kind IN ('assign','unassign','mention')
          ORDER BY e.observed_at,e.event_id LIMIT ?2",
     )?;
     let rows = statement.query_map(params![work_item_kind, limit], |row| {
@@ -3201,16 +3282,12 @@ fn work_item_lifecycle_candidates(
     let limit = i64::try_from(limit)
         .map_err(|_| StoreError::InvalidData("Work Item lifecycle limit exceeds i64".into()))?;
     let mut statement = connection.prepare(
-        "SELECT e.event_id,d.action,r.name_with_owner,w.kind,w.number
+        "SELECT e.event_id,e.detail,r.name_with_owner,w.kind,w.number
          FROM events e
-         JOIN deliveries d ON d.delivery_guid=e.delivery_guid
          JOIN work_items w ON w.node_id=e.work_item_node_id
          JOIN repositories r ON r.node_id=w.repository_node_id
-         WHERE e.lifecycle='pending' AND e.classification='lifecycle'
-           AND w.kind=?1
-           AND ((w.kind='issue' AND d.event_name='issues')
-                OR (w.kind='pr' AND d.event_name='pull_request'))
-           AND d.action IN ('closed','reopened')
+         WHERE e.lifecycle='pending' AND e.kind='lifecycle'
+           AND w.kind=?1 AND e.detail IN ('closed','reopened')
          ORDER BY e.observed_at,e.event_id LIMIT ?2",
     )?;
     let rows = statement.query_map(params![work_item_kind, limit], |row| {
@@ -3233,22 +3310,27 @@ fn prepare_work_item_finalization(database: &Path, event_id: &str) -> Result<boo
     let transaction = connection.transaction()?;
     let candidate = transaction
         .query_row(
-            "SELECT e.work_item_node_id,w.state,d.action
+            "SELECT e.work_item_node_id,w.state,e.detail
              FROM events e
              JOIN work_items w ON w.node_id=e.work_item_node_id
-             JOIN deliveries d ON d.delivery_guid=e.delivery_guid
              WHERE e.event_id=?1 AND e.lifecycle='pending' AND w.kind IN ('issue','pr')",
             [event_id],
             |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             },
         )
         .optional()?;
-    let Some((work_item_node_id, state, action)) = candidate else {
+    let Some((work_item_node_id, state, detail)) = candidate else {
         transaction.commit()?;
         return Ok(false);
     };
-    if action != "closed" || !matches!(state.to_ascii_lowercase().as_str(), "closed" | "merged") {
+    if detail.as_deref() != Some("closed")
+        || !matches!(state.to_ascii_lowercase().as_str(), "closed" | "merged")
+    {
         transaction.execute(
             "UPDATE events SET lifecycle='superseded' WHERE event_id=?1 AND lifecycle='pending'",
             [event_id],
@@ -3334,24 +3416,50 @@ fn begin_work_item_reactivation(
     let transaction = connection.transaction()?;
     let candidate = transaction
         .query_row(
-            "SELECT e.work_item_node_id,w.state,d.action
+            "SELECT e.work_item_node_id,w.state,e.detail
              FROM events e
              JOIN work_items w ON w.node_id=e.work_item_node_id
-             JOIN deliveries d ON d.delivery_guid=e.delivery_guid
              WHERE e.event_id=?1 AND e.lifecycle='pending' AND w.kind IN ('issue','pr')",
             [event_id],
             |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             },
         )
         .optional()?;
-    let Some((work_item_node_id, state, action)) = candidate else {
+    let Some((work_item_node_id, state, detail)) = candidate else {
         transaction.commit()?;
         return Ok(None);
     };
-    if action != "reopened" || !state.eq_ignore_ascii_case("open") {
+    if detail.as_deref() != Some("reopened") || !state.eq_ignore_ascii_case("open") {
         transaction.execute(
             "UPDATE events SET lifecycle='superseded' WHERE event_id=?1 AND lifecycle='pending'",
+            [event_id],
+        )?;
+        transaction.commit()?;
+        return Ok(None);
+    }
+    // Reactivation is idempotent: a group that is already materializing,
+    // active, or finalizing (for example after a trusted mention activated a
+    // fresh generation before the reopen arrived) needs no revival. Consuming
+    // the event here prevents a stale sleeping generation from colliding with
+    // the unique active-assignment index.
+    let busy = transaction
+        .query_row(
+            "SELECT 1 FROM assignments
+             WHERE work_item_node_id=?1
+               AND lifecycle IN ('materializing','active','finalizing') LIMIT 1",
+            [&work_item_node_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if busy {
+        transaction.execute(
+            "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
             [event_id],
         )?;
         transaction.commit()?;
@@ -3421,7 +3529,7 @@ fn begin_work_item_reactivation(
     transaction.execute(
         "UPDATE events SET lifecycle='consumed'
          WHERE work_item_node_id=?1 AND lifecycle='pending'
-           AND classification='hard_invalidation' AND origin!='agent'",
+           AND kind='invalidate' AND detail IS NOT 'cross_surface' AND origin!='agent'",
         [&work_item_node_id],
     )?;
     transaction.execute(
@@ -3562,7 +3670,7 @@ fn has_lifecycle_observation(
             "SELECT 1
              FROM events e JOIN deliveries d ON d.delivery_guid=e.delivery_guid
              WHERE e.work_item_node_id=?1 AND e.object_version=?2
-               AND e.classification='lifecycle' AND d.action=?3 LIMIT 1",
+               AND e.kind='lifecycle' AND e.detail=?3 LIMIT 1",
             params![work_item_node_id, object_version, action],
             |_| Ok(()),
         )
@@ -3570,31 +3678,11 @@ fn has_lifecycle_observation(
         .is_some())
 }
 
-fn begin_agent_assignment(
-    database: &Path,
-    event_id: &str,
+/// Idempotently record the effective Profile revision an assignment binds.
+fn upsert_profile_record(
+    transaction: &rusqlite::Transaction<'_>,
     profile: &ProfileRecord,
-    context_revision: Option<&str>,
-    preserve_wake_batch: bool,
-) -> Result<Option<AgentMaterialization>, StoreError> {
-    require_current_schema(database)?;
-    let now = now_rfc3339();
-    let mut connection = open_read_write(database)?;
-    configure_connection(&connection)?;
-    let transaction = connection.transaction()?;
-    let (work_item_node_id, work_item_kind) = transaction
-        .query_row(
-            "SELECT e.work_item_node_id,w.kind FROM events e
-             JOIN work_items w ON w.node_id=e.work_item_node_id
-             WHERE e.event_id=?1 AND e.lifecycle='pending'",
-            [event_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?
-        .ok_or_else(|| {
-            StoreError::InvalidData(format!("assignment event {event_id} is not pending"))
-        })?;
-    let role = agent_role_for_kind(&work_item_kind)?;
+) -> Result<(), StoreError> {
     transaction.execute(
         "INSERT INTO profiles(profile_id,revision,effective_digest,provider_kind,tags)
          VALUES (?1,?2,?3,?4,?5)
@@ -3610,6 +3698,70 @@ fn begin_agent_assignment(
             profile.tags,
         ],
     )?;
+    Ok(())
+}
+
+/// Consume an activation event (`assign`/`mention`) that targets a non-open
+/// Work Item: closed groups sleep until reopen; the event remains as consumed
+/// evidence. Returns true when the event was consumed as a no-op.
+fn consume_closed_activation(
+    transaction: &rusqlite::Transaction<'_>,
+    event_id: &str,
+    work_item_state: &str,
+    event_kind: &str,
+) -> Result<bool, StoreError> {
+    let activation =
+        matches!(EventKind::from_str(event_kind), Some(EventKind::Assign | EventKind::Mention));
+    if !activation || work_item_state.eq_ignore_ascii_case("open") {
+        return Ok(false);
+    }
+    transaction.execute(
+        "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
+        [event_id],
+    )?;
+    Ok(true)
+}
+
+fn begin_agent_assignment(
+    database: &Path,
+    event_id: &str,
+    profile: &ProfileRecord,
+    context_revision: Option<&str>,
+    preserve_wake_batch: bool,
+) -> Result<Option<AgentMaterialization>, StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let (work_item_node_id, work_item_kind, work_item_state, event_kind) = transaction
+        .query_row(
+            "SELECT e.work_item_node_id,w.kind,w.state,e.kind FROM events e
+             JOIN work_items w ON w.node_id=e.work_item_node_id
+             WHERE e.event_id=?1 AND e.lifecycle='pending'",
+            [event_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::InvalidData(format!("assignment event {event_id} is not pending"))
+        })?;
+    // Activation (assign/mention) applies only to open Work Items: a closed
+    // Work Item's group sleeps and stays asleep until reopen. The event is
+    // still consumed so the ledger carries the evidence.
+    if consume_closed_activation(&transaction, event_id, &work_item_state, &event_kind)? {
+        transaction.commit()?;
+        return Ok(None);
+    }
+    let role = agent_role_for_kind(&work_item_kind)?;
+    upsert_profile_record(&transaction, profile)?;
     if !preserve_wake_batch {
         transaction.execute(
             "UPDATE wake_batches SET lifecycle='consumed',updated_at=?2
@@ -3985,14 +4137,13 @@ fn context_reset_work_item(
                      WHERE e.work_item_node_id=w.node_id AND e.lifecycle='pending'
                        AND e.origin!='agent'
                        AND (e.mention_candidate=0 OR e.trusted_mention=0)
-                       AND (
-                         e.classification='hard_invalidation'
-                         OR (e.classification='cross_surface_invalidation' AND EXISTS (
+                       AND (e.kind='invalidate' AND (
+                         e.detail IS NOT 'cross_surface' OR EXISTS (
                            SELECT 1 FROM wake_batches wb
                            JOIN wake_batch_events be ON be.batch_id=wb.batch_id
                            WHERE be.event_id=e.event_id AND wb.lifecycle='runnable'
-                         ))
-                       )
+                         )
+                       ))
                    )",
                 params![turn_id, work_item_kind, profile_id],
                 |row| row.get::<_, String>(0),
@@ -4011,14 +4162,13 @@ fn context_reset_work_item(
              WHERE e.lifecycle='pending' AND e.origin!='agent'
                AND w.kind=?1 AND ai.profile_id=?2
                AND (e.mention_candidate=0 OR e.trusted_mention=0)
-               AND (
-                 e.classification='hard_invalidation'
-                 OR (e.classification='cross_surface_invalidation' AND EXISTS (
+               AND (e.kind='invalidate' AND (
+                 e.detail IS NOT 'cross_surface' OR EXISTS (
                    SELECT 1 FROM wake_batches wb
                    JOIN wake_batch_events be ON be.batch_id=wb.batch_id
                    WHERE be.event_id=e.event_id AND wb.lifecycle='runnable'
-                 ))
-               )
+                 )
+               ))
                AND NOT EXISTS (
                  SELECT 1 FROM context_resets cr
                  WHERE cr.agent_id=ai.agent_id
@@ -4040,14 +4190,13 @@ fn context_reset_events(
         "SELECT event_id FROM events
          WHERE work_item_node_id=?1 AND lifecycle='pending' AND origin!='agent'
            AND (mention_candidate=0 OR trusted_mention=0)
-           AND (
-             classification='hard_invalidation'
-             OR (classification='cross_surface_invalidation' AND EXISTS (
+           AND (kind='invalidate' AND (
+             detail IS NOT 'cross_surface' OR EXISTS (
                SELECT 1 FROM wake_batches wb
                JOIN wake_batch_events be ON be.batch_id=wb.batch_id
                WHERE be.event_id=events.event_id AND wb.lifecycle='runnable'
-             ))
-           )
+             )
+           ))
          ORDER BY observed_at,event_id",
     )?;
     let rows = statement.query_map([work_item_node_id], |row| row.get::<_, String>(0))?;
@@ -5114,4 +5263,39 @@ fn create_dir_all(path: &Path) -> Result<(), StoreError> {
 
 fn now_rfc3339() -> String {
     OffsetDateTime::now_utc().format(&Rfc3339).expect("UTC timestamp formats as RFC 3339")
+}
+
+#[cfg(test)]
+mod event_kind_tests {
+    use super::EventKind;
+
+    #[test]
+    fn event_kind_roundtrip() {
+        for kind in [
+            EventKind::Assign,
+            EventKind::Unassign,
+            EventKind::Mention,
+            EventKind::Wake,
+            EventKind::Invalidate,
+            EventKind::Lifecycle,
+            EventKind::OriginEcho,
+            EventKind::Noop,
+        ] {
+            assert_eq!(EventKind::from_str(kind.as_str()), Some(kind));
+        }
+        assert_eq!(EventKind::from_str("hard_invalidation"), None);
+        assert_eq!(EventKind::from_str("agent_origin"), None);
+    }
+
+    #[test]
+    fn evidence_kinds_are_consumed_at_ingest() {
+        assert!(EventKind::OriginEcho.consumed_at_ingest());
+        assert!(EventKind::Noop.consumed_at_ingest());
+        assert!(!EventKind::Wake.consumed_at_ingest());
+        assert!(!EventKind::Mention.consumed_at_ingest());
+        assert!(!EventKind::Invalidate.consumed_at_ingest());
+        assert!(!EventKind::Lifecycle.consumed_at_ingest());
+        assert!(!EventKind::Assign.consumed_at_ingest());
+        assert!(!EventKind::Unassign.consumed_at_ingest());
+    }
 }

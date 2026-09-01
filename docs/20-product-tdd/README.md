@@ -121,9 +121,9 @@ sit above the leaf modules (`store`, `context`, `github`, `config`,
 
 ### Internal Event Model
 
-`protocol.rs` owns the typed, platform-neutral event contract `EventKind`
+`store` owns the typed, platform-neutral event contract `EventKind`
 (`assign`, `unassign`, `mention`, `wake`, `invalidate`, `lifecycle`,
-`origin_echo`, `noop`). A producer translates platform deliveries into
+`origin_echo`, `noop`) next to the events ledger it persists. A producer translates platform deliveries into
 `EventKind` at ingress and records only the internal kind plus the per-platform
 opaque Event Reference; `queue` and `group` consume `EventKind` exclusively
 and never branch on platform event names or actions. This is the seam at

@@ -469,7 +469,7 @@ pub(crate) async fn materialize_pr_assignment(
     candidate: AssignmentCandidate,
 ) -> Result<()> {
     if candidate.work_item_kind != "pr"
-        || !matches!(candidate.action.as_str(), "pr_ensure" | "trusted_mention")
+        || !matches!(candidate.action.as_str(), "assign" | "mention")
     {
         store.ignore_assignment_event(candidate.event_id)?;
         return Ok(());

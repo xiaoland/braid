@@ -20,8 +20,8 @@ use crate::{
     github::{GitHubClient, RepositoryName, WorkItemLocator},
     health::HealthSnapshot,
     store::{
-        CanonicalObjectState, IngressEvent, ReactionTarget, RuntimeLease, SchedulerPolicy,
-        StoreActor,
+        CanonicalObjectState, EventKind, IngressEvent, ReactionTarget, RuntimeLease,
+        SchedulerPolicy, StoreActor,
     },
     webhook,
 };
@@ -227,7 +227,7 @@ pub(crate) fn reconcile_observations(
         if previous.is_some_and(|previous| observation_unchanged(previous, observation)) {
             continue;
         }
-        let (mut action, mut classification) = reconciled_change(previous, observation);
+        let (mut action, mut kind) = reconciled_change(previous, observation);
         if matches!(observation.object_kind, "issue" | "pr") {
             let lifecycle_action = if matches!(
                 observation.work_item_state.to_ascii_lowercase().as_str(),
@@ -250,7 +250,7 @@ pub(crate) fn reconcile_observations(
                 )?;
                 if state_changed || observed {
                     action = lifecycle_action;
-                    classification = if observed { "no_wake" } else { "lifecycle" };
+                    kind = if observed { EventKind::Noop } else { EventKind::Lifecycle };
                 }
             }
         }
@@ -265,7 +265,7 @@ pub(crate) fn reconcile_observations(
         let event = reconciled_event(
             observation,
             action,
-            classification,
+            kind,
             external,
             cross_surface_invalidation,
             config,
@@ -303,7 +303,7 @@ pub(crate) fn reconcile_observations(
             visible_body: None,
         };
         let event =
-            reconciled_event(&observation, "deleted", "hard_invalidation", true, false, config);
+            reconciled_event(&observation, "deleted", EventKind::Invalidate, true, false, config);
         if store.ingest_event(event, policy)?.event_id.is_some() {
             changes += 1;
         }
@@ -348,37 +348,39 @@ pub(crate) fn observation_unchanged(
 pub(crate) fn reconciled_change(
     previous: Option<&CanonicalObjectState>,
     observation: &CanonicalObservation,
-) -> (&'static str, &'static str) {
+) -> (&'static str, EventKind) {
     let restored = previous.is_some_and(|previous| {
         previous.lifecycle == "minimized" && observation.lifecycle == "active"
     });
     match observation.object_kind {
-        "issue" | "pr" | "review_thread" if previous.is_none() => ("observed", "no_wake"),
+        "issue" | "pr" | "review_thread" if previous.is_none() => ("observed", EventKind::Noop),
         "review_thread"
             if previous.is_some_and(|previous| {
                 previous.lifecycle == observation.lifecycle
                     && previous.version.starts_with("webhook:")
             }) =>
         {
-            ("observed", "no_wake")
+            ("observed", EventKind::Noop)
         }
-        "review" if previous.is_none() => ("submitted", "wake"),
-        "review" if observation.lifecycle == "dismissed" => ("dismissed", "hard_invalidation"),
-        "review_thread" if observation.lifecycle == "resolved" => ("resolved", "hard_invalidation"),
+        "review" if previous.is_none() => ("submitted", EventKind::Wake),
+        "review" if observation.lifecycle == "dismissed" => ("dismissed", EventKind::Invalidate),
+        "review_thread" if observation.lifecycle == "resolved" => {
+            ("resolved", EventKind::Invalidate)
+        }
         "review_thread" if previous.is_some_and(|previous| previous.lifecycle == "resolved") => {
-            ("unresolved", "wake")
+            ("unresolved", EventKind::Wake)
         }
-        _ if previous.is_none() => ("created", "wake"),
-        _ if restored => ("unminimized", "wake"),
-        _ if observation.lifecycle == "minimized" => ("minimized", "hard_invalidation"),
-        _ => ("edited", "hard_invalidation"),
+        _ if previous.is_none() => ("created", EventKind::Wake),
+        _ if restored => ("unminimized", EventKind::Wake),
+        _ if observation.lifecycle == "minimized" => ("minimized", EventKind::Invalidate),
+        _ => ("edited", EventKind::Invalidate),
     }
 }
 
 pub(crate) fn reconciled_event(
     observation: &CanonicalObservation,
     action: &'static str,
-    classification: &'static str,
+    kind: EventKind,
     external: bool,
     cross_surface_invalidation: bool,
     config: &Config,
@@ -438,7 +440,8 @@ pub(crate) fn reconciled_event(
         visible_body: observation.visible_body.clone(),
         actor_node_id: observation.author_node_id.clone(),
         actor_login: observation.author_login.clone(),
-        classification: if external { classification } else { "agent_origin" },
+        kind: if external { kind } else { EventKind::OriginEcho },
+        detail: Some(action),
         cross_surface_invalidation,
         origin: if external { "reconciliation" } else { "agent" },
         reference: webhook::event_reference(

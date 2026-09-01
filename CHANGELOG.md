@@ -11,6 +11,26 @@ Versioning once release artifacts are published.
   validation rejected the generated config whenever the discovered runtime
   version differed (e.g. codex-cli 0.151.0). The profile now pins the
   discovered runtime version.
+- Reopen reactivation was not idempotent: when a newer assignment generation
+  was already active (or the reopen was delivered twice), reactivation
+  selected a stale sleeping generation, hit the unique active-assignment
+  index, and error-looped every tick, permanently wedging the group scheduler.
+  Reactivation is now an ensure-style no-op when the group is already
+  materializing/active/finalizing.
+- A trusted `@braid` mention on a closed Work Item activated a new assignment
+  generation. Activation (`assign`/`mention`) now applies only to open Work
+  Items; closed groups sleep until reopen, as the lifecycle contract states.
+
+### Changed
+
+- The event ledger now stores the typed, platform-neutral `EventKind`
+  (`assign`/`unassign`/`mention`/`wake`/`invalidate`/`lifecycle`/
+  `origin_echo`/`noop`) plus a semantic detail instead of ad-hoc
+  GitHub-shaped classification strings (schema v2). Producers map platform
+  deliveries at ingress; queue and group consumers branch on `EventKind`
+  only. Cross-surface invalidation folds into `invalidate` with
+  `detail='cross_surface'`; agent-origin echoes and ping/unknown deliveries
+  are evidence-only and consumed at ingest.
 - `braid setup` now creates the Profile workspace directory it writes into
   the config; previously a fresh setup left the workspace missing and the
   first Agent turn materialization failed with the Assignment parked in

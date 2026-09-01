@@ -522,8 +522,8 @@ pub(crate) async fn materialize_issue_assignment(
     profile_record: &ProfileRecord,
     candidate: AssignmentCandidate,
 ) -> Result<()> {
-    let mention_activation = candidate.action == "trusted_mention";
-    if candidate.action != "assigned" && !mention_activation {
+    let mention_activation = candidate.action == "mention";
+    if candidate.action != "assign" && !mention_activation {
         store.ignore_assignment_event(candidate.event_id)?;
         return Ok(());
     }
