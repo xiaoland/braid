@@ -1,7 +1,25 @@
 ## Agent Publication and Identity
 
 Braid does not mirror turn activity or final responses. Coding Agents publish
-short messages themselves. `braid gh` implements the write side needed to use
+short messages themselves.
+
+## Publication Discretion
+
+A delivered comment, review, or mention never obligates a public reply. The
+Agent alone decides what is Human-relevant; a silent turn that only reads,
+thinks, or edits local files is a valid outcome. Event References report
+changes; they are not commands.
+
+The Agent may keep private working reasoning inside its Provider Session and
+publish conclusions when they are ready. Braid never publishes private
+reasoning. Private reasoning lives only in the physical Provider Session: a
+Context Reset replaces that session and discards it, so durable conclusions
+must be published to GitHub (a comment, a description update, or a commit)
+before they are needed again.
+
+## Attribution and Writes
+
+`braid gh` implements the write side needed to use
 the stable Braid App identity and prepends an immutable attribution block:
 
 ```markdown
