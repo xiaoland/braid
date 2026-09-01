@@ -316,6 +316,16 @@ pub struct ProfileRecord {
     pub tags: String,
 }
 
+/// Outcome of a settled (or not yet settled) native unassignment.
+#[derive(Debug, Clone)]
+pub struct UnassignmentOutcome {
+    /// false while the debounce window is still open; the event stays pending.
+    pub settled: bool,
+    /// The provider session whose in-flight turn was fenced by the
+    /// retirement; the caller best-effort interrupts it.
+    pub fenced_provider_session: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AssignmentCandidate {
     pub event_id: String,
@@ -997,6 +1007,18 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
+    pub fn retire_unassigned_work_item(
+        &self,
+        event_id: String,
+        debounce_seconds: u64,
+    ) -> Result<UnassignmentOutcome, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::RetireUnassignedWorkItem(event_id, debounce_seconds, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
     pub fn complete_agent_assignment(
         &self,
         materialization: AgentMaterialization,
@@ -1327,6 +1349,7 @@ enum Command {
         Sender<Result<Option<AgentMaterialization>, StoreError>>,
     ),
     IgnoreAssignmentEvent(String, Sender<Result<(), StoreError>>),
+    RetireUnassignedWorkItem(String, u64, Sender<Result<UnassignmentOutcome, StoreError>>),
     CompleteAgentAssignment(
         AgentMaterialization,
         String,
@@ -1598,6 +1621,10 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             }
             Command::IgnoreAssignmentEvent(event_id, reply) => {
                 let _ = reply.send(ignore_assignment_event(database, &event_id));
+            }
+            Command::RetireUnassignedWorkItem(event_id, debounce_seconds, reply) => {
+                let _ =
+                    reply.send(retire_unassigned_work_item(database, &event_id, debounce_seconds));
             }
             Command::CompleteAgentAssignment(
                 materialization,
@@ -3829,6 +3856,114 @@ fn begin_agent_assignment(
     }
     transaction.commit()?;
     Ok(Some(materialization))
+}
+
+/// Settle a native unassignment after its debounce window: retire the active
+/// Agent Group. An in-flight turn is fenced `interrupted`; the caller
+/// best-effort interrupts it through the session. The event is consumed once
+/// settled; while the debounce window is open the event stays pending.
+fn retire_unassigned_work_item(
+    database: &Path,
+    event_id: &str,
+    debounce_seconds: u64,
+) -> Result<UnassignmentOutcome, StoreError> {
+    require_current_schema(database)?;
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let event = transaction
+        .query_row(
+            "SELECT work_item_node_id,observed_at FROM events
+             WHERE event_id=?1 AND lifecycle='pending' AND kind='unassign'",
+            [event_id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((work_item_node_id, observed_at)) = event else {
+        transaction.commit()?;
+        return Ok(UnassignmentOutcome { settled: true, fenced_provider_session: None });
+    };
+    let observed = OffsetDateTime::parse(&observed_at, &Rfc3339)
+        .map_err(|error| StoreError::InvalidData(format!("event observed_at: {error}")))?;
+    let settled = (OffsetDateTime::now_utc() - observed)
+        >= time::Duration::seconds(i64::try_from(debounce_seconds).unwrap_or(i64::MAX));
+    if !settled {
+        transaction.commit()?;
+        return Ok(UnassignmentOutcome { settled: false, fenced_provider_session: None });
+    }
+    let active = work_item_node_id
+        .as_deref()
+        .map(|node_id| {
+            transaction
+                .query_row(
+                    "SELECT a.assignment_id,ai.agent_id FROM assignments a
+                     JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
+                     WHERE a.work_item_node_id=?1
+                       AND a.lifecycle IN ('materializing','active','finalizing')
+                     ORDER BY a.generation DESC LIMIT 1",
+                    [node_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+        })
+        .transpose()?;
+    let Some((assignment_id, agent_id)) = active.flatten() else {
+        transaction.execute(
+            "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
+            [event_id],
+        )?;
+        transaction.commit()?;
+        return Ok(UnassignmentOutcome { settled: true, fenced_provider_session: None });
+    };
+    let fenced = transaction
+        .query_row(
+            "SELECT ps.provider_session_id FROM provider_sessions ps
+             JOIN turns t ON t.session_id=ps.session_id
+             WHERE ps.agent_id=?1 AND t.lifecycle IN ('starting','running')
+             ORDER BY t.rowid DESC LIMIT 1",
+            [&agent_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(provider_session_id) = &fenced {
+        transaction.execute(
+            "UPDATE turns SET lifecycle='interrupted',ended_at=?2
+             WHERE lifecycle IN ('starting','running')
+               AND session_id IN (SELECT session_id FROM provider_sessions WHERE agent_id=?1)",
+            params![agent_id, now],
+        )?;
+        let _ = provider_session_id;
+    }
+    transaction.execute(
+        "UPDATE provider_sessions SET lifecycle='retired'
+         WHERE agent_id=?1 AND lifecycle NOT IN ('retired','replaced')",
+        [&agent_id],
+    )?;
+    transaction.execute(
+        "UPDATE worktrees SET lifecycle='retired',observed_at=?2
+         WHERE agent_id=?1 AND lifecycle IN ('active','sleeping')",
+        params![agent_id, now],
+    )?;
+    transaction
+        .execute("UPDATE agent_instances SET lifecycle='retired' WHERE agent_id=?1", [&agent_id])?;
+    transaction.execute(
+        "UPDATE assignments SET lifecycle='retired',retired_at=?2 WHERE assignment_id=?1",
+        params![assignment_id, now],
+    )?;
+    if let Some(node_id) = &work_item_node_id {
+        transaction.execute(
+            "UPDATE wake_batches SET lifecycle='consumed',updated_at=?2
+             WHERE work_item_node_id=?1 AND lifecycle IN ('pending','runnable')",
+            params![node_id, now],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
+        [event_id],
+    )?;
+    transaction.commit()?;
+    Ok(UnassignmentOutcome { settled: true, fenced_provider_session: fenced })
 }
 
 fn ignore_assignment_event(database: &Path, event_id: &str) -> Result<(), StoreError> {

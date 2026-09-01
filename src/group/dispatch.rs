@@ -408,6 +408,43 @@ pub(crate) async fn forward_urgent_steer(
     }
 }
 
+/// Settle a native Issue unassignment: confirm from canonical assignees that
+/// the App actor is no longer assigned (flapping may have re-assigned it),
+/// then retire the Agent Group after the debounce window. A fenced in-flight
+/// turn is best-effort interrupted through its session.
+async fn settle_issue_unassignment(
+    store: &StoreActor,
+    github: &GitHubClient,
+    config: &Config,
+    sessions: Arc<SessionManager>,
+    candidate: AssignmentCandidate,
+) -> Result<()> {
+    let repository = candidate.repository.parse::<RepositoryName>()?;
+    let locator = WorkItemLocator { repository, number: candidate.number };
+    let issue = context::materialize_issue(github, &locator, 1).await?;
+    let still_assigned = issue.assignees.iter().any(|assignee| {
+        assignee.node_id == github.identity().actor_node_id
+            || assignee.login == github.identity().actor_login
+    });
+    if still_assigned {
+        store.ignore_assignment_event(candidate.event_id)?;
+        return Ok(());
+    }
+    let outcome =
+        store.retire_unassigned_work_item(candidate.event_id, config.scheduler.quiet_seconds)?;
+    if !outcome.settled {
+        return Ok(());
+    }
+    if let Some(provider_session_id) = &outcome.fenced_provider_session
+        && let Some(session) = sessions.get(provider_session_id).await
+        && let Err(error) = session.interrupt().await
+    {
+        tracing::warn!(%error, "cannot interrupt retired Issue Agent turn");
+    }
+    tracing::info!(issue = candidate.number, "retired unassigned Issue Agent Group");
+    Ok(())
+}
+
 pub(crate) async fn materialize_next_issue_assignment(
     store: &StoreActor,
     github: &GitHubClient,
@@ -425,6 +462,14 @@ pub(crate) async fn materialize_next_issue_assignment(
         }
     };
     let Some(candidate) = candidate else { return };
+    if candidate.action == "unassign" {
+        if let Err(error) =
+            settle_issue_unassignment(store, github, config, Arc::clone(&sessions), candidate).await
+        {
+            tracing::error!(%error, "cannot settle Issue unassignment");
+        }
+        return;
+    }
     if let Err(error) = materialize_issue_assignment(
         store,
         github,
