@@ -316,24 +316,9 @@ pub(crate) async fn resume_issue_provider_sessions(
     for candidate in candidates {
         let instructions = issue_system_prompt(config, profile, candidate.number);
         let instruction_revision = hex::encode(Sha256::digest(instructions.as_bytes()));
-        let Some(worktree_path) = candidate.worktree_path.clone() else {
-            let message = "persisted Issue provider session has no active worktree";
-            store.block_provider_session(candidate.provider_session_id.clone(), message.into())?;
-            enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
-            continue;
-        };
-        let compatible = candidate.repository == config.github.repository
-            && candidate.profile_id == profile.id
-            && candidate.profile_revision == profile_record.revision
-            && candidate.instruction_revision == instruction_revision
-            && profile.workspace().is_dir()
-            && worktree_path.is_dir();
-        if !compatible {
-            let message = "persisted provider session is incompatible with the effective Profile";
-            store.block_provider_session(candidate.provider_session_id.clone(), message.into())?;
-            enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
-            continue;
-        }
+        // A crashed epoch can leave an in-flight turn behind; fence it before
+        // any compatibility verdict so a blocked session never leaks a
+        // 'running' turn that wedges later claims.
         if candidate
             .active_turn_lifecycle
             .as_deref()
@@ -345,6 +330,42 @@ pub(crate) async fn resume_issue_provider_sessions(
                 turn_id.clone(),
                 operational_status_unknown_profile(&profile.id),
             )?;
+        }
+        let Some(worktree_path) = candidate.worktree_path.clone() else {
+            let message = "persisted Issue provider session has no active worktree";
+            tracing::warn!(issue = candidate.number, provider_session = %candidate.provider_session_id, "{message}");
+            store.block_provider_session(candidate.provider_session_id.clone(), message.into())?;
+            enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
+            continue;
+        };
+        let incompatible_reason = if candidate.repository != config.github.repository {
+            Some("repository mismatch")
+        } else if candidate.profile_id != profile.id {
+            Some("Profile id mismatch")
+        } else if candidate.profile_revision != profile_record.revision {
+            Some("Profile revision mismatch")
+        } else if candidate.instruction_revision != instruction_revision {
+            Some("instruction revision mismatch")
+        } else if !profile.workspace().is_dir() {
+            Some("Profile workspace is not a directory")
+        } else if !worktree_path.is_dir() {
+            Some("worktree is not a directory")
+        } else {
+            None
+        };
+        if let Some(reason) = incompatible_reason {
+            let message = "persisted provider session is incompatible with the effective Profile";
+            tracing::warn!(
+                issue = candidate.number,
+                provider_session = %candidate.provider_session_id,
+                reason,
+                stored_profile_revision = candidate.profile_revision,
+                current_profile_revision = profile_record.revision,
+                "{message}"
+            );
+            store.block_provider_session(candidate.provider_session_id.clone(), message.into())?;
+            enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
+            continue;
         }
         let mut effective_profile = profile.clone();
         effective_profile.workspace = Some(worktree_path);

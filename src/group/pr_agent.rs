@@ -274,32 +274,8 @@ pub(crate) async fn resume_pr_provider_sessions(
 ) -> Result<()> {
     let candidates = store.provider_resume_candidates(profile.id.clone(), "pr".into())?;
     for candidate in candidates {
-        let Some(worktree_path) = candidate.worktree_path.clone() else {
-            let message = "persisted PR provider session has no active worktree";
-            store.block_provider_session(candidate.provider_session_id.clone(), message.into())?;
-            enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
-            continue;
-        };
-        let Some(head_ref) = candidate.worktree_head_ref.as_deref() else {
-            let message = "persisted PR provider session has no remote head reference";
-            store.block_provider_session(candidate.provider_session_id.clone(), message.into())?;
-            enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
-            continue;
-        };
-        let instructions = pr_system_prompt(config, profile, candidate.number, head_ref);
-        let instruction_revision = hex::encode(Sha256::digest(instructions.as_bytes()));
-        let compatible = candidate.repository == config.github.repository
-            && candidate.work_item_kind == "pr"
-            && candidate.profile_id == profile.id
-            && candidate.profile_revision == profile_record.revision
-            && candidate.instruction_revision == instruction_revision
-            && worktree_path.is_dir();
-        if !compatible {
-            let message = "persisted PR provider session is incompatible with its Profile/worktree";
-            store.block_provider_session(candidate.provider_session_id.clone(), message.into())?;
-            enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
-            continue;
-        }
+        // Fence a crashed epoch's in-flight turn before any compatibility
+        // verdict so a blocked session never leaks a 'running' turn.
         if candidate
             .active_turn_lifecycle
             .as_deref()
@@ -311,6 +287,51 @@ pub(crate) async fn resume_pr_provider_sessions(
                 turn_id.clone(),
                 operational_status_unknown_profile(&profile.id),
             )?;
+        }
+        let Some(worktree_path) = candidate.worktree_path.clone() else {
+            let message = "persisted PR provider session has no active worktree";
+            tracing::warn!(pr = candidate.number, provider_session = %candidate.provider_session_id, "{message}");
+            store.block_provider_session(candidate.provider_session_id.clone(), message.into())?;
+            enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
+            continue;
+        };
+        let Some(head_ref) = candidate.worktree_head_ref.as_deref() else {
+            let message = "persisted PR provider session has no remote head reference";
+            tracing::warn!(pr = candidate.number, provider_session = %candidate.provider_session_id, "{message}");
+            store.block_provider_session(candidate.provider_session_id.clone(), message.into())?;
+            enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
+            continue;
+        };
+        let instructions = pr_system_prompt(config, profile, candidate.number, head_ref);
+        let instruction_revision = hex::encode(Sha256::digest(instructions.as_bytes()));
+        let incompatible_reason = if candidate.repository != config.github.repository {
+            Some("repository mismatch")
+        } else if candidate.work_item_kind != "pr" {
+            Some("Work Item kind mismatch")
+        } else if candidate.profile_id != profile.id {
+            Some("Profile id mismatch")
+        } else if candidate.profile_revision != profile_record.revision {
+            Some("Profile revision mismatch")
+        } else if candidate.instruction_revision != instruction_revision {
+            Some("instruction revision mismatch")
+        } else if !worktree_path.is_dir() {
+            Some("worktree is not a directory")
+        } else {
+            None
+        };
+        if let Some(reason) = incompatible_reason {
+            let message = "persisted PR provider session is incompatible with its Profile/worktree";
+            tracing::warn!(
+                pr = candidate.number,
+                provider_session = %candidate.provider_session_id,
+                reason,
+                stored_profile_revision = candidate.profile_revision,
+                current_profile_revision = profile_record.revision,
+                "{message}"
+            );
+            store.block_provider_session(candidate.provider_session_id.clone(), message.into())?;
+            enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
+            continue;
         }
         let mut effective_profile = profile.clone();
         effective_profile.workspace = Some(worktree_path);
