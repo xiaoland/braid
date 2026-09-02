@@ -148,7 +148,7 @@ fi
 BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
     --config "$test_config" >"$runtime_log" 2>&1 &
 runtime_pid=$!
-for _ in $(seq 1 120); do
+for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
     if curl -fsS "$health_url" 2>/dev/null | \
         jq -e '.ready == true and .provider == "connected"' >/dev/null; then
         break
@@ -254,7 +254,7 @@ start_candidate_runtime() {
     BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
         --config "$config" >>"$runtime_log" 2>&1 &
     runtime_pid=$!
-    for _ in $(seq 1 120); do
+    for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
         if curl -fsS "$health_url" 2>/dev/null | \
             jq -e '.ready == true and .provider == "connected"' >/dev/null; then
             return 0
@@ -302,7 +302,7 @@ baseline_agent_comments="$(gh api "repos/$repository/issues/$fixture_issue/comme
 
 note "editing idle Issue Context: replace session without starting a turn"
 gh issue edit "$fixture_issue" --repo "$repository" --body "Idle replacement design: $idle_marker" >/dev/null
-for _ in $(seq 1 120); do
+for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
     status_payload="$($binary status --config "$test_config" --json)"
     if jq -e --argjson number "$fixture_issue" '
         any(.transport.context_resets[];
@@ -609,7 +609,7 @@ for _ in $(seq 1 30); do
 done
 [[ -n "$provider_child_pid" ]] || fail "could not identify the app-server child process"
 kill -TERM "$provider_child_pid"
-for _ in $(seq 1 120); do
+for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
     status_payload="$($binary status --config "$test_config" --json)"
     if curl -fsS "$health_url" 2>/dev/null | jq -e '.provider == "connected"' >/dev/null && \
         jq -e --argjson number "$fixture_issue" --arg session "$reopened_session" '

@@ -185,7 +185,7 @@ receiver_pid=$!
 sleep 1
 sampled=0
 probes=0
-for index in $(seq 1 120); do
+for index in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
     result=$("$braid" telemetry probe --config "$sample_config" \
         --marker "BRAID_SLICE6_SAMPLE_$index" --json)
     probes=$index
