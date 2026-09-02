@@ -557,7 +557,9 @@ impl GitHubClient {
     }
 
     pub async fn app_deliveries(&self) -> Result<Vec<AppDeliverySummary>, GitHubError> {
-        let params = PaginationParams { per_page: 100, page: 1 };
+        // The App hook deliveries endpoint is cursor-paginated and rejects
+        // the offset-style `page` key with 422; request the first page only.
+        let params = AppDeliveriesParams { per_page: 100 };
         self.app.get("/app/hook/deliveries", Some(&params)).await.map_err(GitHubError::from)
     }
 
@@ -641,6 +643,11 @@ struct PermissionResponse {
 struct PaginationParams {
     per_page: u8,
     page: u16,
+}
+
+#[derive(Serialize)]
+struct AppDeliveriesParams {
+    per_page: u8,
 }
 
 #[derive(Serialize)]
