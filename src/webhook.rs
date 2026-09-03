@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::{
     context,
-    store::{IngressEvent, ReactionTarget},
+    store::{EventKind, IngressEvent, ReactionTarget},
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -74,18 +74,28 @@ pub fn parse_verified(
         .comment
         .as_ref()
         .and_then(|comment| comment.body.as_deref())
-        .or_else(|| payload.review.as_ref().and_then(|review| review.body.as_deref()));
+        .or_else(|| payload.review.as_ref().and_then(|review| review.body.as_deref()))
+        .or_else(|| payload.issue.as_ref().and_then(|issue| issue.body.as_deref()))
+        .or_else(|| payload.pull_request.as_ref().and_then(|pr| pr.body.as_deref()));
     let agent_origin = actor_node_id.as_deref() == Some(actors.app_node_id)
         || actor_login.as_deref() == Some(actors.app_login)
         || actor_node_id.as_ref().is_some_and(|node_id| actors.agent_node_ids.contains(node_id))
         || body_text.is_some_and(|body| has_agent_attribution(body, actors.agent_attributions));
     let target = target(event_name, &payload, action.as_deref());
     let known = is_known_event(event_name);
-    let classification =
-        if agent_origin { "agent_origin" } else { classify(event_name, action.as_deref()) };
+    let (mapped_kind, detail) = classify(event_name, action.as_deref());
+    let kind = if agent_origin { EventKind::OriginEcho } else { mapped_kind };
     let mention_candidate = !agent_origin
-        && matches!(action.as_deref(), Some("created" | "edited"))
+        && matches!(action.as_deref(), Some("created" | "edited" | "opened"))
         && body_text.is_some_and(|body| has_visible_mention(body, configured_handle));
+    // An opening-body mention would otherwise classify as a consumed-at-ingest
+    // noop and vanish before trusted-mention resolution can run; keep it
+    // pending as a mention candidate (kind is truthful: it IS a mention).
+    let kind = if !agent_origin && mention_candidate && kind == EventKind::Noop {
+        EventKind::Mention
+    } else {
+        kind
+    };
     let reaction_target = if !agent_origin && action.as_deref() == Some("created") {
         match event_name {
             "issue_comment" => payload.comment.as_ref().map(|comment| ReactionTarget {
@@ -128,7 +138,8 @@ pub fn parse_verified(
         visible_body,
         actor_node_id,
         actor_login,
-        classification,
+        kind,
+        detail,
         cross_surface_invalidation,
         origin: if agent_origin { "agent" } else { "external" },
         reference: target.reference,
@@ -165,26 +176,45 @@ fn is_known_event(event_name: &str) -> bool {
     )
 }
 
-fn classify(event_name: &str, action: Option<&str>) -> &'static str {
+/// Map a GitHub delivery onto the platform-neutral internal event contract.
+/// Consumers branch on the returned kind/detail only, never on the GitHub
+/// event name or action.
+fn classify(event_name: &str, action: Option<&str>) -> (EventKind, Option<&'static str>) {
     match (event_name, action) {
-        ("issue_comment" | "pull_request_review_comment", Some("created"))
-        | ("pull_request_review", Some("submitted"))
-        | ("pull_request_review_thread", Some("unresolved"))
-        | ("pull_request", Some("synchronize" | "review_requested")) => "wake",
-        ("issues", Some("assigned" | "unassigned" | "closed" | "reopened"))
-        | ("pull_request", Some("closed" | "reopened")) => "lifecycle",
+        ("issue_comment" | "pull_request_review_comment", Some("created")) => {
+            (EventKind::Wake, Some("created"))
+        }
+        ("pull_request_review", Some("submitted")) => (EventKind::Wake, Some("submitted")),
+        ("pull_request_review_thread", Some("unresolved")) => (EventKind::Wake, Some("unresolved")),
+        ("pull_request", Some("synchronize")) => (EventKind::Wake, Some("synchronize")),
+        ("pull_request", Some("review_requested")) => (EventKind::Wake, Some("review_requested")),
+        ("issues", Some("assigned")) => (EventKind::Assign, None),
+        ("issues", Some("unassigned")) => (EventKind::Unassign, None),
+        // `opened` stays a consumed-at-ingest noop unless a visible mention
+        // promotes it (see the mention override at classification time).
+        ("issues" | "pull_request", Some("closed")) => (EventKind::Lifecycle, Some("closed")),
+        ("issues" | "pull_request", Some("reopened")) => (EventKind::Lifecycle, Some("reopened")),
         (
             "issues"
             | "issue_comment"
             | "pull_request"
             | "pull_request_review"
             | "pull_request_review_comment",
-            Some("edited" | "deleted"),
-        )
-        | ("pull_request_review", Some("dismissed"))
-        | ("pull_request_review_thread", Some("resolved")) => "hard_invalidation",
-        ("ping", _) => "no_wake",
-        _ => "unknown",
+            Some("edited"),
+        ) => (EventKind::Invalidate, Some("edited")),
+        (
+            "issues"
+            | "issue_comment"
+            | "pull_request"
+            | "pull_request_review"
+            | "pull_request_review_comment",
+            Some("deleted"),
+        ) => (EventKind::Invalidate, Some("deleted")),
+        ("pull_request_review", Some("dismissed")) => (EventKind::Invalidate, Some("dismissed")),
+        ("pull_request_review_thread", Some("resolved")) => {
+            (EventKind::Invalidate, Some("resolved"))
+        }
+        _ => (EventKind::Noop, None),
     }
 }
 

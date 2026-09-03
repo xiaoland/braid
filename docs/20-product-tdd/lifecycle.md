@@ -11,7 +11,7 @@ Each Work Item/Profile pair has an Assignment Generation and one state:
 | State | Meaning |
 | --- | --- |
 | `dormant` | No active Braid assignment/activation. |
-| `materializing` | Profile, Context, worktree when applicable, and physical Provider Session are being created. |
+| `materializing` | Profile, Context, the generation-scoped worktree, and physical Provider Session are being created. |
 | `idle` | Session exists and no turn or pending Wake batch exists. |
 | `debouncing` | Wake Events are accumulating against one quiet deadline/count. |
 | `running` | One provider turn is active. |

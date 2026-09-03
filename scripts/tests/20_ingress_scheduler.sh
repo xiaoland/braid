@@ -121,7 +121,7 @@ batch_json() {
 
 wait_for_health() {
     local attempt expected_tunnel
-    for attempt in $(seq 1 120); do
+    for attempt in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
         expected_tunnel="connected"
         [[ "$webhook_mode" == "repository" ]] && expected_tunnel="disabled"
         if curl -fsS "$health_url" 2>/dev/null | \
@@ -133,7 +133,7 @@ wait_for_health() {
         fi
         sleep 1
     done
-    fail "runtime did not become ready within 120 seconds"
+    fail "runtime did not become ready within ${BRAID_TEST_WAIT_SECONDS:-120} seconds"
 }
 
 start_runtime() {

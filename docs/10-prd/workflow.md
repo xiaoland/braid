@@ -2,10 +2,11 @@
 
 ### Discuss
 
-Issue Activation creates the Issue session. A native assignment does not
-invent a turn. On installations without the special Agent App assignment
-capability, the first trusted visible `@braid` both activates the dormant Issue
-and supplies the first Wake Event. Later Human comments, newly populated
+Issue Activation creates the Issue session. A native assignment and the first
+trusted visible `@braid` on a dormant Issue are the same internal `assign`
+event; neither invents a turn by itself. On installations without the special
+Agent App assignment capability, that first mention both activates the dormant
+Issue and supplies the first Wake Event. Later Human comments, newly populated
 included metadata, and unfolded content are Wake Events. They accumulate until
 the Quiet Window expires or the count threshold is reached. The Issue Agent
 receives one current Context plus coalesced Event References and decides
@@ -49,6 +50,7 @@ Context on the next materialization.
 Issue unassignment is debounced; once settled it retires the active Issue Agent
 Group. Closing an Issue, closing a PR, or merging a PR does not interrupt a
 current turn. It grants at most one Finalization Turn, then a closed Issue or
-closed-unmerged PR sleeps and a merged PR retires. Reopen rematerializes Context
-and starts one ordinary debounced turn. Duplicate deliveries never grant extra
-finalization turns.
+closed-unmerged PR sleeps and a merged PR retires. A mention on a closed Work
+Item does not wake the sleeping group; Reopen is the designed re-entry. Reopen
+rematerializes Context and starts one ordinary debounced turn. Duplicate
+deliveries never grant extra finalization turns.

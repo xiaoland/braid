@@ -177,7 +177,7 @@ pub async fn start_verified_quick_tunnel(
     repository_node_id: &str,
 ) -> Result<(QuickTunnel, String)> {
     let mut last_error = None;
-    for attempt in 1..=3 {
+    for attempt in 1..=5 {
         let started = match QuickTunnel::start(&config.tools.wrangler, local_url).await {
             Ok(started) => started,
             Err(error) => {
@@ -188,6 +188,11 @@ pub async fn start_verified_quick_tunnel(
                 continue;
             }
         };
+        // The banner appears before Cloudflare publishes the fresh hostname;
+        // probing immediately primes negative DNS caches (system and
+        // upstream) that outlive the probe loop. Give the record time to
+        // exist before the first lookup.
+        tokio::time::sleep(Duration::from_secs(20)).await;
         let public_webhook = format!("{}/webhook", started.url);
         match signed_public_probe(&public_webhook, secret, repository, repository_node_id).await {
             Ok(()) => return Ok((started, public_webhook)),
@@ -203,7 +208,7 @@ pub async fn start_verified_quick_tunnel(
         }
     }
     bail!(
-        "no verified Quick Tunnel became reachable after 3 candidates: {}",
+        "no verified Quick Tunnel became reachable after 5 candidates: {}",
         last_error.as_deref().unwrap_or("no public probe result")
     )
 }

@@ -155,7 +155,7 @@ note "starting packaged Braid with the real Codex app-server"
 BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
     --config "$test_config" >"$runtime_log" 2>&1 &
 runtime_pid=$!
-for _ in $(seq 1 120); do
+for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
     if curl -fsS "$health_url" 2>/dev/null | \
         jq -e '.ready == true and .provider == "connected"' >/dev/null; then
         break
@@ -392,7 +392,7 @@ runtime_log="$temporary_root/failure-runtime.log"
 BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
     --config "$failure_config" >"$runtime_log" 2>&1 &
 runtime_pid=$!
-for _ in $(seq 1 120); do
+for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
     if curl -fsS "$health_url" 2>/dev/null | \
         jq -e '.ready == true and .provider == "connected"' >/dev/null; then
         break

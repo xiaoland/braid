@@ -27,12 +27,14 @@
 | Profile Tag | Agent Profile 声明适用面的 tag-like 类型，例如 `issue`、`pr`；同一 Profile 可同时拥有多个 tag，也可以只适用于 Issue。 |
 | Braid System Prompt | Braid 在创建 Provider Session 时注入的高优先级、版本化指令，包括 Braid/CLI 的存在、GitHub Working Memory 协议，以及按 Issue/PR surface 选择的角色与任务说明。它帮助 Agent 使用产品能力，而不是把 Braid 变成限制 Agent 的权限沙箱。 |
 | Effective Agent Instructions | Provider 实际收到的指令组合：Braid System Prompt 加 Profile User Instructions。GitHub Context 是带来源边界的不可信工作数据，Event Reference 是 user message，两者都不是系统指令。 |
+| Publication Discretion | 收到评论、review 或提及从不构成公开发表的义务。Agent 自行决定什么内容 Human-relevant；沉默是合法结果。私有工作区（worktree 内的笔记、草稿、中间态文件）在同一 assignment 代际内跨 Provider Session 替换存续。 |
 | Issue Agent | 一个带 `issue` Profile Tag、运行在某个 Issue 上的 Agent 实例。 |
 | Issue Agent Group | 同一 Issue 上所有平行 Issue Agents；没有 primary/sub-agent，收到相同 Context 与 Event Reference batch。 |
 | Issue Group Turn | 同一 Context Revision 和 Event Reference batch 并行扇出给一个 Issue Agent Group 的一次 turn。 |
 | PR Agent | 一个带 `pr` Profile Tag、运行在某个 PR 上的 Agent 实例。v1 只有 Implementation Agent；未来可增加 reviewer、advisor 等角色。 |
 | PR Agent Group | 同一 PR 上的 Agent 集合。v1 恰好包含一个 Implementation Agent；架构保留未来增加非实现角色的路径。 |
 | Implementation Agent | PR Agent Group 中负责修改代码的 Agent。v1 每个 PR 恰好一个，并独占一个专用 worktree。 |
+| Agent Worktree | Braid 为每个 Agent Group session 供给的按 assignment 代际隔离的专用 worktree，即 Agent 的实际 cwd。PR Agent 绑定 PR head；Issue Agent 绑定该 Issue 唯一的同仓 Development 链接分支，零个或多个分支时均落到默认 origin 分支（Agent 可自行切换/创建分支）。worktree 内 `.braid/` 目录不参与 git 跟踪，是否使用由 Agent 自行决定。 |
 | Implementation Request | Issue Agent 根据某条 Issue comment 发起的一次实现请求。该 GitHub comment ID 是 `braid pr ensure` 的幂等键；同一 comment 只得到一个 PR，不同 comment 可得到不同 PR。 |
 | PR Activation | 启动一个 PR Agent Group 的机械事实。产品上等价于把 PR 交给 Braid；具体 GitHub signal 由 adapter 提供，不能在未验证前假定为原生 PR assignee。 |
 | PR Agent Lease | 将一个 PR、一个专用 worktree 和一个 `pr`-capable Profile 原子绑定给唯一 Implementation Agent 的独占租约。 |

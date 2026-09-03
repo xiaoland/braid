@@ -123,10 +123,16 @@ impl TelemetryGuard {
         let fmt_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         let fmt_layer = match config.log_format {
-            LogFormat::Text => tracing_subscriber::fmt::layer().with_filter(fmt_filter).boxed(),
+            // Logs are diagnostics and belong on stderr; stdout is reserved
+            // for CLI results (e.g. `braid telemetry probe --json`).
+            LogFormat::Text => tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(fmt_filter)
+                .boxed(),
             LogFormat::Json => tracing_subscriber::fmt::layer()
                 .json()
                 .with_current_span(true)
+                .with_writer(std::io::stderr)
                 .with_filter(fmt_filter)
                 .boxed(),
         };

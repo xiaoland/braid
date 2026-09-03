@@ -59,6 +59,12 @@ string consisting of:
 2. a clear delimiter;
 3. Profile User Instructions.
 
+The versioned Braid System Prompt must state Publication Discretion
+explicitly: a delivered comment, review, or mention never obligates a public
+reply; the Agent may keep private working state as files in its worktree,
+which persists across Provider Session replacement within the same assignment
+generation; GitHub receives only Human-relevant conclusions.
+
 GitHub Context is not developer instructions. Immediately after start, Braid
 calls stable `thread/inject_items` with one Responses-API user message:
 

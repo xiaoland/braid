@@ -202,7 +202,7 @@ start_runtime() {
         BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" \
         "$braid" serve --config "$config" >"$runtime_log" 2>&1 &
     runtime_pid=$!
-    for _ in $(seq 1 120); do
+    for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
         if curl -fsS "$health_url" 2>/dev/null | \
             jq -e '.ready == true and .provider == "connected"' >/dev/null; then
             return 0
@@ -480,7 +480,7 @@ active_comment=$(gh api --method POST "repos/$repository/issues/$pull_number/com
     -f body="@braid Acceptance: first run \`sleep 30\` in the dedicated worktree so this turn remains active, then publish one concise attributed PR comment containing $active_marker." --jq .id)
 
 active_session=
-for _ in $(seq 1 120); do
+for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
     active_group=$(latest_pr_group)
     if [ -n "$active_group" ] && printf '%s' "$active_group" | \
         jq -e '.session_lifecycle == "running" and .active_turn_id != null' >/dev/null; then
@@ -705,7 +705,7 @@ restart_issue_number=${restart_issue_url##*/}
 restart_comment=$(gh api --method POST "repos/$repository/issues/$restart_issue_number/comments" \
     -f body="@braid Inspect the repository documentation carefully before responding. Keep this turn read-only and report concisely." \
     --jq .id)
-for _ in $(seq 1 120); do
+for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
     active_restart_group=$(latest_issue_group)
     if printf '%s' "$active_restart_group" | jq -e \
         '.assignment_lifecycle == "active" and .session_lifecycle == "running" and
@@ -724,7 +724,7 @@ issue_reaction_exists "$restart_comment" rocket || \
 stop_process "$runtime_pid"
 runtime_pid=
 start_runtime
-for _ in $(seq 1 120); do
+for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
     unknown_group=$(latest_issue_group)
     unknown_status_count=$(gh api "repos/$repository/issues/$restart_issue_number/comments" --paginate | jq \
         --arg app "$app_actor" \

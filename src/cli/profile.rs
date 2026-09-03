@@ -13,7 +13,7 @@ pub fn profile_inspect(arguments: &ProfileInspect) -> Result<()> {
         println!("provider: {}", profile.provider);
         println!("model: {}", profile.model.as_deref().unwrap_or("provider default"));
         println!("reasoning: {}", profile.reasoning.as_deref().unwrap_or("provider default"));
-        println!("workspace: {}", profile.workspace.display());
+        println!("workspace: {}", profile.workspace().display());
         println!("status surfaces: {}", profile.status_surfaces.join(", "));
         println!(
             "context budget: {:.0}% / {} bytes hard",

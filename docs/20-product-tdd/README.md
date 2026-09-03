@@ -107,7 +107,7 @@ crates. Modules are deep and align with authority boundaries:
 | `provider::session` | `ProviderAgentSession` adapter that maps `AgentSession` to `AgentProvider` primitives and translates provider notifications into `SessionEvent`s, deduplicating the provider's response-side and notification-side observation of the same fact. |
 | `session_manager` | In-process `SessionManager` keyed by provider thread id; start/resume/get. Ephemeral per connection epoch: it is rebuilt from the durable store on every (re)connect because sessions bind the epoch's provider handle. |
 | `provider` | Provider-neutral capability contract and Codex NDJSON implementation. |
-| `worktree` | Validate a Profile source checkout, fetch the bound PR head, provision one generation-scoped worktree per Implementation Agent, and expose recovery diagnostics; no Git-operation sandbox. |
+| `worktree` | Validate a Profile source checkout, resolve the bound ref (PR head, sole Development branch, or default origin branch), provision one generation-scoped worktree per Agent Group, and expose recovery diagnostics; no Git-operation sandbox. |
 | `writer` | `braid gh`, attribution, reaction/status desired state, and write-outbox convergence. |
 | `telemetry` | Trace/metric/log creation, payload events, sampling configuration, and OTLP export. |
 | `tunnel` | Wrangler Quick Tunnel supervision and webhook URL handoff. |
@@ -118,6 +118,18 @@ Module dependencies point one way only: `runtime` → `group` → `queue`, and
 `runtime` → `producer` → `outbox`/`health`; `queue`, `outbox`, and `health`
 sit above the leaf modules (`store`, `context`, `github`, `config`,
 `provider`, `worktree`, `telemetry`) and no lower layer imports an upper one.
+
+### Internal Event Model
+
+`store` owns the typed, platform-neutral event contract `EventKind`
+(`assign`, `unassign`, `mention`, `wake`, `invalidate`, `lifecycle`,
+`origin_echo`, `noop`) next to the events ledger it persists. A producer translates platform deliveries into
+`EventKind` at ingress and records only the internal kind plus the per-platform
+opaque Event Reference; `queue` and `group` consume `EventKind` exclusively
+and never branch on platform event names or actions. This is the seam at
+which a future non-GitHub platform plugs in: it adds a producer mapping, not
+new consumer logic. The current GitHub mapping is owned by
+[`github.md`](github.md).
 
 ### State authority
 
@@ -209,14 +221,35 @@ newer than the binary. Compatible application rollback is declared per release;
 an incompatible schema rollback restores the pre-migration backup rather than
 running a down migration.
 
-For a PR-capable Profile, `workspace` names a clean source Git checkout of the
-configured repository, not the directory in which the Agent edits. Braid
-fetches the PR head from that checkout and provisions the actual Agent cwd under
-`runtime.root/worktrees/pr-<number>/<profile>-g<generation>`. SQLite records the
-resolved source, worktree, remote head, and local branch as operational facts.
-The provider session is started and later resumed only against that worktree.
-This provides isolation and recovery identity without turning Braid into a Git
-policy engine.
+For any Agent-serving Profile, `workspace` names the instance source Git
+checkout of the configured repository (one repository = one source checkout,
+defaulting to `<instance>/source`), not the directory in which the Agent
+edits. Every Agent Group session runs in a dedicated generation-scoped
+worktree that Braid provisions from that checkout under the configurable
+`[runtime] worktrees` directory (default `<state>/worktrees`; only new
+generations use a changed location — SQLite records each worktree's actual
+path):
+
+- PR Agent Group: `runtime.root/worktrees/pr-<number>/<profile>-g<generation>`,
+  bound to the fetched PR head;
+- Issue Agent Group: `runtime.root/worktrees/issue-<number>/<profile>-g<generation>`,
+  bound to the Issue's sole same-repository Development linked branch when
+  exactly one exists, otherwise to the repository default branch
+  (`refs/remotes/origin/<default>`). Several Development branches are not an
+  error: the worktree still starts on the default branch, and the Braid
+  System Prompt tells the Agent it may switch or create branches in its
+  worktree as the work requires (Context lists the Development branches).
+
+Every worktree gets `.braid/` added to its `.git/info/exclude` at provision
+time: that directory persists across Provider Session replacement within the
+same assignment generation and stays out of `git status`, commits, and
+GitHub. The System Prompt states these facts and nothing more — whether and
+how the Agent uses the directory is its own choice.
+
+SQLite records the resolved source, worktree, bound ref, and local branch as
+operational facts. The provider session is started and later resumed only
+against that worktree. This provides isolation and recovery identity without
+turning Braid into a Git policy engine.
 
 ## Error and Concurrency Model
 

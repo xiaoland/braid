@@ -62,6 +62,11 @@ pub struct RuntimeConfig {
     /// Defaults to `<root>/backups`.
     #[serde(default)]
     pub backups: Option<PathBuf>,
+    /// Where generation-scoped Agent worktrees are provisioned. Defaults to
+    /// `<root>/worktrees`. Only new provisioning uses it; existing
+    /// generations keep the worktree paths recorded in `SQLite`.
+    #[serde(default)]
+    pub worktrees: Option<PathBuf>,
     #[serde(default)]
     pub auto_migrate: bool,
 }
@@ -81,15 +86,23 @@ impl RuntimeConfig {
         if self.backups.is_none() {
             self.backups = Some(root.join("backups"));
         }
+        if self.worktrees.is_none() {
+            self.worktrees = Some(root.join("worktrees"));
+        }
         self.root = Some(root);
         self.database =
             Some(resolve_path(base, self.database.as_ref().expect("database resolved")));
         self.backups = Some(resolve_path(base, self.backups.as_ref().expect("backups resolved")));
+        self.worktrees =
+            Some(resolve_path(base, self.worktrees.as_ref().expect("worktrees resolved")));
     }
 
     fn require_resolved(&self) {
         assert!(
-            self.root.is_some() && self.database.is_some() && self.backups.is_some(),
+            self.root.is_some()
+                && self.database.is_some()
+                && self.backups.is_some()
+                && self.worktrees.is_some(),
             "RuntimeConfig paths must be resolved before use"
         );
     }
@@ -107,6 +120,11 @@ impl RuntimeConfig {
     pub fn backups(&self) -> &Path {
         self.require_resolved();
         self.backups.as_ref().expect("resolved")
+    }
+
+    pub fn worktrees(&self) -> &Path {
+        self.require_resolved();
+        self.worktrees.as_ref().expect("resolved")
     }
 }
 
@@ -292,11 +310,30 @@ pub struct Profile {
     pub model: Option<String>,
     pub reasoning: Option<String>,
     pub user_instructions: String,
-    pub workspace: PathBuf,
+    /// The source Git checkout for this instance's repository, shared by all
+    /// Profiles as the worktree provisioning source (one repository = one
+    /// source checkout). Defaults to `<config_dir>/source`; Agent sessions
+    /// never edit it directly — they run in provisioned worktrees.
+    #[serde(default)]
+    pub workspace: Option<PathBuf>,
     pub github_actor_node_id: Option<String>,
     pub status_surfaces: Vec<String>,
     pub github_context_soft_ratio: f64,
     pub github_context_hard_bytes: usize,
+}
+
+impl Profile {
+    /// Fill an omitted workspace with the instance source checkout and
+    /// normalize a relative override against the config directory.
+    pub fn resolve_workspace(&mut self, base: &Path) {
+        let workspace = self.workspace.take().unwrap_or_else(|| base.join("source"));
+        self.workspace = Some(resolve_path(base, &workspace));
+    }
+
+    /// The resolved source checkout path (valid after `Config::load`).
+    pub fn workspace(&self) -> &Path {
+        self.workspace.as_deref().expect("Profile workspace resolved before use")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -374,6 +411,9 @@ impl Config {
             std::env::current_dir().map(|cwd| cwd.join(&base)).unwrap_or(base)
         };
         config.runtime.resolve(&base);
+        for profile in &mut config.profiles {
+            profile.resolve_workspace(&base);
+        }
         config.validate()?;
         Ok(config)
     }
@@ -739,7 +779,9 @@ impl Profile {
             )));
         }
         validate_token("profile.provider", &self.provider)?;
-        require_absolute(&format!("profile {:?}.workspace", self.id), &self.workspace)?;
+        if let Some(workspace) = &self.workspace {
+            require_absolute(&format!("profile {:?}.workspace", self.id), workspace)?;
+        }
         if self.tags.is_empty() || (!self.has_tag("issue") && !self.has_tag("pr")) {
             return Err(ConfigError::Invalid(format!(
                 "profile {:?} must have issue or pr capability tag",
@@ -782,16 +824,12 @@ impl Profile {
                 self.id, self.adapter_version, runtime.adapter_type, runtime.version
             )));
         }
-        let llm = config.llm_provider_for(self)?;
-        if let Some(model_id) = &self.model
-            && !llm.models.iter().any(|model| model.model_id == *model_id)
-        {
-            return Err(ConfigError::Invalid(format!(
-                "profile {:?} model {:?} not found in llm_providers {:?}",
-                self.id, model_id, llm.id
-            )));
-        }
-
+        let _llm = config.llm_provider_for(self)?;
+        // The profile's model is a request to the provider, and the provider
+        // is the authority on which models it accepts. The llm_providers
+        // catalog only carries cost metadata, so an uncatalogued model is
+        // not a config error: Codex must be able to answer with a real
+        // turn failure for a model it does not support.
         Ok(())
     }
 }

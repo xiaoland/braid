@@ -3,6 +3,106 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
+## [0.3.1] - unreleased
+
+### Added
+
+- `[runtime] worktrees` overrides where generation-scoped Agent worktrees are
+  provisioned (default `<state>/worktrees`). Only new generations use a
+  changed location; existing generations keep the paths recorded in SQLite.
+- `braid setup` clones the configured repository into the instance source
+  checkout (`<instance>/source`): one clone per repository, shared by all
+  Profiles as the worktree provisioning source. `profile.workspace` is now
+  optional and defaults to this source checkout; `braid doctor` validates it
+  ("Source checkout" check).
+- Braid System Prompt v2: Publication Discretion (a delivered comment or
+  mention never obligates a public reply; silence is a valid outcome) and the
+  private persistent workspace (`.braid/` files in the generation worktree,
+  git-excluded, surviving provider session replacement).
+- Issue Agent sessions run in a dedicated generation-scoped worktree
+  (`worktrees/issue-<number>/<profile>-g<generation>`) bound to the issue's
+  sole same-repository Development linked branch, or the repository default
+  branch when zero or several exist; resume, reopen-reactivation, and Context
+  resets all restore the worktree as the session cwd.
+
+### Fixed
+
+- Live smoke (0.3.1 candidate, reconcile-only mode): Issue Agent worktree
+  provisioning no longer fails on the PR-only worktree record guard;
+  opening-body mentions now activate (scanned alongside comment/review
+  bodies, promoted from noop to pending mention); reconcile no longer skips
+  close/reopen transitions whose body digest survived, nor wedges close
+  events on dormant groups; reopen reactivation provisions a fresh worktree
+  for pre-worktree (v0.3.0) generations, replaces every stale session of the
+  agent, and never wedges the event pending on unselectable generations;
+  fenced-unknown turns replay their wake inputs at-least-once after the
+  reset lands; restart resume fences crashed in-flight turns before any
+  compatibility verdict and logs the exact incompatibility reason.
+- Black-box suite hardening: provider connection loss now surfaces
+  `provider: unavailable` in health until reconnect succeeds; App hook
+  deliveries listing no longer sends the rejected `page` key; an
+  uncatalogued Profile model is no longer a config error (the provider is
+  the authority on model support); the System Prompt requires publishing
+  through `braid gh` only, so Agent comments are always App-authored and
+  uncorrelated identities are not invited.
+
+- `braid setup` pinned a hardcoded profile `adapter_version`, so config
+  validation rejected the generated config whenever the discovered runtime
+  version differed (e.g. codex-cli 0.151.0). The profile now pins the
+  discovered runtime version.
+- Reopen reactivation was not idempotent: when a newer assignment generation
+  was already active (or the reopen was delivered twice), reactivation
+  selected a stale sleeping generation, hit the unique active-assignment
+  index, and error-looped every tick, permanently wedging the group scheduler.
+  Reactivation is now an ensure-style no-op when the group is already
+  materializing/active/finalizing.
+- A trusted `@braid` mention on a closed Work Item activated a new assignment
+  generation. Activation (`assign`/`mention`) now applies only to open Work
+  Items; closed groups sleep until reopen, as the lifecycle contract states.
+
+### Changed
+
+- The event ledger now stores the typed, platform-neutral `EventKind`
+  (`assign`/`unassign`/`mention`/`wake`/`invalidate`/`lifecycle`/
+  `origin_echo`/`noop`) plus a semantic detail instead of ad-hoc
+  GitHub-shaped classification strings (schema v2). Producers map platform
+  deliveries at ingress; queue and group consumers branch on `EventKind`
+  only. Cross-surface invalidation folds into `invalidate` with
+  `detail='cross_surface'`; agent-origin echoes and ping/unknown deliveries
+  are evidence-only and consumed at ingest.
+- `braid setup` now creates the Profile workspace directory it writes into
+  the config; previously a fresh setup left the workspace missing and the
+  first Agent turn materialization failed with the Assignment parked in
+  `blocked`.
+- `braid setup` now bootstraps the instance-scoped Codex provider home:
+  it imports `~/.codex/auth.json` when present and otherwise prints explicit
+  `CODEX_HOME=... codex login` instructions. Previously `braid serve` ran
+  with the provider perpetually disconnected and no guidance.
+- `braid doctor` gained a "Codex credentials" check for provider-home
+  authentication, so the gap is caught before serving.
+
+### Added
+
+- Setup output and the user manual now state the Issue activation contract:
+  a trusted `@braid` mention from a MAINTAIN/ADMIN actor. Native Issue
+  assignment is GitHub-side Agent App provisioning that ordinary
+  manifest-created Apps cannot obtain; Braid detects the mode at runtime.
+
+- The GitHub installation client no longer pins the initial installation
+  token: it is built via octocrab's installation auth state, which caches and
+  auto-refreshes the token. Previously every API call began failing with 401
+  "Bad credentials" one hour after `serve` started (token expiry), silently
+  wedging mention resolution, reactions, and the write outbox until restart.
+- Mention-authority resolution now backs off exponentially (2s to 60s) on
+  persistent GitHub errors instead of retrying every 250ms scheduler tick.
+
+- PR worktree provisioning fetched through libgit2, which ignores the
+  operator's credential helpers and proxy configuration and failed on real
+  networks ("no TLS stream available"). The fetch now uses the configured
+  system `git` executable; libgit2 remains for local reference/worktree
+  operations.
+
+
 ## [0.3.0] - 2026-08-31
 
 ### Added

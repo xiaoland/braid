@@ -172,7 +172,12 @@ write_config "$v1_config" "$v1" 1.0 43189
 backup_count_before=$(find "$runtime/state/backups" -type f -name '*.sqlite3' | wc -l | tr -d ' ')
 run_clean "$braid" migrate apply --config "$v1_config"
 backup_count_after=$(find "$runtime/state/backups" -type f -name '*.sqlite3' | wc -l | tr -d ' ')
-test "$backup_count_after" = "$backup_count_before"
+# Applying v2 on the v1 fixture is a real upgrade and must take exactly one
+# pre-migration backup; re-applying is a no-op and must not add another.
+test "$backup_count_after" = "$((backup_count_before + 1))"
+run_clean "$braid" migrate apply --config "$v1_config"
+backup_count_final=$(find "$runtime/state/backups" -type f -name '*.sqlite3' | wc -l | tr -d ' ')
+test "$backup_count_final" = "$backup_count_after"
 v1_schema=$(run_clean "$braid" status --config "$v1_config" --json | /usr/bin/sed -n 's/.*"config_schema": \([0-9][0-9]*\).*/\1/p')
 test "$v1_schema" = "2"
 /usr/bin/sqlite3 "$v1" \

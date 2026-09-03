@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use git2::{ErrorClass, ErrorCode, Repository, WorktreeAddOptions};
+use git2::{ErrorClass, ErrorCode, Repository};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -27,6 +27,10 @@ pub struct WorktreeRequest<'a> {
     pub target: &'a Path,
     pub repository: &'a str,
     pub remote: &'a str,
+    /// System `git` executable used for the network fetch: it honors the
+    /// operator's credential helpers and proxy configuration, which libgit2
+    /// does not.
+    pub git: &'a Path,
     pub head_ref: &'a str,
     pub local_branch: &'a str,
 }
@@ -54,6 +58,7 @@ pub fn provision(request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, W
             request.remote, request.repository
         )));
     }
+    exclude_private_notes(request, &source)?;
     if request.target.exists() {
         return verify_existing(request, &source);
     }
@@ -62,34 +67,89 @@ pub fn provision(request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, W
             .map_err(|source| WorktreeError::Io { path: parent.to_path_buf(), source })?;
     }
     tokio::task::block_in_place(|| {
-        let repo = Repository::open(&source)?;
-        let mut remote = repo.find_remote(request.remote)?;
-        remote.fetch(
-            &[&format!("refs/heads/{0}:refs/remotes/{1}/{0}", request.head_ref, request.remote)],
-            None,
-            None,
-        )?;
-        let reference = repo
-            .find_reference(&format!("refs/remotes/{}/{}", request.remote, request.head_ref))
-            .map_err(|error| {
-                WorktreeError::Git(format!(
-                    "fetched ref refs/remotes/{}/{} not found: {error}",
-                    request.remote, request.head_ref
-                ))
-            })?;
-        let mut options = WorktreeAddOptions::new();
-        options.reference(Some(&reference));
-        let _worktree = repo
-            .worktree(request.local_branch, request.target, Some(&options))
-            .map_err(|error| {
-                WorktreeError::Git(format!(
-                    "cannot add worktree at {}: {error}",
-                    request.target.display()
-                ))
-            })?;
+        let git = |args: &[&str]| -> Result<(), WorktreeError> {
+            let output = std::process::Command::new(request.git)
+                .arg("-C")
+                .arg(&source)
+                .args(args)
+                .output()
+                .map_err(|source_err| WorktreeError::Io {
+                    path: source.clone(),
+                    source: source_err,
+                })?;
+            if !output.status.success() {
+                return Err(WorktreeError::Git(format!(
+                    "git {} failed: {}",
+                    args.first().unwrap_or(&""),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            Ok(())
+        };
+        let remote_ref = format!("refs/remotes/{}/{}", request.remote, request.head_ref);
+        git(&[
+            "fetch",
+            request.remote,
+            &format!("+refs/heads/{0}:{1}", request.head_ref, remote_ref),
+        ])?;
+        // libgit2's worktree add rejects remote-tracking references
+        // ("reference is not a branch"); the system git creates the
+        // generation-scoped local branch and the worktree in one step.
+        git(&[
+            "worktree",
+            "add",
+            request
+                .target
+                .to_str()
+                .ok_or_else(|| WorktreeError::Git("worktree target path is not UTF-8".into()))?,
+            "-B",
+            request.local_branch,
+            &remote_ref,
+        ])?;
         Ok::<(), WorktreeError>(())
     })?;
     verify_existing(request, &source)
+}
+
+/// `.braid/` inside a worktree is the Agent's private persistent workspace
+/// (working notes, drafts, scratch state). Excluding it through the common
+/// git dir's `info/exclude` keeps it out of `git status`, commits, and GitHub
+/// for the source checkout and every worktree.
+fn exclude_private_notes(
+    request: &WorktreeRequest<'_>,
+    source: &Path,
+) -> Result<(), WorktreeError> {
+    let output = std::process::Command::new(request.git)
+        .arg("-C")
+        .arg(source)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .map_err(|source_err| WorktreeError::Io {
+            path: source.to_path_buf(),
+            source: source_err,
+        })?;
+    if !output.status.success() {
+        return Err(WorktreeError::Git(format!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let common_dir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let common_dir = Path::new(&common_dir);
+    let common_dir =
+        if common_dir.is_absolute() { common_dir.to_path_buf() } else { source.join(common_dir) };
+    let exclude = common_dir.join("info").join("exclude");
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == ".braid/") {
+        return Ok(());
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(".braid/\n");
+    std::fs::write(&exclude, updated)
+        .map_err(|source_err| WorktreeError::Io { path: exclude.clone(), source: source_err })
 }
 
 fn verify_existing(

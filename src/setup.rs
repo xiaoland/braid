@@ -201,6 +201,18 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     }
     config.validate().context("generated config failed validation")?;
 
+    let source = base_dir.join("source");
+    if let Err(error) = ensure_source_checkout(&source, &arguments.repository, &config.tools.git) {
+        println!("\nWarning: {error:#}");
+        println!(
+            "Clone the repository manually and re-run doctor:\n  git clone https://github.com/{} {}",
+            arguments.repository,
+            source.display()
+        );
+    }
+    let runtime_home = base_dir.join("provider").join(&arguments.provider);
+    bootstrap_provider_home(&runtime_home, &arguments.provider)?;
+
     let config_text = toml::to_string(&config).context("cannot serialize generated config")?;
     write_secret(&config_path, config_text.as_bytes())?;
 
@@ -212,6 +224,11 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     println!("\nNext, install the App on {}:\n{}\n", arguments.repository, install_url(&app.slug));
     println!(
         "Then run:\n  braid doctor --instance {instance_key}\n  braid serve --instance {instance_key} --tunnel\n"
+    );
+    println!(
+        "Once serving, activate Braid on an issue with a visible @braid comment from a \
+         repository admin/maintainer. (Native Issue assignment requires GitHub-side Agent \
+         App provisioning and is not available to ordinary Apps.)"
     );
 
     let logo_path = base_dir.join(format!("braid-of-{owner}-logo.png"));
@@ -556,6 +573,7 @@ fn build_config(
     runtime: RuntimeEntry,
     llm_provider: LlmProvider,
 ) -> anyhow::Result<Config> {
+    let runtime_version = runtime.version.clone();
     let mut config = Config {
         schema_version: CONFIG_SCHEMA_VERSION,
         instance: crate::config::InstanceConfig {
@@ -565,6 +583,7 @@ fn build_config(
             root: None,
             database: None,
             backups: None,
+            worktrees: None,
             auto_migrate: false,
         },
         github: GitHubConfig {
@@ -606,11 +625,11 @@ fn build_config(
             display_name: "Braid Agent".to_owned(),
             tags: vec!["issue".to_owned(), "pr".to_owned()],
             adapter_type: arguments.provider.clone(),
-            adapter_version: if arguments.provider == "codex" {
-                "codex-cli 0.147.0-alpha.6.5".to_owned()
-            } else {
-                "0.84.3".to_owned()
-            },
+            // Pin the profile to the runtime that setup actually discovered:
+            // config validation requires adapter_version == runtime.version,
+            // so a hardcoded string breaks the moment the local runtime
+            // upgrades.
+            adapter_version: runtime_version,
             provider: if arguments.provider == "codex" {
                 "openai".to_owned()
             } else {
@@ -619,7 +638,7 @@ fn build_config(
             model: Some(arguments.model.clone()),
             reasoning: Some("high".to_owned()),
             user_instructions: "You are Braid, a helpful coding assistant. Work from the supplied GitHub Context, publish concise public comments, and keep descriptions and implementation state current.".to_owned(),
-            workspace: base_dir.join("workspace/default"),
+            workspace: None,
             github_actor_node_id: None,
             status_surfaces: vec!["issue".to_owned(), "pr".to_owned()],
             github_context_soft_ratio: 0.80,
@@ -632,6 +651,69 @@ fn build_config(
     config.runtime.resolve(base_dir);
     config.validate().context("generated config failed validation")?;
     Ok(config)
+}
+
+/// Prepare the instance-scoped provider home so the runtime can actually
+/// authenticate. Codex isolates `CODEX_HOME` per instance, so its global
+/// credentials do not apply: import `~/.codex/auth.json` when present,
+/// otherwise print explicit login instructions. Pi authenticates through the
+/// persisted provider API key and needs no home bootstrap.
+/// The instance source checkout: one Git clone of the configured repository,
+/// shared by all Profiles as the worktree provisioning source. Clone when
+/// missing or empty; never overwrite a non-Git directory.
+fn ensure_source_checkout(source: &Path, repository: &str, git: &Path) -> Result<()> {
+    if source.join(".git").exists() {
+        println!("Source checkout already present: {}", source.display());
+        return Ok(());
+    }
+    if source.exists() && fs::read_dir(source).ok().is_some_and(|mut d| d.next().is_some()) {
+        anyhow::bail!(
+            "source path {} exists but is not a Git checkout; move it aside or clone into it",
+            source.display()
+        );
+    }
+    println!("Cloning {} into {} ...", repository, source.display());
+    let status = std::process::Command::new(git)
+        .args(["clone", &format!("https://github.com/{repository}.git")])
+        .arg(source)
+        .status()
+        .with_context(|| format!("cannot launch git clone for {}", source.display()))?;
+    if !status.success() {
+        anyhow::bail!("git clone exited with {status}");
+    }
+    Ok(())
+}
+
+fn bootstrap_provider_home(home: &Path, adapter_type: &str) -> Result<()> {
+    fs::create_dir_all(home)
+        .with_context(|| format!("cannot create provider home {}", home.display()))?;
+    if adapter_type != "codex" {
+        return Ok(());
+    }
+    let auth = home.join("auth.json");
+    if auth.is_file() {
+        return Ok(());
+    }
+    let global = dirs::home_dir().map(|dir| dir.join(".codex").join("auth.json"));
+    if let Some(global) = global
+        && global.is_file()
+    {
+        fs::copy(&global, &auth).with_context(|| {
+            format!("cannot import Codex credentials from {}", global.display())
+        })?;
+        write_secret(&auth, &fs::read(&auth)?)?; // enforce 0600
+        println!(
+            "Imported Codex credentials from {} into the instance provider home.",
+            global.display()
+        );
+    } else {
+        println!(
+            "Codex provider home is not authenticated yet. Before `braid serve`, run:\n  \
+             CODEX_HOME={} codex login",
+            home.display()
+        );
+    }
+    Ok(())
 }
 
 fn tool_path(name: &str, fallback: &str) -> String {
@@ -656,6 +738,40 @@ mod tests {
             runtime_api_url: None,
             no_browser: false,
         }
+    }
+
+    #[test]
+    fn bootstrap_provider_home_is_noop_for_pi() {
+        let dir = std::env::temp_dir().join(format!("braid-pi-home-{:?}", std::process::id()));
+        let dir = dir.with_file_name(format!(
+            "braid-pi-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        bootstrap_provider_home(&dir, "pi").expect("pi bootstrap");
+        assert!(dir.is_dir());
+        assert!(!dir.join("auth.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bootstrap_provider_home_respects_existing_codex_auth() {
+        let dir = std::env::temp_dir().join(format!(
+            "braid-codex-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("auth.json"), "{}").expect("seed auth");
+        bootstrap_provider_home(&dir, "codex").expect("codex bootstrap");
+        assert_eq!(std::fs::read_to_string(dir.join("auth.json")).expect("read"), "{}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

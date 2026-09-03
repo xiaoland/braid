@@ -82,7 +82,6 @@ gh auth status >/dev/null 2>&1 || fail "gh must expose the controlled Human/Agen
 
 repository="$($binary config check --config "$config_path" --json | jq -er '.repository')"
 app_actor="$($binary github probe --config "$config_path" --repository "$repository" --json | jq -er '.actor_login')"
-agent_actor="$(gh api user --jq '.login')"
 wrangler="${BRAID_TEST_WRANGLER:-$(command -v wrangler || true)}"
 tunnel_url="${BRAID_TEST_PUBLIC_WEBHOOK_URL:-}"
 tunnel_url="${tunnel_url%/webhook}"
@@ -148,7 +147,7 @@ fi
 BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
     --config "$test_config" >"$runtime_log" 2>&1 &
 runtime_pid=$!
-for _ in $(seq 1 120); do
+for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
     if curl -fsS "$health_url" 2>/dev/null | \
         jq -e '.ready == true and .provider == "connected"' >/dev/null; then
         break
@@ -214,7 +213,7 @@ agent_marker_count() {
     local marker=$1
     local issue=${2:-$fixture_issue}
     gh api "repos/$repository/issues/$issue/comments" | \
-        jq --arg actor "$agent_actor" --arg marker "$marker" \
+        jq --arg actor "$app_actor" --arg marker "$marker" \
             '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")) and (.body | contains($marker)))] | length'
 }
 
@@ -254,7 +253,7 @@ start_candidate_runtime() {
     BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
         --config "$config" >>"$runtime_log" 2>&1 &
     runtime_pid=$!
-    for _ in $(seq 1 120); do
+    for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
         if curl -fsS "$health_url" 2>/dev/null | \
             jq -e '.ready == true and .provider == "connected"' >/dev/null; then
             return 0
@@ -274,6 +273,12 @@ for _ in $(seq 1 180); do
     sleep 2
 done
 has_reaction "$activation_comment" +1 || fail "baseline activation did not complete"
+# GitHub's comments-list read can briefly lag the reactions read right after
+# a turn terminal; give the final marker assertion a short settle window.
+for _ in $(seq 1 15); do
+    [[ "$(agent_marker_count "$baseline_marker")" -eq 1 ]] && break
+    sleep 2
+done
 [[ "$(agent_marker_count "$baseline_marker")" -eq 1 ]] || fail "baseline Agent marker is absent"
 
 for _ in $(seq 1 90); do
@@ -298,11 +303,11 @@ baseline_session="$(jq -er --argjson number "$fixture_issue" '
       .session_lifecycle == "idle")][0].provider_session_id
 ' <<<"$status_payload")"
 baseline_agent_comments="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
-    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
 
 note "editing idle Issue Context: replace session without starting a turn"
 gh issue edit "$fixture_issue" --repo "$repository" --body "Idle replacement design: $idle_marker" >/dev/null
-for _ in $(seq 1 120); do
+for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
     status_payload="$($binary status --config "$test_config" --json)"
     if jq -e --argjson number "$fixture_issue" '
         any(.transport.context_resets[];
@@ -326,7 +331,7 @@ idle_session="$(jq -er --argjson number "$fixture_issue" '
 [[ "$idle_session" != "$baseline_session" ]] || fail "idle invalidation reused the stale provider session"
 sleep 5
 current_agent_comments="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
-    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
 [[ "$current_agent_comments" -eq "$baseline_agent_comments" ]] || \
     fail "idle invalidation fabricated a turn"
 
@@ -392,7 +397,7 @@ distinct_sessions="$(jq --argjson number "$fixture_issue" '
 
 note "minimizing a visible comment: reconcile, replace idle Context, start no turn"
 comments_before_minimize="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
-    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
 gh api graphql \
     -f query='mutation($id:ID!){minimizeComment(input:{subjectId:$id,classifier:OUTDATED}){minimizedComment{isMinimized minimizedReason}}}' \
     -f id="$restored_comment_node_id" | jq -e '.data.minimizeComment.minimizedComment.isMinimized == true' >/dev/null
@@ -427,7 +432,7 @@ grep -q "$restored_marker" <<<"$minimized_context" && \
     fail "minimized comment body remained in current Context"
 sleep 5
 comments_after_minimize="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
-    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
 [[ "$comments_after_minimize" -eq "$comments_before_minimize" ]] || \
     fail "minimize Hard Invalidation fabricated a turn"
 
@@ -462,7 +467,7 @@ grep -q "$restored_marker" <<<"$restored_context" || \
 
 note "deleting another visible comment: retain tombstone, replace idle Context"
 comments_before_delete="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
-    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
 gh api --method DELETE "repos/$repository/issues/comments/$deleted_comment_id" >/dev/null
 for _ in $(seq 1 150); do
     status_payload="$($binary status --config "$test_config" --json)"
@@ -495,7 +500,7 @@ grep -q "$deleted_marker" <<<"$deleted_context" && \
     fail "deleted comment body remained in current Context"
 sleep 5
 comments_after_delete="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
-    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
 [[ "$comments_after_delete" -eq "$comments_before_delete" ]] || \
     fail "delete Hard Invalidation fabricated a turn"
 
@@ -602,14 +607,15 @@ note "terminating the idle app-server: reconnect and resume the same provider th
 provider_child_pid=""
 for _ in $(seq 1 30); do
     provider_child_pid="$(ps -axo pid=,ppid=,command= | awk -v parent="$runtime_pid" '
-        $2 == parent && index($0, "app-server") { print $1; exit }
+        # consume all of ps output; an early exit SIGPIPEs ps under pipefail
+        $2 == parent && index($0, "app-server") && !found { print $1; found = 1 }
     ')"
     [[ -n "$provider_child_pid" ]] && break
     sleep 1
 done
 [[ -n "$provider_child_pid" ]] || fail "could not identify the app-server child process"
 kill -TERM "$provider_child_pid"
-for _ in $(seq 1 120); do
+for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
     status_payload="$($binary status --config "$test_config" --json)"
     if curl -fsS "$health_url" 2>/dev/null | jq -e '.provider == "connected"' >/dev/null && \
         jq -e --argjson number "$fixture_issue" --arg session "$reopened_session" '
@@ -655,7 +661,9 @@ jq -e --argjson number "$fixture_issue" --arg session "$reopened_session" '
 ' >/dev/null <<<"$status_payload" || fail "post-resume turn changed the physical provider session"
 
 app_comments="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
-    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor)] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor
+        and ((.body | startswith("> **Braid Agent")) | not)
+        and ((.body | startswith("> **Braid Operational Status")) | not))] | length')"
 [[ "$app_comments" -eq 0 ]] || fail "Braid published turn activity during Context replacement"
 
 stop_process "$runtime_pid"
