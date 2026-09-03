@@ -82,7 +82,6 @@ gh auth status >/dev/null 2>&1 || fail "gh must expose the controlled Human/Agen
 
 repository="$($binary config check --config "$config_path" --json | jq -er '.repository')"
 app_actor="$($binary github probe --config "$config_path" --repository "$repository" --json | jq -er '.actor_login')"
-agent_actor="$(gh api user --jq '.login')"
 wrangler="${BRAID_TEST_WRANGLER:-$(command -v wrangler || true)}"
 tunnel_url="${BRAID_TEST_PUBLIC_WEBHOOK_URL:-}"
 tunnel_url="${tunnel_url%/webhook}"
@@ -214,7 +213,7 @@ agent_marker_count() {
     local marker=$1
     local issue=${2:-$fixture_issue}
     gh api "repos/$repository/issues/$issue/comments" | \
-        jq --arg actor "$agent_actor" --arg marker "$marker" \
+        jq --arg actor "$app_actor" --arg marker "$marker" \
             '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")) and (.body | contains($marker)))] | length'
 }
 
@@ -304,7 +303,7 @@ baseline_session="$(jq -er --argjson number "$fixture_issue" '
       .session_lifecycle == "idle")][0].provider_session_id
 ' <<<"$status_payload")"
 baseline_agent_comments="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
-    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
 
 note "editing idle Issue Context: replace session without starting a turn"
 gh issue edit "$fixture_issue" --repo "$repository" --body "Idle replacement design: $idle_marker" >/dev/null
@@ -332,7 +331,7 @@ idle_session="$(jq -er --argjson number "$fixture_issue" '
 [[ "$idle_session" != "$baseline_session" ]] || fail "idle invalidation reused the stale provider session"
 sleep 5
 current_agent_comments="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
-    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
 [[ "$current_agent_comments" -eq "$baseline_agent_comments" ]] || \
     fail "idle invalidation fabricated a turn"
 
@@ -398,7 +397,7 @@ distinct_sessions="$(jq --argjson number "$fixture_issue" '
 
 note "minimizing a visible comment: reconcile, replace idle Context, start no turn"
 comments_before_minimize="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
-    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
 gh api graphql \
     -f query='mutation($id:ID!){minimizeComment(input:{subjectId:$id,classifier:OUTDATED}){minimizedComment{isMinimized minimizedReason}}}' \
     -f id="$restored_comment_node_id" | jq -e '.data.minimizeComment.minimizedComment.isMinimized == true' >/dev/null
@@ -433,7 +432,7 @@ grep -q "$restored_marker" <<<"$minimized_context" && \
     fail "minimized comment body remained in current Context"
 sleep 5
 comments_after_minimize="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
-    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
 [[ "$comments_after_minimize" -eq "$comments_before_minimize" ]] || \
     fail "minimize Hard Invalidation fabricated a turn"
 
@@ -468,7 +467,7 @@ grep -q "$restored_marker" <<<"$restored_context" || \
 
 note "deleting another visible comment: retain tombstone, replace idle Context"
 comments_before_delete="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
-    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
 gh api --method DELETE "repos/$repository/issues/comments/$deleted_comment_id" >/dev/null
 for _ in $(seq 1 150); do
     status_payload="$($binary status --config "$test_config" --json)"
@@ -501,7 +500,7 @@ grep -q "$deleted_marker" <<<"$deleted_context" && \
     fail "deleted comment body remained in current Context"
 sleep 5
 comments_after_delete="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
-    jq --arg actor "$agent_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor and (.body | startswith("> **Braid Agent")))] | length')"
 [[ "$comments_after_delete" -eq "$comments_before_delete" ]] || \
     fail "delete Hard Invalidation fabricated a turn"
 
