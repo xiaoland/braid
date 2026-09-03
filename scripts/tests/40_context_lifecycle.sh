@@ -274,6 +274,12 @@ for _ in $(seq 1 180); do
     sleep 2
 done
 has_reaction "$activation_comment" +1 || fail "baseline activation did not complete"
+# GitHub's comments-list read can briefly lag the reactions read right after
+# a turn terminal; give the final marker assertion a short settle window.
+for _ in $(seq 1 15); do
+    [[ "$(agent_marker_count "$baseline_marker")" -eq 1 ]] && break
+    sleep 2
+done
 [[ "$(agent_marker_count "$baseline_marker")" -eq 1 ]] || fail "baseline Agent marker is absent"
 
 for _ in $(seq 1 90); do
