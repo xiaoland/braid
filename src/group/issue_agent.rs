@@ -157,7 +157,11 @@ pub(crate) async fn issue_agent_worker(
         if !disconnected || *shutdown.borrow() {
             return;
         }
-        health.write().await.provider = "reconnecting";
+        // The connection epoch ended: no live provider session exists until
+        // the next connect/resume succeeds, so surface the gap honestly.
+        if !convergence_failed {
+            set_provider_unavailable(&health, "provider connection lost; reconnecting").await;
+        }
     }
 }
 
