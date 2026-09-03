@@ -38,6 +38,13 @@ Versioning once release artifacts are published.
   fenced-unknown turns replay their wake inputs at-least-once after the
   reset lands; restart resume fences crashed in-flight turns before any
   compatibility verdict and logs the exact incompatibility reason.
+- Black-box suite hardening: provider connection loss now surfaces
+  `provider: unavailable` in health until reconnect succeeds; App hook
+  deliveries listing no longer sends the rejected `page` key; an
+  uncatalogued Profile model is no longer a config error (the provider is
+  the authority on model support); the System Prompt requires publishing
+  through `braid gh` only, so Agent comments are always App-authored and
+  uncorrelated identities are not invited.
 
 - `braid setup` pinned a hardcoded profile `adapter_version`, so config
   validation rejected the generated config whenever the discovered runtime

@@ -113,8 +113,8 @@ configuration change; Braid detects the mode at runtime.
 (`~/.braid/instances/<KEY>/source`): one Git clone of the configured
 repository shared by all Profiles. Braid never edits it directly — Agent
 sessions run in dedicated generation-scoped worktrees provisioned from it
-(`state/worktrees/...`), and each worktree's `.braid/` directory is the
-Agent's private, git-excluded workspace for notes and drafts. Setup clones
+(`state/worktrees/...`), and each worktree's `.braid/` directory is git-excluded
+scratch space the Agent may use freely. Setup clones
 the repository automatically; if the clone cannot run, it prints the manual
 `git clone` command and `braid doctor` reports the missing checkout.
 

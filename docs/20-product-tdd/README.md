@@ -241,10 +241,10 @@ path):
   worktree as the work requires (Context lists the Development branches).
 
 Every worktree gets `.braid/` added to its `.git/info/exclude` at provision
-time. That directory is the Agent's private persistent workspace (working
-notes, drafts, scratch state): it survives Provider Session replacement within
-the same assignment generation and stays out of `git status`, commits, and
-GitHub.
+time: that directory persists across Provider Session replacement within the
+same assignment generation and stays out of `git status`, commits, and
+GitHub. The System Prompt states these facts and nothing more — whether and
+how the Agent uses the directory is its own choice.
 
 SQLite records the resolved source, worktree, bound ref, and local branch as
 operational facts. The provider session is started and later resumed only
