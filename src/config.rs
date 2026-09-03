@@ -824,16 +824,12 @@ impl Profile {
                 self.id, self.adapter_version, runtime.adapter_type, runtime.version
             )));
         }
-        let llm = config.llm_provider_for(self)?;
-        if let Some(model_id) = &self.model
-            && !llm.models.iter().any(|model| model.model_id == *model_id)
-        {
-            return Err(ConfigError::Invalid(format!(
-                "profile {:?} model {:?} not found in llm_providers {:?}",
-                self.id, model_id, llm.id
-            )));
-        }
-
+        let _llm = config.llm_provider_for(self)?;
+        // The profile's model is a request to the provider, and the provider
+        // is the authority on which models it accepts. The llm_providers
+        // catalog only carries cost metadata, so an uncatalogued model is
+        // not a config error: Codex must be able to answer with a real
+        // turn failure for a model it does not support.
         Ok(())
     }
 }
