@@ -607,7 +607,8 @@ note "terminating the idle app-server: reconnect and resume the same provider th
 provider_child_pid=""
 for _ in $(seq 1 30); do
     provider_child_pid="$(ps -axo pid=,ppid=,command= | awk -v parent="$runtime_pid" '
-        $2 == parent && index($0, "app-server") { print $1; exit }
+        # consume all of ps output; an early exit SIGPIPEs ps under pipefail
+        $2 == parent && index($0, "app-server") && !found { print $1; found = 1 }
     ')"
     [[ -n "$provider_child_pid" ]] && break
     sleep 1
@@ -660,7 +661,9 @@ jq -e --argjson number "$fixture_issue" --arg session "$reopened_session" '
 ' >/dev/null <<<"$status_payload" || fail "post-resume turn changed the physical provider session"
 
 app_comments="$(gh api "repos/$repository/issues/$fixture_issue/comments" | \
-    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor)] | length')"
+    jq --arg actor "$app_actor" '[.[] | select(.user.login == $actor
+        and ((.body | startswith("> **Braid Agent")) | not)
+        and ((.body | startswith("> **Braid Operational Status")) | not))] | length')"
 [[ "$app_comments" -eq 0 ]] || fail "Braid published turn activity during Context replacement"
 
 stop_process "$runtime_pid"
