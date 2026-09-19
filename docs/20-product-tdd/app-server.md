@@ -1,22 +1,28 @@
 # Provider Contract and Codex app-server Mapping
 
-Braid owns a provider-neutral logical session contract while MVP implements
-Codex app-server only. Pi and Claude Code remain future adapters; their
-different compaction/profile/resource semantics cannot leak into the core state
-machine.
+Braid 的 core 会话契约与 provider 的物理拓扑分离。Codex 与 Pi 都实现同一契约；
+Group 不根据 backend 决定连接数量或故障范围。
 
 ## Provider-Neutral Interface
 
-The core runtime uses the `AgentSession` trait and `SessionManager` rather than
-calling provider primitives directly. The adapter (`ProviderAgentSession`)
-implements `AgentSession` over the lower-level `AgentProvider` contract and
-translates provider notifications into `SessionEvent`s:
+`agent_session` 定义 `SessionFactory` 和 `AgentSession`。Runtime 按实际 Profile
+选择并注入 factory；Group 提供已选择的 Profile、instructions、完整 Context 和工作目录。
+创建结果包含 opaque provider session ID 与中立句柄，store 保存它与 Agent/assignment
+的绑定。Resume 返回同一持久化身份的新句柄，不改变 assignment 或 worktree。
 
 | Core method | Adapter behavior |
 | --- | --- |
-| `send_user_msg(msg, steering)` | If idle, start a new turn with `msg`; if running and `steering`, forward the steer to the active turn; if running and not steering, drop the message (the event queue owns redelivery). Returns `Started` or `Acknowledged`; lifecycle facts arrive only via events. |
-| `interrupt()` | Best-effort termination of the observed in-flight turn (Codex `turn/interrupt`, Pi `abort`); idempotent at the state-machine boundary, terminal still arrives via the event stream. Used by hard invalidation after the DB fence. |
-| `events()` | Emits exactly one `TurnStarted` per turn, then exactly one `TurnTerminal` (carrying the provider error when the outcome is `Failed`/`Unknown`), translated and deduplicated from provider notifications. The receiver created before dispatch is handed to the consumer with the turn — never re-subscribed. Connection death is observed via `AgentProvider::closed()`, not this stream. |
+| `SessionFactory::check()` | 检查 adapter 的启动前置条件；共享运行资源由 adapter 自己维护。 |
+| `SessionFactory::start/resume` | 创建或恢复会话并返回中立句柄。Codex 内部共享 app-server，Pi 每个会话持有独立进程；上层接口相同。 |
+| `send_user_msg(msg, steering)` | Idle 时启动 turn；running 且 steering 时发送 steer；否则返回 Acknowledged，由 queue 保留后续输入。 |
+| `interrupt()` | 尝试停止已观察到的 active turn；terminal 仍通过事件流返回。 |
+| `events()` | 将 provider 的响应与通知去重为 TurnStarted / TurnTerminal；dispatch 前订阅，同一 receiver 随 RunningAgentTurn 交给 driver。失效的 active handle 合成 Unknown，不能伪造失败。 |
+| `is_unavailable()` | 句柄失效后永久返回 true；idle 或晚订阅也可观察。恢复创建新句柄，不复活旧句柄。 |
+| `close()` | 停止使用该句柄，尝试 interrupt，取消监听并释放资源；不能影响其他会话。 |
+
+具体 `AgentProvider` 接口只在 adapter 内使用。共享 Codex 进程退出会使其所有
+句柄失效；独立 Pi 进程退出只影响所属句柄。释放旧句柄会取消旧监听任务，
+防止它继续消费通知；turn ID 去重防止旧 terminal 结算新的 turn。
 
 The core never assumes a provider can rewrite arbitrary history or accept a
 custom compaction result. Context replacement is therefore orchestrated by the

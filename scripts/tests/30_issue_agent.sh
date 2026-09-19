@@ -7,6 +7,7 @@ readonly binary="${BRAID_BIN:-$(command -v braid || true)}"
 readonly ingress_address="${BRAID_TEST_INGRESS:-127.0.0.1:18080}"
 readonly health_address="${BRAID_TEST_HEALTH:-127.0.0.1:18081}"
 readonly health_url="http://$health_address/healthz"
+readonly evidence_root="${BRAID_TEST_EVIDENCE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/braid-slice3-evidence.XXXXXX")}"
 readonly keep_fixture="${BRAID_TEST_KEEP_FIXTURES:-0}"
 
 runtime_pid=""
@@ -64,18 +65,33 @@ cleanup() {
         gh issue close "$failure_issue" --repo "$repository" \
             --comment "Braid Slice 3 failure fixture closed." >/dev/null 2>&1 || true
     fi
-    if [[ -n "$temporary_root" && -d "$temporary_root" ]]; then
-        rm -rf "$temporary_root"
-    fi
     if [[ $exit_status -ne 0 ]]; then
         printf '%s: runtime log follows\n' "$script_name" >&2
         [[ -f "$runtime_log" ]] && tail -200 "$runtime_log" >&2 || true
         printf '%s: tunnel log follows\n' "$script_name" >&2
         [[ -f "$tunnel_log" ]] && tail -100 "$tunnel_log" >&2 || true
     fi
+    if [[ -n "$temporary_root" && -d "$temporary_root" ]]; then
+        mkdir -p "$evidence_root"
+        cp "$temporary_root"/*.log "$evidence_root/" 2>/dev/null || true
+        if [[ -f "$temporary_root/braid.toml" ]]; then
+            "$binary" status --config "$temporary_root/braid.toml" --json > "$evidence_root/status.json" 2>/dev/null || true
+        fi
+        if [[ -f "$temporary_root/failure.toml" ]]; then
+            "$binary" status --config "$temporary_root/failure.toml" --json > "$evidence_root/failure-status.json" 2>/dev/null || true
+        fi
+        for issue in "$fixture_issue" "$failure_issue"; do
+            [[ -n "$issue" ]] || continue
+            gh api "repos/$repository/issues/$issue/comments" > "$evidence_root/issue-$issue-comments.json" 2>/dev/null || true
+        done
+        rm -rf "$temporary_root"
+    fi
+    printf '%s: evidence: %s (exit=%s)\n' "$script_name" "$evidence_root" "$exit_status"
     exit "$exit_status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 [[ -n "$binary" && -x "$binary" ]] || fail "set BRAID_BIN to the packaged braid binary"
 [[ -n "$config_path" && "$config_path" = /* && -f "$config_path" ]] || \
@@ -100,6 +116,7 @@ candidate_version="$($binary --version)"
 candidate_sha256="$(shasum -a 256 "$binary" | sed 's/ .*//')"
 note "candidate $candidate_version sha256=$candidate_sha256"
 
+mkdir -p "$evidence_root"
 temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/braid-slice3.XXXXXX")"
 runtime_log="$temporary_root/runtime.log"
 tunnel_log="$temporary_root/tunnel.log"
@@ -128,7 +145,7 @@ awk \
 $binary migrate apply --config "$test_config" >/dev/null
 $binary status --config "$test_config" --json | \
     jq -e '.database.schema_version == 2 and .database.supported_schema == 2' >/dev/null || \
-    fail "candidate does not expose the expected current schema 1"
+    fail "candidate does not expose the expected current schema 2"
 
 public_url="${BRAID_TEST_PUBLIC_WEBHOOK_URL:-}"
 public_url="${public_url%/webhook}"
@@ -152,7 +169,7 @@ else
 fi
 
 note "starting packaged Braid with the real Codex app-server"
-BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
+BRAID_CONFIG="$test_config" PATH="$(dirname "$binary"):$PATH" BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
     --config "$test_config" >"$runtime_log" 2>&1 &
 runtime_pid=$!
 for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
@@ -165,6 +182,19 @@ for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
 done
 curl -fsS "$health_url" | jq -e '.ready == true and .provider == "connected"' >/dev/null || \
     fail "Braid did not become provider-ready"
+
+note "verifying the public signed webhook path before creating fixtures"
+public_probe_ready=0
+# Give fresh Quick Tunnel DNS time to publish before priming resolver caches.
+sleep 20
+for _ in $(seq 1 3); do
+    if "$binary" tunnel probe --config "$test_config" --url "$public_url/webhook" >> "$temporary_root/public-probe.log" 2>&1; then
+        public_probe_ready=1
+        break
+    fi
+    sleep 5
+done
+[[ "$public_probe_ready" -eq 1 ]] || fail "public signed webhook probe failed"
 
 repository_hook_id="$(jq -nc \
     --arg url "$public_url/webhook" \
@@ -327,7 +357,9 @@ for _ in $(seq 1 90); do
     has_reaction "$unknown_comment" eyes && has_reaction "$unknown_comment" rocket && break
     sleep 1
 done
+printf '%s\n' "$status_payload" > "$evidence_root/unknown-status.json"
 has_reaction "$unknown_comment" rocket || fail "unknown-outcome turn was not accepted"
+unknown_session="$($binary status --config "$test_config" --json | jq -er --argjson number "$fixture_issue" '.transport.agent_groups[] | select(.work_item_number == $number and .turn_lifecycle == "running") | .provider_session_id')"
 provider_pid="$(pgrep -P "$runtime_pid" -f 'codex.*app-server' | head -1 || true)"
 if [[ -z "$provider_pid" ]]; then
     provider_pid="$(pgrep -P "$runtime_pid" | head -1 || true)"
@@ -336,17 +368,11 @@ fi
 pkill -9 -P "$provider_pid" >/dev/null 2>&1 || true
 kill -KILL "$provider_pid"
 for _ in $(seq 1 60); do
-    provider_health="$(curl -fsS "$health_url" 2>/dev/null | jq -r '.provider' || true)"
-    [[ "$provider_health" == "unavailable" ]] && break
-    sleep 1
-done
-[[ "${provider_health:-}" == "unavailable" ]] || fail "provider disconnect was not surfaced"
-for _ in $(seq 1 60); do
     status_payload="$($binary status --config "$test_config" --json)"
     if jq -e --argjson number "$fixture_issue" '
         any(.transport.agent_groups[];
           .work_item_kind == "issue" and .work_item_number == $number and
-          .session_lifecycle == "unknown" and .turn_lifecycle == "unknown")
+          .turn_lifecycle == "unknown")
     ' >/dev/null <<<"$status_payload"; then
         break
     fi
@@ -355,8 +381,9 @@ done
 jq -e --argjson number "$fixture_issue" '
     any(.transport.agent_groups[];
       .work_item_kind == "issue" and .work_item_number == $number and
-      .session_lifecycle == "unknown" and .turn_lifecycle == "unknown")
+      .turn_lifecycle == "unknown")
 ' >/dev/null <<<"$status_payload" || fail "disconnect did not preserve an unknown turn"
+printf '%s\n' "$status_payload" > "$evidence_root/unknown-status.json"
 has_reaction "$unknown_comment" rocket || fail "unknown turn did not retain rocket"
 has_reaction "$unknown_comment" +1 && fail "unknown turn was reported successful"
 has_reaction "$unknown_comment" confused && fail "unknown turn was reported failed"
@@ -367,6 +394,22 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 [[ "${operational_comments:-0}" -eq 1 ]] || fail "provider unknown did not publish one Operational Status comment"
+for _ in $(seq 1 60); do
+    status_payload="$($binary status --config "$test_config" --json)"
+    if jq -e --argjson number "$fixture_issue" --arg old "$unknown_session" '
+        any(.transport.agent_groups[]; .work_item_number == $number and
+            .provider_session_id != $old and .turn_lifecycle == "running")
+    ' >/dev/null <<<"$status_payload"; then break; fi
+    sleep 1
+done
+jq -e --argjson number "$fixture_issue" --arg old "$unknown_session" '
+    any(.transport.agent_groups[]; .work_item_number == $number and
+        .provider_session_id != $old and .turn_lifecycle == "running")
+' >/dev/null <<<"$status_payload" || fail "fenced input did not resume in a replacement session"
+printf '%s\n' "$status_payload" > "$evidence_root/recovery-status.json"
+curl -fsS "$health_url" > "$evidence_root/recovery-health.json"
+jq -e '.provider == "connected"' "$evidence_root/recovery-health.json" >/dev/null || fail "provider health did not recover"
+
 
 stop_process "$runtime_pid"
 runtime_pid=""
@@ -389,7 +432,7 @@ awk \
 ' "$test_config" > "$failure_config"
 $binary migrate apply --config "$failure_config" >/dev/null
 runtime_log="$temporary_root/failure-runtime.log"
-BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
+BRAID_CONFIG="$failure_config" PATH="$(dirname "$binary"):$PATH" BRAID_WEBHOOK_SECRET="$BRAID_WEBHOOK_SECRET" "$binary" serve \
     --config "$failure_config" >"$runtime_log" 2>&1 &
 runtime_pid=$!
 for _ in $(seq 1 "${BRAID_TEST_WAIT_SECONDS:-120}"); do
@@ -406,10 +449,14 @@ failure_issue="$(gh api --method POST "repos/$repository/issues" \
 failure_comment="$(gh api --method POST "repos/$repository/issues/$failure_issue/comments" \
     -f body='@braid Start the controlled real-provider failure turn.' --jq '.id')"
 rocket_observed=0
-for _ in $(seq 1 90); do
-    has_reaction "$failure_comment" rocket && rocket_observed=1
-    has_reaction "$failure_comment" confused && break
-    sleep 1
+# Invalid-model failures can settle in under two seconds. Sample both states
+# from one response, without the blind interval between two separate requests.
+for _ in $(seq 1 180); do
+    reactions="$(gh api "repos/$repository/issues/comments/$failure_comment/reactions")"
+    printf '%s\n' "$reactions" | jq -c . >> "$evidence_root/failure-reactions.ndjson"
+    jq -e --arg actor "$app_actor" 'any(.[]; .user.login == $actor and .content == "rocket")' >/dev/null <<<"$reactions" && rocket_observed=1
+    if jq -e --arg actor "$app_actor" 'any(.[]; .user.login == $actor and .content == "confused")' >/dev/null <<<"$reactions"; then break; fi
+    sleep 0.1
 done
 [[ "$rocket_observed" -eq 1 ]] || fail "failed-terminal turn never exposed accepted rocket"
 has_reaction "$failure_comment" confused || fail "real failed terminal did not converge to confused"
@@ -448,4 +495,4 @@ jq -n \
         fixture_issue:$issue,
         failed_terminal_issue:$failure_issue,
         journeys:["trusted-mention-steer","ordinary-debounce","eight-event-threshold","provider-disconnect-unknown","real-provider-failed-terminal"]
-    }'
+    }' | tee "$evidence_root/result.json"

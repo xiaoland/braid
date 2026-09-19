@@ -6,21 +6,8 @@ use anyhow::{Context as _, Result};
 use crate::{
     config::{Config, Profile},
     context::{ContextPressure, RenderedContext},
-    store::{SchedulerPolicy, StoreActor, TurnClaim},
+    store::{SchedulerPolicy, StoreActor},
 };
-
-/// In-memory projection of the in-flight turn claim: the store is the
-/// authority; this cache exists so the drive loop can attribute the terminal
-/// event and fence resets without re-querying.
-pub(crate) struct RunningAgentTurn {
-    pub(crate) claim: TurnClaim,
-    pub(crate) provider_turn_id: String,
-    pub(crate) reset_id: Option<String>,
-    /// The receiver that observed this turn's `TurnStarted`, created before
-    /// the send and handed off with the turn, so the drive loop consumes the
-    /// terminal with no subscription-timing gap.
-    pub(crate) events: tokio::sync::broadcast::Receiver<crate::agent_session::SessionEvent>,
-}
 
 pub(crate) fn policy_from_config(config: &Config) -> SchedulerPolicy {
     SchedulerPolicy {

@@ -26,6 +26,10 @@ pub struct CodexProvider {
 }
 
 impl CodexProvider {
+    pub(super) fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+
     pub async fn connect(config: &CodexConfig) -> Result<Self, ProviderError> {
         let mut child = Command::new(&config.executable)
             .args(["app-server", "--stdio"])
@@ -288,7 +292,7 @@ fn spawn_codex_stdout(
             let _ = sender.send(Err(ProviderError::Disconnected));
         }
         let _ = notifications.send(ProviderNotification::Disconnected);
-        let _ = closed.send(true);
+        closed.send_replace(true);
     });
 }
 

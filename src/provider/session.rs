@@ -1,5 +1,8 @@
 #![allow(clippy::all, clippy::pedantic)]
-use std::sync::Arc;
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use tokio::sync::{Mutex, broadcast};
 
@@ -23,6 +26,8 @@ enum SessionStatus {
 /// lower-level `AgentProvider` primitives.
 pub struct ProviderAgentSession {
     provider: Arc<dyn AgentProvider>,
+    unavailable: AtomicBool,
+    listener: OnceLock<tokio::task::AbortHandle>,
     profile: Profile,
     instructions: String,
     inner: Mutex<SessionInner>,
@@ -68,6 +73,8 @@ impl ProviderAgentSession {
         let (events, _) = broadcast::channel(512);
         let session = Arc::new(Self {
             provider,
+            unavailable: AtomicBool::new(false),
+            listener: OnceLock::new(),
             profile,
             instructions,
             inner: Mutex::new(SessionInner {
@@ -80,14 +87,27 @@ impl ProviderAgentSession {
         });
         let listener = Arc::downgrade(&session);
         let mut notifications = session.provider.subscribe();
-        tokio::spawn(async move {
-            while let Ok(notification) = notifications.recv().await {
+        let connection = Arc::clone(&session.provider);
+        let task = tokio::spawn(async move {
+            loop {
+                let notification = tokio::select! {
+                    biased;
+                    result = notifications.recv() => match result {
+                        Ok(notification) => notification,
+                        Err(error) => {
+                            tracing::warn!(%error, "session notification stream lost; handle is unavailable");
+                            ProviderNotification::Disconnected
+                        }
+                    },
+                    () = connection.closed() => ProviderNotification::Disconnected,
+                };
                 let Some(session) = listener.upgrade() else { break };
                 if session.handle_notification(notification).await {
                     break;
                 }
             }
         });
+        session.listener.set(task.abort_handle()).expect("session listener initialized once");
         session
     }
 
@@ -183,9 +203,9 @@ impl ProviderAgentSession {
             ProviderNotification::Disconnected => {
                 // A started turn must never be left without a terminal:
                 // synthesize Unknown for the in-flight turn, then fail the
-                // session. Connection death itself is observed by the worker
-                // through `AgentProvider::closed()`, not through events.
-                if let Some(turn_id) = inner.current_turn_id.take() {
+                // session. Availability remains observable even without a turn
+                // subscription; the group can recover this handle while idle.
+                if let Some(turn_id) = inner.current_turn_id.clone() {
                     inner.last_terminal_turn_id = Some(turn_id.clone());
                     let _ = self.events.send(SessionEvent::TurnTerminal {
                         provider_turn_id: turn_id,
@@ -194,6 +214,7 @@ impl ProviderAgentSession {
                     });
                 }
                 inner.status = SessionStatus::Failed;
+                self.unavailable.store(true, Ordering::SeqCst);
                 true
             }
             ProviderNotification::Activity { method, thread_id, turn_id } => {
@@ -210,10 +231,23 @@ impl AgentSession for ProviderAgentSession {
         self.events.subscribe()
     }
 
+    fn is_unavailable(&self) -> bool {
+        self.unavailable.load(Ordering::SeqCst)
+    }
+
+    async fn close(&self) -> Result<(), SessionError> {
+        self.unavailable.store(true, Ordering::SeqCst);
+        let result = self.interrupt().await;
+        if let Some(listener) = self.listener.get() {
+            listener.abort();
+        }
+        result
+    }
+
     async fn send_user_msg(&self, msg: String, steering: bool) -> Result<SendResult, SessionError> {
         let mut inner = self.inner.lock().await;
 
-        if inner.status == SessionStatus::Failed {
+        if self.is_unavailable() || inner.status == SessionStatus::Failed {
             return Err(SessionError::Unavailable);
         }
         if msg.is_empty() {
@@ -265,11 +299,19 @@ impl AgentSession for ProviderAgentSession {
     }
 }
 
-fn map_provider_error(error: ProviderError) -> SessionError {
+pub(super) fn map_provider_error(error: ProviderError) -> SessionError {
     match error {
         ProviderError::Start(_) | ProviderError::Timeout { .. } | ProviderError::Disconnected => {
             SessionError::Unavailable
         }
         ProviderError::Protocol(message) => SessionError::Failed(message),
+    }
+}
+
+impl Drop for ProviderAgentSession {
+    fn drop(&mut self) {
+        if let Some(listener) = self.listener.get() {
+            listener.abort();
+        }
     }
 }

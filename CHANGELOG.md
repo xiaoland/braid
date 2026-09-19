@@ -3,7 +3,24 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
-## [0.3.1] - unreleased
+## [0.3.2] - 2026-09-19
+
+### Changed
+
+- 统一 Issue/PR 的逻辑生命周期驱动，将物理进程与连接的所有权留在 provider adapter。
+  Codex 内部复用 app-server，Pi 每个会话独立持有进程；恢复失效会话不重建健康会话。
+- 将 mention 权限分类、调度推进与 GitHub outbox 拆为独立循环，避免网络权限查询拖延调度和写入。
+
+### Fixed
+
+- Provider 配置与持久化类型沿实际 Profile 解析，避免默认 PR 参数覆盖其他 Profile 或将 Pi 记录为 Codex。
+- Context replacement 前释放旧句柄；Unknown 不生成失败 reaction，并能推进正在等待终态的 Context reset。
+- 调度只领取具有可用句柄的会话；健康状态汇总避免一个 driver 的成功覆盖另一个 driver 的失败。
+- 修正 Slice 3 验收中的公网就绪、Unknown 恢复及快速终态采样，保留完整的验收证据。
+
+本版本不新增数据库 migration，配置与数据库 schema 均保持 v2。
+
+## [0.3.1] - 2026-09-03
 
 ### Added
 

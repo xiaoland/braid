@@ -1,3 +1,9 @@
+use std::sync::Arc;
+use tokio::{
+    sync::watch,
+    time::{Duration, MissedTickBehavior},
+};
+
 use anyhow::Result;
 
 use crate::{
@@ -174,4 +180,20 @@ pub(crate) fn bail_unknown_write(operation: &str) -> Result<AppliedWrite, Outbox
     Err(OutboxWriteError::GitHub(crate::github::GitHubError::GraphQl(format!(
         "unsupported outbox operation {operation:?}"
     ))))
+}
+
+/// Converge durable writes independently of ingress and scheduling latency.
+pub(crate) async fn outbox_worker(
+    store: Arc<StoreActor>,
+    github: Arc<GitHubClient>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tick.tick() => drain_one_write(&store, &github).await,
+        }
+    }
 }

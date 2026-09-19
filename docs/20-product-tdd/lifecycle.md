@@ -138,12 +138,12 @@ replacement comment.
 
 ## Provider and Transport Unknown
 
-Connection loss is not a provider terminal. While a turn outcome is unknown,
-Braid does not start a parallel turn, apply a terminal reaction, or retry Agent
-side effects. It reconnects/resumes the same physical session when compatible;
-if the provider proves it unavailable, the group becomes `blocked` and Braid
-updates Operational Status. Context replacement may create a fresh session
-only after the old turn is terminal or fenced so its later output is ignored.
+连接丢失只证明旧执行结果未知，不能据此生成成功/失败 reaction。Core 将旧 turn
+记为 Unknown 并 fence 旧会话，发布 Operational Status；随后物化完整当前 Context，
+保留 assignment 和 worktree，将已接收输入重新送入调度。它不会盲目重发未知结果的
+provider RPC，也不承诺任意外部副作用 exactly-once。历史 Unknown 记录不因恢复成功消失。
+若断连发生在已经 interrupting 的 Context reset 中，Unknown 同样使 reset 进入
+materializing，继续既有 continuation 规则，不能让 reset 永久等待。
 
 ## AgentSession Event Stream
 
@@ -166,13 +166,12 @@ Delivery semantics are part of the contract:
 - **No subscription-timing gap.** The dispatcher subscribes *before* sending
   and hands the receiver to the drive loop inside `RunningAgentTurn`; the
   consumer never re-subscribes mid-turn.
-- **Connection death is connection-scoped**, observed through
-  `AgentProvider::closed()` — a future, not a channel — so it cannot be lost
-  while idle. The worker marks any in-flight turn `unknown` and starts a new
-  epoch.
-- **Cross-epoch backstop.** On every (re)connect, resume fencing marks
-  orphaned `starting`/`running` turns `unknown`. If in-epoch delivery ever
-  failed, the store still converges at the next epoch boundary.
+- **失效范围由 adapter 决定。** `AgentProvider::closed()` 留在 adapter 内部。
+  Core 使用句柄的 latched `is_unavailable()`，包括 idle 与晚订阅情形。
+  一个句柄失效不触发全局 epoch，也不重建健康的同类会话。
+- **持久化恢复兜底。** 恢复缺失/失效句柄之前，Group 将遗留的 starting/running
+  turn 记为 Unknown。只向具备可用句柄的 opaque session ID 领取 runnable turn；
+  不可用会话的输入保留待处理，不占住其他可用会话。
 
 Responsibilities do not overlap:
 
@@ -185,12 +184,8 @@ Responsibilities do not overlap:
   the control-plane sibling of steering — an immediate operation on the
   observed in-flight turn that carries termination rather than input; the
   terminal still arrives via the event stream.
-- The **group layer** (`SessionManager`) owns the physical session lifecycle
-  for one connection epoch: start/resume keyed by the adapter-created thread
-  id, rebuilt from the durable store on every reconnect. There is no in-place
-  replacement; context replacement fences the old turn in the store and then
-  starts a fresh session with the materialized context.
-- The **adapter** (`ProviderAgentSession`) owns the mechanism only: mapping
-  the contract onto `AgentProvider` RPCs and translating provider
-  notifications into exactly-once `SessionEvent`s. It holds no durable state
-  and makes no scheduling decisions.
+- **Group** 决定 Work Item 的物化、恢复、Context replacement、睡眠和退役，
+  `SessionManager` 只索引中立句柄。替换完整 Context 不等于创建新的逻辑 Agent；
+  adapter 的物理 ID 是可替换的执行绑定。
+- **Adapter** 管理进程、连接、物理会话和通知翻译，不读取 GitHub、不操作业务 store。
+  Group 释放旧句柄时，adapter 清理其资源；Codex 共享连接和 Pi 独立进程都服从同一契约。

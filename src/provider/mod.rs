@@ -63,9 +63,8 @@ pub trait AgentProvider: Send + Sync {
 
     /// Resolves when the provider connection is permanently closed (process
     /// exit, stdio EOF, fatal protocol error). Connection death is a
-    /// connection-scoped fact: the worker that owns the epoch awaits this
-    /// instead of relying on per-session event subscriptions, so it cannot
-    /// be missed while idle.
+    /// connection-scoped fact observed inside the adapter. Adapter session
+    /// handles expose their own latched availability to core consumers.
     async fn closed(&self);
 
     async fn start_session(
@@ -109,7 +108,8 @@ mod session;
 mod util;
 
 pub use codex::CodexProvider;
+pub(crate) use factory::session_factories;
 pub use pi::PiProvider;
 pub use session::ProviderAgentSession;
-pub use util::connect_provider;
+mod factory;
 pub(crate) use util::{path_text, required_string};
