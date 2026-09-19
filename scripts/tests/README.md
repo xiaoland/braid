@@ -72,17 +72,17 @@ then proves:
 - eight durably received events releasing one threshold turn, also without
   request-style reactions;
 - real app-server process loss preserving an unknown turn and `rocket` while
-  publishing one App-authored Operational Status Comment;
+  publishing one App-authored Operational Status Comment；随后验证替换会话重新接收 fenced 输入，历史 Unknown 仍可通过 status 查询；
 - a separate accepted turn using an intentionally unsupported model receiving
   a real Codex `turn.failed`, converging from observed `rocket` to `confused`;
-- Agent-authored attributed comments, one session per fixture, and zero Braid
-  turn-mirror comments.
+- Agent-authored attributed comments, one initial session per fixture, and zero Braid
+  turn-mirror comments；Unknown 恢复会产生替换会话，原 turn 的历史记录保留。
 
 The count timing begins only after all eight `eyes` acknowledgements prove
 durable Braid receipt; GitHub webhook delivery latency is not mislabeled as
 scheduler latency. The helper deletes its temporary webhook and closes both
 Issues unless
-`BRAID_TEST_KEEP_FIXTURES=1`.
+`BRAID_TEST_KEEP_FIXTURES=1`。`BRAID_TEST_EVIDENCE_DIR` 可指定证据目录；未指定时创建独立临时目录，保留日志、状态快照、GitHub 评论与结果 JSON。
 
 Run it with a real authenticated Agent `gh` identity and an acceptance config
 whose Codex home already has provider authentication:

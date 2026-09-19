@@ -365,7 +365,7 @@ fn spawn_pi_stdout(
             let _ = sender.send(Err(ProviderError::Disconnected));
         }
         let _ = notifications.send(ProviderNotification::Disconnected);
-        let _ = closed.send(true);
+        closed.send_replace(true);
     })
 }
 

@@ -487,20 +487,22 @@ impl Config {
         )
     }
 
-    /// Temporary MVP bridge: synthesize a legacy `ProviderConfig` from the
-    /// first `[[runtimes]]` entry so `connect_provider` can still be called
-    /// from `runtime::serve`.
+    /// Provider settings for the default PR Profile, used by operator probes.
     pub fn default_provider_config(&self) -> Result<ProviderConfig, ConfigError> {
-        let runtime = self
-            .runtimes
-            .first()
-            .ok_or_else(|| ConfigError::Invalid("no runtimes configured".into()))?;
-        self.provider_config_for_runtime(runtime)
+        self.provider_config_for_profile(self.profile(&self.profile_selection.default_pr_profile)?)
+    }
+
+    pub(crate) fn provider_config_for_profile(
+        &self,
+        profile: &Profile,
+    ) -> Result<ProviderConfig, ConfigError> {
+        self.provider_config_for_runtime(self.runtime_for(profile)?, profile)
     }
 
     fn provider_config_for_runtime(
         &self,
         runtime: &RuntimeEntry,
+        profile: &Profile,
     ) -> Result<ProviderConfig, ConfigError> {
         if runtime.adapter_type == "codex" {
             let home = runtime.home.clone().ok_or_else(|| {
@@ -535,17 +537,16 @@ impl Config {
 
         if runtime.adapter_type == "pi" {
             // Pi needs an LLM provider entry for its API key and model info.
-            let default_profile = self.profile(&self.profile_selection.default_pr_profile)?;
-            let llm = self.llm_provider_for(default_profile)?;
+            let llm = self.llm_provider_for(profile)?;
             return Ok(ProviderConfig {
                 codex: None,
                 pi: Some(PiConfig {
                     executable: runtime.executable.clone(),
                     provider: Some(llm.id.clone()),
-                    model: default_profile.model.clone(),
+                    model: profile.model.clone(),
                     api_key_environment: llm.api_key_environment.clone(),
                     api_key_file: llm.api_key_file.clone(),
-                    thinking: default_profile.reasoning.clone(),
+                    thinking: profile.reasoning.clone(),
                     home: runtime.home.clone(),
                 }),
             });
@@ -894,6 +895,21 @@ mod tests {
     use std::path::Path;
 
     use super::Config;
+
+    #[test]
+    fn pi_settings_follow_the_requested_profile() {
+        let mut config = Config::load(Path::new("config.example.toml")).unwrap();
+        config.runtimes[0].adapter_type = "pi".into();
+        for profile in &mut config.profiles {
+            profile.adapter_type = "pi".into();
+        }
+        config.profiles[0].model = Some("issue-model".into());
+        config.profiles[0].reasoning = Some("low".into());
+        config.profiles[1].model = Some("pr-model".into());
+        let settings = config.provider_config_for_profile(&config.profiles[0]).unwrap().pi.unwrap();
+        assert_eq!(settings.model.as_deref(), Some("issue-model"));
+        assert_eq!(settings.thinking.as_deref(), Some("low"));
+    }
 
     /// `config.example.toml` is the canonical starter template, not a loose
     /// documentation snippet. It must parse and validate against the canonical

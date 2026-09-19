@@ -1,80 +1,92 @@
-use std::{collections::HashMap, sync::Arc};
-
+use crate::{
+    agent_session::{AgentSession, CreatedSession, SessionError, SessionFactory},
+    config::Profile,
+};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 
-use crate::{
-    agent_session::{AgentSession, SessionError},
-    config::Profile,
-    provider::{AgentProvider, ProviderAgentSession},
-};
-
-/// In-process manager for the active Agent Sessions of one connection epoch.
-///
-/// The durable store is the authority for session identity; this map is an
-/// ephemeral cache keyed by the current provider thread id. Because sessions
-/// bind the epoch's provider handle, workers build a fresh manager per
-/// connection epoch and repopulate it from the store via `resume`.
-pub struct SessionManager {
-    sessions: Mutex<HashMap<String, Arc<ProviderAgentSession>>>,
+/// Ephemeral handles indexed by the store's opaque session identity. Physical
+/// resource ownership and sharing stay in the injected adapter factory.
+pub(super) struct SessionManager {
+    factory: Arc<dyn SessionFactory>,
+    sessions: Mutex<HashMap<String, Arc<dyn AgentSession>>>,
 }
 
 impl SessionManager {
-    pub fn new() -> Self {
-        Self { sessions: Mutex::new(HashMap::new()) }
+    pub(super) fn new(factory: Arc<dyn SessionFactory>) -> Self {
+        Self { factory, sessions: Mutex::new(HashMap::new()) }
     }
 
-    pub async fn get(&self, provider_session_id: &str) -> Option<Arc<dyn AgentSession>> {
-        let sessions = self.sessions.lock().await;
-        sessions.get(provider_session_id).map(|s| Arc::clone(s) as Arc<dyn AgentSession>)
+    pub(super) async fn check(&self) -> Result<(), SessionError> {
+        self.factory.check().await
     }
 
-    /// Start a fresh Agent Session with an initial materialized context.
-    ///
-    /// The adapter owns physical session creation and context injection; the
-    /// manager keys the session by the thread id the adapter actually created.
-    pub async fn start(
-        &self,
-        provider: Arc<dyn AgentProvider>,
-        profile: Profile,
-        instructions: String,
-        initial_context: String,
-    ) -> Result<Arc<ProviderAgentSession>, SessionError> {
-        let session =
-            ProviderAgentSession::start(provider, profile, instructions, Some(initial_context))
-                .await?;
-        let thread_id = session
-            .thread_id()
+    pub(super) async fn get(&self, id: &str) -> Option<Arc<dyn AgentSession>> {
+        self.sessions.lock().await.get(id).cloned()
+    }
+
+    pub(super) async fn is_live(&self, id: &str) -> bool {
+        self.get(id).await.is_some_and(|session| !session.is_unavailable())
+    }
+
+    pub(super) async fn live_ids(&self) -> Vec<String> {
+        self.sessions
+            .lock()
             .await
-            .ok_or_else(|| SessionError::Failed("AgentSession has no provider thread".into()))?;
-        let mut sessions = self.sessions.lock().await;
-        if let Some(existing) = sessions.get(&thread_id) {
-            return Ok(Arc::clone(existing));
-        }
-        sessions.insert(thread_id, Arc::clone(&session));
-        Ok(session)
+            .iter()
+            .filter(|(_, session)| !session.is_unavailable())
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
-    pub async fn resume(
+    pub(super) async fn start(
         &self,
-        provider_session_id: String,
-        provider: Arc<dyn AgentProvider>,
         profile: Profile,
         instructions: String,
-    ) -> Result<Arc<ProviderAgentSession>, SessionError> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get(&provider_session_id) {
-            return Ok(Arc::clone(session));
-        }
-        let session =
-            ProviderAgentSession::resume(provider, profile, instructions, &provider_session_id)
-                .await?;
-        sessions.insert(provider_session_id, Arc::clone(&session));
-        Ok(session)
+        context: String,
+    ) -> Result<String, SessionError> {
+        let CreatedSession { id, session } =
+            self.factory.start(profile, instructions, context).await?;
+        self.sessions.lock().await.insert(id.clone(), session);
+        Ok(id)
     }
-}
 
-impl Default for SessionManager {
-    fn default() -> Self {
-        Self::new()
+    pub(super) async fn resume(
+        &self,
+        id: String,
+        profile: Profile,
+        instructions: String,
+    ) -> Result<(), SessionError> {
+        if self.is_live(&id).await {
+            return Ok(());
+        }
+        self.remove(&id).await;
+        let created = self.factory.resume(&id, profile, instructions).await?;
+        if created.id != id {
+            let _ = created.session.close().await;
+            return Err(SessionError::Failed("resume changed the durable session identity".into()));
+        }
+        self.sessions.lock().await.insert(id, created.session);
+        Ok(())
+    }
+
+    pub(super) async fn remove(&self, id: &str) {
+        let removed = self.sessions.lock().await.remove(id);
+        if let Some(session) = removed
+            && let Err(error) = session.close().await
+        {
+            tracing::debug!(%error, provider_session = id, "session release could not interrupt a turn");
+        }
+    }
+
+    pub(super) async fn retain(&self, ids: &HashSet<String>) {
+        let obsolete: Vec<_> =
+            self.sessions.lock().await.keys().filter(|id| !ids.contains(*id)).cloned().collect();
+        for id in obsolete {
+            self.remove(&id).await;
+        }
     }
 }

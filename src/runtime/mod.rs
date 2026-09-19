@@ -25,13 +25,14 @@ use crate::{
 };
 
 use crate::config::agent_attributions;
-use crate::group::{issue_agent_worker, pr_agent_worker};
+use crate::group::{GroupKind, GroupSpec, agent_group_worker};
 use crate::health::HealthSnapshot;
-use crate::outbox::drain_one_write;
+use crate::outbox::{drain_one_write, outbox_worker};
 use crate::producer::LEASE_TTL_SECONDS;
 use crate::producer::{
-    IngressState, event_worker, lease_worker, reconciliation_worker, webhook_handler,
+    IngressState, lease_worker, mention_worker, reconciliation_worker, webhook_handler,
 };
+use crate::queue::queue_worker;
 use crate::tunnel::{restore_webhook, start_verified_quick_tunnel};
 
 struct RuntimeLeaseGuard {
@@ -124,10 +125,16 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     let health_server =
         spawn_health(config.server.health, Arc::clone(&health), shutdown_receiver.clone()).await?;
     let mut workers = JoinSet::new();
-    workers.spawn(event_worker(
+    workers.spawn(queue_worker(Arc::clone(&store), shutdown_receiver.clone()));
+    workers.spawn(mention_worker(
         Arc::clone(&store),
         Arc::clone(&github),
         policy,
+        shutdown_receiver.clone(),
+    ));
+    workers.spawn(outbox_worker(
+        Arc::clone(&store),
+        Arc::clone(&github),
         shutdown_receiver.clone(),
     ));
     workers.spawn(reconciliation_worker(
@@ -140,24 +147,33 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     workers.spawn(lease_worker(Arc::clone(&store), Arc::clone(&lease), shutdown_receiver.clone()));
 
     if provider_enabled {
-        // Boot gate: provider configuration errors are operator errors and
-        // fail startup. Connection epochs (including the first) are owned by
-        // the workers, which retry transient connection failures.
-        let _ = config.default_provider_config()?;
-        workers.spawn(issue_agent_worker(
-            Arc::clone(&store),
-            Arc::clone(&github),
-            config.clone(),
+        let factories = crate::provider::session_factories(&config)?;
+        let specs = [GroupKind::Issue, GroupKind::Pr]
+            .into_iter()
+            .map(|kind| GroupSpec::new(kind, &config, &store))
+            .collect::<Result<Vec<_>>>()?;
+        let (reports, receiver) = tokio::sync::mpsc::channel(8);
+        workers.spawn(crate::health::provider_health_worker(
             Arc::clone(&health),
+            receiver,
             shutdown_receiver.clone(),
         ));
-        workers.spawn(pr_agent_worker(
-            Arc::clone(&store),
-            Arc::clone(&github),
-            config.clone(),
-            Arc::clone(&health),
-            shutdown_receiver.clone(),
-        ));
+        for spec in specs {
+            let factory = factories
+                .get(spec.profile_id())
+                .context("Profile session factory missing")?
+                .clone();
+            workers.spawn(agent_group_worker(
+                Arc::clone(&store),
+                Arc::clone(&github),
+                config.clone(),
+                spec,
+                factory,
+                reports.clone(),
+                shutdown_receiver.clone(),
+            ));
+        }
+        drop(reports);
     }
 
     let local_url = format!("http://{}", config.server.ingress);

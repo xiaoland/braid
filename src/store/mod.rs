@@ -372,6 +372,7 @@ pub struct TurnClaim {
 
 #[derive(Debug, Clone)]
 pub struct ContextResetClaim {
+    pub old_provider_session_id: String,
     pub reset_id: String,
     pub assignment_id: String,
     pub repository: String,
@@ -1087,10 +1088,11 @@ impl StoreActor {
         &self,
         work_item_kind: String,
         profile_id: String,
+        available_sessions: Vec<String>,
     ) -> Result<Option<TurnClaim>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::ClaimRunnableTurn(work_item_kind, profile_id, reply))
+            .send(Command::ClaimRunnableTurn(work_item_kind, profile_id, available_sessions, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1366,7 +1368,7 @@ enum Command {
         Sender<Result<(), StoreError>>,
     ),
     EnqueueAssignmentOperationalStatus(String, String, Sender<Result<(), StoreError>>),
-    ClaimRunnableTurn(String, String, Sender<Result<Option<TurnClaim>, StoreError>>),
+    ClaimRunnableTurn(String, String, Vec<String>, Sender<Result<Option<TurnClaim>, StoreError>>),
     RecordAgentWorktree(
         AgentMaterialization,
         String,
@@ -1660,8 +1662,13 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
                     &body,
                 ));
             }
-            Command::ClaimRunnableTurn(work_item_kind, profile_id, reply) => {
-                let _ = reply.send(claim_runnable_turn(database, &work_item_kind, &profile_id));
+            Command::ClaimRunnableTurn(work_item_kind, profile_id, available_sessions, reply) => {
+                let _ = reply.send(claim_runnable_turn(
+                    database,
+                    &work_item_kind,
+                    &profile_id,
+                    &available_sessions,
+                ));
             }
             Command::RecordAgentWorktree(
                 materialization,
@@ -3604,7 +3611,9 @@ fn complete_work_item_reactivation(
         "INSERT INTO provider_sessions(
            session_id,agent_id,provider_kind,provider_session_id,context_revision,
            instruction_revision,lifecycle,started_at
-         ) VALUES (?1,?2,'codex',?3,?4,?5,'idle',?6)",
+         ) VALUES (?1,?2,(SELECT p.provider_kind FROM agent_instances ai
+             JOIN profiles p ON p.profile_id=ai.profile_id AND p.revision=ai.profile_revision
+             WHERE ai.agent_id=?2),?3,?4,?5,'idle',?6)",
         params![
             session_id,
             materialization.agent_id,
@@ -4064,7 +4073,9 @@ fn complete_agent_assignment(
         "INSERT INTO provider_sessions(
            session_id,agent_id,provider_kind,provider_session_id,context_revision,
            instruction_revision,lifecycle,started_at
-         ) VALUES (?1,?2,'codex',?3,?4,?5,'idle',?6)",
+         ) VALUES (?1,?2,(SELECT p.provider_kind FROM agent_instances ai
+             JOIN profiles p ON p.profile_id=ai.profile_id AND p.revision=ai.profile_revision
+             WHERE ai.agent_id=?2),?3,?4,?5,'idle',?6)",
         params![
             session_id,
             materialization.agent_id,
@@ -4362,8 +4373,9 @@ fn load_context_reset_claim(
     let mut claim = connection.query_row(
         "SELECT cr.reset_id,a.assignment_id,r.name_with_owner,w.kind,w.number,ai.profile_id,
                 cr.active_turn_id,t.provider_turn_id,cr.continuation,
-                wt.path,wt.head_ref
+                wt.path,wt.head_ref,ps.provider_session_id
          FROM context_resets cr
+         JOIN provider_sessions ps ON ps.session_id=cr.old_session_id
          JOIN agent_instances ai ON ai.agent_id=cr.agent_id
          JOIN assignments a ON a.assignment_id=ai.assignment_id
          JOIN work_items w ON w.node_id=a.work_item_node_id
@@ -4374,6 +4386,7 @@ fn load_context_reset_claim(
         [reset_id],
         |row| {
             Ok(ContextResetClaim {
+                old_provider_session_id: row.get(11)?,
                 reset_id: row.get(0)?,
                 assignment_id: row.get(1)?,
                 repository: row.get(2)?,
@@ -4407,7 +4420,7 @@ fn mark_context_reset_turn_terminal(
     lifecycle: &str,
 ) -> Result<(), StoreError> {
     require_current_schema(database)?;
-    if !matches!(lifecycle, "completed" | "interrupted" | "failed") {
+    if !matches!(lifecycle, "completed" | "interrupted" | "failed" | "unknown") {
         return Err(StoreError::InvalidData(format!("invalid reset turn terminal {lifecycle}")));
     }
     let now = now_rfc3339();
@@ -4484,7 +4497,9 @@ fn complete_context_reset(
         "INSERT INTO provider_sessions(
            session_id,agent_id,provider_kind,provider_session_id,context_revision,
            instruction_revision,lifecycle,started_at
-         ) VALUES (?1,?2,'codex',?3,?4,?5,'idle',?6)",
+         ) VALUES (?1,?2,(SELECT p.provider_kind FROM agent_instances ai
+             JOIN profiles p ON p.profile_id=ai.profile_id AND p.revision=ai.profile_revision
+             WHERE ai.agent_id=?2),?3,?4,?5,'idle',?6)",
         params![
             new_session_id,
             agent_id,
@@ -4618,6 +4633,7 @@ fn claim_runnable_turn(
     database: &Path,
     work_item_kind: &str,
     profile_id: &str,
+    available_sessions: &[String],
 ) -> Result<Option<TurnClaim>, StoreError> {
     require_current_schema(database)?;
     validate_work_item_kind(work_item_kind)?;
@@ -4640,8 +4656,13 @@ fn claim_runnable_turn(
                     OR (a.lifecycle='finalizing' AND ai.lifecycle='finalizing'))
              JOIN provider_sessions ps ON ps.agent_id=ai.agent_id AND ps.lifecycle='idle'
              WHERE b.lifecycle='runnable' AND w.kind=?1 AND ai.profile_id=?2
+               AND ps.provider_session_id IN (SELECT value FROM json_each(?3))
              ORDER BY b.created_at,b.batch_id LIMIT 1",
-            params![work_item_kind, profile_id],
+            params![
+                work_item_kind,
+                profile_id,
+                serde_json::to_string(available_sessions).expect("session IDs serialize")
+            ],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -5495,5 +5516,89 @@ mod event_kind_tests {
         assert!(!EventKind::Lifecycle.consumed_at_ingest());
         assert!(!EventKind::Assign.consumed_at_ingest());
         assert!(!EventKind::Unassign.consumed_at_ingest());
+    }
+}
+
+#[cfg(test)]
+mod session_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_handles_do_not_consume_batches_and_reset_can_settle_unknown() {
+        let root = std::env::temp_dir().join(format!("braid-recovery-{}", Uuid::now_v7()));
+        let database = root.join("state.sqlite3");
+        apply(&database, &root.join("backups")).unwrap();
+        let connection = open_read_write(&database).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO repositories VALUES ('repo','owner/repo',NULL,'now');
+            INSERT INTO profiles VALUES ('profile',1,printf('%064d',0),'pi','[]');",
+            )
+            .unwrap();
+        for (id, kind, number) in [("one", "issue", 1), ("two", "issue", 2), ("three", "pr", 1)] {
+            connection
+                .execute(
+                    "INSERT INTO work_items VALUES (?1,'repo',?2,?3,'OPEN','context','now')",
+                    params![id, kind, number],
+                )
+                .unwrap();
+            connection
+                .execute("INSERT INTO assignments VALUES (?1,?1,1,'active','now',NULL)", [id])
+                .unwrap();
+            connection.execute("INSERT INTO agent_instances(agent_id,assignment_id,profile_id,profile_revision,role,lifecycle) VALUES (?1,?1,'profile',1,?2,'idle')", params![id,kind]).unwrap();
+            connection.execute("INSERT INTO provider_sessions(session_id,agent_id,provider_kind,provider_session_id,context_revision,instruction_revision,lifecycle,started_at) VALUES (?1,?1,'codex',?1,'context','instructions','idle','now')", [id]).unwrap();
+            connection.execute("INSERT INTO wake_batches(batch_id,work_item_node_id,quiet_deadline,lifecycle,created_at,updated_at) VALUES (?1,?1,'now','runnable','now','now')", [id]).unwrap();
+        }
+        assert!(claim_runnable_turn(&database, "issue", "profile", &[]).unwrap().is_none());
+        let claim =
+            claim_runnable_turn(&database, "issue", "profile", &["two".into(), "three".into()])
+                .unwrap()
+                .unwrap();
+        assert_eq!(claim.provider_session_id, "two");
+        assert_eq!(
+            connection
+                .query_row("SELECT lifecycle FROM wake_batches WHERE batch_id='one'", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "runnable"
+        );
+        assert_eq!(
+            claim_runnable_turn(&database, "pr", "profile", &["three".into()])
+                .unwrap()
+                .unwrap()
+                .provider_session_id,
+            "three"
+        );
+        connection.execute("INSERT INTO context_resets(reset_id,agent_id,old_session_id,active_turn_id,context_revision_before,continuation,lifecycle,created_at,updated_at) VALUES ('reset','two','two',?1,'context',1,'interrupting','now','now')", [&claim.turn_id]).unwrap();
+        mark_context_reset_turn_terminal(&database, "reset", &claim.turn_id, "unknown").unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT lifecycle FROM context_resets WHERE reset_id='reset'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "materializing"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT lifecycle FROM turns WHERE turn_id=?1",
+                    [&claim.turn_id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "unknown"
+        );
+        assert_eq!(
+            load_context_reset_claim(&connection, "reset").unwrap().old_provider_session_id,
+            "two"
+        );
+        complete_context_reset(&database, "reset", "replacement", "new-context", "instructions")
+            .unwrap();
+        assert_eq!(connection.query_row("SELECT provider_kind FROM provider_sessions WHERE provider_session_id='replacement'", [], |row| row.get::<_,String>(0)).unwrap(), "pi");
+        drop(connection);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

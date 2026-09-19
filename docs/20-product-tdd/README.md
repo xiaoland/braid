@@ -98,15 +98,13 @@ crates. Modules are deep and align with authority boundaries:
 | `context` | Canonical snapshot model, HTML-comment removal, deterministic Markdown rendering, budget, and revision. |
 | `events` | Canonical diff classification and compact Event Reference rendering. |
 | `store` | One dedicated SQLite actor, transactions, migrations, leases, ledgers, sessions, batches, and outbox. |
-| `scheduler` | Quiet/count/urgent coalescing and single-flight group turn claims. |
-| `producer` | Webhook/GraphQL ingress → canonical diff → classified events (`ingress`, `reconcile`). |
-| `queue` | Per-work-item per-agent-group quiet window, batch emission, claim decisions, context-pressure policy, and store-side reset fencing (`scheduler`). Never touches provider sessions or connections. |
-| `outbox` | Drain the GitHub write outbox (reactions, comments, statuses) with uncertain-write recovery. Leaf over `store` + `github`, called by ingress and the runtime drain loop. |
-| `group` | Agent Group workers that own every provider connection epoch (connect, resume, drive, reconnect), the dispatch/materialization half that executes queue decisions against `AgentSession`s, provider supervision/prompts/attribution, and the per-epoch in-process `SessionManager` (`issue_agent`, `pr_agent`, `dispatch`, `provider`, `session_manager`). |
-| `agent_session` | Core `AgentSession` trait and event stream (`TurnStarted`, `TurnTerminal`, `Failed`). Core callers operate sessions only through `send_user_msg`; the event stream is the single authority for lifecycle facts. |
-| `provider::session` | `ProviderAgentSession` adapter that maps `AgentSession` to `AgentProvider` primitives and translates provider notifications into `SessionEvent`s, deduplicating the provider's response-side and notification-side observation of the same fact. |
-| `session_manager` | In-process `SessionManager` keyed by provider thread id; start/resume/get. Ephemeral per connection epoch: it is rebuilt from the durable store on every (re)connect because sessions bind the epoch's provider handle. |
-| `provider` | Provider-neutral capability contract and Codex NDJSON implementation. |
+| `producer` | Webhook/GraphQL observation、canonical diff 与事件分类；独立的 `mentions` 循环补全 GitHub 权限事实并保留失败 backoff。 |
+| `queue` | 独立推进 Quiet Window、count、urgent 与批次状态；通过 store 领取可运行 turn，不执行网络权限查询或持有会话事件 receiver。 |
+| `outbox` | 独立收敛 GitHub reactions、comments、statuses 及 uncertain writes；runtime 关闭时执行最终 drain。 |
+| `group` | `GroupDriver` 统一 Issue/PR 的逻辑生命周期、dispatch、Context replacement 和恢复；领域模块保留 Profile、prompt、worktree 与兼容性规则。`RunningAgentTurn` 保存当前 claim 和事件 receiver。 |
+| `agent_session` | Core 定义的 `SessionFactory` 创建/恢复契约与 `AgentSession` 行为、事件、失效观察和释放契约。 |
+| `group::session_manager` | 按 opaque provider session ID 索引中立句柄；只恢复缺失或失效的句柄，并释放不再使用的句柄。持久化绑定仍由 store 权威保存。 |
+| `provider` | 实现 core 会话契约，拥有物理进程、连接、会话寻址和通知翻译。Codex factory 内部缓存共享 app-server；Pi factory 为每个物理会话创建独立资源。 |
 | `worktree` | Validate a Profile source checkout, resolve the bound ref (PR head, sole Development branch, or default origin branch), provision one generation-scoped worktree per Agent Group, and expose recovery diagnostics; no Git-operation sandbox. |
 | `writer` | `braid gh`, attribution, reaction/status desired state, and write-outbox convergence. |
 | `telemetry` | Trace/metric/log creation, payload events, sampling configuration, and OTLP export. |
@@ -114,10 +112,11 @@ crates. Modules are deep and align with authority boundaries:
 | `runtime` | Owner lease, worker supervision, boot-time configuration gates, shutdown ordering, health, and public operator state. Never touches provider connections or sessions directly. |
 | `cli` | `serve`, `config`, `doctor`, `profile`, `gh`, `status`, and migration/version surfaces. |
 
-Module dependencies point one way only: `runtime` → `group` → `queue`, and
-`runtime` → `producer` → `outbox`/`health`; `queue`, `outbox`, and `health`
-sit above the leaf modules (`store`, `context`, `github`, `config`,
-`provider`, `worktree`, `telemetry`) and no lower layer imports an upper one.
+`runtime` 装配 `group` 与 provider 实现。`group` 和 `provider` 都依赖
+core 的 `agent_session` 契约；adapter 不导入 Group、queue 或 store。
+Group 使用 store/context/github/worktree 编排产品状态，不操纵连接 epoch。
+Producer、queue、outbox 各自通过 store 收敛其负责的状态；只有需要平台
+事实或写入的 producer/outbox 依赖 GitHub 网络操作。
 
 ### Internal Event Model
 
@@ -140,9 +139,9 @@ best-effort one-way projection from it. Nonessential state is not persisted.
 | --- | --- | --- |
 | Work Items, assignments, turns, context ledger/resets, queue/batches, outbox, owner lease | Durable store (SQLite) | In-memory `RunningAgentTurn` (claim cache for the in-flight turn), health snapshot |
 | GitHub canonical state | GitHub | `canonical_objects` / `sync_cursors` snapshots for diffing |
-| Physical session identity (`provider_session_id`) | Durable store (`provider_sessions`) | `SessionManager` map key + adapter `thread_id` (both ephemeral, rebuilt per epoch) |
-| Current provider turn | Provider process | `SessionEvent` stream (exactly one `TurnStarted`/`TurnTerminal` per turn; receiver handed off with the turn, never re-subscribed) → durable store; resume fencing as the cross-epoch backstop |
-| Provider connectivity | Provider connection | `AgentProvider::closed()` future → worker epoch loop → health snapshot + blocked-session records |
+| Physical session identity (`provider_session_id`) | Durable store (`provider_sessions`) | `SessionManager` 的 opaque key 与 adapter 寻址；句柄可替换，assignment 与 worktree 连续性不依赖连接 |
+| Current provider turn | Provider process | `SessionEvent` stream (exactly one `TurnStarted`/`TurnTerminal` per turn; receiver handed off with the turn, never re-subscribed) → durable store; 恢复时 fencing 遗留的 starting/running turn |
+| Provider connectivity | Provider connection | adapter 内部观察连接退出 → 受影响句柄的 latched availability；runtime 汇总各 driver 的恢复结果，成功不能覆盖另一方的失败 |
 | Worktree presence | Filesystem + git | `worktrees` table (refreshed by inspection at prepare time) |
 
 Selected dependency baseline, verified against crates.io on 2026-08-13:

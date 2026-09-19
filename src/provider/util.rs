@@ -128,17 +128,3 @@ impl AgentProvider for Box<dyn AgentProvider> {
         self.as_ref().interrupt(thread_id, turn_id).await
     }
 }
-
-pub async fn connect_provider(
-    config: &crate::config::ProviderConfig,
-) -> Result<Arc<dyn crate::provider::AgentProvider>, crate::provider::ProviderError> {
-    if let Some(codex) = &config.codex {
-        let provider = CodexProvider::connect(codex).await?;
-        Ok(Arc::new(provider))
-    } else if let Some(pi) = &config.pi {
-        let provider = PiProvider::connect(pi);
-        Ok(Arc::new(provider))
-    } else {
-        Err(crate::provider::ProviderError::Protocol("no provider configured".into()))
-    }
-}

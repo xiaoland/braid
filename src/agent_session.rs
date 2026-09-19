@@ -45,9 +45,9 @@ pub enum SendResult {
 ///   `TurnTerminal { outcome: Unknown, .. }` for the in-flight turn before
 ///   going quiet, so a started turn is never left without a terminal.
 /// - No events for messages that only return `Acknowledged`.
-/// - There is no session-scoped event kind. Connection death is a
-///   connection-scoped fact observed through `AgentProvider::closed()` by the
-///   worker that owns the epoch, not through this per-session stream.
+/// - Handle availability is observed independently through `is_unavailable`,
+///   including while idle. It is latched for the lifetime of the handle;
+///   restoring a durable session produces a new handle.
 ///
 /// Delivery reliability is the consumer's side of the contract: the receiver
 /// that observed `TurnStarted` (created before the send) is handed to the
@@ -84,6 +84,14 @@ pub enum SessionError {
 pub trait AgentSession: Send + Sync {
     fn events(&self) -> broadcast::Receiver<SessionEvent>;
 
+    /// True once this handle can no longer safely dispatch. This does not
+    /// imply that the provider's persisted session has been deleted.
+    fn is_unavailable(&self) -> bool;
+
+    /// Release this handle's execution resources, best-effort interrupting
+    /// its active turn. Other sessions must remain usable.
+    async fn close(&self) -> Result<(), SessionError>;
+
     /// Send a user message batch. `steering` selects the provider steer path
     /// for a running turn; a non-steering message while a turn runs is
     /// dropped (`Acknowledged`) because the caller is expected to route it
@@ -100,4 +108,30 @@ pub trait AgentSession: Send + Sync {
     /// the event stream — `Interrupted` when honored, or the natural outcome
     /// if the turn completed first — so callers never wait on a side channel.
     async fn interrupt(&self) -> Result<(), SessionError>;
+}
+
+/// An adapter-created handle and the opaque identity to bind in the durable store.
+pub(crate) struct CreatedSession {
+    pub(crate) id: String,
+    pub(crate) session: std::sync::Arc<dyn AgentSession>,
+}
+
+/// Core-owned creation contract. Implementations own their physical topology;
+/// callers supply already-selected instructions, Context and workspace.
+#[async_trait::async_trait]
+pub(crate) trait SessionFactory: Send + Sync {
+    /// Check runtime availability even before a Work Item has a session.
+    async fn check(&self) -> Result<(), SessionError>;
+    async fn start(
+        &self,
+        profile: crate::config::Profile,
+        instructions: String,
+        context: String,
+    ) -> Result<CreatedSession, SessionError>;
+    async fn resume(
+        &self,
+        id: &str,
+        profile: crate::config::Profile,
+        instructions: String,
+    ) -> Result<CreatedSession, SessionError>;
 }
