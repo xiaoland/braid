@@ -66,11 +66,7 @@ async fn diff(
     Path(number): Path<u64>,
 ) -> Result<Json<Value>, HttpError> {
     let source = state.policy.source.clone();
-    run_read(state, move |objects| {
-        objects.diff(number, &source).map(|diff| serde_json::json!({"diff":diff}))
-    })
-    .await
-    .map(Json)
+    run_read(state, move |objects| objects.diff(number, &source)).await.map(Json)
 }
 async fn receipt(
     State(state): State<Arc<ControlState>>,

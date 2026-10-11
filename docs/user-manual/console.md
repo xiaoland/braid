@@ -54,6 +54,10 @@ worktree。Harness 核验责任后交接固定提交 OID，平台在绑定 Git �
 保留候选；浏览器不能提交任意路径。Git 合并沿用平台对象的持久意图和 base 引用检查，
 不是 Git 与 SQLite 的跨系统原子事务。
 
+Diff 显示生成该内容时的对象编号、revision 及固定 head/base OID。它与详情页
+版本不一致时，页面提示详情已过期并提供刷新；该快照不会自动改变合并使用的
+revision 前提，采纳前应重新核对当前候选。
+
 每次命令带 request ID。同一个 ID 不可换成另一份命令，响应丢失后查询原回执，
 不自动重新执行修改。对象回执表示对象与事件已接受，不能证明 Agent 已阅读或
 业务完成。runtime 启停回执也只表示请求接受；只有监督器收到全部 worker 的
@@ -64,6 +68,9 @@ worktree。Harness 核验责任后交接固定提交 OID，平台在绑定 Git �
 提供网页“强制清除”来绕过停止证明。Console 可与托管平台和 Harness 处于同一进程，尚不提供
 进程级故障隔离、暂停/恢复、远程访问、多人权限或外部 GitHub 对象修改入口。GitHub 接入拥有同一 Harness 启停入口，
 对象编辑仍使用该上游已有操作方式；不能用内建平台 UI 向 GitHub 伪装对象写入。
+外部隧道接入 managed GitHub ingress 时，App webhook URL 必须包含 `/webhook`
+路由；仅公网 host 根路径不会接收对象事件。以 GitHub 的实际 delivery 响应
+确认投递，不把隧道存活或另一路径的签名请求当作当前 App URL 已生效。
 
 ## 数据边界
 

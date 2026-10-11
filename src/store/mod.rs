@@ -3392,7 +3392,7 @@ fn work_item_lifecycle_candidates(
          JOIN work_items w ON w.node_id=e.work_item_node_id
          JOIN repositories r ON r.node_id=w.repository_node_id
          WHERE e.lifecycle='pending' AND e.kind='lifecycle'
-           AND w.kind=?1 AND e.detail IN ('closed','reopened')
+           AND w.kind=?1 AND e.detail IN ('closed','merged','reopened')
          ORDER BY e.observed_at,e.event_id LIMIT ?2",
     )?;
     let rows = statement.query_map(params![work_item_kind, limit], |row| {
@@ -3407,6 +3407,7 @@ fn work_item_lifecycle_candidates(
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
 }
 
+#[allow(clippy::too_many_lines)]
 fn prepare_work_item_finalization(database: &Path, event_id: &str) -> Result<bool, StoreError> {
     require_current_schema(database)?;
     let now = now_rfc3339();
@@ -3433,7 +3434,7 @@ fn prepare_work_item_finalization(database: &Path, event_id: &str) -> Result<boo
         transaction.commit()?;
         return Ok(false);
     };
-    if detail.as_deref() != Some("closed")
+    if !matches!(detail.as_deref(), Some("closed" | "merged"))
         || !matches!(state.to_ascii_lowercase().as_str(), "closed" | "merged")
     {
         transaction.execute(
@@ -3442,6 +3443,15 @@ fn prepare_work_item_finalization(database: &Path, event_id: &str) -> Result<boo
         )?;
         transaction.commit()?;
         return Ok(false);
+    }
+    // A previously admitted built-in merge can still carry the platform's
+    // closed state. Project its immutable merge fact before terminal handling
+    // chooses retired rather than the reopenable closed/sleeping state.
+    if detail.as_deref() == Some("merged") {
+        transaction.execute(
+            "UPDATE work_items SET state='merged' WHERE node_id=?1 AND kind='pr'",
+            [&work_item_node_id],
+        )?;
     }
     let selected = transaction
         .query_row(

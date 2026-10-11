@@ -376,7 +376,7 @@ async function objects(token){
   },'Issue'),el('option',{
     value:'pr'
   },'Pull Request')),head=field('Head 分支'),base=field('Base 分支'),issue=field('关联 Issue 编号','','number');
-  let current=null;
+  let current=null,selection=0;
   const profiles=harness?.profileSuggestions||{};
   const reply=field('回复评论编号（可选）','','number');
   let lastRequest=null;
@@ -422,8 +422,9 @@ async function objects(token){
   }
   async function select(number,acceptedRefresh=false){
     if(!acceptedRefresh){if(controlPending){showError(new Error('控制请求尚未取得回执，暂时不能切换对象。'));return;}if(hasDrafts()&&!await confirmAction('切换对象将丢弃尚未提交的编辑与评论，继续吗？'))return;}
+    const selected=++selection;
     const v=await api('/api/control/items/'+number);
-    if(token!==generation)return;
+    if(token!==generation||selected!==selection)return;
     current=v;
     const i=v.item,title=field('标题',i.title),body=field('正文',i.body,'textarea'),comment=field('新评论','','textarea'),profile=field('指派给 Actor',i.desired_profile||(i.kind==='issue'?profiles.issue:profiles.pr)||''),linked=field('关联 PR 编号','','number');
     const merged=v.merge?.lifecycle==='applied';
@@ -462,6 +463,7 @@ async function objects(token){
     },i.revision),'primary')));
     let candidate=null;
     if(i.kind==='pull_request'||i.kind==='pr'){
+      let diffRequest=0;
       const worktree=field('Git Commit ID'),diff=el('div'),candidateKind=el('select',{},el('option',{value:'source'},'配置 Source 的当前已提交 Checkout'),el('option',{value:'commit'},'配置 Source 中的 Commit'));worktree.node.hidden=true;candidateKind.addEventListener('change',()=>worktree.node.hidden=candidateKind.value!=='commit');
       candidate=panel('Git 候选',badge(i.published?'候选已发布':'候选未发布'),el('p',{
         class:'meta'
@@ -477,7 +479,19 @@ async function objects(token){
         if(await confirmAction(`将 PR #${i.number} 的已发布候选合并到 ${i.base_ref}？`))await execute({
           type:'merge',number:i.number
         },i.revision);
-      },'danger'),button('读取真实 Git Diff',async()=>{const result=await api('/api/control/items/'+i.number+'/diff');diff.replaceChildren(el('pre',{},result.diff||'无差异'));})),diff,raw(v.merge,'持久合并记录'));
+      },'danger'),button('读取真实 Git Diff',async()=>{
+        const request=++diffRequest;
+        const active=()=>token===generation&&selected===selection&&current===v&&request===diffRequest&&diff.isConnected;
+        diff.replaceChildren(empty('正在读取固定候选 Diff…'));
+        try{
+          const result=await api('/api/control/items/'+i.number+'/diff');
+          if(!active())return;
+          if(result.number!==i.number||!Number.isInteger(result.revision)||typeof result.headCommit!=='string'||typeof result.baseCommit!=='string'||typeof result.diff!=='string')throw new Error('Diff 响应缺少完整候选身份，无法将内容归属到 Head / Base / Revision。');
+          const stale=result.revision!==i.revision||result.headCommit!==i.head_commit||result.baseCommit!==i.base_commit;
+          diff.replaceChildren(panel('Diff 固定快照',el('p',{class:'meta'},`PR #${result.number} · Revision ${result.revision}`),el('p',{class:'meta'},`Head ${result.headCommit}`),el('p',{class:'meta'},`Base ${result.baseCommit}`),stale?el('div',{class:'notice error'},'对象详情已过期。此 Diff 属于以上固定快照；合并操作仍采用页面原 Revision 前提。',button('刷新对象详情',()=>select(i.number))):el('p',{class:'meta'},'Diff 与当前对象详情身份一致；后续发布仍可能更新对象。'),el('pre',{},result.diff||'无差异')));
+        }
+        catch(e){if(active())diff.replaceChildren(el('div',{class:'notice error'},'Diff 读取失败，未展示成功内容。\n'+(e.message||String(e))));}
+      })),diff,raw(v.merge,'持久合并记录'));
     }
     else{
       candidate=panel('关联 Pull Request',linked.node,button('关联',async()=>{

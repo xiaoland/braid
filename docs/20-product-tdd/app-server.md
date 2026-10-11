@@ -10,6 +10,11 @@ Group 不根据 backend 决定连接数量或故障范围。
 创建结果包含 opaque provider session ID 与中立句柄，store 保存它与 Agent/assignment
 的绑定。Resume 返回同一持久化身份的新句柄，不改变 assignment 或 worktree。
 
+两种上游的 Codex 与 Pi 子进程都取得当前 Harness 配置的绝对路径
+`BRAID_CONFIG` 和 `BRAID_AGENT=1`。原生工具因此使用所属运行的配置，不能因
+GitHub 接入而遗漏路径、继承宿主的其它实例或自行寻找旧运行配置。这提供明确
+绑定，不构成对同账户进程的文件系统隔离。
+
 | Core method | Adapter behavior |
 | --- | --- |
 | `SessionFactory::check()` | 检查 adapter 的启动前置条件；共享运行资源由 adapter 自己维护。 |

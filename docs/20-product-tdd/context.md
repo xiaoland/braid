@@ -96,6 +96,10 @@ changes to them produce Event References when subscribed.
 
 ## Body Filtering
 
+内建 `object context` 使用此 projector，供 Agent 重新读取设计与讨论。
+`object show` 返回平台原始对象，供对象及操作元数据检查，不承诺移除 HTML 注释；
+该过滤不是原始对象、provider history 或任意工具读取的机密隔离边界。
+
 Braid preserves original Markdown bytes except for actual HTML comment nodes.
 The Context projector parses GitHub Flavored Markdown, obtains source ranges for
 HTML inline/block comments beginning with `<!--`, and splices those ranges from

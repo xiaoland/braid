@@ -582,7 +582,7 @@ impl Config {
             })?;
             return Ok(ProviderConfig {
                 codex: Some(CodexConfig {
-                    braid_config_path: self.is_builtin().then(|| self.loaded_from.clone()),
+                    braid_config_path: Some(self.loaded_from.clone()),
                     executable: runtime.executable.clone(),
                     home,
                     version: runtime.version.clone(),
@@ -599,7 +599,7 @@ impl Config {
             return Ok(ProviderConfig {
                 codex: None,
                 pi: Some(PiConfig {
-                    braid_config_path: self.is_builtin().then(|| self.loaded_from.clone()),
+                    braid_config_path: Some(self.loaded_from.clone()),
                     executable: runtime.executable.clone(),
                     provider: Some(llm.id.clone()),
                     model: profile.model.clone(),

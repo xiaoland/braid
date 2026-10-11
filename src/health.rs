@@ -43,7 +43,7 @@ pub(crate) async fn provider_health_worker(
         } else {
             "starting"
         };
-        if current.ingress == "local" {
+        if current.ingress == "builtin" {
             current.ready = current.provider == "connected";
         }
         if error.is_some() || current.last_error == prior_error {

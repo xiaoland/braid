@@ -669,7 +669,7 @@ impl PlatformObjects {
         Ok(self.connection.query_row("SELECT expected_base,expected_head,merge_commit,lifecycle,error,created_at,updated_at FROM local_merges WHERE pr_number=?1",[sql_id(number)?],|r|Ok(serde_json::json!({"expected_base":r.get::<_,String>(0)?,"expected_head":r.get::<_,String>(1)?,"merge_commit":r.get::<_,Option<String>>(2)?,"lifecycle":r.get::<_,String>(3)?,"error":r.get::<_,Option<String>>(4)?,"created_at":r.get::<_,String>(5)?,"updated_at":r.get::<_,String>(6)?}))).optional()?)
     }
 
-    pub fn diff(&self, number: u64, source: &Path) -> Result<String> {
+    pub fn diff(&self, number: u64, source: &Path) -> Result<serde_json::Value> {
         self.verify_source(source)?;
         let item = self.item(number)?;
         ensure!(item.kind == "pr", "#{number} is not a PR");
@@ -693,7 +693,16 @@ impl PlatformObjects {
             output.extend_from_slice(line.content());
             true
         })?;
-        String::from_utf8(output).context("Git diff contains non-UTF-8 content")
+        let diff = String::from_utf8(output).context("Git diff contains non-UTF-8 content")?;
+        // Return the identity read before generating the patch: a later publish must
+        // not label this immutable comparison with a different object revision.
+        Ok(serde_json::json!({
+            "number": item.number,
+            "revision": item.revision,
+            "headCommit": item.head_commit,
+            "baseCommit": item.base_commit,
+            "diff": diff,
+        }))
     }
 
     pub fn merge(&mut self, number: u64, source: &Path, author: &str) -> Result<MergeResult> {

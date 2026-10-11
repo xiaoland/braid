@@ -66,7 +66,7 @@ impl GroupDriver<'_> {
             return (false, None);
         };
         match candidate.action.as_str() {
-            "closed" => match store.prepare_work_item_finalization(candidate.event_id) {
+            "closed" | "merged" => match store.prepare_work_item_finalization(candidate.event_id) {
                 Ok(true) => {
                     tracing::info!(
                         work_item_kind,

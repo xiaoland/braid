@@ -137,6 +137,33 @@ pub async fn run_options(
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
+    // Public reads do not need an Agent writing identity or capability. The
+    // connected client still verifies the persisted platform-space binding.
+    match &command {
+        LocalCommand::List => {
+            let result: serde_json::Value = client.get("api/control/items").await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            return Ok(());
+        }
+        LocalCommand::Show(a) => {
+            let result: serde_json::Value =
+                client.get(&format!("api/control/items/{}", a.number)).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            return Ok(());
+        }
+        LocalCommand::Context(a) => {
+            let canonical = client.context(a.number).await?;
+            print!("{}", context::render_complete(&canonical, 1.0, usize::MAX).text);
+            return Ok(());
+        }
+        LocalCommand::Diff(a) => {
+            let result: serde_json::Value =
+                client.get(&format!("api/control/items/{}/diff", a.number)).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            return Ok(());
+        }
+        _ => {}
+    }
     let writer = if std::env::var_os("BRAID_AGENT").is_some() {
         Some(active_writer(config.runtime.database(), &std::env::current_dir()?)?)
     } else {
@@ -167,28 +194,10 @@ pub async fn run_options(
     };
     let object = match command {
         LocalCommand::Receipt(_) => unreachable!("receipt handled before writer admission"),
-        LocalCommand::List => {
-            let result: serde_json::Value = client.get("api/control/items").await?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            return Ok(());
-        }
-        LocalCommand::Show(a) => {
-            let result: serde_json::Value =
-                client.get(&format!("api/control/items/{}", a.number)).await?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            return Ok(());
-        }
-        LocalCommand::Context(a) => {
-            let canonical = client.context(a.number).await?;
-            print!("{}", context::render_complete(&canonical, 1.0, usize::MAX).text);
-            return Ok(());
-        }
-        LocalCommand::Diff(a) => {
-            let result: serde_json::Value =
-                client.get(&format!("api/control/items/{}/diff", a.number)).await?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            return Ok(());
-        }
+        LocalCommand::List
+        | LocalCommand::Show(_)
+        | LocalCommand::Context(_)
+        | LocalCommand::Diff(_) => unreachable!("public reads handled before writer admission"),
         LocalCommand::Issue(a) => {
             ObjectCommand::CreateIssue { title: a.title, body: a.body.read()?.unwrap_or_default() }
         }
@@ -320,6 +329,19 @@ fn published_commit(source: &Path, cwd: &Path) -> Result<String> {
     let workdir =
         actual.workdir().context("candidate must be a non-bare worktree")?.canonicalize()?;
     ensure!(cwd.starts_with(workdir), "candidate cwd is outside its Git worktree");
-    ensure!(actual.statuses(None)?.is_empty(), "publish requires a clean committed worktree");
+    // libgit2's default status flags include ignored files. Native session
+    // storage and application data do not make a committed candidate dirty.
+    let mut options = git2::StatusOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(true).include_ignored(false);
+    let statuses = actual.statuses(Some(&mut options))?;
+    ensure!(
+        statuses.is_empty(),
+        "publish requires a clean committed worktree: {}",
+        statuses
+            .iter()
+            .map(|entry| entry.path().unwrap_or("<non-UTF8 path>").to_owned())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     Ok(actual.head()?.peel_to_commit()?.id().to_string())
 }

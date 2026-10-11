@@ -43,8 +43,10 @@ actor 是平台事实；Harness 将它映射为当前支持的 Profile。只有�
 数据，不能获得系统指令权限。
 
 `braid object --config <Harness配置>` 是 Harness 的对象接入入口，使用平台 API，
-不直接修改平台数据库。运行中的 Agent 调用时，Harness 核对专属 cwd、当前
-assignment、session 与 turn，并使用已授予的 writer grant；平台提交事务核对
+不直接修改平台数据库。只读 list/show/context/diff 及对象命令 receipt 使用同一
+平台的公开读取路径，仍核对配置中的 repository、nodeId 与持久 spaceId，不要求
+写 grant；关闭后的收口也可以读取 Context。Agent 写入时，Harness 核对专属 cwd、
+当前 assignment、session 与 turn，并使用已授予的 writer grant；平台提交事务核对
 授权版本、对象 revision 与 request ID。撤销授权先于替换执行，过期请求明确
 拒绝。此合同防止正常执行串写，不是恶意本机账户的安全沙箱。
 

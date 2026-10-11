@@ -1,6 +1,7 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
 use std::path::PathBuf;
+use std::process::ExitStatus;
 
 struct PiRequest {
     response: oneshot::Sender<Result<Value, ProviderError>>,
@@ -10,7 +11,7 @@ struct PiRequest {
 type PiPendingRequests = BTreeMap<i64, PiRequest>;
 
 struct PiProcess {
-    writer: ChildStdin,
+    writer: Option<ChildStdin>,
     child: Child,
     #[allow(dead_code)]
     stdout_handle: tokio::task::JoinHandle<()>,
@@ -154,7 +155,8 @@ impl PiProvider {
         );
         let stderr_handle =
             spawn_pi_stderr(stderr, Arc::clone(&self.thread_id), Arc::clone(&self.turn_id));
-        state.process = Some(PiProcess { writer, child, stdout_handle, stderr_handle });
+        state.process =
+            Some(PiProcess { writer: Some(writer), child, stdout_handle, stderr_handle });
         Ok(())
     }
 
@@ -194,13 +196,14 @@ impl PiProvider {
             bytes.push(b'\n');
             bytes
         };
-        if let Err(error) = process.writer.write_all(&bytes).await {
+        let writer = process.writer.as_mut().ok_or(ProviderError::Disconnected)?;
+        if let Err(error) = writer.write_all(&bytes).await {
             state.pending.lock().await.remove(&id);
             return Err(ProviderError::Unknown(format!(
                 "Pi {method} request {id} write failed: {error}"
             )));
         }
-        if let Err(error) = process.writer.flush().await {
+        if let Err(error) = writer.flush().await {
             state.pending.lock().await.remove(&id);
             return Err(ProviderError::Unknown(format!(
                 "Pi {method} request {id} flush failed: {error}"
@@ -432,14 +435,15 @@ impl AgentProvider for PiProvider {
 
     async fn close_session(
         &self,
-        _thread_id: &str,
+        thread_id: &str,
         confirmed_idle: bool,
     ) -> Result<(), ProviderError> {
         let mut state = self.state.lock().await;
         if let Some(result) = &state.close_result {
             return result.clone().map_err(ProviderError::Protocol);
         }
-        let result = async {
+        let native_session_id = state.native_session_id.clone();
+        let mut result = async {
             if !confirmed_idle {
                 let cleared = Self::request(&mut state, json!({"type":"clear_queue"})).await?;
                 Self::success_or_protocol(&cleared, "clear_queue")?;
@@ -453,10 +457,10 @@ impl AgentProvider for PiProvider {
                 }
             }
             if let Some(process) = state.process.as_mut() {
-                process.writer.shutdown().await?;
-                timeout(REQUEST_TIMEOUT, process.child.wait()).await.map_err(|_| {
-                    ProviderError::Timeout { method: "Pi child exit after stop".into() }
-                })??;
+                // Unix pipe shutdown is a no-op; dropping stdin delivers Pi's EOF shutdown.
+                drop(process.writer.take());
+                wait_for_pi_child(process, thread_id, native_session_id.as_deref(), "graceful_eof")
+                    .await?;
             }
             Ok(())
         }
@@ -466,8 +470,41 @@ impl AgentProvider for PiProvider {
         {
             // Reclaim the parent, but never promote a forced kill into a
             // claim that detached tools have stopped.
-            let _ = process.child.start_kill();
-            let _ = timeout(REQUEST_TIMEOUT, process.child.wait()).await;
+            let pid = process.child.id();
+            let kill_result = process.child.start_kill();
+            tracing::info!(
+                name = "braid.provider.process",
+                provider.kind = "pi",
+                braid.provider_session.id = thread_id,
+                provider.thread.id = thread_id,
+                provider.native_session.id = native_session_id.as_deref().unwrap_or(""),
+                process.pid = pid,
+                provider.process.operation = "kill_request",
+                braid.outcome = if kill_result.is_ok() { "sent" } else { "failed" },
+                error.reason =
+                    kill_result.as_ref().err().map(ToString::to_string).as_deref().unwrap_or(""),
+                "Pi parent cleanup request; does not confirm detached tools stopped"
+            );
+            let wait_result = wait_for_pi_child(
+                process,
+                thread_id,
+                native_session_id.as_deref(),
+                "forced_cleanup",
+            )
+            .await;
+            let cleanup_errors = kill_result
+                .err()
+                .map(|error| format!("kill request: {error}"))
+                .into_iter()
+                .chain(wait_result.err().map(|error| error.to_string()))
+                .collect::<Vec<_>>();
+            if !cleanup_errors.is_empty() {
+                let original = result.as_ref().expect_err("failed stop triggered cleanup");
+                result = Err(ProviderError::Unknown(format!(
+                    "{original}; parent cleanup: {}",
+                    cleanup_errors.join("; ")
+                )));
+            }
         }
         state.close_result = Some(result.as_ref().copied().map_err(ToString::to_string));
         if result.is_ok() {
@@ -475,6 +512,45 @@ impl AgentProvider for PiProvider {
         }
         result
     }
+}
+
+async fn wait_for_pi_child(
+    process: &mut PiProcess,
+    thread_id: &str,
+    native_session_id: Option<&str>,
+    stage: &'static str,
+) -> Result<ExitStatus, ProviderError> {
+    let pid = process.child.id();
+    let waited = timeout(REQUEST_TIMEOUT, process.child.wait()).await;
+    let result = match waited {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(ProviderError::Protocol(format!(
+            "Pi child wait ({stage}, pid {pid:?}) failed: {error}"
+        ))),
+        Err(_) => {
+            Err(ProviderError::Timeout { method: format!("Pi child wait ({stage}, pid {pid:?})") })
+        }
+    };
+    let exit_status = result.as_ref().ok().map(ToString::to_string);
+    let exit_code = result.as_ref().ok().and_then(ExitStatus::code);
+    tracing::info!(
+        name = "braid.provider.process",
+        provider.kind = "pi",
+        braid.runtime.generation =
+            telemetry::evidence_health().runtime_generation.as_deref().unwrap_or(""),
+        braid.provider_session.id = thread_id,
+        provider.thread.id = thread_id,
+        provider.native_session.id = native_session_id.unwrap_or(""),
+        process.pid = pid,
+        provider.process.operation = "wait",
+        provider.process.stage = stage,
+        braid.outcome = if result.is_ok() { "exited" } else { "unconfirmed" },
+        process.exit.status = exit_status.as_deref().unwrap_or(""),
+        process.exit.code = exit_code,
+        error.reason = result.as_ref().err().map(ToString::to_string).as_deref().unwrap_or(""),
+        "Pi child wait observation; parent exit does not prove detached tools stopped"
+    );
+    result
 }
 
 #[allow(clippy::too_many_arguments)]

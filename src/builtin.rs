@@ -97,7 +97,11 @@ impl WireEvent {
             work_item_node_id: self.work_item_node_id,
             work_item_kind,
             work_item_number: self.work_item_number,
-            work_item_state: self.work_item_state,
+            work_item_state: if work_item_kind == Some("pr") && detail == Some("merged") {
+                Some("merged".into())
+            } else {
+                self.work_item_state
+            },
             object_node_id: self.object_node_id,
             object_version: self.object_version,
             object_digest: self.object_digest,
