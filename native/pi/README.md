@@ -4,7 +4,7 @@
 不读取系统全局 Pi 扩展；CLI 和 RPC 使用同一入口。共同生命周期与停止合同归
 [provider 技术说明](../../docs/20-product-tdd/app-server.md)。
 
-在有 Node 与 npm 的开发宿主安装到新的绝对目录。不要覆盖正在使用的安装，
+在有 Node、npm、curl 与 tar 的开发宿主安装到新的绝对目录。不要覆盖正在使用的安装，
 保留旧版本和执行回执。Mac 本项目的目录必须位于 WorkSSD。
 
 ```sh
@@ -13,8 +13,12 @@ node native/pi/install.mjs /Volumes/WorkSSD/Development/braid-runtime/pi-1.0.2 \
 /Volumes/WorkSSD/Development/braid-runtime/pi-1.0.2/pi --version
 ```
 
-安装使用锁定依赖并应用有序补丁，生成固定 Node 副本、`pi` 入口和
-`runtime-manifest.json`。安装目录中的缓存和临时目录也位于该目录。
+安装使用锁定依赖并应用有序补丁，下载 Node 官方 24.15.0 对应平台发行包，
+核对内置 archive SHA-256 后交付独立的 `bin/node`、许可证、`pi` 入口和
+`runtime-manifest.json`。支持 macOS/Linux 的 arm64 与 x64；manifest 保留发行身份
+和实际文件哈希。安装器不复制可能依赖 Homebrew 动态库的宿主 Node。
+安装目录中的缓存和临时目录也位于该目录；安装时会实际启动交付的 Node，
+Pi 的实际能力仍须通过 doctor 与运行核实。
 可选插件名称为 subagents、background、context7、fff、mcporter；默认不启用插件。
 FFF 使用平台原生依赖，安装失败应保留原始错误，不降级为不可用的工具。
 
