@@ -139,6 +139,9 @@ session 身份和 `get_entries` 的当前分支祖先中的实际 user message�
 不是新的当前 Context 权威，也不据此重发结果未知的事件输入。
 
 Pi 的锁定原生材料由 `native/pi/` 交付，CLI 与 RPC 使用同一安装入口。
+周期 readiness 仅检查可执行入口与凭据，不重复遍历整份安装的文件哈希。
+每次新建或恢复物理 Pi 前，以及显式 doctor，仍完整校验材料；readiness 成功
+不能当作安装目录当前完整性证明。
 `RuntimeEntry.native_runtime` 指向相邻 `runtime-manifest.json`；adapter 在启动前
 核对所有声明文件、入口与固定 Node 的 SHA-256，启动后通过 `get_state` 核对当前
 execution ID 和实际生命周期能力。`doctor` 的静态材料检查不能代替这个 live 握手。

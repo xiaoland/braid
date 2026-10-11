@@ -22,6 +22,11 @@ Pi 的实际能力仍须通过 doctor 与运行核实。
 可选插件名称为 subagents、background、context7、fff、mcporter；默认不启用插件。
 FFF 使用平台原生依赖，安装失败应保留原始错误，不降级为不可用的工具。
 
+锁定的 pi-subagents 0.56.0 对自定义角色 frontmatter 使用字符串列表解析，
+`fallbackModels: []` 和 `fallbackModels: false` 都会成为模型名称，不能用于禁用回退。
+只有主模型时省略该字段；需要限制模型范围时配置插件的 modelScope，并通过实际
+角色读取核对候选，随后从根与子会话的调用记录确认真正使用的模型。
+
 将实例的 `[[runtimes]]` 中 `executable` 设为安装的 `pi`，
 `native_runtime` 设为同目录的 `runtime-manifest.json`。`braid setup` 对明确指定
 的原生入口识别相邻 manifest；`braid doctor` 核对材料身份，实际会话启动再核对

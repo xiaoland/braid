@@ -92,7 +92,7 @@ struct PiSessions {
 impl SessionFactory for PiSessions {
     async fn check(&self) -> Result<(), SessionError> {
         // Pi has no global process: processes belong to physical sessions.
-        PiProvider::validate_material(&self.config).map_err(super::session::map_provider_error)?;
+        // Readiness is periodic; full material identity is verified before each physical spawn.
         which::which(&self.config.executable).map_err(|error| {
             SessionError::Unavailable(format!(
                 "Pi executable {}: {error}",
