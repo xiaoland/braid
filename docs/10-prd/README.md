@@ -1,7 +1,7 @@
 # Product Truth
 
 Braid turns an Issue or pull request into the durable working memory of a
-local Coding Agent. GitHub or a Braid-owned local space holds the current collaboration state; provider
+local Coding Agent. GitHub or the built-in collaboration platform holds current collaboration state; provider
 sessions are replaceable execution contexts built from that state.
 
 The project vocabulary is owned by [`glossary.md`](glossary.md).

@@ -1,22 +1,22 @@
 //! Canonical collaboration state, independent of the provider session transport.
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result;
 
 use crate::{
+    builtin::BuiltinClient,
     context::{self, Actor, CanonicalContext, IssueSnapshot, PullRequestSnapshot},
     github::{GitHubClient, WorkItemLocator},
-    local::objects::LocalObjects,
 };
 
 pub(crate) enum CollaborationBackend {
     GitHub(Arc<GitHubClient>),
-    Local { objects: Arc<Mutex<LocalObjects>>, default_branch: String },
+    Builtin(Arc<BuiltinClient>),
 }
 
 impl CollaborationBackend {
-    pub(crate) fn is_local(&self) -> bool {
-        matches!(self, Self::Local { .. })
+    pub(crate) fn is_builtin(&self) -> bool {
+        matches!(self, Self::Builtin(_))
     }
 
     pub(crate) async fn materialize_issue(
@@ -27,14 +27,10 @@ impl CollaborationBackend {
             Self::GitHub(github) => {
                 Ok(Box::pin(context::materialize_issue(github, locator, 100)).await?)
             }
-            Self::Local { objects, .. } => match objects
-                .lock()
-                .map_err(|_| anyhow::anyhow!("local object store lock poisoned"))?
-                .context(locator.number)?
-            {
+            Self::Builtin(client) => match client.context(locator.number).await? {
                 CanonicalContext::Issue(issue) => Ok(issue),
                 CanonicalContext::PullRequest(_) => {
-                    anyhow::bail!("local item #{} is not an Issue", locator.number)
+                    anyhow::bail!("built-in item #{} is not an Issue", locator.number)
                 }
             },
         }
@@ -48,38 +44,44 @@ impl CollaborationBackend {
             Self::GitHub(github) => {
                 Ok(Box::pin(context::materialize_pull_request(github, locator, 100)).await?)
             }
-            Self::Local { objects, .. } => match objects
-                .lock()
-                .map_err(|_| anyhow::anyhow!("local object store lock poisoned"))?
-                .context(locator.number)?
-            {
+            Self::Builtin(client) => match client.context(locator.number).await? {
                 CanonicalContext::PullRequest(pr) => Ok(pr),
                 CanonicalContext::Issue(_) => {
-                    anyhow::bail!("local item #{} is not a PR", locator.number)
+                    anyhow::bail!("built-in item #{} is not a PR", locator.number)
                 }
             },
         }
     }
 
-    /// Local PR generations start from the frozen candidate, not a mutable source branch.
-    pub(crate) fn pr_worktree_ref(&self, number: u64, head_ref: &str) -> Result<String> {
+    /// Built-in PR generations start from the authority's frozen candidate commit.
+    pub(crate) async fn pr_worktree_ref(&self, number: u64, head_ref: &str) -> Result<String> {
         match self {
             Self::GitHub(_) => Ok(head_ref.to_owned()),
-            Self::Local { objects, .. } => objects
-                .lock()
-                .map_err(|_| anyhow::anyhow!("local object store lock poisoned"))?
-                .item(number)?
-                .head_commit
-                .ok_or_else(|| {
-                    anyhow::anyhow!("local PR #{number} lacks a frozen candidate commit")
-                }),
+            Self::Builtin(client) => client.candidate(number).await,
+        }
+    }
+    pub(crate) async fn ensure_grant(
+        &self,
+        session_id: &str,
+        number: u64,
+        actor: &str,
+    ) -> Result<()> {
+        match self {
+            Self::GitHub(_) => Ok(()),
+            Self::Builtin(client) => client.ensure_grant(session_id, number, actor).await,
+        }
+    }
+    pub(crate) async fn revoke_session(&self, session_id: &str) -> Result<()> {
+        match self {
+            Self::GitHub(_) => Ok(()),
+            Self::Builtin(client) => client.revoke_session(session_id).await,
         }
     }
 
     pub(crate) async fn default_branch(&self) -> Result<String> {
         match self {
             Self::GitHub(github) => Ok(github.repository_details().await?.default_branch),
-            Self::Local { default_branch, .. } => Ok(default_branch.clone()),
+            Self::Builtin(client) => client.default_branch().await,
         }
     }
 
@@ -89,7 +91,7 @@ impl CollaborationBackend {
                 actor.node_id == github.identity().actor_node_id
                     || actor.login == github.identity().actor_login
             }
-            Self::Local { .. } => actor.login == profile_id,
+            Self::Builtin(_) => actor.login == profile_id,
         }
     }
 }

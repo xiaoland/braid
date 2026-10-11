@@ -1,7 +1,18 @@
-use crate::{config::Config, context, local::objects::LocalObjects};
+use crate::{
+    builtin::BuiltinClient,
+    config::Config,
+    context,
+    platform::grants::WriterGrant,
+    platform::objects::{CandidateLocation, CommandRequest, ControlReceipt, ObjectCommand},
+    store::{BuiltinCommand, BuiltinReply, StoreActor},
+};
 use anyhow::{Context as _, Result, ensure};
 use clap::{Args, Subcommand};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(Debug, Subcommand)]
 pub enum LocalCommand {
@@ -12,6 +23,8 @@ pub enum LocalCommand {
     List,
     Show(Target),
     Context(Target),
+    /// Read a command receipt without resubmitting its payload.
+    Receipt(ReceiptTarget),
     Comment(CommentArguments),
     Edit(EditArguments),
     Assign(AssignmentArguments),
@@ -27,6 +40,10 @@ pub enum LocalCommand {
 #[derive(Debug, Args)]
 pub struct Target {
     pub number: u64,
+}
+#[derive(Debug, Args)]
+pub struct ReceiptTarget {
+    pub request_id: String,
 }
 #[derive(Debug, Args)]
 pub struct Body {
@@ -93,99 +110,216 @@ pub struct LinkArguments {
     pub pr: u64,
 }
 
-pub fn run(command: LocalCommand, config: &Config) -> Result<()> {
-    let local =
-        config.local.as_ref().context("braid local requires a local collaboration config")?;
-    let mut objects = LocalObjects::open(config.runtime.database(), &local.repository)?;
-    objects.bind_source(&local.source)?;
-    let caller = if std::env::var_os("BRAID_AGENT").is_some() {
-        objects.bind_agent(&std::env::current_dir()?)?
+#[allow(clippy::too_many_lines)]
+pub async fn run_options(
+    command: LocalCommand,
+    config: &Config,
+    request_id: Option<String>,
+    expected_revision: Option<u64>,
+) -> Result<()> {
+    let store = Arc::new(StoreActor::start(
+        config.runtime.database().to_path_buf(),
+        config.runtime.backups().to_path_buf(),
+    )?);
+    let client = BuiltinClient::connect(config, Arc::clone(&store)).await?;
+    if let LocalCommand::Receipt(target) = &command {
+        let mut url = config
+            .builtin
+            .as_ref()
+            .context("built-in upstream is required")?
+            .endpoint
+            .join("api/control/receipts/")?;
+        url.path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("invalid platform URL"))?
+            .pop_if_empty()
+            .push(&target.request_id);
+        let result: ControlReceipt = client.get(url.as_str()).await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    let writer = if std::env::var_os("BRAID_AGENT").is_some() {
+        Some(active_writer(config.runtime.database(), &std::env::current_dir()?)?)
     } else {
-        "human".into()
+        None
     };
-    let author = caller.as_str();
-    let result = match command {
-        LocalCommand::Issue(a) => serde_json::to_value(objects.create_issue(
-            &a.title,
-            &a.body.read()?.unwrap_or_default(),
-            author,
-        )?)?,
-        LocalCommand::Pr(a) => serde_json::to_value(objects.create_pr(
-            &a.title,
-            &a.body.read()?.unwrap_or_default(),
-            author,
-            &local.source,
-            &a.head,
-            &a.base,
-            a.issue,
-        )?)?,
-        LocalCommand::List => serde_json::to_value(objects.list()?)?,
+    let actor = writer.as_ref().map_or("human", |writer| writer.actor.as_str()).to_owned();
+    let capability = if let Some(writer) = &writer {
+        let BuiltinReply::Grant(Some(grant)) =
+            store.builtin(BuiltinCommand::Grant(writer.session_id.clone()))?
+        else {
+            anyhow::bail!(
+                "Agent has no active platform writer capability; refusing operator fallback"
+            )
+        };
+        ensure!(
+            grant.lifecycle == "active"
+                && grant.actor == writer.actor
+                && grant.item_number == writer.number,
+            "Agent writer capability does not match current assignment"
+        );
+        Some(WriterGrant {
+            grant_id: grant.grant_id.context("writer grant has no identity")?,
+            epoch: grant.epoch,
+            token: grant.token.context("writer grant has no capability")?,
+        })
+    } else {
+        None
+    };
+    let object = match command {
+        LocalCommand::Receipt(_) => unreachable!("receipt handled before writer admission"),
+        LocalCommand::List => {
+            let result: serde_json::Value = client.get("api/control/items").await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            return Ok(());
+        }
         LocalCommand::Show(a) => {
-            serde_json::json!({"item":objects.item(a.number)?,"comments":objects.comments(a.number)?,"merge":objects.merge_status(a.number)?})
+            let result: serde_json::Value =
+                client.get(&format!("api/control/items/{}", a.number)).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            return Ok(());
         }
         LocalCommand::Context(a) => {
-            let context = objects.context(a.number)?;
-            let rendered = context::render_complete(&context, 1.0, usize::MAX);
-            print!("{}", rendered.text);
+            let canonical = client.context(a.number).await?;
+            print!("{}", context::render_complete(&canonical, 1.0, usize::MAX).text);
             return Ok(());
-        }
-        LocalCommand::Comment(a) => serde_json::to_value(objects.reply(
-            a.number,
-            &a.body.read()?.context("provide --body or --body-file")?,
-            author,
-            a.reply_to,
-        )?)?,
-        LocalCommand::Edit(a) => serde_json::to_value(objects.edit(
-            a.number,
-            a.title.as_deref(),
-            a.body.read()?.as_deref(),
-            author,
-        )?)?,
-        LocalCommand::Assign(a) => {
-            config.profile(&a.profile)?;
-            let item = objects.item(a.number)?;
-            let expected = if item.kind == "pr" {
-                &config.profile_selection.default_pr_profile
-            } else {
-                &config
-                    .profiles
-                    .iter()
-                    .find(|p| p.tags.iter().any(|t| t == "issue"))
-                    .context("no Issue profile configured")?
-                    .id
-            };
-            ensure!(
-                &a.profile == expected,
-                "this runtime supports profile {expected} for {} objects",
-                item.kind
-            );
-            serde_json::to_value(objects.assign(a.number, Some(&a.profile), author)?)?
-        }
-        LocalCommand::Unassign(a) => serde_json::to_value(objects.assign(a.number, None, author)?)?,
-        LocalCommand::Close(a) => {
-            serde_json::to_value(objects.set_state(a.number, false, author)?)?
-        }
-        LocalCommand::Reopen(a) => {
-            serde_json::to_value(objects.set_state(a.number, true, author)?)?
-        }
-        LocalCommand::Link(a) => {
-            objects.link(a.issue, a.pr, author)?;
-            serde_json::json!({"issue":a.issue,"pr":a.pr})
         }
         LocalCommand::Diff(a) => {
-            print!("{}", objects.diff(a.number, &local.source)?);
+            let result: serde_json::Value =
+                client.get(&format!("api/control/items/{}/diff", a.number)).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
             return Ok(());
         }
-        LocalCommand::Publish(a) => serde_json::to_value(objects.publish(
-            a.number,
-            &local.source,
-            &std::env::current_dir()?,
-            author,
-        )?)?,
-        LocalCommand::Merge(a) => {
-            serde_json::to_value(objects.merge(a.number, &local.source, author)?)?
+        LocalCommand::Issue(a) => {
+            ObjectCommand::CreateIssue { title: a.title, body: a.body.read()?.unwrap_or_default() }
+        }
+        LocalCommand::Pr(a) => ObjectCommand::CreatePr {
+            title: a.title,
+            body: a.body.read()?.unwrap_or_default(),
+            head: a.head,
+            base: a.base,
+            issue: a.issue,
+            issue_revision: if let Some(issue) = a.issue {
+                Some(client.item(issue).await?.revision)
+            } else {
+                None
+            },
+        },
+        LocalCommand::Comment(a) => ObjectCommand::Comment {
+            number: a.number,
+            body: a.body.read()?.context("provide --body or --body-file")?,
+            reply_to: a.reply_to,
+        },
+        LocalCommand::Edit(a) => {
+            ObjectCommand::Edit { number: a.number, title: a.title, body: a.body.read()? }
+        }
+        LocalCommand::Assign(a) => ObjectCommand::Assign { number: a.number, actor: a.profile },
+        LocalCommand::Unassign(a) => ObjectCommand::Unassign { number: a.number },
+        LocalCommand::Close(a) => ObjectCommand::Close { number: a.number },
+        LocalCommand::Reopen(a) => ObjectCommand::Reopen { number: a.number },
+        LocalCommand::Link(a) => ObjectCommand::Link {
+            issue: a.issue,
+            pr: a.pr,
+            expected_pr_revision: client.item(a.pr).await?.revision,
+        },
+        LocalCommand::Merge(a) => ObjectCommand::Merge { number: a.number },
+        LocalCommand::Publish(a) => {
+            let cwd = std::env::current_dir()?.canonicalize()?;
+            let source = writer.as_ref().map_or_else(
+                || {
+                    config
+                        .profiles
+                        .first()
+                        .map(crate::config::Profile::workspace)
+                        .context("no Harness workspace configured")
+                },
+                |writer| Ok(writer.worktree.as_path()),
+            )?;
+            ObjectCommand::Publish {
+                number: a.number,
+                candidate: CandidateLocation::Commit { commit: published_commit(source, &cwd)? },
+            }
         }
     };
+    let revision = if let Some(revision) = expected_revision {
+        Some(revision)
+    } else if let Some(number) = object.target() {
+        Some(client.item(number).await?.revision)
+    } else {
+        None
+    };
+    let request_id = request_id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+    let request = CommandRequest {
+        request_id: request_id.clone(),
+        expected_revision: revision,
+        command: object,
+        actor,
+        writer: capability,
+    };
+    let result: ControlReceipt = client
+        .post("api/control/commands", &request)
+        .await
+        .with_context(|| format!("platform command requestId={request_id}"))?;
     println!("{}", serde_json::to_string_pretty(&result)?);
+    ensure!(
+        result.state == "applied",
+        "platform command requestId={request_id} settled as {}: {}",
+        result.state,
+        result.error.as_ref().map(ToString::to_string).unwrap_or_default()
+    );
     Ok(())
+}
+
+struct AgentWriter {
+    session_id: String,
+    actor: String,
+    number: u64,
+    worktree: PathBuf,
+}
+fn active_writer(database: &Path, cwd: &Path) -> Result<AgentWriter> {
+    let cwd = cwd.canonicalize()?;
+    let connection = rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let mut query=connection.prepare("SELECT s.provider_session_id,g.profile_id,i.number,w.path FROM provider_sessions s JOIN turns t ON t.session_id=s.session_id JOIN agent_instances g ON g.agent_id=s.agent_id JOIN assignments a ON a.assignment_id=g.assignment_id JOIN work_items i ON i.node_id=a.work_item_node_id JOIN worktrees w ON w.agent_id=g.agent_id WHERE s.lifecycle='running' AND t.lifecycle IN ('starting','running') AND a.lifecycle IN ('active','finalizing') AND g.lifecycle IN ('idle','finalizing') AND w.lifecycle='active'")?;
+    let rows = query
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut matches = Vec::new();
+    for (session_id, actor, number, path) in rows {
+        let worktree = PathBuf::from(path).canonicalize()?;
+        if cwd.starts_with(&worktree) {
+            matches.push(AgentWriter {
+                session_id,
+                actor,
+                number: u64::try_from(number)?,
+                worktree,
+            });
+        }
+    }
+    ensure!(
+        matches.len() == 1,
+        "Agent caller has no unique active assignment/session/turn for this worktree"
+    );
+    Ok(matches.pop().expect("exactly one active caller"))
+}
+fn published_commit(source: &Path, cwd: &Path) -> Result<String> {
+    let expected = git2::Repository::open(source)?;
+    let actual = git2::Repository::discover(cwd)?;
+    ensure!(
+        expected.commondir().canonicalize()? == actual.commondir().canonicalize()?,
+        "candidate is not in the Harness source Git object store"
+    );
+    let workdir =
+        actual.workdir().context("candidate must be a non-bare worktree")?.canonicalize()?;
+    ensure!(cwd.starts_with(workdir), "candidate cwd is outside its Git worktree");
+    ensure!(actual.statuses(None)?.is_empty(), "publish requires a clean committed worktree");
+    Ok(actual.head()?.peel_to_commit()?.id().to_string())
 }

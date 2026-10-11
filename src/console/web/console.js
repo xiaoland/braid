@@ -124,9 +124,8 @@ function table(headers,rows){
   },el('table',{},el('thead',{},el('tr',{},headers.map(h=>el('th',{},h)))),el('tbody',{},rows.map(r=>el('tr',{},r.map(c=>el('td',{},c)))))));
 }
 async function overview(token){
-  const [resources,runtime]=await Promise.all([api('/api/resources'),api('/api/runtime').catch(e=>({
-    unavailable:e.message
-  }))]);
+  const capabilities=await api('/api/console');
+  const [resources,runtime,harness]=await Promise.all([api('/api/resources'),capabilities.harness.configured?api('/api/runtime').catch(e=>({unavailable:e.message})):null,capabilities.harness.configured?api('/api/harness/snapshot').catch(e=>({error:e.message})):null]);
   if(token!==generation)return;
   const cards=el('div',{
     class:'grid'
@@ -135,9 +134,9 @@ async function overview(token){
   },title),el('div',{
     class:'stat'
   },value))));
-  content.replaceChildren(cards,panel('Braid 权威状态',runtime.unavailable?el('div',{
+  content.replaceChildren(cards,panel('Harness 权威状态',!runtime?empty('未接入 Harness；平台和 Collector 可独立使用。'):runtime.unavailable?el('div',{
     class:'notice error'
-  },runtime.unavailable):runtimePanel(runtime)),panel('采集来源',(resources.resources||[]).length?table(['实例','服务','首次 / 最近接收','记录数'],resources.resources.map(r=>[r.instance||'未标识',r.service||'未标识',`${stamp(r.first_received)} / ${stamp(r.last_received)}`,r.records])):empty('Collector 正在等待 OTLP 数据。请检查 Braid 的 exporter 目标。')),panel('数据边界',el('p',{
+  },runtime.unavailable):runtimePanel(runtime)),panel('平台接入',capabilities.platform.configured?el('p',{},`${capabilities.platform.endpoint} · ${capabilities.platform.managed?'Console 托管独立监听':'外部独立监听'} · Harness 上游 ${capabilities.harness.backend||'未接入'}`):empty('未声明内建平台。GitHub Harness 的启停与观测仍可使用；此处不提供 GitHub 对象编辑。')),harness?panel('Harness 调度事实',raw(harness,'Session、Turn、队列、Assignment 与 Worktree')):el('div'),panel('采集来源',(resources.resources||[]).length?table(['实例','服务','首次 / 最近接收','记录数'],resources.resources.map(r=>[r.instance||'未标识',r.service||'未标识',`${stamp(r.first_received)} / ${stamp(r.last_received)}`,r.records])):empty('Collector 正在等待 OTLP 数据。请检查 Braid 的 exporter 目标。')),panel('数据边界',el('p',{
     class:'body'
   },'接收时间表示 Collector 收到数据的时刻，不是运行完成时间。采样、网络错误或 exporter 停止都可能造成未收到的内容。没有上游序列与交付回执时，采集缺口不可量化；Trace 缺少父 Span、Transcript 缺少消息均保留为未确认。'),raw(resources,'完整采集状态')));
   if(resources.receive_errors){
@@ -195,7 +194,7 @@ function runtimePanel(runtime){
   },transport,'仅运行传输与调度，不启动 Provider / 模型'),el('div',{
     class:'actions'
   },button('启动 Braid',()=>command('start'),'primary'),button('停止 Braid',async()=>{
-    if(await confirmAction('停止本实例 Braid runtime？Collector 保持接收与查询服务。'))await command('stop');
+    if(await confirmAction('停止本实例 Harness？平台和 Collector 保持服务。'))await command('stop');
   },'danger')),receipt,raw(runtime,'完整权威运行状态'));
 }
 async function telemetry(page,token){
@@ -367,7 +366,9 @@ function requestId(){
   return crypto.randomUUID();
 }
 async function objects(token){
-  const snapshot=await api('/api/control/snapshot');
+  const capabilities=await api('/api/console');
+  if(!capabilities.platform.configured){if(token===generation)content.replaceChildren(panel('平台对象',empty('未声明内建平台；当前 Console 不提供 GitHub 对象编辑。Harness 启停与 OTLP 观测可在概览中使用。')));return;}
+  const [snapshot,harness]=await Promise.all([api('/api/control/snapshot'),capabilities.harness.configured?api('/api/harness/snapshot').catch(e=>({error:e.message})):null]);
   if(token!==generation)return;
   const list=el('div'),detail=el('div'),receipt=el('div');
   const createTitle=field('标题'),createBody=field('正文','','textarea'),kind=el('select',{},el('option',{
@@ -375,7 +376,8 @@ async function objects(token){
   },'Issue'),el('option',{
     value:'pr'
   },'Pull Request')),head=field('Head 分支'),base=field('Base 分支'),issue=field('关联 Issue 编号','','number');
-  let current=null,profiles=snapshot.supportedProfiles||{};
+  let current=null;
+  const profiles=harness?.profileSuggestions||{};
   const reply=field('回复评论编号（可选）','','number');
   let lastRequest=null;
   function renderReceipt(value){
@@ -395,12 +397,12 @@ async function objects(token){
     },`请求 ${id}`),el('p',{},'正在等待权威端回执…')));
     try{
       const result=await api('/api/control/commands',{
-        requestId:id,expectedRevision:revision,command
+        requestId:id,actor:'human',expectedRevision:revision,command
       });
       renderReceipt(result);
       if(command.type==='createIssue'||command.type==='createPR'){for(const f of [createTitle,createBody,head,base,issue]){f.input.value='';f.input.dataset.initialValue='';}}
       await reload();
-      if(current)await select(current.item.number);
+      if(current)await select(current.item.number,true);
     }
     catch(e){
       showError(e);
@@ -413,21 +415,17 @@ async function objects(token){
   }
   async function reload(){
     const s=await api('/api/control/snapshot');
-    profiles=s.supportedProfiles||{};
     if(token!==generation)return;
     list.replaceChildren(panel('Issue / Pull Request',s.items.length?table(['对象','状态','指派','修订'],s.items.map(v=>{
       const i=v.item;return[button(`#${i.number} ${i.title}`,()=>select(i.number),'link-button'),badge(i.kind+' · '+i.state),i.desired_profile||'未指派',i.revision];
-    })):empty('协作空间为空。创建 Issue 开始讨论。')),panel('运行与调度事实',el('p',{
-      class:'meta'
-    },`来源 ${s.source} · 观察 ${s.observedAt||'未记录'}`),raw({
-      sessions:s.sessions,turns:s.turns,queue:s.queue,assignments:s.assignments,worktrees:s.worktrees
-    },'Provider Session、Turn、队列、Assignment 与 Worktree')));
+    })):empty('协作空间为空。创建 Issue 开始讨论。')),panel('平台对象来源',el('p',{class:'meta'},`来源 ${s.source} · 观察 ${s.observedAt||'未记录'} · ${capabilities.platform.endpoint}`)),harness?panel('Harness 调度事实',raw(harness,'独立 Harness ledger（本页打开时读取）')):panel('Harness 接入',empty('未接入 Harness；Actor 指派属于平台对象，不代表 Agent 正在运行。')));
   }
-  async function select(number){
+  async function select(number,acceptedRefresh=false){
+    if(!acceptedRefresh){if(controlPending){showError(new Error('控制请求尚未取得回执，暂时不能切换对象。'));return;}if(hasDrafts()&&!await confirmAction('切换对象将丢弃尚未提交的编辑与评论，继续吗？'))return;}
     const v=await api('/api/control/items/'+number);
     if(token!==generation)return;
     current=v;
-    const i=v.item,title=field('标题',i.title),body=field('正文',i.body,'textarea'),comment=field('新评论','','textarea'),profile=field('Profile',i.desired_profile||(i.kind==='issue'?profiles.issue:profiles.pr)||''),linked=field('关联 PR 编号','','number');
+    const i=v.item,title=field('标题',i.title),body=field('正文',i.body,'textarea'),comment=field('新评论','','textarea'),profile=field('指派给 Actor',i.desired_profile||(i.kind==='issue'?profiles.issue:profiles.pr)||''),linked=field('关联 PR 编号','','number');
     const merged=v.merge?.lifecycle==='applied';
     const heading=el('div',{
       class:'row'
@@ -437,7 +435,7 @@ async function objects(token){
     },button('保存标题与正文',()=>execute({
       type:'edit',number:i.number,title:title.input.value,body:body.input.value
     },i.revision),'primary'),button('指派',()=>execute({
-      type:'assign',number:i.number,profile:profile.input.value
+      type:'assign',number:i.number,actor:profile.input.value
     },i.revision)),button('解除指派',()=>execute({
       type:'unassign',number:i.number
     },i.revision)),merged?el('span',{class:'badge'},'已合并，不能重新打开'):button(i.state==='closed'?'重新打开':'关闭',()=>execute({
@@ -445,7 +443,7 @@ async function objects(token){
     },i.revision),'danger'));
     const controls=panel('编辑与控制',el('div',{
       class:'form-grid'
-    },title.node,body.node,profile.node),actions);
+    },title.node,body.node,profile.node),el('p',{class:'meta'},`Actor 可自由填写。Harness Profile 建议：Issue ${profiles.issue||'无'} / PR ${profiles.pr||'无'}；建议不限制平台指派。`),actions);
     const discussion=panel('讨论',...(v.comments||[]).map(c=>el('article',{
       class:'record'
     },el('div',{
@@ -464,17 +462,17 @@ async function objects(token){
     },i.revision),'primary')));
     let candidate=null;
     if(i.kind==='pull_request'||i.kind==='pr'){
-      const worktree=field('权威 Worktree ID'),diff=el('div'),candidateKind=el('select',{},el('option',{value:'source'},'配置 Source 的当前已提交 Checkout'),el('option',{value:'worktree'},'权威 Worktree'));worktree.node.hidden=true;candidateKind.addEventListener('change',()=>worktree.node.hidden=candidateKind.value!=='worktree');
+      const worktree=field('Git Commit ID'),diff=el('div'),candidateKind=el('select',{},el('option',{value:'source'},'配置 Source 的当前已提交 Checkout'),el('option',{value:'commit'},'配置 Source 中的 Commit'));worktree.node.hidden=true;candidateKind.addEventListener('change',()=>worktree.node.hidden=candidateKind.value!=='commit');
       candidate=panel('Git 候选',badge(i.published?'候选已发布':'候选未发布'),el('p',{
         class:'meta'
       },`Head ${i.head_ref||''} · ${i.head_commit||''}`),el('p',{
         class:'meta'
       },`Base ${i.base_ref||''} · ${i.base_commit||''}`),el('p',{
         class:'body'
-      },'发布使用配置 Source 当前 Checkout 或已有权威 Worktree 中的干净提交。合并将更新 Git Base 分支；Base 必须未被任何 Worktree 检出。'),merged?null:el('label',{},'候选来源',candidateKind),merged?null:worktree.node,el('div',{
+      },'发布使用平台配置 Source 的当前已提交 Checkout 或其中已存在的 Commit。合并将更新 Git Base 分支；Base 必须未被任何 Worktree 检出。'),merged?null:el('label',{},'候选来源',candidateKind),merged?null:worktree.node,el('div',{
         class:'actions'
       },merged?el('span',{class:'badge'},'已合并，候选操作已结束'):button('发布候选',()=>execute({
-        type:'publish',number:i.number,candidate:candidateKind.value==='source'?{type:'source'}:{type:'worktree',worktreeId:worktree.input.value}
+        type:'publish',number:i.number,candidate:candidateKind.value==='source'?{type:'source'}:{type:'commit',commit:worktree.input.value}
       },i.revision)),merged?null:button('合并已发布候选',async()=>{
         if(await confirmAction(`将 PR #${i.number} 的已发布候选合并到 ${i.base_ref}？`))await execute({
           type:'merge',number:i.number
@@ -517,7 +515,7 @@ async function objects(token){
   const lookup=field('请求 ID');
   content.replaceChildren(el('p',{
     class:'meta'
-  },'对象与运行状态来自当前协作空间；观测历史可在 Trace、日志和指标中查看。'),list,el('div',{
+  },'对象权威来自独立平台；Harness 调度状态单独读取，OTLP 只用于观测历史。'),panel('请求身份',el('p',{class:'meta'},'本地控制操作以 human 作者记录。指派给对象的 Actor 可自由填写；Agent 写入需要 Harness 授予的 writer grant。')),list,el('div',{
     class:'split'
   },create,panel('查询控制回执',lookup.node,button('查询',async()=>renderReceipt(await api('/api/control/receipts/'+encodeURIComponent(lookup.input.value||lastRequest||'')))))),receipt,detail);
   await reload();

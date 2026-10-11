@@ -1,81 +1,83 @@
-# 本地协作空间
+# 内建协作平台
 
-Braid 的内建空间持有自己的 Issue、评论、负责人和关联 PR。它无需 GitHub App、
-webhook 或外部协作平台；原生 Agent CLI、Git 与模型服务仍分别负责执行和代码。
-一个实例只使用一个协作后端，已有 GitHub 配置继续有效。
+GitHub 与内建协作平台是 Braid Harness 的两种上游。内建平台独立持有仓库、
+Issue、PR、正文、评论、指派、事件和候选合并记录，不依赖 Harness 的 Profile、
+会话或执行数据库。停止 Harness 不停止平台，也不删除协作内容。Web Console
+属于整个 Braid，可同时阅读平台、Harness 和 OTLP 观测。
 
-## 创建与启动
+## 声明平台与 Harness
 
-先准备一个有命名分支的本地 Git checkout，以及实际安装的 Pi 或 Codex。创建
-配置时明确模型与 API key 环境变量名称；命令不会读取或保存 key 值。
-
-```shell
-braid init --source /absolute/path/to/repository --config /absolute/path/to/space/config.toml --name demo --adapter pi --executable /absolute/path/to/pi --provider deepseek --model deepseek-chat --api-key-environment DEEPSEEK_API_KEY
-braid config check --config /absolute/path/to/space/config.toml
-braid migrate apply --config /absolute/path/to/space/config.toml
-braid serve --config /absolute/path/to/space/config.toml
-```
-
-配置的 `[local]` 保存稳定空间名称、本地 source 路径和明确默认分支，不能同时配置 `[github]`。
-默认分支不会随 source 当前检出的分支改变。
-当前单个 `default` Profile 可以承担 Issue 和 PR，两者仍有独立工作树和会话。
-Codex 需要在配置中的 provider home 登录；初始化不会复制个人凭据。多个实例
-运行时须为它们配置不同 health 端口。
-
-## 工作项与讨论
-
-下例沿用 `BRAID_CONFIG`，也可以逐次提供 `--config`。Issue 与 PR 共享编号，
-从实际命令回执取得编号，不从下例推断已有对象身份。
+先准备有命名分支的真实 Git checkout。平台有自己的配置与数据库，不需要安装
+Agent CLI 或提供模型凭据：
 
 ```shell
-export BRAID_CONFIG=/absolute/path/to/space/config.toml
-braid local issue --title '改进导出流程' --body '说明用户目标和允许范围'
-braid local list
-braid local show 1
-braid local assign 1 --profile default
-braid local comment 1 --body '请调查现有导出入口并维护当前方案'
-braid local edit 1 --body-file /absolute/path/to/current-design.md
-braid local context 1
+braid platform init --source /absolute/path/to/repository --config /absolute/path/to/platform.toml --name demo
+braid platform serve --config /absolute/path/to/platform.toml
 ```
 
-Issue 指派先物化会话，评论唤醒工作；PR 指派会启动实施。没有 daemon 时，
-对象修改和待投递事件仍持久保存，下一次 serve 接续投递。对象正文是当前工作
-依据，评论是讨论数据，不能获得系统指令权限。
+平台声明固定 repository、source、默认分支、数据库与 loopback listen 地址。
+默认分支不会随 source 当前检出的分支改变。平台对象只能访问已绑定的 Git
+对象库，HTTP 调用不能提交任意文件路径。
 
-`unassign` 撤销当前负责人；`close` 关闭工作项，`reopen` 重开。它们复用现有
-Group 生命周期，不能以对象状态推断代码已被采用或用户目标已经验收。
-
-## PR 候选与采用
-
-PR 从真实 Git head/base 分支建立，并可关联一个 Issue。代码提交之后要明确
-发布候选，diff 与合并才能消费当前交付版本。源 checkout 和 Agent 工作树共用
-Git 对象，操作不会 push 到远端。发布保存当前提交身份；新的实施工作树从该
-候选接续，不把最初 head 分支仍指向旧提交当作最新成果。
+Harness 单独声明上游与执行环境。准备实际安装的 Pi 或 Codex，并明确模型与
+API key 环境变量名称；初始化不读取或保存 key 值：
 
 ```shell
-braid local pr --title '实现导出流程' --head feature/export --base main --issue 1 --body '实现范围与待验项'
-braid local assign 2 --profile default
-# 在实施工作树提交代码后，从该工作树发布候选：
-braid local publish 2
-braid local diff 2
-braid local merge 2
+braid init --source /absolute/path/to/repository --config /absolute/path/to/harness/config.toml --name demo --endpoint http://127.0.0.1:18082 --adapter pi --executable /absolute/path/to/pi --provider deepseek --model deepseek-chat --api-key-environment DEEPSEEK_API_KEY
+braid config check --config /absolute/path/to/harness/config.toml
+braid migrate apply --config /absolute/path/to/harness/config.toml
+braid serve --config /absolute/path/to/harness/config.toml
 ```
 
-合并是显式的候选采纳动作，不自动验收或关闭关联 Issue。命令核对冻结的 head
-和 base，保留具体冲突及失败原因；分支变化后须先形成新的明确候选。为避免
-移动已检出分支却让工作目录保持旧内容，合并拒绝任何工作树正在检出的 base。
-调用前把 source 切换到另一分支，并确认其它工作树也未检出目标 base。
+Harness 的 `[builtin]` 只选择平台 repository 与 endpoint，与 `[github]` 互斥。
+Profile 的 workspace 是执行源，与平台声明分别维护；首版候选交接要求两者
+能访问同一个 Git 对象库，不承诺远程 clone/push 托管。平台不读取 Harness
+数据库；Harness 通过 HTTP 获取当前对象和稳定事件，在自己的 ledger 保留
+消费游标与去重记录。更换执行实例不会消耗或删除平台事件。
 
-合并意图持久保存。若 Git 引用已更新而数据库记录未完成，后续重试核对实际
-引用后收敛记录；不因重试重复应用代码。停止 daemon 不删除对象、评论或候选。
+## 工作项与候选
 
-## 操作反馈与边界
+通过[Web Console](console.md)可以不启动 Harness 就创建和讨论工作项。指派的
+actor 是平台事实；Harness 将它映射为当前支持的 Profile。只有实际开始执行
+并取得写入授权后，Agent 才能发布内容。对象正文是当前工作依据，评论是讨论
+数据，不能获得系统指令权限。
 
-`braid status` 和本地 health 提供执行事实，具体失败保存完整原因，并按 Profile
-配置写入工作项状态评论。结果未知或不能确认旧执行停止时，自动替换会话会被
-阻断。没有模型调用时，可用 `serve --transport-only` 实际检查事件投递和队列，
-这种操作不能证明 Agent 已完成产品工作。
+`braid object --config <Harness配置>` 是 Harness 的对象接入入口，使用平台 API，
+不直接修改平台数据库。运行中的 Agent 调用时，Harness 核对专属 cwd、当前
+assignment、session 与 turn，并使用已授予的 writer grant；平台提交事务核对
+授权版本、对象 revision 与 request ID。撤销授权先于替换执行，过期请求明确
+拒绝。此合同防止正常执行串写，不是恶意本机账户的安全沙箱。
 
-Agent 子进程使用配置入口并按当前工作树、assignment、session、turn核对写入
-来源。它用于防止正常执行串写或失效会话回写，不是针对恶意本机进程的安全
-沙箱。当前没有 Web UI、GitHub API 仿真、平台用户权限系统或双向同步。
+失去响应时，先用 `braid object --config <Harness配置> receipt <request-id>` 查询
+原回执，不生成新请求。需要重复提交时保留原 `--request-id`、命令内容和
+`--expected-revision`；不能重新读取当前 revision 后把不同前提当成同一请求。
+关闭后的执行收口先确认撤权，清理执行不重新获得正文发布权限。
+
+PR 保存固定的 base/head 提交；发布候选交接完整 commit OID，不重新解析可变
+工作分支。平台在自己的 Git 对象库核验并保留候选引用。新实施工作树从已发布
+候选接续。合并是显式的候选采纳动作，不自动验收或关闭关联 Issue；拒绝冲突、
+base 移动及不安全的检出状态。合并前将 source 和其它 worktree 切离目标 base。
+
+Git 引用与 SQLite 不是同一事务。合并意图持久保存，重复同一请求回读原回执；
+若引用更新而记录未完成，重试核对实际引用后收敛，不重复应用代码。
+
+## 从旧 Local 实例迁移
+
+旧 `[local]` 将平台和 Harness 数据混在一起，新 binary 明确拒绝继续使用。
+停止旧 daemon 和对象写入入口，保留现场并核实 prepared/unknown 写入、合并意图
+及原生执行停止结果。声明独立平台后显式导入旧 runtime 数据库：
+
+```shell
+braid platform import --config /absolute/path/to/platform.toml --from-runtime-db /absolute/path/to/old/state/braid.sqlite3
+```
+
+导入保留原数据库及对象编号、local:*身份、事件、正文、评论、关联、候选与
+对象命令回执。执行会话和运行回执留在 Harness；旧会话不自动取得新写授权。
+将 Harness 配置改为 `[builtin]`，保留原 Profile workspace 和 runtime 路径，
+应用 Harness 迁移后再接入平台。新入口重新投递稳定事件，已有 delivery 去重，
+不以旧 consumed_at 最大值跳过未消费事件。不可继续用旧 binary 写原库，否则
+会形成两份对象权威。
+
+没有模型调用时，`serve --transport-only` 可实际核对上游接入、事件和队列，
+不能证明 Agent 已完成产品工作。当前不提供 GitHub API 全兼容、双向同步、
+远程多人权限系统或完整跨进程崩溃恢复。

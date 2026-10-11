@@ -44,7 +44,7 @@ pub(crate) fn provision_issue_agent_worktree(
         target: &target,
         repository: config.repository(),
         remote: "origin",
-        local_only: config.is_local(),
+        local_only: config.is_builtin(),
         git: &config.tools.git,
         head_ref,
         local_branch: &local_branch,
@@ -250,10 +250,9 @@ pub(super) async fn resolve_issue_worktree_ref(
 }
 
 impl GroupDriver<'_> {
-    /// Settle a native Issue unassignment: confirm from canonical assignees that
-    /// the App actor is no longer assigned (flapping may have re-assigned it),
-    /// then retire the Agent Group after the debounce window. A fenced in-flight
-    /// turn is best-effort interrupted through its session.
+    /// Retire an explicitly unassigned built-in generation. GitHub unassignments
+    /// first check current assignees and debounce because webhook assignment flapping
+    /// can be superseded; built-in events record an authoritative responsibility change.
     pub(super) async fn settle_issue_unassignment(
         &self,
         candidate: AssignmentCandidate,
@@ -262,22 +261,24 @@ impl GroupDriver<'_> {
         let github = self.collaboration;
         let config = self.config;
         let sessions = &self.sessions;
-        let repository = if github.is_local() {
+        let repository = if github.is_builtin() {
             RepositoryName::local(&candidate.repository)
         } else {
             candidate.repository.parse::<RepositoryName>()?
         };
-        let locator = WorkItemLocator { repository, number: candidate.number };
-        let issue = github.materialize_issue(&locator).await?;
-        let still_assigned = issue
-            .assignees
-            .iter()
-            .any(|assignee| github.assignee_matches(assignee, &self.spec.profile.id));
-        if still_assigned {
-            store.ignore_assignment_event(candidate.event_id)?;
-            return Ok(());
+        if !github.is_builtin() {
+            let locator = WorkItemLocator { repository, number: candidate.number };
+            let issue = github.materialize_issue(&locator).await?;
+            if issue
+                .assignees
+                .iter()
+                .any(|assignee| github.assignee_matches(assignee, &self.spec.profile.id))
+            {
+                store.ignore_assignment_event(candidate.event_id)?;
+                return Ok(());
+            }
         }
-        if github.is_local() {
+        if github.is_builtin() {
             for active in
                 store.provider_resume_candidates(self.spec.profile.id.clone(), "issue".into())?
             {
@@ -288,7 +289,7 @@ impl GroupDriver<'_> {
         }
         let outcome = store.retire_unassigned_work_item(
             candidate.event_id,
-            if github.is_local() { 0 } else { config.scheduler.quiet_seconds },
+            if github.is_builtin() { 0 } else { config.scheduler.quiet_seconds },
         )?;
         if !outcome.settled {
             return Ok(());
@@ -475,7 +476,7 @@ impl GroupDriver<'_> {
         let github = self.collaboration;
         let profile = &self.spec.profile;
         let profile_record = &self.spec.profile_record;
-        let repository = if github.is_local() {
+        let repository = if github.is_builtin() {
             RepositoryName::local(&candidate.repository)
         } else {
             candidate.repository.parse::<RepositoryName>()?

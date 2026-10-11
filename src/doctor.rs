@@ -136,11 +136,11 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
         ("GitHub CLI", &config.tools.gh),
         ("Wrangler", &config.tools.wrangler),
     ] {
-        if !config.is_local() || name == "Git" {
+        if !config.is_builtin() || name == "Git" {
             checks.push(command_version(name, executable).await);
         }
     }
-    if !config.is_local() {
+    if !config.is_builtin() {
         checks.push(github_app_check(config).await);
     }
     checks.push(otlp_check(config));
@@ -161,15 +161,22 @@ fn source_checkout_check(config: &Config) -> Check {
         return Check {
             name: name.into(),
             state: CheckState::Fail,
-            detail: format!(
-                "{} is not a Git checkout; clone with `git clone https://github.com/{} {}`",
-                source.display(),
-                config.repository(),
-                source.display()
-            ),
+            detail: if config.is_builtin() {
+                format!(
+                    "{} is not a Git checkout; configure profile.workspace with the execution source for this platform repository",
+                    source.display()
+                )
+            } else {
+                format!(
+                    "{} is not a Git checkout; clone with `git clone https://github.com/{} {}`",
+                    source.display(),
+                    config.repository(),
+                    source.display()
+                )
+            },
         };
     }
-    if config.is_local() {
+    if config.is_builtin() {
         return match git2::Repository::open(source) {
             Ok(repo) if !repo.is_bare() => Check {
                 name: name.into(),
@@ -179,7 +186,7 @@ fn source_checkout_check(config: &Config) -> Check {
             Ok(_) => Check {
                 name: name.into(),
                 state: CheckState::Fail,
-                detail: "local.source must be a working Git checkout".into(),
+                detail: "profile.workspace must be a working Git checkout".into(),
             },
             Err(error) => {
                 Check { name: name.into(), state: CheckState::Fail, detail: error.to_string() }

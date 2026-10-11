@@ -1,4 +1,4 @@
-//! Long-lived local collaboration runtime; object mutations feed the shared scheduler.
+//! Built-in upstream event bridge and execution lifecycle, backed by the Harness ledger.
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result, bail};
@@ -9,16 +9,15 @@ use tokio::{
 };
 
 use crate::{
+    builtin::{BuiltinClient, EventFeed},
     collaboration::CollaborationBackend,
     config::Config,
     group::{GroupKind, GroupSpec, agent_group_worker_backend},
     health::HealthSnapshot,
-    local::objects::LocalObjects,
     producer::LEASE_TTL_SECONDS,
     queue::{queue_worker, scheduler::policy_from_config},
     runtime::worker_result,
     store::{RuntimeLease, StoreActor},
-    telemetry::TelemetryGuard,
 };
 
 struct LeaseGuard {
@@ -29,40 +28,7 @@ impl Drop for LeaseGuard {
     fn drop(&mut self) {
         let lease = self.lease.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         if let Err(error) = self.store.release_runtime_lease(lease) {
-            tracing::error!(%error, "cannot release local runtime lease");
-        }
-    }
-}
-
-pub(crate) async fn serve(config: Config, provider_enabled: bool) -> Result<()> {
-    let telemetry = TelemetryGuard::install(&config.telemetry, config.instance_key())?;
-    let generation = uuid::Uuid::now_v7().to_string();
-    crate::telemetry::set_runtime_generation(Some(generation.clone()));
-    let health = Arc::new(RwLock::new(initial_health(&config, provider_enabled)));
-    let (stop, shutdown) = watch::channel(false);
-    let mut runtime = Box::pin(serve_managed(config, provider_enabled, shutdown, health));
-    let result = tokio::select! {
-        result = &mut runtime => result,
-        signal = crate::runtime::wait_for_shutdown_signal() => {
-            let _ = stop.send(true);
-            let stopped = runtime.await;
-            signal.and(stopped)
-        }
-    };
-    tracing::info!(
-        name="braid.runtime.stop",
-        braid.runtime.generation=%generation,
-        braid.runtime.stop_confirmed=result.is_ok(),
-        braid.runtime.error=result.as_ref().err().map(|error|format!("{error:#}")).as_deref().unwrap_or(""),
-        "standalone runtime ended"
-    );
-    crate::telemetry::set_runtime_generation(None);
-    match (result, telemetry.shutdown()) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error.into()),
-        (Err(error), Err(exporter)) => {
-            Err(error.context(format!("telemetry shutdown also failed: {exporter}")))
+            tracing::error!(%error, "cannot release Harness runtime lease");
         }
     }
 }
@@ -70,11 +36,11 @@ pub(crate) async fn serve(config: Config, provider_enabled: bool) -> Result<()> 
 pub(crate) fn initial_health(config: &Config, provider_enabled: bool) -> HealthSnapshot {
     HealthSnapshot {
         ready: !provider_enabled,
-        ingress: "local".into(),
+        ingress: "builtin".into(),
         repository: config.repository().into(),
         tunnel: "disabled",
         webhook_url: None,
-        reconciliation: "local",
+        reconciliation: "builtin",
         provider: if provider_enabled { "starting" } else { "disabled" },
         last_error: None,
     }
@@ -109,27 +75,12 @@ pub(crate) async fn serve_managed(
     )?));
     let _lease_guard = LeaseGuard { store: Arc::clone(&store), lease: Arc::clone(&lease) };
     store.recover_writes()?;
-    let local = config.local.as_ref().context("local collaboration configuration missing")?;
-    let repository =
-        git2::Repository::open(&local.source).context("local source is not a Git checkout")?;
-    if repository.head_detached()? {
-        bail!("local source requires a named checkout branch");
-    }
-    repository
-        .find_branch(&local.default_branch, git2::BranchType::Local)
-        .with_context(|| {
-            format!("configured local default branch {} does not exist", local.default_branch)
-        })?
-        .get()
-        .peel_to_commit()
-        .context("configured local default branch does not resolve to a commit")?;
-    let default_branch = local.default_branch.clone();
-    drop(repository);
-    let local_objects = LocalObjects::open(config.runtime.database(), config.repository())?;
-    local_objects.bind_source(&local.source)?;
-    let objects = Arc::new(Mutex::new(local_objects));
-    let backend =
-        Arc::new(CollaborationBackend::Local { objects: Arc::clone(&objects), default_branch });
+    let client = BuiltinClient::connect(&config, Arc::clone(&store)).await?;
+    client
+        .revoke_all()
+        .await
+        .context("cannot revoke old built-in writer grants before execution")?;
+    let backend = Arc::new(CollaborationBackend::Builtin(Arc::clone(&client)));
     let mut provider_groups = Vec::new();
     if provider_enabled {
         let factories = crate::provider::session_factories(&config)?;
@@ -153,7 +104,12 @@ pub(crate) async fn serve_managed(
         lease,
         receiver.clone(),
     )));
-    workers.spawn(object_worker(Arc::clone(&store), objects, config.clone(), receiver.clone()));
+    workers.spawn(object_worker(
+        Arc::clone(&store),
+        Arc::clone(&client),
+        config.clone(),
+        receiver.clone(),
+    ));
     if provider_enabled {
         let (reports, report_receiver) = tokio::sync::mpsc::channel(8);
         workers.spawn(worker_result(crate::health::provider_health_worker(
@@ -174,14 +130,14 @@ pub(crate) async fn serve_managed(
         }
         drop(reports);
     }
-    tracing::info!(repository = %config.repository(), "Braid local collaboration runtime is ready");
+    tracing::info!(repository = %config.repository(), "Braid built-in Harness runtime is ready");
     let result = tokio::select! {
         _ = external_stop.changed() => Ok(()),
         worker = workers.join_next() => match worker {
-            Some(Ok(Err(error))) => Err(error.context("local collaboration worker failed")),
-            Some(Err(error)) => Err(anyhow::Error::new(error).context("local runtime worker failed")),
-            Some(Ok(Ok(()))) => Err(anyhow::anyhow!("local runtime worker stopped unexpectedly")),
-            None => Err(anyhow::anyhow!("all local runtime workers stopped unexpectedly")),
+            Some(Ok(Err(error))) => Err(error.context("built-in collaboration worker failed")),
+            Some(Err(error)) => Err(anyhow::Error::new(error).context("built-in Harness worker failed")),
+            Some(Ok(Ok(()))) => Err(anyhow::anyhow!("built-in Harness worker stopped unexpectedly")),
+            None => Err(anyhow::anyhow!("all built-in Harness workers stopped unexpectedly")),
         },
     };
     {
@@ -203,8 +159,11 @@ pub(crate) async fn serve_managed(
             Err(error) => failures.push(format!("runtime worker failed during shutdown: {error}")),
         }
     }
+    if let Err(error) = client.revoke_all().await {
+        failures.push(format!("built-in writer stop remains unconfirmed: {error:#}"));
+    }
     if let Err(error) = health_server.await {
-        failures.push(format!("local health server failed: {error}"));
+        failures.push(format!("Harness health server failed: {error}"));
     }
     let mut snapshot = health.write().await;
     snapshot.ready = false;
@@ -215,7 +174,7 @@ pub(crate) async fn serve_managed(
         braid.runtime.stop_confirmed=failures.is_empty(),
         braid.runtime.ready=false,
         braid.runtime.error=%failures.join("\n"),
-        "managed local runtime stopped"
+        "built-in Harness runtime stopped"
     );
     if failures.is_empty() {
         Ok(())
@@ -228,7 +187,7 @@ pub(crate) async fn serve_managed(
 
 async fn object_worker(
     store: Arc<StoreActor>,
-    objects: Arc<Mutex<LocalObjects>>,
+    client: Arc<BuiltinClient>,
     config: Config,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -238,30 +197,60 @@ async fn object_worker(
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),
             _ = tick.tick() => {
-                advance_objects(&store, &objects, &config).context("cannot advance local collaboration")?;
+                advance_objects(&store, &client, &config).await.context("cannot advance built-in collaboration")?;
             }
         }
     }
 }
 
-fn advance_objects(
+fn client_cursor(store: &StoreActor) -> Result<u64> {
+    let crate::store::BuiltinReply::Binding(binding) =
+        store.builtin(crate::store::BuiltinCommand::State)?
+    else {
+        anyhow::bail!("built-in upstream is not bound")
+    };
+    Ok(binding.cursor)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn advance_objects(
     store: &StoreActor,
-    objects: &Mutex<LocalObjects>,
+    client: &BuiltinClient,
     config: &Config,
 ) -> Result<()> {
-    let mut objects =
-        objects.lock().map_err(|_| anyhow::anyhow!("local object store lock poisoned"))?;
-    for pending in objects.pending_events(100)? {
-        let delivery_guid = pending.event.delivery_guid.clone();
-        let number = pending.event.work_item_number;
-        let item_kind = pending.event.work_item_kind;
-        let queue_kind = pending.event.kind.as_str();
+    let feed: EventFeed = client
+        .get(&format!("api/platform/events?after={}&limit=100", client_cursor(store)?))
+        .await?;
+    let mut cursor = client_cursor(store)?;
+    anyhow::ensure!(
+        feed.last_sequence >= cursor,
+        "platform event history regressed behind the Harness cursor"
+    );
+    for pending in feed.events {
+        anyhow::ensure!(
+            pending.sequence > cursor && pending.sequence <= feed.last_sequence,
+            "platform events are not in immutable increasing order"
+        );
+        let event = pending.event.into_ingress()?;
+        anyhow::ensure!(
+            event.repository == config.repository()
+                && event.repository_node_id == format!("local:{}", config.repository()),
+            "platform event belongs to a different collaboration authority"
+        );
+        client
+            .reconcile_fence(&event)
+            .await
+            .context("cannot reconcile upstream writer revocation")?;
+        let delivery_guid = event.delivery_guid.clone();
+        let number = event.work_item_number;
+        let item_kind = event.work_item_kind;
+        let queue_kind = event.kind.as_str();
         let generation = crate::telemetry::evidence_health().runtime_generation;
-        let ingest = store.ingest_event(pending.event, policy_from_config(config));
+        let ingest = store.ingest_event(event, policy_from_config(config));
         tracing::info!(
             name="braid.local.event_ingest",
             braid.runtime.generation=generation.as_deref().unwrap_or(""),
-            braid.local.event_id=pending.event_id,
+            braid.local.event_id=pending.sequence,
             braid.delivery.guid=%delivery_guid,
             braid.work_item.number=number,
             braid.work_item.kind=item_kind.unwrap_or(""),
@@ -273,26 +262,31 @@ fn advance_objects(
             braid.queue.batch_id=ingest.as_ref().ok().and_then(|result|result.batch_id.as_deref()).unwrap_or(""),
             braid.queue.lifecycle=ingest.as_ref().ok().and_then(|result|result.batch_lifecycle.as_deref()).unwrap_or(""),
             braid.event.error=ingest.as_ref().err().map(ToString::to_string).as_deref().unwrap_or(""),
-            "local collaboration event ingested"
+            "built-in upstream event ingested"
         );
         ingest?;
-        let ack = objects.ack_event(pending.event_id);
+        let ack = store.builtin(crate::store::BuiltinCommand::Advance(pending.sequence));
         tracing::info!(
-            name="braid.local.event_ack",
+            name="braid.builtin.cursor_advance",
             braid.runtime.generation=generation.as_deref().unwrap_or(""),
-            braid.local.event_id=pending.event_id,
+            braid.local.event_id=pending.sequence,
             braid.delivery.guid=%delivery_guid,
             braid.work_item.number=number,
             braid.work_item.kind=item_kind.unwrap_or(""),
             braid.queue.kind=queue_kind,
-            braid.event.acked=ack.is_ok(),
+            braid.event.cursor_saved=ack.is_ok(),
             braid.event.error=ack.as_ref().err().map(|error|format!("{error:#}")).as_deref().unwrap_or(""),
-            "local collaboration event acknowledged"
+            "Harness upstream cursor advanced"
         );
         ack?;
+        cursor = pending.sequence;
     }
+    anyhow::ensure!(
+        feed.next_after == cursor,
+        "platform nextAfter does not match delivered event sequence"
+    );
     if let Some(write) = store.claim_github_write()? {
-        match objects.apply_outbox(&write) {
+        match client.apply_write(&write).await {
             Ok((database_id, node_id)) => {
                 tracing::info!(
                     name="braid.local.outbox_result",
@@ -300,7 +294,7 @@ fn advance_objects(
                     braid.outbox.intent_id=%write.intent_id,
                     braid.outbox.operation=%write.operation,
                     braid.outbox.lifecycle="applied",
-                    "local collaboration write applied"
+                    "built-in upstream write applied"
                 );
                 store.finish_github_write(
                     write.intent_id,
@@ -311,9 +305,14 @@ fn advance_objects(
                 )?;
             }
             Err(error) => {
-                let lifecycle = if error.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
-                    matches!(error, rusqlite::Error::SqliteFailure(code, _) if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked | rusqlite::ErrorCode::SystemIoFailure))
-                }) { "uncertain" } else { "rejected" };
+                let lifecycle = if error
+                    .downcast_ref::<crate::builtin::PlatformHttpError>()
+                    .is_some_and(|error| error.status.is_client_error())
+                {
+                    "rejected"
+                } else {
+                    "uncertain"
+                };
                 tracing::error!(
                     name="braid.local.outbox_result",
                     braid.runtime.generation=crate::telemetry::evidence_health().runtime_generation.as_deref().unwrap_or(""),
@@ -321,7 +320,7 @@ fn advance_objects(
                     braid.outbox.operation=%write.operation,
                     braid.outbox.lifecycle=lifecycle,
                     braid.outbox.error=%format!("{error:#}"),
-                    "local collaboration write failed"
+                    "built-in upstream write failed"
                 );
                 store.finish_github_write(
                     write.intent_id,

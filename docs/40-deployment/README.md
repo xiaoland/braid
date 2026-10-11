@@ -55,7 +55,7 @@ Everything below is scoped by trust boundary:
   config.toml                   # optional user defaults (future)
   secrets/                      # user-level provider API keys
   instances/<key>/
-    config.toml                 # instance config, schema version 2
+    config.toml                 # Harness config, schema version 3 (GitHub v2 still readable)
     github-app.pem              # GitHub App private key
     secrets.toml                # webhook secret
     state/
@@ -188,36 +188,48 @@ Then drive only the real campaign in
 private DB edits, fake events, or a manually signed local request cannot accept
 the release.
 
-## Local 实例
+## 内建平台与 Harness 接入
 
-`braid init` 从本地 Git checkout 和明确原生 runtime 创建类型化配置，不创建
-GitHub App，不写入 API key 值。`[local]` 指定稳定 `repository` 空间名称与绝对
-`source` 路径；省去 `[github]`，其它 runtime、Profile 和存储配置共用。旧 GitHub
-schema 2 配置继续有效，两个后端段必须互斥。数据库 schema 4 新增本地对象与
-事件表，旧迁移不可变。空间与 source 的绑定不能通过改配置静默迁到另一仓库。
+内建平台使用独立声明、schema 与数据库，作为 Harness 的上游与 GitHub 并列。
+`braid platform init/serve/import` 管理平台；`braid init` 只声明 Harness 执行环境
+与 `[builtin]` repository/endpoint，不创建 GitHub App 或保存 API key 值。
+平台 source 与默认分支独立绑定，不能通过修改 endpoint 静默切换空间身份。
 
-Local serve 不启动 webhook、Quick Tunnel 或 GitHub reconciliation。它持有同样
-的 runtime lease，监督 queue、对象事件桥接、状态 outbox 与 Agent Groups。
-`--transport-only` 处理对象事件和队列，不启动原生模型会话，可供实际操作取证。
-GitHub 专属命令在 Local 实例明确拒绝。
+Harness 配置 schema 3 选择 `[github]` 或 `[builtin]`。原 GitHub schema 2 声明
+继续有效，旧 `[local]` 明确拒绝，并给出显式平台导入指引。导入前停止旧进程
+和写入入口，核实在途意图；保留原数据库、对象身份、事件及对象回执。Harness
+数据库迁移至 schema 6，平台此后使用自己的 schema，不读取执行表。迁移及
+启动命令见[内建平台指南](../user-manual/local.md)。
 
-Agent 子进程取得 `BRAID_CONFIG` 与 `BRAID_AGENT`，CLI 通过专属 cwd、有效工作
-责任、会话与 turn 校验写入来源；失效调用明确失败。环境与 SQLite 检查防止正常
-执行串写，不能作为恶意本机进程或用户的权限沙箱。对象、provider history 与 Git
-资料均须随所属实例保留，停止 daemon 不删除空间。
+平台当前 schema 2 持有自己的嵌入迁移名称与 SHA-256 校验。旧平台 schema 1
+在启动时先备份再向前升级，保留空间身份、对象和回执；不通过重建空库升级。
+未知版本或迁移校验不一致明确拒绝。历史候选与合并提交保留平台专属 Git 引用，
+避免工作分支移动或清理后丢失已接受的提交。
 
-## 内置 Collector 与 Console
+两个上游经过同一 Harness 运行入口、lease、调度和 Group/provider 停止合同。
+内建 adapter 使用 HTTP 平台接口，事件 cursor 和 grant 能力保留在 Harness
+ledger；平台不为每个消费者修改事件。`--transport-only` 接入对象事件和队列，
+不启动原生模型会话。GitHub 专属命令在内建上游明确拒绝。
 
-`braid console` 提供 loopback OTLP HTTP/protobuf 接收、独立 SQLite 原始批次与记录
-读模型，以及内嵌 Web 资源。Local 配置可接入直接对象控制与长期存活的 runtime
-监督器；停止 runtime 不关闭 Collector。数据库 schema 5 增加对象及启停命令的
-持久回执，旧迁移不变。编辑 revision 与对象写入原子检查，Git 操作保留各自意图
-与失败边界。具体使用和未确认停止的处置见[Console 指南](../user-manual/console.md)。
+Agent 子进程取得 `BRAID_CONFIG` 与 `BRAID_AGENT`，对象 gateway 通过专属 cwd、
+当前 assignment/session/turn 选择有效 grant；平台提交事务核验授权版本。撤销
+失败传播并阻断执行替换，不把一次 gateway 读取当作提交时仍有效的证明。同
+账户进程不是安全沙箱的隔离对手。平台对象、provider history 与 Git 资料保留
+各自身份和数据库，停止 Harness 不删除平台。
 
-Console 的 Collector 保存接收事实，不反推业务完成。runtime generation、明确的
-provider session/turn 关联和证据缺口用于诊断；Console 的当前状态来自应用模块与
-实际任务句柄，不从 OTLP 到达顺序重建权威状态。所有停止错误向监督器传播，
-未确认停止会阻止替代启动。此模式与外部 Collector 并存，不改变 GitHub 权威。
+## Braid Collector 与 Console
+
+`braid console` 提供 loopback OTLP HTTP/protobuf、独立原始证据库和内嵌 Web。
+`--config` 可连接任一上游的 Harness；`--platform-config` 可便捷托管独立平台，
+也可只配置平台而不配置 Harness。对象操作经过固定平台 API，执行 snapshot
+只读 Harness ledger，runtime manager 持有真实任务与启停回执。Console 不走
+CLI 子进程，也不由 OTLP 重建权威。停止 Harness 后平台和 Collector 继续在线。
+使用方法和未确认停止的处置见[Console 指南](../user-manual/console.md)。
+
+平台命令回执属于平台数据库，启停回执属于 Harness。普通对象变更、事件和
+回执原子提交，Git 候选保留自己的意图与 ref CAS。监督器等待所有 Group/provider
+停止结果，任何未确认停止进入 blocked 并禁止替代启动。Console 可在同进程
+装配三项职责，但不因此合并权威，亦不提供进程级故障隔离。
 
 真实指标使用低基数标签：runtime 观察代次开始/结束次数、provider 生命周期事件计数、接纳到
 终态的单调时钟观察时长，以及 provider payload 的采样和关联覆盖计数。时长是

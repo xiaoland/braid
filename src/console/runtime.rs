@@ -57,7 +57,7 @@ fn internal(error: impl std::fmt::Display) -> ApiError {
 
 impl Manager {
     pub fn new(config: Config) -> Result<Self> {
-        let mut initial = crate::local::runtime::initial_health(&config, false);
+        let mut initial = crate::runtime::initial_health(&config, false);
         initial.ready = false;
         let db = Connection::open_with_flags(
             config.runtime.database(),
@@ -260,10 +260,10 @@ async fn start_runtime(
     state.provider_enabled = provider_enabled;
     state.stop = Some(stop);
     *manager.0.health.write().await =
-        crate::local::runtime::initial_health(&manager.0.config, provider_enabled);
+        crate::runtime::initial_health(&manager.0.config, provider_enabled);
     crate::telemetry::set_runtime_generation(Some(generation.clone()));
     let task_manager = manager.clone();
-    let task = tokio::spawn(crate::local::runtime::serve_managed(
+    let task = tokio::spawn(crate::runtime::serve_managed(
         manager.0.config.clone(),
         provider_enabled,
         receiver,

@@ -30,7 +30,7 @@ pub(crate) async fn prepare_pr_context(
     profile: &Profile,
     candidate: &AssignmentCandidate,
 ) -> Result<PreparedPrContext> {
-    let repository = if github.is_local() {
+    let repository = if github.is_builtin() {
         RepositoryName::local(&candidate.repository)
     } else {
         candidate.repository.parse::<RepositoryName>()?
@@ -54,7 +54,7 @@ pub(crate) async fn prepare_pr_context(
     Ok(PreparedPrContext {
         rendered,
         repository_node_id: pull_request.repository_node_id,
-        head_ref: github.pr_worktree_ref(candidate.number, &pull_request.head_ref)?,
+        head_ref: github.pr_worktree_ref(candidate.number, &pull_request.head_ref).await?,
     })
 }
 
@@ -98,7 +98,7 @@ pub(super) fn provision_pr_worktree_from_ref(
         target: &target,
         repository: config.repository(),
         remote: "origin",
-        local_only: config.is_local(),
+        local_only: config.is_builtin(),
         git: &config.tools.git,
         head_ref,
         local_branch: &local_branch,
@@ -290,9 +290,9 @@ impl GroupDriver<'_> {
             }
         };
         let Some(candidate) = candidate else { return };
-        if candidate.action == "unassign" && self.collaboration.is_local() {
-            if let Err(error) = self.settle_local_pr_unassignment(candidate).await {
-                tracing::error!(%error, "cannot settle local PR unassignment");
+        if candidate.action == "unassign" && self.collaboration.is_builtin() {
+            if let Err(error) = self.settle_builtin_pr_unassignment(candidate).await {
+                tracing::error!(%error, "cannot settle built-in PR unassignment");
             }
             return;
         }
@@ -301,20 +301,9 @@ impl GroupDriver<'_> {
         }
     }
 
-    async fn settle_local_pr_unassignment(&self, candidate: AssignmentCandidate) -> Result<()> {
-        let locator = WorkItemLocator {
-            repository: RepositoryName::local(&candidate.repository),
-            number: candidate.number,
-        };
-        let pr = self.collaboration.materialize_pull_request(&locator).await?;
-        if pr
-            .assignees
-            .iter()
-            .any(|actor| self.collaboration.assignee_matches(actor, &self.spec.profile.id))
-        {
-            self.store.ignore_assignment_event(candidate.event_id)?;
-            return Ok(());
-        }
+    async fn settle_builtin_pr_unassignment(&self, candidate: AssignmentCandidate) -> Result<()> {
+        // The immutable unassign event retires this generation even if a later
+        // assignment has already restored the same actor in the current snapshot.
         for active in
             self.store.provider_resume_candidates(self.spec.profile.id.clone(), "pr".into())?
         {

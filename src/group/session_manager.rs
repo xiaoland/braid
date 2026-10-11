@@ -1,5 +1,6 @@
 use crate::{
     agent_session::{AgentSession, CreatedSession, SessionError, SessionFactory},
+    collaboration::CollaborationBackend,
     config::Profile,
 };
 use std::{
@@ -12,13 +13,22 @@ use tokio::sync::Mutex;
 /// resource ownership and sharing stay in the injected adapter factory.
 pub(super) struct SessionManager {
     factory: Arc<dyn SessionFactory>,
+    collaboration: Arc<CollaborationBackend>,
     sessions: Mutex<HashMap<String, Arc<dyn AgentSession>>>,
     stopped: Mutex<HashSet<String>>,
 }
 
 impl SessionManager {
-    pub(super) fn new(factory: Arc<dyn SessionFactory>) -> Self {
-        Self { factory, sessions: Mutex::new(HashMap::new()), stopped: Mutex::new(HashSet::new()) }
+    pub(super) fn new(
+        factory: Arc<dyn SessionFactory>,
+        collaboration: Arc<CollaborationBackend>,
+    ) -> Self {
+        Self {
+            factory,
+            collaboration,
+            sessions: Mutex::new(HashMap::new()),
+            stopped: Mutex::new(HashSet::new()),
+        }
     }
 
     pub(super) async fn check(&self) -> Result<(), SessionError> {
@@ -84,6 +94,12 @@ impl SessionManager {
     }
 
     pub(super) async fn remove(&self, id: &str) -> Result<(), SessionError> {
+        // Revocation fences platform writes even when the native stop remains uncertain.
+        self.collaboration.revoke_session(id).await.map_err(|error| {
+            SessionError::Failed(format!(
+                "cannot revoke writer grant for provider session {id}: {error:#}"
+            ))
+        })?;
         if let Some(session) = self.get(id).await {
             // Keep the handle until its adapter proves the old execution stopped.
             session.close().await?;

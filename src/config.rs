@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::home::validate_instance_key;
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -39,6 +39,8 @@ pub struct Config {
     pub github: Option<GitHubConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local: Option<LocalConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<BuiltinConfig>,
     #[serde(skip)]
     pub loaded_from: PathBuf,
     pub scheduler: SchedulerConfig,
@@ -189,6 +191,14 @@ pub struct LlmAllowance {
     pub amount: f64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuiltinConfig {
+    pub repository: String,
+    pub endpoint: Url,
+}
+
+// Parsed only to provide an actionable migration error for the previous declaration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalConfig {
@@ -362,6 +372,7 @@ pub struct ProfileSelection {
 #[derive(Debug, Serialize)]
 pub struct ConfigSummary<'a> {
     pub schema_version: u32,
+    pub upstream: &'static str,
     pub instance_key: &'a str,
     pub repository: &'a str,
     pub runtime_root: &'a Path,
@@ -437,9 +448,6 @@ impl Config {
         config.runtime.resolve(&base);
         for profile in &mut config.profiles {
             profile.resolve_workspace(&base);
-            if let Some(local) = &config.local {
-                profile.workspace = Some(local.source.clone());
-            }
         }
         config.validate()?;
         Ok(config)
@@ -451,21 +459,21 @@ impl Config {
     }
 
     pub fn repository(&self) -> &str {
-        match (&self.github, &self.local) {
+        match (&self.github, &self.builtin) {
             (Some(github), None) => &github.repository,
-            (None, Some(local)) => &local.repository,
+            (None, Some(builtin)) => &builtin.repository,
             _ => unreachable!("configuration validates exactly one collaboration backend"),
         }
     }
 
-    pub fn is_local(&self) -> bool {
-        self.local.is_some()
+    pub fn is_builtin(&self) -> bool {
+        self.builtin.is_some()
     }
 
     pub fn github(&self) -> Result<&GitHubConfig, ConfigError> {
         self.github.as_ref().ok_or_else(|| {
             ConfigError::Invalid(
-                "this command requires the GitHub backend; this instance uses local collaboration"
+                "this command requires the GitHub backend; this Harness connects to the built-in collaboration platform"
                     .into(),
             )
         })
@@ -481,6 +489,7 @@ impl Config {
     pub fn summary(&self) -> ConfigSummary<'_> {
         ConfigSummary {
             schema_version: self.schema_version,
+            upstream: if self.is_builtin() { "builtin" } else { "github" },
             instance_key: &self.instance.key,
             repository: self.repository(),
             runtime_root: self.runtime.root(),
@@ -573,7 +582,7 @@ impl Config {
             })?;
             return Ok(ProviderConfig {
                 codex: Some(CodexConfig {
-                    braid_config_path: self.is_local().then(|| self.loaded_from.clone()),
+                    braid_config_path: self.is_builtin().then(|| self.loaded_from.clone()),
                     executable: runtime.executable.clone(),
                     home,
                     version: runtime.version.clone(),
@@ -590,7 +599,7 @@ impl Config {
             return Ok(ProviderConfig {
                 codex: None,
                 pi: Some(PiConfig {
-                    braid_config_path: self.is_local().then(|| self.loaded_from.clone()),
+                    braid_config_path: self.is_builtin().then(|| self.loaded_from.clone()),
                     executable: runtime.executable.clone(),
                     provider: Some(llm.id.clone()),
                     model: profile.model.clone(),
@@ -607,7 +616,7 @@ impl Config {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
-        if self.schema_version != CONFIG_SCHEMA_VERSION {
+        if self.schema_version != CONFIG_SCHEMA_VERSION && self.schema_version != 2 {
             return Err(ConfigError::Schema {
                 found: self.schema_version,
                 supported: CONFIG_SCHEMA_VERSION,
@@ -616,9 +625,12 @@ impl Config {
         validate_instance_key(&self.instance.key)
             .map_err(|message| ConfigError::Invalid(format!("instance.key: {message}")))?;
 
-        if self.github.is_some() == self.local.is_some() {
+        if self.local.is_some() {
+            return Err(ConfigError::Invalid("[local] combined platform and Harness state is no longer supported; stop the old runtime, import its objects with braid platform import, then replace [local] with [builtin] repository and endpoint; see docs/user-manual/local.md".into()));
+        }
+        if self.github.is_some() == self.builtin.is_some() {
             return Err(ConfigError::Invalid(
-                "configure exactly one of [github] or [local]".into(),
+                "configure exactly one upstream: [github] or [builtin]".into(),
             ));
         }
         for (name, path) in [
@@ -636,13 +648,32 @@ impl Config {
                 "runtime database and backups must be inside runtime.root".into(),
             ));
         }
-        if let Some(local) = &self.local {
-            validate_token("local.repository", &local.repository)?;
-            require_absolute("local.source", &local.source)?;
-            if !git2::Reference::is_valid_name(&format!("refs/heads/{}", local.default_branch)) {
-                return Err(ConfigError::Invalid(
-                    "local.default_branch must be a valid Git branch name".into(),
-                ));
+        if let Some(builtin) = &self.builtin {
+            validate_token("builtin.repository", &builtin.repository)?;
+            let endpoint = &builtin.endpoint;
+            let loopback = match endpoint.host() {
+                Some(url::Host::Domain("localhost")) => true,
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                _ => false,
+            };
+            if endpoint.scheme() != "http"
+                || !loopback
+                || !endpoint.username().is_empty()
+                || endpoint.password().is_some()
+                || endpoint.query().is_some()
+                || endpoint.fragment().is_some()
+                || endpoint.path() != "/"
+            {
+                return Err(ConfigError::Invalid("builtin.endpoint must be a loopback HTTP origin without credentials, query, fragment or path".into()));
+            }
+            for profile in &self.profiles {
+                if profile.workspace.is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "profile {:?} requires workspace for the built-in platform's Git source",
+                        profile.id
+                    )));
+                }
             }
         }
         if let Some(github) = &self.github {

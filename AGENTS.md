@@ -1,7 +1,8 @@
 # Braid Project Instructions
 
-This repository implements Braid: GitHub Issue and pull-request state become the
-durable working memory of local Coding Agents. Apply these instructions only in
+This repository implements Braid: collaboration Issue and pull-request state become
+the durable working memory of Coding Agents. GitHub and the built-in platform are
+peer upstreams; the Web Console belongs to Braid as a whole. Apply these instructions only in
 this repository; do not modify user-scope Agent instructions.
 
 <!-- svc:begin navigation sha256=48c8d7b497ed094589c4a192f3ef97450fd7f614712dc1b4b22e9a20578360cd -->

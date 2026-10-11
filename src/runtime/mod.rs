@@ -1,4 +1,5 @@
 #![allow(clippy::large_futures)]
+mod builtin;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context as _, Result, bail};
@@ -49,21 +50,45 @@ impl Drop for RuntimeLeaseGuard {
     }
 }
 
+pub(crate) fn initial_health(config: &Config, provider_enabled: bool) -> HealthSnapshot {
+    if config.is_builtin() {
+        return builtin::initial_health(config, provider_enabled);
+    }
+    HealthSnapshot {
+        ready: false,
+        ingress: config.server.ingress.to_string(),
+        repository: config.repository().into(),
+        tunnel: "disabled",
+        webhook_url: None,
+        reconciliation: "starting",
+        provider: if provider_enabled { "starting" } else { "disabled" },
+        last_error: None,
+    }
+}
+
 pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -> Result<()> {
+    if config.is_builtin() && quick_tunnel {
+        bail!("built-in upstream does not use a GitHub webhook tunnel");
+    }
     let telemetry = TelemetryGuard::install(&config.telemetry, config.instance_key())?;
     let generation = Uuid::now_v7().to_string();
     crate::telemetry::set_runtime_generation(Some(generation.clone()));
-    let result = serve_inner(config, quick_tunnel, provider_enabled).await;
-    tracing::info!(
-        name="braid.runtime.stop",
-        braid.runtime.generation=%generation,
-        braid.runtime.stop_confirmed=result.is_ok(),
-        braid.runtime.error=result.as_ref().err().map(|error|format!("{error:#}")).as_deref().unwrap_or(""),
-        "standalone GitHub runtime ended"
-    );
+    let health = Arc::new(RwLock::new(initial_health(&config, provider_enabled)));
+    let (stop, shutdown) = watch::channel(false);
+    let mut runtime = Box::pin(async move {
+        if config.is_builtin() {
+            serve_managed(config, provider_enabled, shutdown, health).await
+        } else {
+            serve_github_managed(config, quick_tunnel, provider_enabled, shutdown, health).await
+        }
+    });
+    let result = tokio::select! {
+        result=&mut runtime=>result,
+        signal=wait_for_shutdown_signal()=>{let _=stop.send(true);signal.and(runtime.await)}
+    };
+    tracing::info!(name="braid.runtime.stop",braid.runtime.generation=%generation,braid.runtime.stop_confirmed=result.is_ok(),braid.runtime.error=result.as_ref().err().map(|error|format!("{error:#}")).as_deref().unwrap_or(""),"standalone runtime ended");
     crate::telemetry::set_runtime_generation(None);
-    let telemetry_result = telemetry.shutdown();
-    match (result, telemetry_result) {
+    match (result, telemetry.shutdown()) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
         (Ok(()), Err(error)) => Err(error.into()),
@@ -73,8 +98,31 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     }
 }
 
+pub(crate) async fn serve_managed(
+    config: Config,
+    provider_enabled: bool,
+    stop: watch::Receiver<bool>,
+    health: Arc<RwLock<HealthSnapshot>>,
+) -> Result<()> {
+    if config.is_builtin() {
+        builtin::serve_managed(config, provider_enabled, stop, health).await
+    } else {
+        serve_github_managed(config, false, provider_enabled, stop, health).await
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-async fn serve_inner(config: Config, quick_tunnel: bool, provider_enabled: bool) -> Result<()> {
+async fn serve_github_managed(
+    config: Config,
+    quick_tunnel: bool,
+    provider_enabled: bool,
+    mut external_stop: watch::Receiver<bool>,
+    health: Arc<RwLock<HealthSnapshot>>,
+) -> Result<()> {
+    if *external_stop.borrow() {
+        return Ok(());
+    }
+    *health.write().await = initial_health(&config, provider_enabled);
     let store = Arc::new(StoreActor::start(
         config.runtime.database().to_path_buf(),
         config.runtime.backups().to_path_buf(),
@@ -99,7 +147,7 @@ async fn serve_inner(config: Config, quick_tunnel: bool, provider_enabled: bool)
         connection.query_row("SELECT COUNT(*) FROM local_space", [], |row| row.get(0))?;
     if local_space != 0 {
         bail!(
-            "this database belongs to local collaboration; use its local config or a distinct GitHub runtime root"
+            "this database contains legacy collaboration objects; import them into the built-in platform and use a separate Harness ledger for GitHub"
         );
     }
     drop(connection);
@@ -129,16 +177,6 @@ async fn serve_inner(config: Config, quick_tunnel: bool, provider_enabled: bool)
         quiet_seconds: config.scheduler.quiet_seconds,
         event_threshold: config.scheduler.event_threshold,
     };
-    let health = Arc::new(RwLock::new(HealthSnapshot {
-        ready: false,
-        ingress: config.server.ingress.to_string(),
-        repository: config.repository().to_owned(),
-        tunnel: if quick_tunnel { "starting" } else { "disabled" },
-        webhook_url: None,
-        reconciliation: "starting",
-        provider: if provider_enabled { "starting" } else { "disabled" },
-        last_error: None,
-    }));
     let state = Arc::new(IngressState {
         store: Arc::clone(&store),
         policy,
@@ -255,14 +293,10 @@ async fn serve_inner(config: Config, quick_tunnel: bool, provider_enabled: bool)
 
     let mut tunnel_poll = tokio::time::interval(Duration::from_secs(2));
     tunnel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut shutdown_signal = Box::pin(wait_for_shutdown_signal());
     let mut runtime_failure = None;
     loop {
         tokio::select! {
-            result = &mut shutdown_signal => {
-                result?;
-                break;
-            }
+            _ = external_stop.changed() => {break;}
             worker = workers.join_next() => {
                 let message = match worker {
                     Some(Ok(Ok(()))) => "a supervised runtime worker stopped unexpectedly".to_owned(),

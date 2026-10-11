@@ -1,6 +1,8 @@
 //! Braid-owned collaboration objects and their atomic event outbox.
 mod commands;
-pub use commands::{CommandFailure, CommandRequest, ControlPolicy, ControlReceipt};
+pub use commands::{
+    CandidateLocation, CommandFailure, CommandRequest, ControlPolicy, ControlReceipt, ObjectCommand,
+};
 use std::{path::Path, time::Duration};
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -8,6 +10,7 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Savepoint, Transaction, TransactionBehavior, params,
 };
 use serde::Serialize;
+use sha2::Digest as _;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
@@ -27,6 +30,7 @@ pub struct Item {
     pub body: String,
     pub author: String,
     pub state: String,
+    /// Legacy wire/storage name; its value is a platform actor, not a Harness Profile.
     pub desired_profile: Option<String>,
     pub head_ref: Option<String>,
     pub base_ref: Option<String>,
@@ -57,18 +61,16 @@ pub struct PendingEvent {
 
 #[derive(Clone)]
 struct Writer {
-    session: String,
-    turn: String,
+    grant: super::grants::WriterGrant,
     item: String,
-    profile: String,
+    actor: String,
 }
 
-pub struct LocalObjects {
+pub struct PlatformObjects {
     connection: Connection,
     repository: String,
     writer: Option<Writer>,
     revision_guard: Option<(u64, u64)>,
-    candidate_guard: Option<(String, String)>,
 }
 
 pub fn repository_node(repository: &str) -> String {
@@ -88,7 +90,7 @@ fn nonempty(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
-impl LocalObjects {
+impl PlatformObjects {
     pub fn open(database: &Path, repository: &str) -> Result<Self> {
         nonempty(repository, "repository")?;
         let mut connection =
@@ -97,25 +99,8 @@ impl LocalObjects {
             )?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        let version: u32 = connection.query_row(
-            "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
-            [],
-            |r| r.get(0),
-        )?;
-        ensure!(
-            version == crate::store::DATABASE_SCHEMA_VERSION && version >= 4,
-            "local collaboration requires the current database schema; run braid migrate apply"
-        );
+        super::store::verify_schema(&connection)?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let foreign: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM repositories WHERE node_id NOT LIKE 'local:%'",
-            [],
-            |r| r.get(0),
-        )?;
-        ensure!(
-            foreign == 0,
-            "database already contains GitHub collaboration authority; use a separate local database"
-        );
         tx.execute(
             "INSERT OR IGNORE INTO local_space(singleton,repository) VALUES(1,?1)",
             [repository],
@@ -127,27 +112,13 @@ impl LocalObjects {
             "local database belongs to repository {bound}, not {repository}"
         );
         tx.commit()?;
-        Ok(Self {
-            connection,
-            repository: repository.into(),
-            writer: None,
-            revision_guard: None,
-            candidate_guard: None,
-        })
+        Ok(Self { connection, repository: repository.into(), writer: None, revision_guard: None })
     }
 
     pub fn open_read_only(database: &Path, repository: &str) -> Result<Self> {
         let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        let version: u32 = connection.query_row(
-            "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
-            [],
-            |r| r.get(0),
-        )?;
-        ensure!(
-            version == crate::store::DATABASE_SCHEMA_VERSION,
-            "database schema is not current; apply migrations before HTTP control"
-        );
+        super::store::verify_schema(&connection)?;
         let bound: String = connection.query_row(
             "SELECT repository FROM local_space WHERE singleton=1",
             [],
@@ -157,13 +128,7 @@ impl LocalObjects {
             bound == repository,
             "local database belongs to repository {bound}, not {repository}"
         );
-        Ok(Self {
-            connection,
-            repository: repository.into(),
-            writer: None,
-            revision_guard: None,
-            candidate_guard: None,
-        })
+        Ok(Self { connection, repository: repository.into(), writer: None, revision_guard: None })
     }
 
     pub fn verify_source(&self, source: &Path) -> Result<()> {
@@ -198,37 +163,6 @@ impl LocalObjects {
         )?;
         ensure!(bound == source, "local database belongs to Git source {bound}, not {source}");
         Ok(())
-    }
-
-    pub fn bind_agent(&mut self, cwd: &Path) -> Result<String> {
-        let cwd = cwd.canonicalize()?;
-        let mut stmt=self.connection.prepare("SELECT s.session_id,t.turn_id,a.work_item_node_id,g.profile_id,w.path FROM provider_sessions s JOIN turns t ON t.session_id=s.session_id JOIN agent_instances g ON g.agent_id=s.agent_id JOIN assignments a ON a.assignment_id=g.assignment_id JOIN worktrees w ON w.agent_id=g.agent_id WHERE s.lifecycle='running' AND t.lifecycle IN ('starting','running') AND a.lifecycle IN ('active','finalizing') AND g.lifecycle IN ('idle','finalizing') AND w.lifecycle='active'")?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut matches = Vec::new();
-        for (session, turn, item, profile, path) in rows {
-            let root = Path::new(&path).canonicalize()?;
-            if cwd.starts_with(root) {
-                matches.push(Writer { session, turn, item, profile });
-            }
-        }
-        ensure!(
-            matches.len() == 1,
-            "Agent CLI caller has no unique active assignment/session/turn in this worktree"
-        );
-        let writer = matches.pop().expect("exactly one caller");
-        let profile = writer.profile.clone();
-        self.writer = Some(writer);
-        Ok(profile)
     }
 
     pub fn item(&self, number: u64) -> Result<Item> {
@@ -281,6 +215,8 @@ impl LocalObjects {
             author,
             Some((head, base, &head_commit, &base_commit, issue)),
         )?;
+        pin_commit(&self.connection, &git, item.number, "heads", &head_commit)?;
+        pin_commit(&self.connection, &git, item.number, "bases", &base_commit)?;
         Ok(item)
     }
 
@@ -415,27 +351,30 @@ impl LocalObjects {
         self.item(number)
     }
 
-    pub fn assign(&mut self, number: u64, profile: Option<&str>, author: &str) -> Result<Item> {
+    pub fn assign(
+        &mut self,
+        number: u64,
+        assigned_actor: Option<&str>,
+        author: &str,
+    ) -> Result<Item> {
         let old = self.item(number)?;
         nonempty(author, "author")?;
-        if let Some(profile) = profile {
-            nonempty(profile, "profile")?;
-        }
-        if old.desired_profile.as_deref() == profile {
-            return Ok(old);
+        if let Some(assigned_actor) = assigned_actor {
+            nonempty(assigned_actor, "assigned_actor")?;
         }
         let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
         validate_revision(&tx, &self.repository, self.revision_guard)?;
         tx.execute(
             "UPDATE local_items SET desired_profile=?1 WHERE number=?2",
-            params![profile, sql_id(number)?],
+            params![assigned_actor, sql_id(number)?],
         )?;
         bump(&tx, number)?;
+        revoke_item_grants(&tx, number)?;
         if old.desired_profile.is_some() {
             emit(&tx, number, "unassign", Some("unassigned"), author, None, self.writer.as_ref())?;
         }
-        if profile.is_some() {
+        if assigned_actor.is_some() {
             emit(&tx, number, "assign", Some("assigned"), author, None, self.writer.as_ref())?;
         }
         tx.commit()?;
@@ -461,6 +400,7 @@ impl LocalObjects {
             params![state, sql_id(number)?],
         )?;
         bump(&tx, number)?;
+        revoke_item_grants(&tx, number)?;
         emit(
             &tx,
             number,
@@ -615,10 +555,10 @@ impl LocalObjects {
         }))
     }
 
-    pub fn pending_events(&self, limit: u32) -> Result<Vec<PendingEvent>> {
-        let mut stmt=self.connection.prepare("SELECT event_id,item_number,kind,detail,actor,body,revision,item_state,created_at,origin FROM local_events WHERE consumed_at IS NULL AND item_number IN (SELECT number FROM local_items WHERE repository=?1) ORDER BY event_id LIMIT ?2")?;
+    pub fn events(&self, after: u64, limit: u32) -> Result<Vec<PendingEvent>> {
+        let mut stmt=self.connection.prepare("SELECT event_id,item_number,kind,detail,actor,body,revision,item_state,created_at,origin FROM local_events WHERE event_id>?3 AND item_number IN (SELECT number FROM local_items WHERE repository=?1) ORDER BY event_id LIMIT ?2")?;
         let rows = stmt
-            .query_map(params![self.repository, limit], |r| {
+            .query_map(params![self.repository, limit, sql_id(after)?], |r| {
                 Ok((
                     row_id(r, 0)?,
                     row_id(r, 1)?,
@@ -639,11 +579,6 @@ impl LocalObjects {
             let event=IngressEvent {delivery_guid:format!("local:{id}"),event_name:"local".into(),action:None,repository_node_id:repository_node(&self.repository),repository:self.repository.clone(),work_item_node_id:Some(item_node(&self.repository,number)),work_item_kind:Some(if item.kind=="issue" {"issue"} else {"pr"}),work_item_number:Some(number),work_item_state:Some(state),object_node_id:Some(format!("local:{}:event:{id}",self.repository)),object_version:Some(format!("{revision}:{at}")),object_digest:None,visible_body:body.clone(),actor_node_id:Some(actor(&author).node_id),actor_login:Some(author.clone()),kind:EventKind::from_str(&kind).context("invalid local event kind")?,detail,cross_surface_invalidation:detail==Some("cross_surface"),origin:match origin.as_str(){"agent"=>"agent","human"=>"human",_=>bail!("invalid local event origin {origin}")},reference:format!("Braid {}#{} event {id}",self.repository,number),mention_candidate:false,reaction_target:None,known:true,raw_payload:serde_json::to_vec(&serde_json::json!({"event_id":id,"number":number,"revision":revision,"actor":author,"body":body}))?};
             Ok(PendingEvent {event_id:id,event})
         }).collect()
-    }
-
-    pub fn ack_event(&self, event_id: u64) -> Result<()> {
-        ensure!(self.connection.execute("UPDATE local_events SET consumed_at=COALESCE(consumed_at,?1) WHERE event_id=?2 AND item_number IN (SELECT number FROM local_items WHERE repository=?3)",params![now(),sql_id(event_id)?,self.repository])? == 1,"local event {event_id} does not exist");
-        Ok(())
     }
 }
 
@@ -715,8 +650,7 @@ fn invalidate_links(
 
 fn validate_writer(tx: &Connection, writer: Option<&Writer>) -> Result<()> {
     if let Some(w) = writer {
-        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM turns t JOIN provider_sessions s ON s.session_id=t.session_id JOIN agent_instances g ON g.agent_id=s.agent_id JOIN assignments a ON a.assignment_id=g.assignment_id WHERE t.turn_id=?1 AND s.session_id=?2 AND t.lifecycle IN ('starting','running') AND s.lifecycle='running' AND g.lifecycle IN ('idle','finalizing') AND a.lifecycle IN ('active','finalizing') AND a.work_item_node_id=?3)",params![w.turn,w.session,w.item],|r|r.get(0))?;
-        ensure!(valid, "Agent writer assignment/session/turn is no longer active");
+        super::grants::validate(tx, &w.grant, &w.actor, &w.item)?;
     }
     Ok(())
 }
@@ -729,7 +663,7 @@ pub struct MergeResult {
     pub recovered: bool,
 }
 
-impl LocalObjects {
+impl PlatformObjects {
     pub fn merge_status(&self, number: u64) -> Result<Option<serde_json::Value>> {
         self.item(number)?;
         Ok(self.connection.query_row("SELECT expected_base,expected_head,merge_commit,lifecycle,error,created_at,updated_at FROM local_merges WHERE pr_number=?1",[sql_id(number)?],|r|Ok(serde_json::json!({"expected_base":r.get::<_,String>(0)?,"expected_head":r.get::<_,String>(1)?,"merge_commit":r.get::<_,Option<String>>(2)?,"lifecycle":r.get::<_,String>(3)?,"error":r.get::<_,Option<String>>(4)?,"created_at":r.get::<_,String>(5)?,"updated_at":r.get::<_,String>(6)?}))).optional()?)
@@ -970,6 +904,9 @@ impl LocalObjects {
         let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
         validate_revision(&tx, &self.repository, self.revision_guard)?;
+        let source: String =
+            tx.query_row("SELECT source FROM local_space WHERE singleton=1", [], |row| row.get(0))?;
+        pin_commit(&tx, &git2::Repository::open(source)?, number, "merges", commit)?;
         let applied=tx.execute("UPDATE local_merges SET lifecycle='applied',error=NULL,updated_at=?1 WHERE pr_number=?2 AND merge_commit=?3 AND lifecycle='prepared'",params![now(),sql_id(number)?,commit])?;
         if applied == 0 {
             let complete:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM local_merges WHERE pr_number=?1 AND merge_commit=?2 AND lifecycle='applied')",params![sql_id(number)?,commit],|r|r.get(0))?;
@@ -979,6 +916,7 @@ impl LocalObjects {
         }
         tx.execute("UPDATE local_items SET state='closed' WHERE number=?1", [sql_id(number)?])?;
         bump(&tx, number)?;
+        revoke_item_grants(&tx, number)?;
         emit(&tx, number, "lifecycle", Some("merged"), author, None, self.writer.as_ref())?;
         tx.commit()?;
         Ok(())
@@ -986,17 +924,23 @@ impl LocalObjects {
 
     pub fn apply_outbox(
         &mut self,
-        intent: &crate::store::PendingGitHubWrite,
+        intent: &super::writes::WriteRequest,
     ) -> Result<(Option<String>, Option<String>)> {
         ensure!(
             intent.repository == self.repository,
             "outbox intent belongs to another repository"
         );
         let tx = write_transaction(&mut self.connection)?;
+        let payload = serde_json::to_string(intent)?;
+        let digest = hex::encode(sha2::Sha256::digest(payload.as_bytes()));
+        let old:Option<String>=tx.query_row("SELECT payload_sha256 FROM control_receipts WHERE scope='writes' AND request_id=?1",[&intent.request_id],|r|r.get(0)).optional()?;
+        if let Some(old) = old {
+            ensure!(old == digest, "requestId already names another platform write");
+        }
         let existing = tx
             .query_row(
                 "SELECT database_id,node_id FROM local_write_receipts WHERE intent_id=?1",
-                [&intent.intent_id],
+                [&intent.request_id],
                 |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
             )
             .optional()?;
@@ -1022,7 +966,7 @@ impl LocalObjects {
                 )
             }
             "reaction_add" => {
-                let visible:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM local_comments c JOIN local_items i ON i.number=c.item_number WHERE c.id=?1 AND i.repository=?2)",params![sql_id(target)?,self.repository],|r|r.get(0))?;
+                let visible:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM local_comments c JOIN local_items i ON i.number=c.item_number WHERE c.comment_id=?1 AND i.repository=?2)",params![sql_id(target)?,self.repository],|r|r.get(0))?;
                 ensure!(visible, "local reaction target comment {target} does not exist");
                 tx.execute(
                     "INSERT OR IGNORE INTO local_reactions(comment_id,content) VALUES(?1,?2)",
@@ -1051,8 +995,9 @@ impl LocalObjects {
         };
         tx.execute(
             "INSERT INTO local_write_receipts(intent_id,database_id,node_id) VALUES(?1,?2,?3)",
-            params![intent.intent_id, result.0, result.1],
+            params![intent.request_id, result.0, result.1],
         )?;
+        tx.execute("INSERT OR IGNORE INTO control_receipts(scope,request_id,payload_sha256,request_json,state,response_json,created_at,updated_at) VALUES('writes',?1,?2,?3,'applied',?4,?5,?5)",params![intent.request_id,digest,payload,serde_json::to_string(&result)?,now()])?;
         tx.commit()?;
         Ok(result)
     }
@@ -1099,13 +1044,13 @@ fn row_id(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     })
 }
 
-impl LocalObjects {
-    /// Publish a concrete commit from the caller's checkout without moving its branch.
+impl PlatformObjects {
+    /// Publish a verified commit in the fixed Git object library without moving any branch.
     pub fn publish(
         &mut self,
         number: u64,
         source: &Path,
-        cwd: &Path,
+        candidate: &str,
         author: &str,
     ) -> Result<Item> {
         self.bind_source(source)?;
@@ -1119,18 +1064,7 @@ impl LocalObjects {
             );
         }
         let git = git2::Repository::open(source)?;
-        let checkout = git2::Repository::discover(cwd)?;
-        ensure!(
-            git.commondir().canonicalize()? == checkout.commondir().canonicalize()?,
-            "publication checkout belongs to another Git repository"
-        );
-        let mut status_options = git2::StatusOptions::new();
-        status_options.include_untracked(true).recurse_untracked_dirs(true);
-        ensure!(
-            checkout.statuses(Some(&mut status_options))?.is_empty(),
-            "publication checkout has uncommitted changes; commit the complete candidate first"
-        );
-        let commit = checkout.head()?.peel_to_commit()?.id().to_string();
+        let commit = git.find_commit(git2::Oid::from_str(candidate)?)?.id().to_string();
         ensure!(
             commit != item.base_commit.as_deref().unwrap_or_default(),
             "candidate is identical to the frozen base"
@@ -1138,13 +1072,6 @@ impl LocalObjects {
         let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
         validate_revision(&tx, &self.repository, self.revision_guard)?;
-        if let Some((worktree, node)) = &self.candidate_guard {
-            let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM worktrees w JOIN agent_instances g ON g.agent_id=w.agent_id JOIN assignments a ON a.assignment_id=g.assignment_id WHERE w.worktree_id=?1 AND a.work_item_node_id=?2 AND a.lifecycle IN ('active','finalizing') AND w.lifecycle='active')",params![worktree,node],|r|r.get(0))?;
-            ensure!(
-                current,
-                "candidate worktree no longer belongs to this PR's current assignment"
-            );
-        }
         if item.head_commit.as_deref() == Some(&commit) && item.published {
             tx.commit()?;
             return Ok(item);
@@ -1158,6 +1085,7 @@ impl LocalObjects {
             !merging,
             "PR has a durable merge attempt; create another candidate PR instead of replacing its evidence"
         );
+        pin_commit(&tx, &git, number, "heads", &commit)?;
         ensure!(tx.execute("UPDATE local_items SET head_commit=?1,published=1 WHERE number=?2 AND revision=?3 AND state='open'",params![commit,sql_id(number)?,sql_id(item.revision)?])?==1,"PR changed while publishing; read it again before retrying");
         bump(&tx, number)?;
         emit(
@@ -1215,4 +1143,116 @@ fn validate_revision(
         ensure!(actual == expected, "object #{number} revision is {actual}, expected {expected}");
     }
     Ok(())
+}
+
+impl PlatformObjects {
+    pub fn repository_info(&self) -> Result<serde_json::Value> {
+        let (space, source, branch): (String, String, String) = self.connection.query_row(
+            "SELECT space_id,source,default_branch FROM local_space WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(
+            serde_json::json!({"repository":self.repository,"nodeId":repository_node(&self.repository),"spaceId":space,"source":source,"defaultBranch":branch}),
+        )
+    }
+    pub fn event_page(&self, after: u64, limit: u32) -> Result<serde_json::Value> {
+        ensure!((1..=1000).contains(&limit), "events limit must be 1..1000");
+        let tx = self.connection.unchecked_transaction()?;
+        let events = self.events(after, limit)?;
+        let last: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(event_id),0) FROM local_events",
+            [],
+            |r| r.get(0),
+        )?;
+        let next = events.last().map_or(after, |event| event.event_id);
+        let events=events.into_iter().map(|pending|{let e=pending.event;serde_json::json!({"sequence":pending.event_id,"event":{
+ "delivery_guid":e.delivery_guid,"event_name":e.event_name,"action":e.action,"repository_node_id":e.repository_node_id,"repository":e.repository,"work_item_node_id":e.work_item_node_id,"work_item_kind":e.work_item_kind,"work_item_number":e.work_item_number,"work_item_state":e.work_item_state,"object_node_id":e.object_node_id,"object_version":e.object_version,"object_digest":e.object_digest,"visible_body":e.visible_body,"actor_node_id":e.actor_node_id,"actor_login":e.actor_login,"kind":e.kind.as_str(),"detail":e.detail,"cross_surface_invalidation":e.cross_surface_invalidation,"origin":e.origin,"reference":e.reference,"mention_candidate":e.mention_candidate,"known":e.known,"raw_payload":e.raw_payload}})}).collect::<Vec<_>>();
+        tx.commit()?;
+        Ok(serde_json::json!({"events":events,"nextAfter":next,"lastSequence":last}))
+    }
+}
+
+fn revoke_item_grants(connection: &Connection, number: u64) -> Result<()> {
+    connection.execute("UPDATE platform_grants SET epoch=epoch+1,lifecycle='revoked',updated_at=?1 WHERE item_number=?2 AND lifecycle='active'",params![now(),sql_id(number)?])?;
+    Ok(())
+}
+
+/// Retention refs never move. A rolled-back publication may leave a harmless retained commit,
+/// but the SQL `head_commit` and receipt remain the sole published-candidate authority.
+fn pin_commit(
+    connection: &Connection,
+    git: &git2::Repository,
+    number: u64,
+    role: &str,
+    commit: &str,
+) -> Result<()> {
+    let space: String =
+        connection.query_row("SELECT space_id FROM local_space WHERE singleton=1", [], |row| {
+            row.get(0)
+        })?;
+    let oid = git2::Oid::from_str(commit)?;
+    git.find_commit(oid)?;
+    let name = format!("refs/braid-platform/{space}/items/{number}/{role}/{oid}");
+    match git.find_reference(&name) {
+        Ok(reference) => ensure!(
+            reference.target() == Some(oid),
+            "platform candidate retention ref does not match its immutable commit"
+        ),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => {
+            if let Err(error) =
+                git.reference(&name, oid, false, "Braid platform candidate retention")
+            {
+                ensure!(
+                    git.find_reference(&name)?.target() == Some(oid),
+                    "platform retention ref creation failed: {error}"
+                );
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+impl PlatformObjects {
+    pub fn pin_existing_candidates(&self, source: &Path) -> Result<()> {
+        self.verify_source(source)?;
+        let git = git2::Repository::open(source)?;
+        for item in self.list()? {
+            if let (Some(head), Some(base)) = (&item.head_commit, &item.base_commit) {
+                pin_commit(&self.connection, &git, item.number, "heads", head)?;
+                pin_commit(&self.connection, &git, item.number, "bases", base)?;
+            }
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT pr_number,merge_commit FROM local_merges WHERE merge_commit IS NOT NULL",
+        )?;
+        let merges = statement
+            .query_map([], |row| Ok((row_id(row, 0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (number, commit) in merges {
+            pin_commit(&self.connection, &git, number, "merges", &commit)?;
+        }
+        // Earlier CLI publications survive as events; HTTP preparations survive in applied receipts.
+        // Preserve those candidates too when later publications replaced the current head.
+        let mut events=self.connection.prepare("SELECT item_number,body FROM local_events WHERE detail='head_published' AND body IS NOT NULL")?;
+        for event in events.query_map([], |row| Ok((row_id(row, 0)?, row.get::<_, String>(1)?)))? {
+            let (number, commit) = event?;
+            pin_commit(&self.connection, &git, number, "heads", &commit)?;
+        }
+        let mut receipts=self.connection.prepare("SELECT response_json FROM control_receipts WHERE scope='objects' AND state='applied' AND response_json IS NOT NULL")?;
+        for response in receipts.query_map([], |row| row.get::<_, String>(0))? {
+            let response: serde_json::Value = serde_json::from_str(&response?)?;
+            let result = &response["result"];
+            if let Some(number) = result["number"].as_u64() {
+                for (field, role) in
+                    [("head_commit", "heads"), ("base_commit", "bases"), ("merge_commit", "merges")]
+                {
+                    if let Some(commit) = result[field].as_str() {
+                        pin_commit(&self.connection, &git, number, role, commit)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }

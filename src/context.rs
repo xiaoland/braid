@@ -38,13 +38,13 @@ pub enum ContextError {
     InvalidPageSize(usize),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Actor {
     pub node_id: String,
     pub login: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItemReference {
     pub node_id: String,
     pub repository_node_id: String,
@@ -71,26 +71,26 @@ impl WorkItemReference {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkItemKind {
     Issue,
     PullRequest,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectEntry {
     pub title: String,
     pub fields: Vec<ProjectField>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectField {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommentSnapshot {
     pub node_id: String,
     pub database_id: String,
@@ -106,7 +106,7 @@ pub struct CommentSnapshot {
     pub deleted: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssueSnapshot {
     pub node_id: String,
     pub database_id: String,
@@ -134,7 +134,7 @@ pub struct IssueSnapshot {
     pub comments: Vec<CommentSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewSnapshot {
     pub node_id: String,
     pub database_id: String,
@@ -147,7 +147,7 @@ pub struct ReviewSnapshot {
     pub minimized_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewThreadSnapshot {
     pub node_id: String,
     pub path: String,
@@ -160,7 +160,7 @@ pub struct ReviewThreadSnapshot {
     pub comments: Vec<CommentSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequestSnapshot {
     pub node_id: String,
     pub database_id: String,
@@ -187,14 +187,14 @@ pub struct PullRequestSnapshot {
     pub review_threads: Vec<ReviewThreadSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CanonicalContext {
     Issue(IssueSnapshot),
     PullRequest(PullRequestSnapshot),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextPressure {
     Normal,
@@ -202,7 +202,7 @@ pub enum ContextPressure {
     Hard,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderedContext {
     pub text: String,
     pub revision: String,

@@ -118,7 +118,7 @@ pub(crate) async fn agent_group_worker_backend(
         collaboration: &collaboration,
         config: &config,
         spec: &spec,
-        sessions: SessionManager::new(factory),
+        sessions: SessionManager::new(factory, Arc::clone(&collaboration)),
     };
     driver.drive(&reports, &mut shutdown).await;
     driver
@@ -173,10 +173,18 @@ impl GroupDriver<'_> {
         ));
         if let Some(reset_id) = active.reset_id {
             let _ = self.store.mark_context_reset_turn_terminal(
-                reset_id,
+                reset_id.clone(),
                 active.claim.turn_id.clone(),
                 outcome.lifecycle().into(),
             );
+            if let Err(error) = &closed {
+                let reason = format!(
+                    "Context reset shutdown could not confirm old writer revocation and execution stop: {error}"
+                );
+                if let Err(error) = self.store.fail_context_reset(reset_id, reason) {
+                    tracing::error!(%error, "cannot block Context reset after unconfirmed shutdown");
+                }
+            }
         } else {
             let _ = self
                 .store
@@ -281,6 +289,13 @@ impl GroupDriver<'_> {
                                         active.claim.turn_id.clone(),
                                         lifecycle.into(),
                                     );
+                                    if let Err(error) = self.sessions.remove(&active.claim.provider_session_id).await {
+                                        let reason = format!("Context reset could not confirm old writer revocation and execution stop: {error}");
+                                        if let Err(error) = store.fail_context_reset(reset_id.clone(), reason.clone()) {
+                                            tracing::error!(%error, "cannot block Context reset after unconfirmed stop");
+                                        }
+                                        self.publish_turn_error(&active.claim, "unknown", &reason);
+                                    }
                                 } else {
                                     let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), lifecycle.into());
                                     if active.claim.trusted_mention && lifecycle != "unknown" {
@@ -293,6 +308,7 @@ impl GroupDriver<'_> {
                                     self.publish_turn_error(&active.claim, lifecycle, &reason);
                                 }
                                 if lifecycle == "unknown"
+                                    && active.reset_id.is_none()
                                     && let Err(stop_error) = self.sessions.remove(&active.claim.provider_session_id).await {
                                     tracing::error!(%stop_error, "old execution stop remains unconfirmed");
                                     self.publish_turn_error(&active.claim, "unknown", &format!("{}; old execution stop failed: {stop_error}", error.as_deref().unwrap_or("provider outcome unknown")));

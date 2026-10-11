@@ -32,7 +32,7 @@ mod status;
 mod telemetry_cmd;
 
 #[derive(Debug, Parser)]
-#[command(name = "braid", version, about = "GitHub working memory for local coding agents")]
+#[command(name = "braid", version, about = "Collaboration working memory for coding agents")]
 pub struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -41,7 +41,9 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Setup(SetupArguments),
-    Local(LocalArguments),
+    Object(ObjectArguments),
+    /// Built-in collaboration platform, independent of the Agent Harness.
+    Platform(crate::platform::cli::PlatformArguments),
     /// Initialize a Braid-owned collaboration space around a local Git checkout.
     Init(crate::local::init::InitArguments),
     Config {
@@ -84,9 +86,15 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
-struct LocalArguments {
+struct ObjectArguments {
     #[command(flatten)]
     source: ConfigSource,
+    /// Reuse the original identity when recovering an uncertain object command.
+    #[arg(long, global = true)]
+    request_id: Option<String>,
+    /// Reject a mutation when the platform object has changed since this revision.
+    #[arg(long, global = true)]
+    expected_revision: Option<u64>,
     #[command(subcommand)]
     command: crate::local::cli::LocalCommand,
 }
@@ -320,7 +328,7 @@ struct ServeArguments {
         help = "Expose ingress through a free Wrangler Quick Tunnel and own the App webhook while running"
     )]
     tunnel: bool,
-    #[arg(long, help = "Run GitHub transport without starting the configured Coding Agent")]
+    #[arg(long, help = "Run collaboration transport without starting the configured Coding Agent")]
     transport_only: bool,
 }
 
@@ -398,20 +406,20 @@ pub async fn run() -> Result<()> {
         Command::Serve(arguments) => {
             let config_path = arguments.source.resolve_config_path()?;
             let config = helpers::load(&config_path)?;
-            if config.is_local() {
-                if arguments.tunnel {
-                    bail!("--tunnel applies only to the GitHub backend");
-                }
-                crate::local::runtime::serve(config, !arguments.transport_only).await?;
-            } else {
-                crate::runtime::serve(config, arguments.tunnel, !arguments.transport_only).await?;
-            }
+            crate::runtime::serve(config, arguments.tunnel, !arguments.transport_only).await?;
         }
         Command::Init(arguments) => crate::local::init::run(arguments).await?,
-        Command::Local(arguments) => {
+        Command::Object(arguments) => {
             let config = helpers::load(&arguments.source.resolve_config_path()?)?;
-            crate::local::cli::run(arguments.command, &config)?;
+            crate::local::cli::run_options(
+                arguments.command,
+                &config,
+                arguments.request_id,
+                arguments.expected_revision,
+            )
+            .await?;
         }
+        Command::Platform(arguments) => crate::platform::cli::run(arguments).await?,
         Command::Console(arguments) => crate::console::serve(arguments).await?,
         Command::Setup(arguments) => {
             setup::run(arguments).await?;

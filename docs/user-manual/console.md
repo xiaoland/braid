@@ -1,27 +1,32 @@
-# 本地 Web Console
+# Braid Web Console
 
 Console 与 Braid 一起交付，不需要 Python、Node 或前端构建环境。它接收 OTLP
 HTTP/protobuf，保存原始批次和解码记录，并在浏览器中展示 traces、logs、metrics
-和 provider 证据。配置 Local 实例时，它还直接提供对象操作和 runtime 启停。
+和 provider 证据。Console 属于整个 Braid，接入平台对象 API 与统一 Harness 控制，
+不属于内建平台的专属运行模式。
 HTTP 后端调用 Braid 的应用模块，不执行 Braid CLI 子进程。
 
-先按[本地协作指南](local.md)创建 Local 实例，再启动 Console：
+先按[内建平台指南](local.md)分别声明平台与 Harness，再由 Console 便捷装配：
 
 ```shell
 braid migrate apply --config /absolute/space/config.toml
-braid console --config /absolute/space/config.toml \
+braid console --platform-config /absolute/platform.toml --config /absolute/space/config.toml \
   --database /absolute/space/observations.sqlite3 --listen 127.0.0.1:4318
 ```
 
 遥测数据库必须与 runtime 数据库分开。Console 仅监听 loopback；浏览器打开输出
-的地址。Mac 本项目的配置、数据库和临时数据都应位于 WorkSSD。没有 `--config`
-时 Console 仅提供 Collector 和观测阅读，也可接收 GitHub 实例导出的 OTLP。
+的地址。平台库、Harness 库、遥测库必须各自独立。Mac 本项目的配置、数据库
+和临时数据都应位于 WorkSSD。`--config` 可为 GitHub 或内建上游；只有
+`--platform-config` 时也可管理对象。两者均省略时只提供 Collector 和观测阅读。
+已经独立启动平台时，不再提供 `--platform-config`，Console 按 Harness 的
+`builtin.endpoint` 接入其 API。
 
 Console 启动后 runtime 尚未启动。页面中的“启动”操作携带当前 generation；
 “仅传输”处理本地对象和队列，不启动模型。普通启动会使用配置中的真实 provider，
 需要对应凭据和运行授权。托管 runtime 在内存中使用本 Console 地址作为 OTLP
 endpoint，不改磁盘配置。停止 runtime 后页面、Collector 和对象操作仍可使用，
-停服期间的对象事件等待下一次 runtime 消费。
+停服期间平台继续接受对象操作，稳定事件等待 Harness 从自己的 cursor 接续。
+平台服务是否可用、Harness 是否执行与最后观测时间分别展示；启动平台不启动 Agent。
 
 ## 阅读证据与当前状态
 
@@ -42,10 +47,11 @@ provider 决定当前对象和执行事实，OTLP 只提供观测历史，不承
 
 ## 操作与回执
 
-Local 对象页可创建 Issue/PR、编辑正文、评论及回复、指派或解除、关闭或重开、
+内建平台对象页可创建 Issue/PR、编辑正文、评论及回复、指派或解除、关闭或重开、
 关联 PR、发布候选和合并。修改携带开始编辑时的 revision；冲突保留草稿，用户
 查看最新正文后再决定是否重新提交。发布可以明确选择配置 source 的当前已提交 checkout，或该 PR 当前责任登记的
-worktree；浏览器不能提交任意本地路径。Git 合并沿用本地对象的持久意图和 base 引用检查，
+worktree。Harness 核验责任后交接固定提交 OID，平台在绑定 Git 对象库中核验并
+保留候选；浏览器不能提交任意路径。Git 合并沿用平台对象的持久意图和 base 引用检查，
 不是 Git 与 SQLite 的跨系统原子事务。
 
 每次命令带 request ID。同一个 ID 不可换成另一份命令，响应丢失后查询原回执，
@@ -55,8 +61,9 @@ worktree；浏览器不能提交任意本地路径。Git 合并沿用本地对�
 
 若 Console 异常退出而没有保存停止确认，下次使用同一实例会展示阻塞状态，
 不会把旧执行当作已经结束。需要核对并处置该实例原生执行后再恢复；当前版本不
-提供网页“强制清除”来绕过停止证明。Console 与 runtime 处于同一进程，尚不提供
-进程级故障隔离、暂停/恢复、远程访问、多人权限或外部 GitHub 对象修改入口。
+提供网页“强制清除”来绕过停止证明。Console 可与托管平台和 Harness 处于同一进程，尚不提供
+进程级故障隔离、暂停/恢复、远程访问、多人权限或外部 GitHub 对象修改入口。GitHub 接入拥有同一 Harness 启停入口，
+对象编辑仍使用该上游已有操作方式；不能用内建平台 UI 向 GitHub 伪装对象写入。
 
 ## 数据边界
 

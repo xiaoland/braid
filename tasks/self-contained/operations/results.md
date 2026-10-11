@@ -92,3 +92,85 @@ console/upgrade/upgrade-observed.json。原迁移 1–4 没有改动。
 自动重试、真实模型 provider/session/turn 全链路或 Console 崩溃后的完整恢复。
 Collector 与 managed runtime 同进程，不提供进程级故障隔离；未确认停止会阻断
 替代启动。采样证据不能替代 SQLite/provider 权威或产品完成。
+
+2026-10-11 平台独立权威这一轮的原始回执在 `platform/`。此前 runtime 同库和
+worktree 候选接口是旧版本事实；当前平台另有配置、Git source、默认分支和数据库，
+发布入口接受固定 source 当前已提交 HEAD 或该对象库内可解析的明确 commit OID。
+平台 HTTP 进程在未装配 Harness 的情况下完成 Issue、讨论、指派、PR、发布、真实
+Diff 和双父提交合并。平台数据库只有 12 个平台/SQLite 表，没有 provider_sessions、
+turns、assignments 或 worktrees。初始化时 source 为 primary，切到 candidate 后
+repository API 仍返回固定 defaultBranch=primary。
+
+普通作者 alice 创建并指派 implementer。Grant epoch 1 评论被接纳并产生 agent
+origin_echo；同 actor 再次指派推进对象 revision 并同事务撤销旧 grant（epoch 2）。
+随后旧 epoch 的 revoke 确认返回 HTTP 200 / revoked / epoch 2，旧凭据晚到评论即使
+携带正确 revision 仍返回 HTTP 409，具体错误为 writer grant stale/revoked。
+旧 revision 的普通编辑也返回 409 与实际/预期 revision。异端口 Origin 返回 403。
+Grant token 没有出现在 snapshot 或记录的 JSON 回执中。
+
+PR 初建 head 为 `efb436c8d209f3e10c5bb4ad28b3a7c6f3afcc92`，发布明确 candidate
+`820cb2e416a05ed2dab9356b9db7115cb7e79e62` 后 Diff 包含后来提交的正文。
+真实 primary 合并为 `0822892fb2e49ff816e190febeadd096017a0d66`，父提交分别是
+base `946ab4250f246bf8d199c0924181ec8a57d0d931` 与已发布 candidate。重复合并 request ID
+返回同一回执，关联 Issue 保持 open。状态评论幂等重放、reaction 添加与删除均返回
+HTTP 200。分段 events(after=0/3) 读取后，9 条事件的 consumed_at 全部仍为 NULL；
+消费游标属于各 Harness，此处没有通过读取事件修改全局消费事实。
+
+显式 import 从此前 schema 5 runtime 副本导入独立平台库：6 个对象、2 条评论、
+16 条事件、3 条合并事实，以及 scope=objects 的 3 条控制回执。7 张对象表的逐行
+JSON SHA-256 前后一致，旧 `local:*` context 和创建回执通过新 HTTP 读取成功。
+源 SQLite 文件导入前后 SHA-256 同为
+`3ecfac3f2fa28913567ca7e8282e535c3850b72a6765b9a105eba9105fbdace3`。
+导入目标没有 Harness 表，原数据库保留。两次独立平台服务均通过 SIGINT 正常退出
+（exit 0）。未进行强制崩溃、模型执行或远端 GitHub 操作；实际证据不宣称这些边界
+已经取得资格验证。
+
+
+## Builtin 双 Harness 与旧消费事实接入
+
+2026-10-11 通过独立 Console HTTP controller实际运行两套 transport-only Harness，共用独立平台，provider disabled、无模型/GitHub调用。两个不同稳定clientId各自首次cursor1，实际running/ready；正常stop均confirmed stopped。停止期间平台新增指派sequence2，重启后各cursor2、delivery2/event2/wake_batch_event1，平台consumed_at始终NULL。没有新事件的第二次正常重启后 cursor、event/delivery/wake数量及duplicate_count均未变化。最终A/B及迁移Harness均stopped、ready=false、error=null，本轮所有服务正常退出0。
+
+正式 import 导入旧 Console upgrade schema5的真实消费现场副本，保留源原件，副本Harness迁移至6。新的cursor从0读至4；4条旧event IDs/lifecycle保持（1 consumed、3 pending），wake_batch_events仍3，4条原local:N delivery各duplicate_count0→1。这是通过原delivery去重保留旧消费事实，不是跳latest cursor。导入平台的历史consumed_at也保持原值，feed不会修改它。
+
+新增object receipt入口实际GET原创建回执、退出0。完整原始证据与具体请求见[独立接入反馈](dual-harness/results.md)，其中包括双client绑定、每代generation、受理/终态、原SQLite只读事实与receipt JSON。实际native Agent grant/turn执行、close后的native清理和真实GitHub接入未获本轮模型授权，未验证。
+
+2026-10-11 整体 Console 的实际操作证据在 `platform-console/`。仅装配平台时，
+浏览器完成 Issue 创建、评论及不依赖 Harness Profile 的指派；关联 PR #2 发布固定
+候选并读取真实 Diff。随后同一 Console 装配独立 Harness 数据库，启动仅传输运行，
+provider 始终 disabled。停止请求先返回 accepted，再取得 stopped；Collector 和平台
+仍在线，浏览器随后完成真实 PR 合并。base 为
+`bfe87fc57c04eb2345f8217ef7010d490f781b1c`，head 为
+`61261833bbf799ecc4b9d34e0b12138961286fb7`，双父 merge 为
+`70ebc16e1b4bd2bf22ca1579124cea4bd9492c31`。已合并页面保留 Diff 和记录，结束候选
+发布及合并入口。最终正常重启后 Harness 保持 stopped，独立 snapshot 保留平台
+space ID、client ID 与 cursor=6，以及两个已有队列；24 条已接收观测和 7 个批次
+属于前次采集事实，不是执行完成证明。
+
+GitHub schema 2 示例通过公开 config check 和 Harness schema 6 迁移后，装配相同
+Console 控制器。实际浏览器与 HTTP metadata 确认 backend=github、未装配内建
+平台、控制器 stopped、provider disabled。未启动 GitHub Harness、调用外部 API
+或运行模型；该操作证明配置和 Console 装配，不能宣称 GitHub 执行全链路已验证。
+证据在 `github-console/`。旧 `[local]` 配置通过公开入口被拒绝并给出显式平台导入
+与 `[builtin]` 配置迁移指导，没有静默覆盖既有数据库。
+
+最终源严格 Clippy（`-D warnings`）和编译通过；末尾历史候选保留补丁已纳入该
+二进制。所有反馈来自编译、真实 HTTP、浏览器和 Git 操作，未编写或运行测试。
+
+最终嵌入页面只读回读见 `platform-console/browser-final-*`：Harness 保持 stopped，
+上游 cursor=6 与上述合并提交不变；Collector 随本轮正常启动/关闭累计为 29 条记录、
+12 个批次、2 个实例，旧平台实例过滤所得 5 条原日志仍可视化读取。最终 Console
+收到 SIGINT 后正常退出（exit 0），没有启动模型或修改对象。
+
+最终二进制正常重启以上两个原版本 1 平台空间后，数据库均向前升级为版本 2，
+没有重建对象库。平台自己的 migration ledger 分别记录 initial / schema_checksums
+及其嵌入 SQL SHA-256；启动校验通过。每个空间产生一份保留版本 1 的 SQLite 备份：
+独立空间保留 2 items / 9 events，导入空间保留 6 items / 16 events。合并回执与旧
+创建回执均经 HTTP 200 读回，原对象 revision、事件与消费事实保持，证据见各空间的
+`upgrade-restart-facts.json`。
+
+Git 回读确认独立空间保存了初始候选 efb436、发布候选 820cb2、冻结 base 946ab4 和
+merge 082289 四个不可移动 retention refs；历史候选由已接纳回执和发布事件补齐，
+不会只保护最近的 head。导入空间的 4 个 PR 共取得 9 个 head/base/merge refs。
+源 legacy SQLite 文件 SHA-256 仍为前述值。最终两服务均 SIGINT 正常退出（exit 0），
+没有遗留本 owner 的后台 listener。严格 Clippy 和编译由中央构建取得反馈；没有
+强制崩溃资格验证，也没有执行模型、GitHub 或任何测试。

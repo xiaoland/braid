@@ -5,7 +5,7 @@
 # Braid
 
 Braid turns Issues and pull requests into durable working memory for
-local Coding Agents. GitHub or a Braid-owned local space holds the current design, implementation state,
+local Coding Agents. GitHub or the built-in collaboration platform holds the current design, implementation state,
 metadata, relationships, and discussion; Braid rebuilds a provider session from
 that state whenever prior context becomes stale.
 
@@ -19,19 +19,21 @@ On macOS arm64:
 brew install xiaoland/braid/braid
 ```
 
-## 内建协作空间
+## 内建协作平台
 
-Braid 可以直接持有 Issue、讨论、指派和 PR，无需 GitHub App。每个实例选择
-一个对象权威：GitHub 或本地 SQLite。原生 Agent CLI 和模型服务仍是执行依赖。
+内建平台与 GitHub 是 Harness 的两种上游。平台独立持有仓库、Issue、PR、讨论
+和事件；Harness 单独接入并执行 Agent，不以 `local` 运行模式拥有协作对象。
+Web Console 属于整个 Braid，平台配置与 Harness 配置可分别装配。
+
+先声明平台，再声明 Harness；[内建平台指南](docs/user-manual/local.md)包含启动、
+对象操作、候选发布和旧 Local 数据迁移。
 
 ```shell
-braid init --source /absolute/path/to/repository --config /absolute/path/to/space/config.toml --name demo --adapter pi --executable /absolute/path/to/pi --provider deepseek --model deepseek-chat --api-key-environment DEEPSEEK_API_KEY
-braid migrate apply --config /absolute/path/to/space/config.toml
-braid local --config /absolute/path/to/space/config.toml issue --title '需要完成的工作' --body '目标与依据'
-braid serve --config /absolute/path/to/space/config.toml
+braid platform init --source /absolute/path/to/repository --config /absolute/path/to/platform.toml --name demo
+braid init --source /absolute/path/to/repository --config /absolute/path/to/harness/config.toml --name demo --endpoint http://127.0.0.1:18082 --adapter pi --executable /absolute/path/to/pi --provider deepseek --model deepseek-chat --api-key-environment DEEPSEEK_API_KEY
+braid migrate apply --config /absolute/path/to/harness/config.toml
+braid console --platform-config /absolute/path/to/platform.toml --config /absolute/path/to/harness/config.toml --database /absolute/path/to/observations.sqlite3
 ```
-
-对象操作、候选发布和合并见[本地协作指南](docs/user-manual/local.md)。
 
 ## Bootstrap
 
@@ -108,5 +110,5 @@ Braid 使用编译、实际操作及获授权实验取得反馈，不维护或�
 ## 本地 Web Console
 
 内置 Console 接收 OTLP HTTP/protobuf，持久保存 traces、logs、metrics 的原始证据，
-并提供浏览器可视化。连接 Local 配置时可直接管理对象与启停 runtime，不经 CLI
-子进程。操作方法和数据边界见[Console 指南](docs/user-manual/console.md)。
+并提供浏览器可视化。Console 接入平台对象 API 和统一 Harness 控制接口，支持
+GitHub 或内建上游，不经 CLI 子进程；停止 Harness 后 Collector 和平台仍可使用。操作方法和数据边界见[Console 指南](docs/user-manual/console.md)。

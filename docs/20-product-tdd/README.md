@@ -20,59 +20,69 @@ from typed code and external wire details owned by the linked contracts.
 ## Authority and Topology
 
 ```text
-GitHub webhook ──verify/durable ingest──┐
-                                       ├─> canonical object ledger
-GitHub GraphQL/REST reconciliation ────┘          │
-                                                  v
-                                        Context materializer
-                                                  │
-                                  canonical diff + Event References
-                                                  │
-                              event classifier / debounce scheduler
-                                                  │
-                              Agent Group + logical session manager
-                                                  │
-                                     provider adapter (Codex v1)
+GitHub (object authority) ── webhook / canonical API ──┐
+                                                      ├─> Harness collaboration adapter
+Built-in platform (object authority) ── HTTP / events ┘             │
+                                                                   v
+                                                     Harness ledger / event cursor
+                                                                   │
+                                                Context / scheduler / Agent Group
+                                                                   │
+                                                          provider / worktree
 
-Agent ── braid gh ──> Braid write outbox ──> GitHub ──> origin-correlated echo
-Agent ── ordinary gh/git ─────────────────> GitHub ──> ordinary external event
+Agent ── Harness gateway / writer grant ──> selected platform API
+Harness outbox ── idempotent write ───────> selected platform API
 
-Quick Tunnel ──> loopback webhook ingress
-OTel SDK ──sampled OTLP──> operator-selected endpoint
+Braid Web Console ── object API ─────────> built-in platform
+                  ├─ runtime controller ─> Harness (either upstream)
+                  └─ OTLP Collector ──────> independent observation store / visualization
+
+Platform, Harness and observations each own their database and lifecycle.
+Quick Tunnel is optional GitHub webhook connectivity, not a Harness mode.
 ```
 
 - **GitHub** owns current Issue/PR bodies, metadata, relationships, comments,
   reviews, lifecycle, identity, and App permissions.
-- **GitHub Context** is a deterministic, complete projection of that state plus
+- **Built-in platform** independently owns its Issue/PR state, actors, event sequence,
+  candidate commits and command receipts; its SQLite is collaboration authority.
+- **Collaboration Context** is a deterministic, complete projection of upstream state plus
   durable deletion tombstones. It is the collaboration memory authority.
 - **Provider** owns physical session data, model execution, provider-native
   compaction, turn lifecycle, and resume availability.
 - **Coding Agent** owns interpretation, design/implementation choices, code,
   verification, and its Git/GitHub operations.
-- **Braid** owns canonical reads, projection, logical Agent Group/session
+- **Braid Harness** owns canonical reads, projection, logical Agent Group/session
   generations, scheduling, Context fencing/replacement, provider addressing,
-  PR worktree provisioning, Braid-authored GitHub writes, and mechanical
+  PR worktree provisioning, Braid-authored upstream writes, and mechanical
   idempotency/reconciliation.
 
-SQLite stores enough canonical object metadata and lifecycle tombstones to
+Harness SQLite stores enough canonical object metadata and lifecycle tombstones to
 compare versions, but it does not become an alternate Issue/PR or provider
-transcript authority. A full Context is rebuilt from GitHub before every turn.
+transcript authority. A full Context is rebuilt from the selected upstream before every turn.
 
-## 内建协作后端
+## 协作平台与 Harness
 
-一个实例恰好配置 `[github]` 或 `[local]`。GitHub 后端保持远端对象权威；Local
-后端以自身 SQLite 对象表持有正文、评论、指派与关联。两者不双写或自动同步。
-`collaboration` 给 Group 提供当前 Issue/PR snapshot、指派判断和默认分支；
-Context、queue、Group、provider 的生命周期与停止证明合同复用。
+一个 Harness 恰好接入 `[github]` 或 `[builtin]`。GitHub 和内建平台拥有上游
+对象权威，不双写或自动同步。内建平台有自己的配置、schema、SQLite 与 API，
+持有仓库、Issue/PR、评论、指派、关联、revision、候选、合并意图及对象回执。
+平台不读取 Profile、assignment、session、turn 或 worktree 执行表。
 
-`local::objects` 在同一事务中修改对象并保存待投递事件。`local::runtime` 以固定
-事件身份重试现有 ingest，成功后确认事件，避免提交对象却永久丢失唤醒。Braid
-状态 outbox 在本地写回同一空间。Local runtime 持续监督工作，不按全项终态退出。
-原始模型会话、Git 仓库和协作对象仍分别有自己的权威。
+Harness 的 `collaboration` adapter 从所选上游取得当前对象与默认分支，Group、
+Context、queue、provider 和停止证明共用。内建 adapter 使用 HTTP 平台接口，
+在自己的 ledger 保存平台身份、事件 cursor 和 delivery 去重。平台对象变化
+与稳定事件原子提交，事件不因某一消费者读过而消失；Harness 成功 ingest 后才
+推进自己的 cursor，状态 outbox 通过幂等接口写回平台。
 
-本地 PR 保存明确的 base/head 候选。发布使新候选可取得，合并以持久意图与 Git
-引用比较更新处理 SQLite/Git 的跨介质边界；拒绝分支移动、冲突或不安全的检出
-状态。模型 Completed 不意味着候选被采用，也不意味着 Issue 完成。
+平台 actor 与 Harness Profile 分别拥有含义。Harness gateway 核验当前工作区及
+执行身份，使用平台 writer grant。平台提交事务检查 grant epoch、对象 revision
+和 request ID；执行替换先撤销旧 grant，撤销确认后才能完成 fencing。平台
+保存授权版本，不保存原生会话状态；撤销前已经提交的命令仍属于合法历史。
+
+PR 交接固定 commit OID。Harness 验证工作树责任，平台只在绑定 Git 对象库中
+验证提交并保留可达引用。首版要求两者能访问同一 Git 对象库，不提供远程
+Git 托管。合并用持久意图与 ref CAS 处理 SQLite/Git 边界；模型 Completed 不
+意味着候选被采用或 Issue 完成。旧 local:*对象与事件身份在显式导入时保留，
+历史迁移不可变；平台与 Harness 的 schema 此后各自演进。
 
 ## Single Source of Truth for Schema
 
@@ -294,14 +304,14 @@ are outside it and converge only when GitHub reports them.
 Console 的 OTLP Collector 保存原始传输批次与完整解码记录，使用独立数据库，
 不能写回对象或执行权威。资源身份、runtime generation、session、turn 与原生
 协议身份显式关联；采样和未关联记录是证据缺口，不是空闲状态。Web 查询分页
-读取该读模型，当前对象与执行状态则直接查询 LocalObjects 与 runtime manager。
+读取该读模型，当前对象来自协作平台 API，执行状态来自 Harness ledger 与 runtime manager。
 
-`control` 通过有类型的应用命令调用本地对象方法。命令 request ID、内容摘要、
-预期 revision 与回执持久保存在 schema 5；普通对象变更与事件、回执一起提交，
+平台通过有类型的应用命令修改对象。命令 request ID、内容摘要、预期 revision
+与回执持久保存在平台库；普通对象变更与事件、回执一起提交，
 并发正文修改不会覆盖新 revision。发布和合并保留 Git/SQLite 意图边界，不能用
-外层数据库事务假装跨系统原子化。浏览器只能引用固定配置 source 或登记的 worktree 身份。
+外层数据库事务假装跨系统原子化。浏览器只能选择固定 source 或由 Harness 验证的候选，不能提供任意路径。
 
 `console::runtime` 持有实际 runtime task、停止通道与启动 generation。Collector
-和控制端点持续存活，runtime 可单独停止。请求接受不等于任务已就绪或已停止；
+、平台和控制端点持续存活，Harness 可单独停止。GitHub 与内建上游通过统一 runtime 接口托管。请求接受不等于任务已就绪或已停止；
 监督器等待所有 Group/provider 停止结果，失败进入 blocked 并禁止新执行覆盖。
 Console 不调用 CLI，也不复制 Factory 的实验、赛事或容器生命周期。

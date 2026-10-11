@@ -5,20 +5,17 @@ Versioning once release artifacts are published.
 
 ## [Unreleased]
 
-- 内置本地 OTLP Collector 与 Web Console，直接查询/控制 Local 对象及托管 runtime，
-  保存原始批次、具体接收错误与明确会话/轮次证据。
-- 停止失败向监督器传播，不再把未确认的原生停止当作成功；替代启动受停止证明约束。
-- 数据库 schema 5 增加持久控制回执。使用新版本须先迁移；旧二进制不可读取 schema 5。
-
-
-- 新增内建协作空间：本地 Issue、讨论、指派、正文、生命周期和关联 PR，复用
-  Context、调度及原生执行。`braid init` 不需要 GitHub App，Local serve 持续运行。
-- 新增真实 Git 候选发布、diff 与手工合并；持久合并意图和引用比较更新支持失败后
-  重试收敛，不把模型终态当作产品验收。
-- 修复输入接纳、首次 Context 持久化、完整错误保存和停止证明不足时的恢复门控。
-- 数据库新增 schema 3 的完整 turn 错误与 schema 4 的 Local 对象、事件和合并记录。
-  运行新版本前应用迁移；schema 4 不能直接由旧版本消费。旧迁移保持不可变。
-- 配置 schema 2 保持原 GitHub 声明兼容，`[github]` 与 `[local]` 必须恰好选择一个。
+- 内建协作平台与 GitHub 作为 Harness 的同层上游。平台独立配置、schema、对象库
+  与 HTTP API，不再依赖 Harness 会话表或 `local` 运行模式。
+- Web Console 属于整个 Braid，集成 OTLP 三信号原始证据与可视化，直接控制任一
+  上游的 Harness，并可便捷托管独立平台；停止 Harness 不关闭平台或 Collector。
+- Harness 自存上游事件游标及写入授权。平台 grant、对象 revision、命令回执与
+  Git 候选意图保留并发和停止边界，过期执行不能继续发布。
+- 配置 schema 3 使用互斥 `[github]` / `[builtin]`；原 GitHub schema 2 配置可继续
+  读取。旧 `[local]` 必须停止后显式导入平台，保留原对象身份、历史与回执。
+- Harness 数据库 schema 6 增加接入状态，平台 schema 独立演进。旧迁移保持不可变，
+  新版本使用前须迁移，旧二进制不能读取更新后的 Harness 数据库。
+- 修复输入接纳、首次 Context 持久化、完整错误保存与停止证明不足时的恢复门控。
 
 ## [0.3.2] - 2026-09-19
 

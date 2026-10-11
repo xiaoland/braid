@@ -1,6 +1,6 @@
-//! Create a local collaboration declaration without GitHub credentials.
+//! Declare a Harness connected to an existing built-in collaboration platform.
 use crate::config::{
-    CONFIG_SCHEMA_VERSION, Config, InstanceConfig, LlmModel, LlmProvider, LocalConfig, LogFormat,
+    BuiltinConfig, CONFIG_SCHEMA_VERSION, Config, InstanceConfig, LlmModel, LlmProvider, LogFormat,
     Profile, ProfileSelection, RuntimeConfig, SchedulerConfig, ServerConfig, TelemetryConfig,
     ToolConfig,
 };
@@ -16,6 +16,9 @@ pub(crate) struct InitArguments {
     pub config: PathBuf,
     #[arg(long)]
     pub name: String,
+    /// Built-in collaboration platform HTTP origin.
+    #[arg(long, default_value = "http://127.0.0.1:18082")]
+    pub endpoint: url::Url,
     #[arg(long, default_value="pi", value_parser=["pi","codex"])]
     pub adapter: String,
     #[arg(long)]
@@ -34,8 +37,6 @@ pub(crate) async fn run(a: InitArguments) -> Result<()> {
     let repo = git2::Repository::open(&source).context("local source must be a Git checkout")?;
     ensure!(!repo.is_bare(), "local source must have a working tree");
     ensure!(!repo.head_detached()?, "local source needs a named branch");
-    let default_branch =
-        repo.head()?.shorthand().context("local source has no branch name")?.to_owned();
     ensure!(!a.config.exists(), "config already exists: {}", a.config.display());
     let config_path =
         if a.config.is_absolute() { a.config } else { std::env::current_dir()?.join(a.config) };
@@ -63,7 +64,8 @@ pub(crate) async fn run(a: InitArguments) -> Result<()> {
     let mut config = Config {
         schema_version: CONFIG_SCHEMA_VERSION,
         instance: InstanceConfig { key: a.name.clone() },
-        local: Some(LocalConfig { repository: a.name, source, default_branch }),
+        local: None,
+        builtin: Some(BuiltinConfig { repository: a.name, endpoint: a.endpoint }),
         github: None,
         loaded_from: config_path.clone(),
         runtime: RuntimeConfig {
@@ -127,7 +129,7 @@ pub(crate) async fn run(a: InitArguments) -> Result<()> {
     file.write_all(text.as_bytes())?;
     file.sync_all()?;
     println!(
-        "已创建本地协作配置：{}\n接下来应用数据库迁移，然后运行 braid serve --config <PATH>。",
+        "已创建 Harness 配置：{}\n内建协作平台使用自己的配置和数据库；启动平台后迁移 Harness 数据库，再通过 braid serve 或 Web Console 启动执行。",
         config_path.display()
     );
     Ok(())

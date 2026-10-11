@@ -124,7 +124,7 @@ impl GroupDriver<'_> {
             bail!(message);
         }
         let result = Box::pin(async {
-            let repository = if github.is_local() {
+            let repository = if github.is_builtin() {
                 RepositoryName::local(&candidate.repository)
             } else {
                 candidate.repository.parse::<RepositoryName>()?
@@ -140,38 +140,39 @@ impl GroupDriver<'_> {
                         candidate.number
                     );
                 }
-                let (head_ref, effective_profile) =
-                    if let Some(path) = materialization.worktree_path.clone() {
-                        let head_ref = if github.is_local() {
-                            materialization
-                                .worktree_head_ref
-                                .clone()
-                                .context("preserved local PR worktree has no creation ref")?
-                        } else {
-                            materialization
-                                .worktree_head_ref
-                                .clone()
-                                .unwrap_or_else(|| pull_request.head_ref.clone())
-                        };
-                        let mut effective_profile = profile.clone();
-                        effective_profile.workspace = Some(path);
-                        (head_ref, effective_profile)
-                    } else if github.is_local() {
-                        let head_ref =
-                            github.pr_worktree_ref(candidate.number, &pull_request.head_ref)?;
-                        let effective_profile = super::pr_agent::provision_pr_worktree_from_ref(
-                            store,
-                            config,
-                            profile,
-                            candidate.number,
-                            &materialization,
-                            &pull_request.repository_node_id,
-                            &head_ref,
-                        )?;
-                        (head_ref, effective_profile)
+                let (head_ref, effective_profile) = if let Some(path) =
+                    materialization.worktree_path.clone()
+                {
+                    let head_ref = if github.is_builtin() {
+                        materialization
+                            .worktree_head_ref
+                            .clone()
+                            .context("preserved built-in PR worktree has no creation ref")?
                     } else {
-                        bail!("reopened PR Agent has no preserved worktree");
+                        materialization
+                            .worktree_head_ref
+                            .clone()
+                            .unwrap_or_else(|| pull_request.head_ref.clone())
                     };
+                    let mut effective_profile = profile.clone();
+                    effective_profile.workspace = Some(path);
+                    (head_ref, effective_profile)
+                } else if github.is_builtin() {
+                    let head_ref =
+                        github.pr_worktree_ref(candidate.number, &pull_request.head_ref).await?;
+                    let effective_profile = super::pr_agent::provision_pr_worktree_from_ref(
+                        store,
+                        config,
+                        profile,
+                        candidate.number,
+                        &materialization,
+                        &pull_request.repository_node_id,
+                        &head_ref,
+                    )?;
+                    (head_ref, effective_profile)
+                } else {
+                    bail!("reopened PR Agent has no preserved worktree");
+                };
                 (
                     CanonicalContext::PullRequest(pull_request),
                     pr_system_prompt(config, profile, candidate.number, &head_ref),
@@ -372,7 +373,7 @@ impl GroupDriver<'_> {
                 profile.id
             );
         }
-        let repository = if github.is_local() {
+        let repository = if github.is_builtin() {
             RepositoryName::local(&reset.repository)
         } else {
             reset.repository.parse::<RepositoryName>()?
@@ -533,6 +534,39 @@ impl GroupDriver<'_> {
             let _ = store.defer_turn_claim(claim.turn_id.clone());
             return None;
         };
+        let finalizing_builtin =
+            self.collaboration.is_builtin() && claim.trigger_kind == "finalization";
+        // Closed work items still run native cleanup, without platform write authority.
+        let grant_admission = if finalizing_builtin {
+            self.collaboration.revoke_session(&claim.provider_session_id).await
+        } else {
+            self.collaboration
+                .ensure_grant(&claim.provider_session_id, claim.number, &profile.id)
+                .await
+        };
+        if let Err(error) = grant_admission {
+            let reason = format!(
+                "{} failed for provider session {}: {error:#}",
+                if finalizing_builtin {
+                    "finalization writer revocation"
+                } else {
+                    "writer grant admission"
+                },
+                claim.provider_session_id,
+            );
+            if let Err(error) = store.mark_turn_terminal(claim.turn_id.clone(), "failed".into()) {
+                tracing::error!(%error, turn = %claim.turn_id, "cannot record writer grant admission failure");
+            }
+            self.publish_turn_error(&claim, "failed", &reason);
+            crate::telemetry::lifecycle_event(
+                &claim.provider_session_id,
+                None,
+                "prompt",
+                "failed",
+                Some(&reason),
+            );
+            return None;
+        }
         // Subscribe before sending so the `TurnStarted` event — the single
         // authority for provider turn identity — cannot be missed.
         let mut events = session.events();
@@ -665,6 +699,20 @@ impl GroupDriver<'_> {
             braid.turn.id = %active.claim.turn_id, provider.turn.id = %active.provider_turn_id,
             braid.context.reset.id = %reset.reset_id, braid.assignment.id = %reset.assignment_id,
             "context reset began");
+        if let Err(error) =
+            self.collaboration.revoke_session(&active.claim.provider_session_id).await
+        {
+            let reason = format!(
+                "Context reset {} could not confirm old writer grant revocation: {error:#}",
+                reset.reset_id
+            );
+            if let Err(error) =
+                store.record_turn_error(active.claim.turn_id.clone(), reason.clone())
+            {
+                tracing::error!(%error, "cannot retain writer grant revocation failure");
+            }
+            tracing::error!(%reason, reset = %reset.reset_id, "old writer grant remains unconfirmed; replacement requires confirmed revocation");
+        }
         match sessions.get(&active.claim.provider_session_id).await {
             Some(session) => {
                 if let Err(error) = session.interrupt().await {

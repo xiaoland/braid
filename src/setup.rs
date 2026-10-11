@@ -587,6 +587,7 @@ fn build_config(
             auto_migrate: false,
         },
         local: None,
+        builtin: None,
         loaded_from: base_dir.join("config.toml"),
         github: Some(GitHubConfig {
             app_id,

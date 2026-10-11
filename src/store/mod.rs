@@ -15,7 +15,9 @@ use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
+mod builtin;
 mod gh_writes;
+pub use builtin::{BuiltinBinding, BuiltinCommand, BuiltinGrant, BuiltinReply};
 
 pub use gh_writes::{
     GhWriteReceipt, ImplementationProgress, ImplementationRequestReceipt, NewGhWriteIntent,
@@ -26,7 +28,7 @@ use gh_writes::{
     prepare_gh_write, prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 5;
+pub const DATABASE_SCHEMA_VERSION: u32 = 6;
 
 const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
 const EVENT_KINDS_SQL: &str = include_str!("../../migrations/0002_event_kinds.sql");
@@ -47,6 +49,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "control_receipts",
         sql: include_str!("../../migrations/0005_control_receipts.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "builtin_harness",
+        sql: include_str!("../../migrations/0006_builtin_harness.sql"),
     },
 ];
 
@@ -540,6 +547,14 @@ impl StoreActor {
             .spawn(move || actor_loop(&database, &backups, receiver))
             .map_err(|source| StoreError::Io { path: PathBuf::from("<database-actor>"), source })?;
         Ok(Self { sender, join: Some(join) })
+    }
+
+    pub fn builtin(&self, command: BuiltinCommand) -> Result<BuiltinReply, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::Builtin(command, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
     pub fn plan(&self) -> Result<MigrationPlan, StoreError> {
@@ -1301,6 +1316,7 @@ impl Drop for StoreActor {
 }
 
 enum Command {
+    Builtin(BuiltinCommand, Sender<Result<BuiltinReply, StoreError>>),
     Plan(Sender<Result<MigrationPlan, StoreError>>),
     Apply(Sender<Result<MigrationResult, StoreError>>),
     Status(Sender<Result<StoreStatus, StoreError>>),
@@ -1458,6 +1474,9 @@ struct LedgerEntry {
 fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
     for command in receiver {
         match command {
+            Command::Builtin(command, reply) => {
+                let _ = reply.send(builtin::execute(database, command));
+            }
             Command::Plan(reply) => {
                 let _ = reply.send(plan(database));
             }
