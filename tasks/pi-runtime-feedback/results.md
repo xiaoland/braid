@@ -53,7 +53,8 @@ process-owner 为 `203f39fd4da47b6539ac95ade9e3a094ebe95bd4daae6d1e33eb623ac9105
 | `operations/braid-cli/doctor-v11.json` | Braid 的材料和 version 检查通过。隔离配置没有 source checkout／OTLP，整体 ready=false；placeholder 只证明 key 存在，不证明供应商认证。 |
 
 中央 `cargo check --locked`、`cargo clippy --locked -- -D warnings`、
-`cargo build --locked`、`cargo fmt --check` 与 diff 空白检查通过。
+`cargo build --locked`、`cargo fmt --check` 与 diff 空白检查通过。统一补丁的
+上游上下文标记和缩进按 `.gitattributes` 保留，不能为普通源码的空白规则破坏补丁输入。
 
 早期失败均保留，没有覆盖成成功。v5 的 await 传播遗漏导致实际加载 parse 错误；
 v6/v7 暴露 Mac lease 的 Linux-only 查询、writer 与 launcher PID 混淆及退出期间
