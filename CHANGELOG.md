@@ -3,6 +3,17 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
+## [Unreleased]
+
+- 新增内建协作空间：本地 Issue、讨论、指派、正文、生命周期和关联 PR，复用
+  Context、调度及原生执行。`braid init` 不需要 GitHub App，Local serve 持续运行。
+- 新增真实 Git 候选发布、diff 与手工合并；持久合并意图和引用比较更新支持失败后
+  重试收敛，不把模型终态当作产品验收。
+- 修复输入接纳、首次 Context 持久化、完整错误保存和停止证明不足时的恢复门控。
+- 数据库新增 schema 3 的完整 turn 错误与 schema 4 的 Local 对象、事件和合并记录。
+  运行新版本前应用迁移；schema 4 不能直接由旧版本消费。旧迁移保持不可变。
+- 配置 schema 2 保持原 GitHub 声明兼容，`[github]` 与 `[local]` 必须恰好选择一个。
+
 ## [0.3.2] - 2026-09-19
 
 ### Changed

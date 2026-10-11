@@ -4,6 +4,10 @@ This document owns the mechanical transition model from GitHub canonical
 changes to Context replacement, provider turns, reactions, and shutdown.
 Product interpretation remains with the Agent.
 
+Local 对象写入生成同一组内部事件，经持久事件桥接进入现有调度。关闭、重开、
+撤销指派及 Context 更换复用本合同；本地空间不因所有对象关闭而结束。对象与
+事件身份带独立 Local namespace，不将本地数据库当作 GitHub 当前正文权威。
+
 ## Agent Group Lifecycle
 
 Each Work Item/Profile pair has an Assignment Generation and one state:

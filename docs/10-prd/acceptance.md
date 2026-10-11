@@ -1,14 +1,8 @@
 # End-to-End Acceptance
 
-This document is the PRD acceptance oracle. It defines what "done" means for
-Braid: real GitHub Work Items, the packaged Rust binary, a real public webhook
-path, a real Codex app-server, and observable Agent behavior. Unit/component/
-fake transport checks may diagnose code but do not satisfy this contract.
-
-Braid is accepted only through real GitHub Work Items, the packaged Rust
-binary, a real public webhook path, a real Codex app-server, and observable
-Agent behavior. Unit/component/fake transport checks may diagnose code but do
-not satisfy this contract.
+本文件持有真实产品验收判据。GitHub 后端的下述 campaign 要求真实工作项、
+发行 binary、公网 webhook、原生执行器及可观察 Agent 行为；Local 后端的入口与
+判别事实见末尾内建空间章节。编译和机械对象操作各自只支持它们实际覆盖的结论。
 
 ## Boundary and Fixture
 
@@ -222,3 +216,11 @@ assertions but cannot substitute for public product behavior.
 The golden Issue-to-PR journey must pass without corrective operator action. A
 fresh installation and fixture must pass the entire campaign three consecutive
 times before the implementation PR becomes ready.
+## 内建空间的验收边界
+
+Local 后端的操作验收从公开 `init/local/serve` 入口进行：没有 GitHub App 配置时，
+创建、指派、讨论、关联 PR、发布与采用实际候选，重启后仍能读写并投递剩余输入。
+核对对象、队列、Git 引用和具体执行状态。机械对象操作不代替模型实际消费和
+多 Agent 协作效果；需要判断完整 Agent 工作经历时，应在获授权的真实模型任务上
+沿同一流程取证，不构造 provider 或修改私有执行状态。当前隔离操作结果归任务
+记录，不据此宣称完成下述 GitHub campaign 或完整模型验收。

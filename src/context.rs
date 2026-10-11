@@ -62,7 +62,12 @@ impl WorkItemReference {
             WorkItemKind::Issue => "Issue",
             WorkItemKind::PullRequest => "PR",
         };
-        format!("GitHub {noun}: {}#{}", self.repository, self.number)
+        format!(
+            "{} {noun}: {}#{}",
+            surface_name(&self.repository_node_id),
+            self.repository,
+            self.number
+        )
     }
 }
 
@@ -799,8 +804,20 @@ fn deleted_comment(
     }
 }
 
+fn surface_name(repository_node_id: &str) -> &'static str {
+    if repository_node_id.starts_with("local:") { "Braid" } else { "GitHub" }
+}
+
 fn render_issue(output: &mut String, issue: &IssueSnapshot, complete: bool) {
-    push_line(output, &format!("# GitHub Issue: {}#{}", issue.repository, issue.number));
+    push_line(
+        output,
+        &format!(
+            "# {} Issue: {}#{}",
+            surface_name(&issue.repository_node_id),
+            issue.repository,
+            issue.number
+        ),
+    );
     push_line(output, &issue.title);
     output.push('\n');
     push_state(output, &issue.state, issue.state_reason.as_deref());
@@ -832,13 +849,22 @@ fn render_issue(output: &mut String, issue: &IssueSnapshot, complete: bool) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_pull_request(output: &mut String, pull_request: &PullRequestSnapshot) {
     for issue in &pull_request.associated_issues {
         let complete = !issue.state.eq_ignore_ascii_case("closed");
         render_issue(output, issue, complete);
         output.push_str("\n---\n\n");
     }
-    push_line(output, &format!("# GitHub PR: {}#{}", pull_request.repository, pull_request.number));
+    push_line(
+        output,
+        &format!(
+            "# {} PR: {}#{}",
+            surface_name(&pull_request.repository_node_id),
+            pull_request.repository,
+            pull_request.number
+        ),
+    );
     push_line(output, &pull_request.title);
     output.push('\n');
     push_line(output, &format!("State: {}", pull_request.state.to_ascii_lowercase()));

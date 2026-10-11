@@ -48,3 +48,11 @@ sub-agent roles. MVP acceptance deliberately uses:
 
 Multi-Agent fan-out is not rejected, but cross-peer ordering, semantic merge,
 arbitration, and convergence are outside the MVP correctness claim.
+
+### 内建空间的对象
+
+Local Issue 和 PR 共享递增编号，使用稳定空间名称标识；编号不是 GitHub ID。
+正文、评论、负责人及关联由 Braid 持久保存。当前沿用一个 Issue Profile 与默认
+PR Profile，拒绝指派到没有对应执行者的配置。Issue 指派物化会话，后续评论唤醒
+设计工作；PR 指派启动实施。关闭与重开沿用当前逻辑会话生命周期，空间本身持续
+存在。评论和描述是工作数据，不获得系统指令权限。

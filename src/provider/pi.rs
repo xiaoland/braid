@@ -1,5 +1,6 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
+use std::path::PathBuf;
 
 struct PiRequest {
     response: oneshot::Sender<Result<Value, ProviderError>>,
@@ -95,22 +96,30 @@ impl PiProvider {
         {
             cmd.env(api_key_env, api_key);
         }
-        // Ensure the spawned Pi process can find the same `braid` binary and config
-        // so it can execute `braid gh` and `gh` shell commands.
+        // Native shell commands must reach the same Braid binary as this runtime.
         if let Ok(current_exe) = std::env::current_exe()
             && let Some(exe_dir) = current_exe.parent()
         {
-            let mut path_parts: Vec<String> =
-                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect();
-            let exe_dir_str = exe_dir.to_string_lossy().into_owned();
-            if !path_parts.iter().any(|p| p == &exe_dir_str) {
-                path_parts.insert(0, exe_dir_str);
+            let mut path_parts: Vec<PathBuf> =
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+            if !path_parts.iter().any(|p| p == exe_dir) {
+                path_parts.insert(0, exe_dir.to_path_buf());
             }
-            cmd.env("PATH", std::env::join_paths(path_parts).unwrap_or_default());
+            cmd.env(
+                "PATH",
+                std::env::join_paths(path_parts).map_err(|error| {
+                    ProviderError::Protocol(format!("cannot build native Pi PATH: {error}"))
+                })?,
+            );
         }
-        if let Ok(braid_config) = std::env::var("BRAID_CONFIG") {
+        if let Some(braid_config) = &state.config.braid_config_path {
+            let braid_config = if braid_config.is_absolute() {
+                braid_config.clone()
+            } else {
+                std::env::current_dir()?.join(braid_config)
+            };
+            cmd.env("BRAID_CONFIG", braid_config).env("BRAID_AGENT", "1");
+        } else if let Ok(braid_config) = std::env::var("BRAID_CONFIG") {
             cmd.env("BRAID_CONFIG", braid_config);
         }
         if let Some(session_path) = session {

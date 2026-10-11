@@ -1,4 +1,4 @@
-# Product TDD: GitHub Working Memory Runtime
+# Product TDD: Working Memory Runtime
 
 This document owns Braid's cross-unit authority, topology, state ownership, and
 Rust realization. It deliberately excludes unit algorithms that are evident
@@ -58,6 +58,22 @@ SQLite stores enough canonical object metadata and lifecycle tombstones to
 compare versions, but it does not become an alternate Issue/PR or provider
 transcript authority. A full Context is rebuilt from GitHub before every turn.
 
+## 内建协作后端
+
+一个实例恰好配置 `[github]` 或 `[local]`。GitHub 后端保持远端对象权威；Local
+后端以自身 SQLite 对象表持有正文、评论、指派与关联。两者不双写或自动同步。
+`collaboration` 给 Group 提供当前 Issue/PR snapshot、指派判断和默认分支；
+Context、queue、Group、provider 的生命周期与停止证明合同复用。
+
+`local::objects` 在同一事务中修改对象并保存待投递事件。`local::runtime` 以固定
+事件身份重试现有 ingest，成功后确认事件，避免提交对象却永久丢失唤醒。Braid
+状态 outbox 在本地写回同一空间。Local runtime 持续监督工作，不按全项终态退出。
+原始模型会话、Git 仓库和协作对象仍分别有自己的权威。
+
+本地 PR 保存明确的 base/head 候选。发布使新候选可取得，合并以持久意图与 Git
+引用比较更新处理 SQLite/Git 的跨介质边界；拒绝分支移动、冲突或不安全的检出
+状态。模型 Completed 不意味着候选被采用，也不意味着 Issue 完成。
+
 ## Single Source of Truth for Schema
 
 A schema must have exactly one authority. When the same shape is defined both
@@ -70,16 +86,15 @@ against it.
 truth for the config schema. `braid setup` builds a `Config` value and
 serializes it, rather than formatting a template. If the type changes, the
 compiler forces the generator to change with it.
-- **Round-trip tests for generated artifacts**: Any code that emits a
-structured file a Human might edit must be covered by a test that parses the
-output back through the canonical type and validates it.
+- **Generated artifacts**: 配置由 canonical Rust type 序列化；编译与实际公开
+  命令操作核实消费者能解析和使用产物，不维护测试入口。
 - **No parallel string templates**: Do not maintain a separate text template
 for a file whose shape is already defined by a Rust type. Avoid
 `format!`-based generators for config, manifest, or protocol files.
 - **ROI boundary**: Not every documentation snippet is a schema instance.
 Only canonical or generated artifacts participate in SSoT validation. For
 example, `config.example.toml` is the canonical starter template, so it is
-loaded through `Config::load` in tests; a partial snippet in a runbook is not.
+loaded through `Config::load` by the public configuration command; a partial snippet in a runbook is not.
 - **Migrations are the exception**: SQLite schema is forward-only, immutable,
 and checksum-verified; it is not derived from Rust structs because the database
 must outlive any single binary version.

@@ -129,7 +129,7 @@ pub(crate) async fn reconcile_work_items(
     for work_item in &tracked {
         let repository = work_item.repository.parse::<RepositoryName>()?;
         let scoped;
-        let client = if repository == config.github.repository.parse::<RepositoryName>()? {
+        let client = if repository == config.repository().parse::<RepositoryName>()? {
             github
         } else {
             scoped = github.for_repository(&repository).await?;
@@ -415,10 +415,12 @@ pub(crate) fn reconciled_event(
     };
     let mention_candidate = external
         && matches!(action, "created" | "edited" | "unminimized")
-        && observation
-            .body
-            .as_deref()
-            .is_some_and(|body| webhook::has_visible_mention(body, &config.github.handle));
+        && observation.body.as_deref().is_some_and(|body| {
+            config
+                .github
+                .as_ref()
+                .is_some_and(|github| webhook::has_visible_mention(body, &github.handle))
+        });
     let reaction_target = (external && action == "created").then(|| ReactionTarget {
         kind: if observation.object_kind == "review_comment" {
             "review_comment"

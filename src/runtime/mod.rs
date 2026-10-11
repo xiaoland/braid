@@ -68,14 +68,26 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
             );
         }
     }
+    let connection = rusqlite::Connection::open_with_flags(
+        config.runtime.database(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let local_space: i64 =
+        connection.query_row("SELECT COUNT(*) FROM local_space", [], |row| row.get(0))?;
+    if local_space != 0 {
+        bail!(
+            "this database belongs to local collaboration; use its local config or a distinct GitHub runtime root"
+        );
+    }
+    drop(connection);
     let owner_id = Uuid::now_v7().to_string();
     let lease = store.acquire_runtime_lease("runtime".into(), owner_id, LEASE_TTL_SECONDS)?;
     let lease = Arc::new(StdMutex::new(lease));
     let _lease_guard = RuntimeLeaseGuard { store: Arc::clone(&store), lease: Arc::clone(&lease) };
     store.recover_writes()?;
 
-    let repository = config.github.repository.parse::<RepositoryName>()?;
-    let github = Arc::new(GitHubClient::connect(&config.github, &repository).await?);
+    let repository = config.repository().parse::<RepositoryName>()?;
+    let github = Arc::new(GitHubClient::connect(config.github()?, &repository).await?);
     if !github
         .identity()
         .permissions
@@ -97,7 +109,7 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     let health = Arc::new(RwLock::new(HealthSnapshot {
         ready: false,
         ingress: config.server.ingress.to_string(),
-        repository: config.github.repository.clone(),
+        repository: config.repository().to_owned(),
         tunnel: if quick_tunnel { "starting" } else { "disabled" },
         webhook_url: None,
         reconciliation: "starting",
@@ -107,8 +119,8 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     let state = Arc::new(IngressState {
         store: Arc::clone(&store),
         policy,
-        repository: config.github.repository.clone(),
-        handle: config.github.handle.clone(),
+        repository: config.repository().to_owned(),
+        handle: config.github()?.handle.clone(),
         app_actor_node_id: github.identity().actor_node_id.clone(),
         app_actor_login: github.identity().actor_login.clone(),
         agent_actor_node_ids: config
@@ -188,7 +200,7 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
             &config,
             &local_url,
             &state.webhook_secret,
-            &config.github.repository,
+            config.repository(),
             &github.identity().repository_node_id,
         )
         .await?;
@@ -212,7 +224,7 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
         tunnel = Some(started);
     }
     health.write().await.ready = true;
-    tracing::info!(repository = %config.github.repository, "Braid transport runtime is ready");
+    tracing::info!(repository = %config.repository(), "Braid transport runtime is ready");
 
     let mut tunnel_poll = tokio::time::interval(Duration::from_secs(2));
     tunnel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -311,7 +323,7 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     Ok(())
 }
 
-async fn wait_for_shutdown_signal() -> Result<()> {
+pub(crate) async fn wait_for_shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
         let mut terminate =
@@ -350,7 +362,7 @@ async fn spawn_ingress(
     }))
 }
 
-async fn spawn_health(
+pub(crate) async fn spawn_health(
     address: std::net::SocketAddr,
     state: Arc<RwLock<HealthSnapshot>>,
     mut shutdown: watch::Receiver<bool>,

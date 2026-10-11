@@ -35,7 +35,12 @@ pub struct Config {
     pub schema_version: u32,
     pub instance: InstanceConfig,
     pub runtime: RuntimeConfig,
-    pub github: GitHubConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GitHubConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<LocalConfig>,
+    #[serde(skip)]
+    pub loaded_from: PathBuf,
     pub scheduler: SchedulerConfig,
     /// Adapter connectivity, keyed by `adapter_type`. One entry per `adapter_type`
     /// per worker; the profile's `adapter_type` locates the runtime entry.
@@ -186,6 +191,14 @@ pub struct LlmAllowance {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct LocalConfig {
+    pub repository: String,
+    pub source: PathBuf,
+    pub default_branch: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitHubConfig {
     pub app_id: u64,
     pub repository: String,
@@ -219,6 +232,8 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodexConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub braid_config_path: Option<PathBuf>,
     pub executable: PathBuf,
     pub home: PathBuf,
     pub version: String,
@@ -229,6 +244,8 @@ pub struct CodexConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PiConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub braid_config_path: Option<PathBuf>,
     pub executable: PathBuf,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -410,9 +427,19 @@ impl Config {
         } else {
             std::env::current_dir().map(|cwd| cwd.join(&base)).unwrap_or(base)
         };
+        config.loaded_from = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?
+                .join(path)
+        };
         config.runtime.resolve(&base);
         for profile in &mut config.profiles {
             profile.resolve_workspace(&base);
+            if let Some(local) = &config.local {
+                profile.workspace = Some(local.source.clone());
+            }
         }
         config.validate()?;
         Ok(config)
@@ -421,6 +448,27 @@ impl Config {
     #[allow(dead_code)]
     pub fn instance_key(&self) -> &str {
         &self.instance.key
+    }
+
+    pub fn repository(&self) -> &str {
+        match (&self.github, &self.local) {
+            (Some(github), None) => &github.repository,
+            (None, Some(local)) => &local.repository,
+            _ => unreachable!("configuration validates exactly one collaboration backend"),
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.local.is_some()
+    }
+
+    pub fn github(&self) -> Result<&GitHubConfig, ConfigError> {
+        self.github.as_ref().ok_or_else(|| {
+            ConfigError::Invalid(
+                "this command requires the GitHub backend; this instance uses local collaboration"
+                    .into(),
+            )
+        })
     }
 
     pub fn profile(&self, id: &str) -> Result<&Profile, ConfigError> {
@@ -434,7 +482,7 @@ impl Config {
         ConfigSummary {
             schema_version: self.schema_version,
             instance_key: &self.instance.key,
-            repository: &self.github.repository,
+            repository: self.repository(),
             runtime_root: self.runtime.root(),
             database: self.runtime.database(),
             profile_ids: self.profiles.iter().map(|profile| profile.id.as_str()).collect(),
@@ -448,10 +496,10 @@ impl Config {
     /// Load the GitHub webhook secret from `github.webhook_secret_file` if set,
     /// otherwise from `github.webhook_secret_environment`.
     pub fn webhook_secret(&self) -> Result<String, ConfigError> {
-        if let Some(path) = &self.github.webhook_secret_file {
+        if let Some(path) = &self.github()?.webhook_secret_file {
             return load_webhook_secret_file(path);
         }
-        if let Some(env) = &self.github.webhook_secret_environment {
+        if let Some(env) = &self.github()?.webhook_secret_environment {
             return std::env::var(env).map_err(|_| {
                 ConfigError::Invalid(format!(
                     "environment variable {env:?} for github.webhook_secret_environment is not set"
@@ -525,6 +573,7 @@ impl Config {
             })?;
             return Ok(ProviderConfig {
                 codex: Some(CodexConfig {
+                    braid_config_path: self.is_local().then(|| self.loaded_from.clone()),
                     executable: runtime.executable.clone(),
                     home,
                     version: runtime.version.clone(),
@@ -541,6 +590,7 @@ impl Config {
             return Ok(ProviderConfig {
                 codex: None,
                 pi: Some(PiConfig {
+                    braid_config_path: self.is_local().then(|| self.loaded_from.clone()),
                     executable: runtime.executable.clone(),
                     provider: Some(llm.id.clone()),
                     model: profile.model.clone(),
@@ -566,22 +616,17 @@ impl Config {
         validate_instance_key(&self.instance.key)
             .map_err(|message| ConfigError::Invalid(format!("instance.key: {message}")))?;
 
+        if self.github.is_some() == self.local.is_some() {
+            return Err(ConfigError::Invalid(
+                "configure exactly one of [github] or [local]".into(),
+            ));
+        }
         for (name, path) in [
             ("runtime.root", self.runtime.root()),
             ("runtime.database", self.runtime.database()),
             ("runtime.backups", self.runtime.backups()),
-            ("github.private_key_file", &self.github.private_key_file),
-            ("tools.git", &self.tools.git),
-            ("tools.gh", &self.tools.gh),
-            ("tools.wrangler", &self.tools.wrangler),
-        ]
-        .into_iter()
-        .chain(
-            self.github
-                .webhook_secret_file
-                .as_ref()
-                .map(|path| ("github.webhook_secret_file", path.as_path())),
-        ) {
+            ("tools.git", self.tools.git.as_path()),
+        ] {
             require_absolute(name, path)?;
         }
         if !self.runtime.database().starts_with(self.runtime.root())
@@ -591,20 +636,33 @@ impl Config {
                 "runtime database and backups must be inside runtime.root".into(),
             ));
         }
-        if self.github.app_id == 0 {
-            return Err(ConfigError::Invalid("github.app_id must be positive".into()));
+        if let Some(local) = &self.local {
+            validate_token("local.repository", &local.repository)?;
+            require_absolute("local.source", &local.source)?;
+            if !git2::Reference::is_valid_name(&format!("refs/heads/{}", local.default_branch)) {
+                return Err(ConfigError::Invalid(
+                    "local.default_branch must be a valid Git branch name".into(),
+                ));
+            }
         }
-        validate_repository(&self.github.repository)?;
-        validate_token("github.handle", &self.github.handle)?;
-        if self.github.webhook_secret_environment.is_none()
-            && self.github.webhook_secret_file.is_none()
-        {
-            return Err(ConfigError::Invalid(
-                "one of github.webhook_secret_environment or github.webhook_secret_file must be set".into(),
-            ));
-        }
-        if let Some(env) = &self.github.webhook_secret_environment {
-            validate_token("github.webhook_secret_environment", env)?;
+        if let Some(github) = &self.github {
+            require_absolute("github.private_key_file", &github.private_key_file)?;
+            require_absolute("tools.gh", &self.tools.gh)?;
+            require_absolute("tools.wrangler", &self.tools.wrangler)?;
+            if let Some(path) = &github.webhook_secret_file {
+                require_absolute("github.webhook_secret_file", path)?;
+            }
+            if github.app_id == 0 {
+                return Err(ConfigError::Invalid("github.app_id must be positive".into()));
+            }
+            validate_repository(&github.repository)?;
+            validate_token("github.handle", &github.handle)?;
+            if github.webhook_secret_environment.is_none() && github.webhook_secret_file.is_none() {
+                return Err(ConfigError::Invalid("one of github.webhook_secret_environment or github.webhook_secret_file must be set".into()));
+            }
+            if let Some(env) = &github.webhook_secret_environment {
+                validate_token("github.webhook_secret_environment", env)?;
+            }
         }
         if self.scheduler.quiet_seconds == 0
             || self.scheduler.event_threshold == 0

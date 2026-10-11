@@ -4,8 +4,8 @@
 
 # Braid
 
-Braid turns GitHub Issues and pull requests into durable working memory for
-local Coding Agents. GitHub holds the current design, implementation state,
+Braid turns Issues and pull requests into durable working memory for
+local Coding Agents. GitHub or a Braid-owned local space holds the current design, implementation state,
 metadata, relationships, and discussion; Braid rebuilds a provider session from
 that state whenever prior context becomes stale.
 
@@ -18,6 +18,20 @@ On macOS arm64:
 ```shell
 brew install xiaoland/braid/braid
 ```
+
+## 内建协作空间
+
+Braid 可以直接持有 Issue、讨论、指派和 PR，无需 GitHub App。每个实例选择
+一个对象权威：GitHub 或本地 SQLite。原生 Agent CLI 和模型服务仍是执行依赖。
+
+```shell
+braid init --source /absolute/path/to/repository --config /absolute/path/to/space/config.toml --name demo --adapter pi --executable /absolute/path/to/pi --provider deepseek --model deepseek-chat --api-key-environment DEEPSEEK_API_KEY
+braid migrate apply --config /absolute/path/to/space/config.toml
+braid local --config /absolute/path/to/space/config.toml issue --title '需要完成的工作' --body '目标与依据'
+braid serve --config /absolute/path/to/space/config.toml
+```
+
+对象操作、候选发布和合并见[本地协作指南](docs/user-manual/local.md)。
 
 ## Bootstrap
 

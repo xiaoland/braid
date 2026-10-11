@@ -6,6 +6,11 @@ in Issue Context and PR Context, see `docs/10-prd/objects.md` and
 `docs/10-prd/workflow.md`. It does not own webhook scheduling or provider
 history.
 
+Local 后端使用同一 canonical snapshot 和渲染合同，在单个 SQLite 读取事务中
+取得正文、讨论及直接关联对象。内部身份带 `local:` 前缀，对外标为
+`Braid Issue: <space>#<number>` 或 `Braid PR: <space>#<number>`。GitHub 后端
+保留下述分页与漂移核对，Local 不伪装网络分页、远端权限或 GitHub ID。
+
 ## Materialization Transaction
 
 For one Work Item Braid reads every required GitHub connection to exhaustion,

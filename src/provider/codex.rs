@@ -1,5 +1,6 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
+use std::path::PathBuf;
 
 struct ProcessGuard {
     child: StdMutex<Option<Child>>,
@@ -31,14 +32,36 @@ impl CodexProvider {
     }
 
     pub async fn connect(config: &CodexConfig) -> Result<Self, ProviderError> {
-        let mut child = Command::new(&config.executable)
-            .args(["app-server", "--stdio"])
+        let mut cmd = Command::new(&config.executable);
+        cmd.args(["app-server", "--stdio"])
             .env("CODEX_HOME", &config.home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        if let Some(braid_config) = &config.braid_config_path {
+            let braid_config = if braid_config.is_absolute() {
+                braid_config.clone()
+            } else {
+                std::env::current_dir()?.join(braid_config)
+            };
+            cmd.env("BRAID_CONFIG", braid_config).env("BRAID_AGENT", "1");
+            let current_exe = std::env::current_exe()?;
+            if let Some(exe_dir) = current_exe.parent() {
+                let mut path_parts: Vec<PathBuf> =
+                    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+                if !path_parts.iter().any(|p| p == exe_dir) {
+                    path_parts.insert(0, exe_dir.to_path_buf());
+                }
+                cmd.env(
+                    "PATH",
+                    std::env::join_paths(path_parts).map_err(|error| {
+                        ProviderError::Protocol(format!("cannot build native Codex PATH: {error}"))
+                    })?,
+                );
+            }
+        }
+        let mut child = cmd.spawn()?;
         let writer = child
             .stdin
             .take()

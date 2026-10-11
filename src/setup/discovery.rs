@@ -59,6 +59,7 @@ pub async fn discover(adapter_type: &str) -> Result<Vec<DiscoveredRuntime>> {
 pub async fn verify(runtime: DiscoveredRuntime) -> Result<RuntimeEntry> {
     if runtime.adapter_type == "codex" {
         let temp_config = CodexConfig {
+            braid_config_path: None,
             executable: runtime.executable.clone(),
             home: runtime.executable.parent().map_or_else(PathBuf::new, Path::to_path_buf),
             version: runtime.version.clone(),

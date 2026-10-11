@@ -187,3 +187,21 @@ Then drive only the real campaign in
 [`../10-prd/acceptance.md`](../10-prd/acceptance.md). Source-tree execution,
 private DB edits, fake events, or a manually signed local request cannot accept
 the release.
+
+## Local 实例
+
+`braid init` 从本地 Git checkout 和明确原生 runtime 创建类型化配置，不创建
+GitHub App，不写入 API key 值。`[local]` 指定稳定 `repository` 空间名称与绝对
+`source` 路径；省去 `[github]`，其它 runtime、Profile 和存储配置共用。旧 GitHub
+schema 2 配置继续有效，两个后端段必须互斥。数据库 schema 4 新增本地对象与
+事件表，旧迁移不可变。空间与 source 的绑定不能通过改配置静默迁到另一仓库。
+
+Local serve 不启动 webhook、Quick Tunnel 或 GitHub reconciliation。它持有同样
+的 runtime lease，监督 queue、对象事件桥接、状态 outbox 与 Agent Groups。
+`--transport-only` 处理对象事件和队列，不启动原生模型会话，可供实际操作取证。
+GitHub 专属命令在 Local 实例明确拒绝。
+
+Agent 子进程取得 `BRAID_CONFIG` 与 `BRAID_AGENT`，CLI 通过专属 cwd、有效工作
+责任、会话与 turn 校验写入来源；失效调用明确失败。环境与 SQLite 检查防止正常
+执行串写，不能作为恶意本机进程或用户的权限沙箱。对象、provider history 与 Git
+资料均须随所属实例保留，停止 daemon 不删除空间。

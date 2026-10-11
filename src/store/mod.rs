@@ -26,7 +26,7 @@ use gh_writes::{
     prepare_gh_write, prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 3;
+pub const DATABASE_SCHEMA_VERSION: u32 = 4;
 
 const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
 const EVENT_KINDS_SQL: &str = include_str!("../../migrations/0002_event_kinds.sql");
@@ -37,6 +37,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "turn_errors",
         sql: include_str!("../../migrations/0003_turn_errors.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "local_collaboration",
+        sql: include_str!("../../migrations/0004_local_collaboration.sql"),
     },
 ];
 

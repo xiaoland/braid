@@ -41,6 +41,9 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Setup(SetupArguments),
+    Local(LocalArguments),
+    /// Initialize a Braid-owned collaboration space around a local Git checkout.
+    Init(crate::local::init::InitArguments),
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -76,6 +79,14 @@ enum Command {
         command: TunnelCommand,
     },
     Serve(ServeArguments),
+}
+
+#[derive(Debug, Args)]
+struct LocalArguments {
+    #[command(flatten)]
+    source: ConfigSource,
+    #[command(subcommand)]
+    command: crate::local::cli::LocalCommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -145,7 +156,7 @@ enum GhPrCommand {
 /// this struct.
 #[derive(Debug, Args)]
 struct ConfigSource {
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "BRAID_CONFIG")]
     config: Option<PathBuf>,
     #[arg(long, value_name = "KEY", env = "BRAID_INSTANCE")]
     instance: Option<String>,
@@ -385,7 +396,19 @@ pub async fn run() -> Result<()> {
         Command::Serve(arguments) => {
             let config_path = arguments.source.resolve_config_path()?;
             let config = helpers::load(&config_path)?;
-            crate::runtime::serve(config, arguments.tunnel, !arguments.transport_only).await?;
+            if config.is_local() {
+                if arguments.tunnel {
+                    bail!("--tunnel applies only to the GitHub backend");
+                }
+                crate::local::runtime::serve(config, !arguments.transport_only).await?;
+            } else {
+                crate::runtime::serve(config, arguments.tunnel, !arguments.transport_only).await?;
+            }
+        }
+        Command::Init(arguments) => crate::local::init::run(arguments).await?,
+        Command::Local(arguments) => {
+            let config = helpers::load(&arguments.source.resolve_config_path()?)?;
+            crate::local::cli::run(arguments.command, &config)?;
         }
         Command::Setup(arguments) => {
             setup::run(arguments).await?;

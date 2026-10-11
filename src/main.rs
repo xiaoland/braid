@@ -1,5 +1,6 @@
 mod agent_session;
 mod cli;
+mod collaboration;
 mod config;
 mod context;
 mod doctor;
@@ -7,6 +8,7 @@ mod github;
 mod group;
 mod health;
 mod home;
+mod local;
 mod outbox;
 mod producer;
 mod protocol;

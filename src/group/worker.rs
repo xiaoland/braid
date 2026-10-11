@@ -10,6 +10,7 @@ use tokio::{
 use super::{SessionManager, provider::materialized_profile};
 use crate::{
     agent_session::SessionFactory,
+    collaboration::CollaborationBackend,
     config::{Config, Profile},
     github::GitHubClient,
     store::{ProfileRecord, StoreActor, TurnClaim},
@@ -60,7 +61,7 @@ impl GroupSpec {
 /// Shared logical driver; adapters own physical resources and the store owns durable identities.
 pub(super) struct GroupDriver<'a> {
     pub(super) store: &'a StoreActor,
-    pub(super) github: &'a GitHubClient,
+    pub(super) collaboration: &'a CollaborationBackend,
     pub(super) config: &'a Config,
     pub(super) spec: &'a GroupSpec,
     pub(super) sessions: SessionManager,
@@ -89,11 +90,32 @@ pub(crate) async fn agent_group_worker(
     spec: GroupSpec,
     factory: Arc<dyn SessionFactory>,
     reports: tokio::sync::mpsc::Sender<crate::health::ProviderHealthUpdate>,
+    shutdown: watch::Receiver<bool>,
+) {
+    agent_group_worker_backend(
+        store,
+        Arc::new(CollaborationBackend::GitHub(github)),
+        config,
+        spec,
+        factory,
+        reports,
+        shutdown,
+    )
+    .await;
+}
+
+pub(crate) async fn agent_group_worker_backend(
+    store: Arc<StoreActor>,
+    collaboration: Arc<CollaborationBackend>,
+    config: Config,
+    spec: GroupSpec,
+    factory: Arc<dyn SessionFactory>,
+    reports: tokio::sync::mpsc::Sender<crate::health::ProviderHealthUpdate>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let driver = GroupDriver {
         store: &store,
-        github: &github,
+        collaboration: &collaboration,
         config: &config,
         spec: &spec,
         sessions: SessionManager::new(factory),

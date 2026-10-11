@@ -13,3 +13,9 @@ The MVP does not promise Claude adapters, hosted ingress, deterministic
 multi-Agent merge, automatic merge, universal GitHub CLI parity, automatic
 semantic readiness/acceptance, or recovery of a provider transcript that the
 provider itself has lost.
+
+内建协作空间是独立 Braid 的另一种对象权威，承载 Issue、评论、指派、正文、
+生命周期和关联 PR。它复用现有调度、记忆投影及原生执行，允许没有 GitHub App
+的本地 Git 仓库持续协作。PR 对应真实 Git 候选，候选发布与手工合并独立于模型
+终态或产品验收。当前入口是 CLI；不承诺 GitHub HTTP API 全兼容、平台用户权限
+系统、Web UI、GitHub/Local 双向同步或自动验收。

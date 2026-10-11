@@ -227,12 +227,12 @@ pub async fn probe_public_webhook(config: &Config, url: &str) -> Result<()> {
     if secret.is_empty() {
         bail!("GitHub webhook secret must not be empty");
     }
-    let repository = config.github.repository.parse::<RepositoryName>()?;
-    let github = GitHubClient::connect(&config.github, &repository).await?;
+    let repository = config.repository().parse::<RepositoryName>()?;
+    let github = GitHubClient::connect(config.github()?, &repository).await?;
     signed_public_probe(
         url,
         secret.as_bytes(),
-        &config.github.repository,
+        config.repository(),
         &github.identity().repository_node_id,
     )
     .await

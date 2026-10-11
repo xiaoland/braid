@@ -14,11 +14,12 @@ Group 不根据 backend 决定连接数量或故障范围。
 | --- | --- |
 | `SessionFactory::check()` | 检查 adapter 的启动前置条件；共享运行资源由 adapter 自己维护。 |
 | `SessionFactory::start/resume` | 创建或恢复会话并返回中立句柄。Codex 内部共享 app-server，Pi 每个会话持有独立进程；上层接口相同。 |
-| `send_user_msg(msg, steering)` | Idle 时启动 turn；running 且 steering 时发送 steer；否则返回 Acknowledged，由 queue 保留后续输入。 |
+| `send_user_msg(msg, steering)` | Idle 时申请启动 turn；已知拒收返回 Deferred，queue 保留输入。Acknowledged 只代表原生执行明确接纳，结果不明返回具体 Unknown。 |
+| `steer_user_msg(msg, expected_turn_id)` | 只向已观察且仍匹配的 active turn 投递，不偷换为新 turn；明确拒收返回 Deferred，结果不明保留具体 Unknown。 |
 | `interrupt()` | 尝试停止已观察到的 active turn；terminal 仍通过事件流返回。 |
 | `events()` | 将 provider 的响应与通知去重为 TurnStarted / TurnTerminal；dispatch 前订阅，同一 receiver 随 RunningAgentTurn 交给 driver。失效的 active handle 合成 Unknown，不能伪造失败。 |
 | `is_unavailable()` | 句柄失效后永久返回 true；idle 或晚订阅也可观察。恢复创建新句柄，不复活旧句柄。 |
-| `close()` | 停止使用该句柄，尝试 interrupt，取消监听并释放资源；不能影响其他会话。 |
+| `close()` | 确认所属执行停止后释放资源；失败保留句柄与具体原因，阻断替代执行，不能影响其它会话。 |
 
 具体 `AgentProvider` 接口只在 adapter 内使用。共享 Codex 进程退出会使其所有
 句柄失效；独立 Pi 进程退出只影响所属句柄。释放旧句柄会取消旧监听任务，

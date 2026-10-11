@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 
 use crate::cli::SetupArguments;
 
-mod discovery;
+pub(crate) mod discovery;
 mod logo;
 
 use crate::config::{
@@ -586,7 +586,9 @@ fn build_config(
             worktrees: None,
             auto_migrate: false,
         },
-        github: GitHubConfig {
+        local: None,
+        loaded_from: base_dir.join("config.toml"),
+        github: Some(GitHubConfig {
             app_id,
             repository: arguments.repository.clone(),
             handle: "braid".to_owned(),
@@ -595,7 +597,7 @@ fn build_config(
             webhook_secret_environment: None,
             webhook_secret_file: Some(secrets_file.to_path_buf()),
             projects_v2_enabled: false,
-        },
+        }),
         scheduler: SchedulerConfig {
             quiet_seconds: 30,
             event_threshold: 8,
