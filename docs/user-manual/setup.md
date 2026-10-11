@@ -21,6 +21,14 @@ braid --version
   the environment variable configured with `--api-key-environment`) *only at
   setup time*.
 
+## Pi 原生插件
+
+需要 subagents 或 background 时，先按 [原生材料说明](../../native/pi/README.md)
+安装锁定材料，再给 setup 指定 `--runtime-executable <install>/pi`。
+Setup 识别相邻 `runtime-manifest.json`；既有配置可将 `[[runtimes]]` 的
+`executable` 与 `native_runtime` 指向同一安装。外部 Pi 仍可基础接入，但不会自动
+加载宿主扩展。材料验证失败须修复明确的文件或配置漂移，不能静默改走全局 Pi。
+
 ## Bootstrap
 
 ```shell

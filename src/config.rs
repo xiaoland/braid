@@ -138,6 +138,9 @@ impl RuntimeConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeEntry {
+    /// Braid Pi material package manifest; absent for an external base Pi.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_runtime: Option<PathBuf>,
     pub adapter_type: String,
     /// Contract version checked at setup and serve time.
     pub version: String,
@@ -254,6 +257,8 @@ pub struct CodexConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PiConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_runtime: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub braid_config_path: Option<PathBuf>,
     pub executable: PathBuf,
@@ -446,6 +451,11 @@ impl Config {
                 .join(path)
         };
         config.runtime.resolve(&base);
+        for runtime in &mut config.runtimes {
+            if let Some(manifest) = &mut runtime.native_runtime {
+                *manifest = resolve_path(&base, manifest);
+            }
+        }
         for profile in &mut config.profiles {
             profile.resolve_workspace(&base);
         }
@@ -599,6 +609,7 @@ impl Config {
             return Ok(ProviderConfig {
                 codex: None,
                 pi: Some(PiConfig {
+                    native_runtime: runtime.native_runtime.clone(),
                     braid_config_path: Some(self.loaded_from.clone()),
                     executable: runtime.executable.clone(),
                     provider: Some(llm.id.clone()),
@@ -727,6 +738,14 @@ impl Config {
                 &format!("runtime.{}.executable", runtime.adapter_type),
                 &runtime.executable,
             )?;
+            if let Some(manifest) = &runtime.native_runtime {
+                require_absolute("runtime.native_runtime", manifest)?;
+                if runtime.adapter_type != "pi" {
+                    return Err(ConfigError::Invalid(
+                        "native_runtime is only supported by Pi".into(),
+                    ));
+                }
+            }
             if !runtime_types.insert(runtime.adapter_type.as_str()) {
                 return Err(ConfigError::Invalid(format!(
                     "duplicate runtime adapter_type {:?}",

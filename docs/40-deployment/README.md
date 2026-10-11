@@ -20,6 +20,11 @@ Release artifacts include `braid`, `LICENSE`, `README`, default config example,
 OTel Collector example for optional tail sampling, SHA-256 checksums, and
 release notes generated from `CHANGELOG.md` under SemVer.
 
+Pi 可使用外部基础 CLI 或 [锁定原生材料](../../native/pi/README.md)。需要
+subagents/background 的共同结果与停止合同时，先安装材料并明确选用插件，
+配置 `[[runtimes]].executable` 与 `native_runtime` 为同一安装的入口与 manifest。
+`doctor` 校验文件身份，实际启动核对 live 能力；安装或升级不修改系统全局 Pi。
+
 ## Configuration
 
 The instance `config.toml` is versioned independently from binary and

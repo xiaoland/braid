@@ -48,7 +48,9 @@ Quick Tunnel is optional GitHub webhook connectivity, not a Harness mode.
 - **Collaboration Context** is a deterministic, complete projection of upstream state plus
   durable deletion tombstones. It is the collaboration memory authority.
 - **Provider** owns physical session data, model execution, provider-native
-  compaction, turn lifecycle, and resume availability.
+  compaction, turn lifecycle, and resume availability. Pi 的锁定原生材料同时拥有
+  plugin 后台结果、物理执行登记及 owned 停止回执；Core turn idle 不推导这些义务
+  已收口。材料的版本与启动合同见 [provider 技术说明](app-server.md)。
 - **Coding Agent** owns interpretation, design/implementation choices, code,
   verification, and its Git/GitHub operations.
 - **Braid Harness** owns canonical reads, projection, logical Agent Group/session

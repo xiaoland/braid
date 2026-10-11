@@ -1,0 +1,931 @@
+--- a/src/extension/index.ts
++++ b/src/extension/index.ts
+@@ -12,6 +12,7 @@
+  *   { "asyncByDefault": true, "defaultSubagentContext": "fork", "forceTopLevelAsync": true, "maxSubagentDepth": 1, "intercomBridge": { "mode": "always", "instructionFile": "./intercom-bridge.md" }, "worktreeSetupHook": "./scripts/setup-worktree.mjs" }
+  */
+ 
++import { snapshotBackgroundWork } from "../api/background-work.ts";
+ import { randomUUID } from "node:crypto";
+ import * as fs from "node:fs";
+ import * as os from "node:os";
+@@ -54,7 +55,7 @@
+ import registerSubagentNotify, { parseSubagentNotifyContent, type SubagentNotifyDetails } from "../runs/background/notify.ts";
+ import { formatSteeringNotice, handleSubagentSteeringNotice, SUBAGENT_STEERING_MESSAGE_TYPE, type SubagentSteeringMessageDetails } from "./steering-notices.ts";
+ import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/pi-args.ts";
+-import { resolveCurrentSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
++import { isAgentAllowedByCapabilityCeiling, resolveCurrentSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
+ import { formatDuration, shortenPath } from "../shared/formatters.ts";
+ import { loadConfig, resolveAsyncByDefault, resolveScheduledStoreRoot } from "./config.ts";
+ import { buildSubagentToolDescription, buildSubagentToolPromptMetadata } from "./tool-description.ts";
+@@ -510,6 +511,18 @@
+ 			agents: merged.agents.map((agent) => agent.maxThinking === discovered.maxThinking ? agent : { ...agent, maxThinking: discovered.maxThinking }),
+ 		};
+ 	};
++	// Project only discovery metadata; role and skill bodies remain independent files.
++	if (process.env.BRAID_SUBAGENT_CATALOG === "1") {
++		pi.on("before_agent_start", (event, ctx) => {
++			const ceiling = resolveCurrentSubagentCapabilityCeiling(resolveCurrentSessionId(ctx.sessionManager));
++			const agents = discoverAgentsForRuntime(ctx.cwd, "both").agents
++				.filter((agent) => !agent.disabled && isAgentAllowedByCapabilityCeiling(agent.name, ceiling))
++				.sort((a, b) => a.name.localeCompare(b.name));
++			if (!agents.length) return;
++			const catalog = agents.map((agent) => `- ${agent.name}: ${agent.description.replace(/\s+/g, " ").trim()}`).join("\n");
++			return { systemPrompt: `${event.systemPrompt}\n\nAvailable native sub-agent roles:\n${catalog}` };
++		});
++	}
+ 	const { ensurePoller, refreshWidget, handleStarted, handleComplete, resetJobs, restoreActiveJobs, dispose: disposeAsyncJobTracker } = createAsyncJobTracker(pi, state, DIRS.async, {
+ 		widgetEnabled: asyncWidgetEnabled,
+ 		onJobTerminal: () => refreshResultDelivery(),
+@@ -530,6 +543,11 @@
+ 	);
+ 	const { startResultWatcher, primeExistingResults, stopResultWatcher } = resultWatcher;
+ 	refreshResultDelivery = resultWatcher.refreshResultDelivery;
++	const managedRuntime = (globalThis as any)[Symbol.for("braid.native-runtime.v1")];
++	const unregisterManaged = managedRuntime?.registerManagedProvider("pi-subagents", () => ({
++		status: resultWatcher.hasUnconsumedCurrentSessionResults() ? "busy" : "quiescent",
++		reason: "result_not_consumed",
++	}));
+ 	const asyncRetentionAbort = new AbortController();
+ 	const asyncRetentionTimer = setTimeout(async () => {
+ 		try {
+@@ -717,8 +735,36 @@
+ 
+ 	registerWaitTool(pi, state, waitToolConfig.enabled, waitSubscriptionManager);
+ 
+-	pi.on("agent_end", async (_event, ctx) => {
+-		if (!ctx.hasUI) await drainOutstandingWork({ state, events: pi.events });
++	pi.on("agent_end", async (event, ctx) => {
++		if (event.willRetry) return;
++		const lastAssistant = [...event.messages].reverse().find((message) => message.role === "assistant");
++		if (lastAssistant?.stopReason === "error") {
++			// Result files and active work keep their ownership; failed inference is not a completion acknowledgement.
++			pi.sendMessage({ customType: "subagent-terminal-background", content: "Model inference failed; background work and saved results remain available for recovery.", display: false,
++				details: { sessionId: state.currentSessionId, active: snapshotBackgroundWork(state.currentSessionId ?? "", Date.now()).items,
++					retained: state.currentSessionId ? listRetainedChildren(DIRS.async, state.currentSessionId) : [] } }, { triggerTurn: false });
++			return;
++		}
++		if (ctx.mode !== "tui") {
++			completionNotifier.beginDrain();
++			try {
++				let drainError: unknown;
++				try {
++					await drainOutstandingWork({ state, events: pi.events });
++				} catch (error) {
++					drainError = error;
++				}
++				try {
++					await resultWatcher.drainCurrentSessionResults();
++				} catch (resultError) {
++					if (drainError) throw new Error(`Background drain failed: ${String(drainError)}; result delivery failed: ${String(resultError)}`);
++					throw resultError;
++				}
++				if (drainError) throw drainError;
++			} finally {
++				completionNotifier.endDrain();
++			}
++		}
+ 		const ownerSessionId = state.currentSessionId;
+ 		if (!ownerSessionId) return;
+ 		goalTurnId += 1;
+@@ -1031,6 +1077,7 @@
+ 	});
+ 
+ 	pi.on("session_shutdown", async () => {
++		unregisterManaged?.();
+ 		runtimeEntry.cleanup();
+ 		await herdrStatusBridge.flush();
+ 	});
+--- a/src/runs/background/async-execution.ts
++++ b/src/runs/background/async-execution.ts
+@@ -493,7 +493,7 @@
+ 	startupDidNotProceed?: boolean;
+ }
+ 
+-function spawnRunner(cfg: object, suffix: string, cwd: string, onProcessTerminal?: (proof: unknown) => void): SpawnRunnerResult {
++async function spawnRunner(cfg: object, suffix: string, cwd: string, onProcessTerminal?: (proof: unknown) => void): Promise<SpawnRunnerResult> {
+ 	if (!jitiCliPath) {
+ 		return { error: "upstream jiti for TypeScript execution could not be found; ensure package dependencies are installed" };
+ 	}
+@@ -537,7 +537,9 @@
+ 			stdoutFd = fs.openSync(logPaths.stdoutPath, "a");
+ 			stderrFd = fs.openSync(logPaths.stderrPath, "a");
+ 		}
+-		const proc = spawn(nodeCommand, [jitiCliPath, runner, cfgPath], {
++		const managedRuntime = (globalThis as any)[Symbol.for("braid.native-runtime.v1")];
++		if (managedRuntime && launchAsyncDir) fs.rmSync(path.join(launchAsyncDir, "native-child-startup.json"), { force: true });
++		const proc = (managedRuntime?.spawnManaged ?? spawn)(nodeCommand, [jitiCliPath, runner, cfgPath], {
+ 			cwd,
+ 			detached: true,
+ 			stdio: ["ignore", stdoutFd ?? "ignore", stderrFd ?? "ignore"],
+@@ -546,13 +548,15 @@
+ 				...omitExtensionBindingsEnv(process.env),
+ 				...(piPackageRoot ? { [PI_CODING_AGENT_PACKAGE_ROOT_ENV]: piPackageRoot } : {}),
+ 			},
+-		});
++		}, { kind: "native", manifest: launchAsyncDir ? path.join(launchAsyncDir, "status.json") : undefined });
+ 		closeFd(stdoutFd);
+ 		closeFd(stderrFd);
+ 		proc.on("error", (error) => {
+ 			console.error(`[pi-subagents] async spawn failed: ${error.message}`);
+ 		});
+-		proc.once("close", (exitCode, signal) => {
++		const managedStartup = managedRuntime?.waitManagedStartup(proc);
++		proc.once("close", async (exitCode, signal) => {
++			await managedRuntime?.finishManagedProcess(proc, { exit_code: exitCode, signal, observed_at: Date.now() });
+ 			const launch = launchConfig as { asyncDir?: unknown; id?: unknown; nestedRoute?: NestedRouteInfo; nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> } };
+ 			const asyncDir = launch.asyncDir;
+ 			const runId = launch.id;
+@@ -600,7 +604,8 @@
+ 					console.error("Failed to emit final nested process-terminal status:", error);
+ 				}
+ 			}
+-			onProcessTerminal?.(persisted);
++			try { onProcessTerminal?.(persisted); }
++			catch (error) { console.error("Native process terminal proof was persisted but its owning extension context could not receive it:", error); }
+ 		});
+ 		if (typeof proc.pid !== "number") {
+ 			return { error: `async runner did not produce a pid for cwd: ${cwd}` };
+@@ -642,6 +647,27 @@
+ 				fs.rmSync(startupPath, { force: true });
+ 			} catch {
+ 				// Proceed is the commit point; handshake cleanup cannot turn a running revival into a start error.
++			}
++		}
++		if (managedRuntime) {
++			try {
++				await managedStartup;
++				if (launchAsyncDir) {
++					const startup = await managedRuntime.waitChildStartup(launchAsyncDir, RUNNER_STARTUP_TIMEOUT_MS);
++					if (startup.status !== "started") throw new Error(startup.reason || "Async child was not physically started.");
++				}
++			} catch (error) {
++				const message = `native_start_failed: ${error instanceof Error ? error.message : String(error)}`;
++				const terminal = await managedRuntime.finishManagedProcess(proc, { observation: "async_child_start_failed", observed_at: Date.now() });
++				if (launchAsyncDir) {
++					try {
++						const statusPath = path.join(launchAsyncDir, "status.json");
++						const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
++						writePrivateAtomicJson(statusPath, { ...status, state: "failed", lastUpdate: Date.now(), error: message });
++					} catch (persistError) { console.error("Failed to persist native async startup error:", persistError); }
++				}
++				// Proceed may already have happened; a stop proof does not undo preparation or detached child effects.
++				return { pid: proc.pid, runnerProcessInstanceId, error: message, terminationObserved: terminal?.status === "stopped", startupDidNotProceed: false };
+ 			}
+ 		}
+ 		return { pid: proc.pid, runnerProcessInstanceId };
+@@ -1080,10 +1106,10 @@
+ /**
+  * Execute a chain asynchronously
+  */
+-export function executeAsyncChain(
++export async function executeAsyncChain(
+ 	id: string,
+ 	params: AsyncChainParams,
+-): AsyncExecutionResult {
++): Promise<AsyncExecutionResult> {
+ 	const {
+ 		chain,
+ 		agents,
+@@ -1194,7 +1220,7 @@
+ 
+ 	let spawnResult: SpawnRunnerResult = {};
+ 	try {
+-		spawnResult = spawnRunner(
++		spawnResult = await spawnRunner(
+ 			{
+ 				id,
+ 				steps,
+@@ -1379,10 +1405,10 @@
+ 	return path.join(asyncDir, "workflow-result.json");
+ }
+ 
+-export function executeAsyncSingle(
++export async function executeAsyncSingle(
+ 	id: string,
+ 	params: AsyncSingleParams,
+-): AsyncExecutionResult {
++): Promise<AsyncExecutionResult> {
+ 	const {
+ 		agent,
+ 		agentConfig,
+@@ -1679,7 +1705,7 @@
+ 	}
+ 	let spawnResult: SpawnRunnerResult = {};
+ 	try {
+-		spawnResult = spawnRunner(
++		spawnResult = await spawnRunner(
+ 			{
+ 				id,
+ 				steps: [
+--- a/src/runs/background/notify.ts
++++ b/src/runs/background/notify.ts
+@@ -95,6 +95,8 @@
+ 
+ export interface CompletionNotifier {
+ 	deliver(result: CompletionNotification): Promise<boolean>;
++	beginDrain(): void;
++	endDrain(): void;
+ 	dispose(): void;
+ }
+ 
+@@ -335,6 +337,7 @@
+ 	const batchConfig = resolveCompletionBatchConfig(options.batchConfig);
+ 	const batchers = new Map<string, CompletionBatcher<PendingCompletion>>();
+ 	let disposed = false;
++	let draining = false;
+ 
+ 	const settle = (items: PendingCompletion[], accepted: boolean) => {
+ 		for (const item of items) {
+@@ -379,7 +382,7 @@
+ 			triggerTurn: result.triggerTurn !== false,
+ 			resolve,
+ 		};
+-		if (details.source === "foreground") {
++		if (draining || details.source === "foreground") {
+ 			emit([item]);
+ 			return completion;
+ 		}
+@@ -402,6 +405,11 @@
+ 
+ 	return {
+ 		deliver,
++		beginDrain() {
++			draining = true;
++			for (const batcher of batchers.values()) batcher.flush();
++		},
++		endDrain() { draining = false; },
+ 		dispose() {
+ 			if (disposed) return;
+ 			disposed = true;
+--- a/src/runs/background/result-watcher.ts
++++ b/src/runs/background/result-watcher.ts
+@@ -199,6 +199,8 @@
+ 	primeExistingResults: (options?: { triggerTurn?: boolean }) => void;
+ 	refreshResultDelivery: () => void;
+ 	stopResultWatcher: () => void;
++	drainCurrentSessionResults: () => Promise<void>;
++	hasUnconsumedCurrentSessionResults: () => boolean;
+ } {
+ 	const fsApi = deps.fs ?? fs;
+ 	const timers = deps.timers ?? { setTimeout, clearTimeout, setInterval, clearInterval };
+@@ -206,7 +208,8 @@
+ 	const parseResult = deps.parseResult ?? ((raw: string) => JSON.parse(raw) as ResultFileData);
+ 	const deliverIntercomResults = deps.deliverIntercomResults !== false;
+ 	const pendingTriggerTurn = new Map<string, boolean>();
+-	const processing = new Set<string>();
++	const processing = new Map<string, Promise<void>>();
++	const acceptedResults = new Map<string, PublicResultIdentity>();
+ 	const identityCache = new Map<string, { signature: string; identity: ResultFileIdentity }>();
+ 	let deliveryActive = true;
+ 	let deliveryEpoch = 0;
+@@ -314,6 +317,7 @@
+ 		try {
+ 			if (publicResultFileExists(file)) fsApi.unlinkSync(publicResultPath(file));
+ 			identityCache.delete(file);
++			acceptedResults.delete(file);
+ 			removeResultIndex(resultsDir, sessionId, runId, toolCallId);
+ 			return true;
+ 		} catch (error) {
+@@ -324,8 +328,7 @@
+ 			return true;
+ 		}
+ 	};
+-	const handleResult = async (file: string, triggerTurn: boolean) => {
+-		if (processing.has(file)) return;
++	const processResult = async (file: string, triggerTurn: boolean) => {
+ 		let observed: ReadonlySet<string> | undefined;
+ 		try {
+ 			if (!shouldProcessResult(file)) {
+@@ -339,7 +342,6 @@
+ 			scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+ 			return;
+ 		}
+-		processing.add(file);
+ 		let rereadReplacedPayload = false;
+ 		let resultPath = publicResultPath(file);
+ 		const readPublicResultIdentity = (): PublicResultIdentity | undefined => {
+@@ -547,6 +549,10 @@
+ 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+ 				return;
+ 			}
++			acceptedResults.set(file, {
++				state: typeof data.state === "string" ? data.state : undefined,
++				timestamp: typeof data.timestamp === "number" ? data.timestamp : undefined,
++			});
+ 			if (markReplacedPayload()) return;
+ 			try {
+ 				data = markDeliveredNotification(publicResultPath(file), data, runId, Date.now());
+@@ -592,9 +598,17 @@
+ 				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+ 			} else if (!isNotFound(error)) console.error(`Failed to process subagent result file '${resultPath}':`, error);
+ 		} finally {
+-			processing.delete(file);
+ 			if (rereadReplacedPayload) scheduleResult(file, triggerTurn);
+ 		}
++	};
++
++	const handleResult = (file: string, triggerTurn: boolean): Promise<void> => {
++		const active = processing.get(file);
++		if (active) return active;
++		const task = processResult(file, triggerTurn);
++		processing.set(file, task);
++		void task.then(() => processing.delete(file), () => processing.delete(file));
++		return task;
+ 	};
+ 
+ 	state.resultFileCoalescer = createFileCoalescer((file) => {
+@@ -642,6 +656,38 @@
+ 		} catch (error) {
+ 			if (!isNotFound(error)) console.error(`Failed to scan subagent result index in '${resultsDir}':`, error);
+ 		}
++	};
++
++	const currentResults = () => {
++		const sessionId = state.currentSessionId;
++		if (!sessionId) throw new Error("Cannot inspect subagent results without a Pi session identity.");
++		return resultCandidateFilesForSession(resultsDir, sessionId).filter((file) => {
++			const identity = inspectResult(file)?.identity;
++			if (identity?.sessionId && (identity.sessionId !== sessionId || identity.completionOwnerId !== state.completionOwnerId)) return false;
++			try {
++				const payload = resultPayloadPath(file);
++				if (payload) {
++					const current = JSON.parse(fsApi.readFileSync(payload, "utf-8")) as ResultFileData;
++					if (hasDeliveredNotification(current)) return false;
++					const accepted = acceptedResults.get(file);
++					if (accepted && (accepted.state !== undefined || accepted.timestamp !== undefined)
++						&& accepted.state === current.state && accepted.timestamp === current.timestamp) return false;
++				}
++			} catch { /* Treat unreadable results as undelivered. */ }
++			return true;
++		});
++	};
++	const hasUnconsumedCurrentSessionResults = () => processing.size > 0 || currentResults().length > 0;
++	const drainCurrentSessionResults = async () => {
++		const sessionId = state.currentSessionId;
++		const files = currentResults();
++		for (const file of files) {
++			state.resultFileCoalescer.flush(file);
++			await handleResult(file, true);
++		}
++		await Promise.all(files.map((file) => processing.get(file)).filter((task): task is Promise<void> => task !== undefined));
++		const remaining = currentResults();
++		if (remaining.length) throw new Error(`Subagent results were not accepted for session '${sessionId}': ${remaining.join(", ")}`);
+ 	};
+ 
+ 	const clearResultScan = () => {
+@@ -762,8 +808,9 @@
+ 		state.resultFileCoalescer.clear();
+ 		pendingTriggerTurn.clear();
+ 		processing.clear();
++		acceptedResults.clear();
+ 		identityCache.clear();
+ 	};
+ 
+-	return { startResultWatcher, primeExistingResults, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
+-}
++	return { startResultWatcher, primeExistingResults, stopResultWatcher, drainCurrentSessionResults, hasUnconsumedCurrentSessionResults, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
++}
+--- a/src/runs/background/stale-run-reconciler.ts
++++ b/src/runs/background/stale-run-reconciler.ts
+@@ -1,3 +1,5 @@
++import { getProcessStartIdentity } from "../shared/session-lease.ts";
++import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
+ import * as fs from "node:fs";
+ import * as path from "node:path";
+ import { writeAtomicJson } from "../../shared/atomic-json.ts";
+@@ -275,6 +277,13 @@
+ 
+ function writeFailedRepair(asyncDir: string, status: AsyncStatus, resultPath: string, now: number, reason?: string): ReconcileAsyncRunResult {
+ 	const repair = buildFailedRepair(status, asyncDir, now, reason);
++	if (reason?.startsWith("INTERRUPTED_")) {
++		repair.result.interrupted = true;
++		delete repair.result.exitCode;
++		for (const step of repair.status.steps ?? []) {
++			if (step.error?.includes("INTERRUPTED_")) delete step.exitCode;
++		}
++	}
+ 	if (repair.result.sessionId) writeAsyncResultFile(resultPath, repair.result);
+ 	writeAtomicJson(path.join(asyncDir, "status.json"), repair.status);
+ 	updateActiveRunIndex(asyncDir, repair.status.state, repair.status.toolCallId);
+@@ -391,6 +400,19 @@
+ 		}
+ 	}
+ 
++	// A workflow continuation lives in its owning Pi process, not in status.json.
++	// A detached runner may survive parent restoration; verify its OS birth
++	// identity independently rather than using the parent's completion token.
++	const actualBirth = getProcessStartIdentity(effectiveStatus.pid);
++	const workflowHere = effectiveStatus.mode === "workflow" && effectiveStatus.pid === process.pid;
++	const lostWorkflow = workflowHere && effectiveStatus.completionOwnerId !== currentCompletionOwnerId();
++	const unknownBirth = !effectiveStatus.processStartIdentity || !actualBirth;
++	const changedBirth = !unknownBirth && effectiveStatus.processStartIdentity !== actualBirth;
++	if (lostWorkflow || changedBirth || (unknownBirth && !workflowHere)) {
++		const reason = lostWorkflow ? "INTERRUPTED_OWNER_REPLACED" : changedBirth ? "INTERRUPTED_PROCESS_REPLACED" : "INTERRUPTED_OWNERSHIP_UNVERIFIED";
++		return writeFailedRepair(asyncDir, effectiveStatus, resultPath, now,
++			`${reason}: retained task metadata cannot restore execution ownership. Existing results and artifacts remain available; no process was killed and no process exit code was observed.`);
++	}
+ 	const liveness = checkPidLiveness(effectiveStatus.pid, options.kill);
+ 	if (liveness !== "dead") {
+ 		const staleAfterMs = options.staleAlivePidMs ?? 24 * 60 * 60 * 1000;
+--- a/src/runs/background/subagent-runner.ts
++++ b/src/runs/background/subagent-runner.ts
+@@ -88,6 +88,7 @@
+ import { claimRunFanoutBatch, getRunFanoutBudgetSnapshot } from "../shared/run-fanout-budget.ts";
+ import { nestedSummaryFromAsyncStatus, projectNestedEvents, resolveNestedAsyncDir, writeNestedEvent } from "../shared/nested-events.ts";
+ import { formatModelAttemptNote, formatSubagentModelVerificationError, isContextOverflow, isRetryableModelFailure, recordRetryableModelFailure } from "../shared/model-fallback.ts";
++import { describeModelExclusion } from "../shared/model-exclusions.ts";
+ import {
+ 	SUBAGENT_STARTUP_RETRY_DELAYS_MS,
+ 	formatSubagentExtensionConflictError,
+@@ -142,7 +143,7 @@
+ import { formatParallelHandoffError, formatParallelHandoffReference, parallelHandoffPath, writeParallelHandoffGroup, writePendingParallelHandoff } from "../shared/parallel-handoff.ts";
+ import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
+ import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, PI_AGGREGATE_EVENT_PROJECTOR, projectChildLifecycle, type ChildLifecycleAction, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
+-import { acquireSessionLease, type SessionLeaseRequest } from "../shared/session-lease.ts";
++import { getProcessStartIdentity, acquireSessionLease, type SessionLeaseRequest } from "../shared/session-lease.ts";
+ import { buildExternalCliPrompt, runExternalCli } from "../shared/external-cli-runner.ts";
+ import { runExternalJob } from "../shared/external-job-runner.ts";
+ import { createOrcaProgressTab, type OrcaProgressTab } from "../shared/orca-progress-tabs.ts";
+@@ -582,13 +583,34 @@
+ 			...(piPackageRoot ? { piPackageRoot } : {}),
+ 			...(piArgv1 ? { argv1: piArgv1 } : {}),
+ 		});
+-		const child = spawn(spawnSpec.command, spawnSpec.args, {
++		const managedRuntime = (globalThis as any)[Symbol.for("braid.native-runtime.v1")];
++		let child: ReturnType<typeof spawn>;
++		let nativeStartupError: string | undefined;
++		try {
++		child = (managedRuntime?.spawnManaged ?? spawn)(spawnSpec.command, spawnSpec.args, {
+ 			cwd,
+ 			stdio: ["ignore", "pipe", "pipe"],
+ 			env: spawnEnv,
+ 			windowsHide: true,
+ 			detached: process.platform !== "win32",
++		}, { kind: "native", manifest: outputFile });
++		void managedRuntime?.waitManagedStartup(child).then((startup: { payload_pid?: number }) => {
++			if (!Number.isInteger(startup.payload_pid)) throw new Error("Managed native Pi start receipt has no payload PID.");
++			onWriterProcess?.({ state: "running", pid: startup.payload_pid! });
++			managedRuntime.publishChildStartup(path.dirname(outputFile), "started");
++		}).catch((error) => {
++			nativeStartupError = `native_start_failed: ${error instanceof Error ? error.message : String(error)}`;
++			managedRuntime.publishChildStartup(path.dirname(outputFile), "failed", nativeStartupError);
++			try { child.kill("SIGTERM"); } catch {}
+ 		});
++		} catch (error) {
++			const message = `native_start_failed: ${error instanceof Error ? error.message : String(error)}`;
++			managedRuntime?.publishChildStartup(path.dirname(outputFile), "failed", message);
++			outputStream.end();
++			onWriterProcess?.({ state: "none" });
++			resolve({ stderr: message, exitCode: 75, messages: [], usage: emptyUsage(), toolCount: 0, durationMs: Date.now() - startedAt, error: message, finalOutput: message, outputState: "absent", processInstanceId, processTree: { state: "unknown", reason: "verification-failed", diagnostic: message } });
++			return;
++		}
+ 		let processTreeController: OwnedProcessTreeController | undefined;
+ 		const stderrTail = createBoundedByteTail();
+ 		const rawStdoutTail = createBoundedByteTail();
+@@ -597,9 +619,9 @@
+ 		let model: string | undefined;
+ 		let writerRegistrationError: string | undefined;
+ 		if (typeof child.pid === "number") {
+-			processTreeController = createOwnedProcessTreeController(child.pid);
++			processTreeController = managedRuntime?.createManagedProcessTreeController(child) ?? createOwnedProcessTreeController(child.pid);
+ 			try {
+-				onWriterProcess?.({ state: "running", pid: child.pid });
++				if (!managedRuntime) onWriterProcess?.({ state: "running", pid: child.pid });
+ 			} catch (writerError) {
+ 				writerRegistrationError = `Failed to record revived Pi writer ownership: ${writerError instanceof Error ? writerError.message : String(writerError)}`;
+ 				trySignalChild(child, "SIGKILL");
+@@ -987,6 +1009,7 @@
+ 			clearDrainTimers();
+ 		});
+ 		child.on("close", async (exitCode, signal) => {
++			await managedRuntime?.finishManagedProcess(child, { exit_code: exitCode, signal, observed_at: Date.now() });
+ 			settled = true;
+ 			const processCloseObservedAt = Date.now();
+ 			const processTree = processTreeController
+@@ -1008,7 +1031,7 @@
+ 			outputStream.end();
+ 			const stderr = stderrTail.text();
+ 			const finalOutput = getFinalOutput(messages) || rawStdoutTail.text().trim();
+-			const finalError = error ?? assistantError;
++			const finalError = nativeStartupError ?? error ?? assistantError;
+ 			const forcedDrainAfterFinalSuccess = Boolean(forcedTerminationSignal || signal) && (cleanTerminalAssistantStopReceived || agentSettledReceived) && !finalError;
+ 			const signalError = isUnexplainedProcessSignal({
+ 				processSignal: signal,
+@@ -1508,6 +1531,14 @@
+ 		});
+ 	}
+ 
++	if (step.modelCandidates !== undefined && step.modelCandidates.length === 0) {
++		const diagnostic = step.model ? describeModelExclusion(step.model) : undefined;
++		const error = diagnostic
++			? `No launchable subagent model candidates; refusing ambient provider fallback. ${diagnostic}`
++			: "No launchable subagent model candidates; refusing ambient provider fallback.";
++		return omitUndefinedProperties({ agent: step.agent, context: step.context, output: error, error, success: false, exitCode: 1 });
++	}
++
+ 	const candidates = step.modelCandidates !== undefined
+ 		? step.modelCandidates.length > 0 ? step.modelCandidates : [undefined]
+ 		: step.model
+@@ -1808,7 +1839,8 @@
+ 			turnBudgetExceeded: run.turnBudgetExceeded,
+ 		})) ? formatProcessSignalError(run.processSignal!) : undefined;
+ 		const error = formatSubagentExtensionConflictError(
+-			toolAvailabilityError
++			(run.error?.startsWith("native_start_failed:") ? run.error : undefined)
++				?? toolAvailabilityError
+ 				?? completionGuardError
+ 				?? structuredError
+ 				?? emptyOutputError
+@@ -1840,7 +1872,7 @@
+ 			toolBudget = toolBudgetState(step.toolBudget, toolMessages.length, blockedMessage ? (blockedMessage as { toolName?: string }).toolName : undefined);
+ 		}
+ 		finalResult = { ...run, exitCode: effectiveExitCode, model: candidate ?? run.model, error, structuredOutput, runtimeAcknowledgedExtensions, ...(step.agentContract ? { agentContract: step.agentContract } : {}), ...(fileMutationEffect ? { effects: { fileMutation: fileMutationEffect } } : {}) } as RunPiStreamingResult & { structuredOutput?: unknown; agentContract?: import("../../shared/types.ts").AgentContract; effects?: import("../../shared/types.ts").EffectsProjection };
+-		if (run.turnBudgetExceeded) break modelAttemptsLoop;
++		if (run.turnBudgetExceeded || run.error?.startsWith("native_start_failed:")) break modelAttemptsLoop;
+ 		if (run.stopped || run.timedOut || ctx.timeoutSignal?.aborted || ctx.stopSignal?.aborted || ctx.skipAcceptance?.()) break modelAttemptsLoop;
+ 		if (attempt.success || completionGuardTriggered) break modelAttemptsLoop;
+ 
+@@ -2504,6 +2536,7 @@
+ 		...(config.toolBudget ? { toolBudget: initialToolBudgetState(config.toolBudget) } : {}),
+ 		...(config.usageBudget ? { usageBudget: usageBudgetState(config.usageBudget, undefined) } : {}),
+ 		pid: process.pid,
++		processStartIdentity: getProcessStartIdentity(process.pid),
+ 		cwd,
+ 		currentStep: 0,
+ 		chainStepCount: steps.length,
+@@ -3754,6 +3787,7 @@
+ 			mode: statusPayload.mode,
+ 			cwd,
+ 			pid: process.pid,
++		processStartIdentity: getProcessStartIdentity(process.pid),
+ 		}),
+ 	);
+ 
+@@ -3788,6 +3822,12 @@
+ 					const thinkingOverride = step.thinkingOverrides?.[itemIndex];
+ 					const model = thinkingOverride ? applyThinkingSuffix(step.parallel.model, thinkingOverride, true) : step.parallel.model;
+ 					const configThinking = thinkingOverride ? thinkingOverride : step.parallel.thinking;
++					if (step.parallel.modelCandidates !== undefined && step.parallel.modelCandidates.length === 0) {
++						const diagnostic = step.parallel.model ? describeModelExclusion(step.parallel.model) : undefined;
++						throw new Error(diagnostic
++							? `No launchable subagent model candidates; refusing ambient provider fallback. ${diagnostic}`
++							: "No launchable subagent model candidates; refusing ambient provider fallback.");
++					}
+ 					const candidates = step.parallel.modelCandidates !== undefined
+ 						? step.parallel.modelCandidates.length > 0
+ 							? step.parallel.modelCandidates.map((candidate) => thinkingOverride ? applyThinkingSuffix(candidate, thinkingOverride, true) ?? candidate : candidate)
+@@ -5369,6 +5409,7 @@
+ }
+ 
+ async function runConfiguredSubagent(config: SubagentRunConfig): Promise<void> {
++	const managedRuntime = process.env.BRAID_NATIVE_RUNTIME_MODULE ? await import(process.env.BRAID_NATIVE_RUNTIME_MODULE) : undefined;
+ 	let lease: ReturnType<typeof acquireSessionLease> | undefined;
+ 	let startupCommitted = config.revivalLease === undefined;
+ 	const startupPath = path.join(config.asyncDir, "runner-startup.json");
+@@ -5400,6 +5441,10 @@
+ 			}
+ 		}
+ 		await runSubagent(config, lease ? (writer) => lease!.updateWriter(writer) : undefined);
++		if (managedRuntime && !fs.existsSync(path.join(config.asyncDir, "native-child-startup.json"))) {
++			const status = JSON.parse(fs.readFileSync(path.join(config.asyncDir, "status.json"), "utf8"));
++			managedRuntime.publishChildStartup(config.asyncDir, "failed", status.error ?? status.steps?.find((step: any) => step.error)?.error ?? "No native Pi child was started; the retained status records the completed preparation or failure.");
++		}
+ 	} catch (error) {
+ 		if (config.revivalLease && !startupCommitted) {
+ 			try {
+@@ -5408,6 +5453,7 @@
+ 				// The parent will time out and terminate this runner if the handshake cannot be written.
+ 			}
+ 		}
++		managedRuntime?.publishChildStartup(config.asyncDir, "failed", error instanceof Error ? error.message : String(error));
+ 		throw error;
+ 	} finally {
+ 		process.off("exit", releaseOnExit);
+--- a/src/runs/background/subagent-wait.ts
++++ b/src/runs/background/subagent-wait.ts
+@@ -550,9 +550,19 @@
+ 
+ 	let providerActive = providerSnapshot.items;
+ 	if (active.length === 0 && providerActive.length === 0) {
++		if (params.id) {
++			const retained = listAsyncRuns(deps.asyncDirRoot ?? DIRS.async, {
++				sessionId: deps.state.currentSessionId ?? undefined, resultsDir: deps.resultsDir ?? DIRS.results,
++				includeNested: false, runId: params.id,
++			}).filter(run => matchesId(run, params.id!));
++			if (retained.length === 1 && !ACTIVE_STATES.includes(retained[0]!.state)) {
++				const run = retained[0]!;
++				return result(`Subagent ${run.id} is already ${run.state}; no live task will be waited for. ${formatAsyncRunList(retained)} Inspect its retained result and artifacts before deciding whether to start a new task.`, run.state === "failed");
++			}
++		}
+ 		return result(params.id
+-			? `No active run matched "${params.id}". Nothing to wait for.`
+-			: "No active async runs or registered provider work in this session. Nothing to wait for.");
++			? `UNKNOWN_SUBAGENT: no active subagent matched "${params.id}". Bash pbb handles belong to background_job; use result or wait there.`
++			: "No active async runs or registered provider work in this session. Nothing to wait for.", Boolean(params.id));
+ 	}
+ 	const waitParams = params.id ? { ...params, id: active[0]!.id } : params;
+ 	const initialAsyncIds = new Set(active.map((run) => run.id));
+--- a/src/runs/foreground/execution.ts
++++ b/src/runs/foreground/execution.ts
+@@ -541,15 +541,31 @@
+ 
+ 	const exitCode = await new Promise<number>((resolve) => {
+ 		const spawnSpec = getPiSpawnCommand(args);
+-		const proc = spawn(spawnSpec.command, spawnSpec.args, {
++		const managedRuntime = (globalThis as any)[Symbol.for("braid.native-runtime.v1")];
++		let proc: ReturnType<typeof spawn>;
++		try {
++		proc = (managedRuntime?.spawnManaged ?? spawn)(spawnSpec.command, spawnSpec.args, {
+ 			cwd: options.cwd ?? runtimeCwd,
+ 			env: spawnEnv,
+ 			stdio: ["ignore", "pipe", "pipe"],
+ 			windowsHide: true,
+-		});
++		}, { kind: "native", manifest: shared.jsonlPath });
++		} catch (error) {
++			result.error = `native_start_failed: ${error instanceof Error ? error.message : String(error)}`;
++			result.finalOutput = result.error;
++			cleanupTempDir(tempDir);
++			resolve(75);
++			return;
++		}
+ 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
+ 		let processClosed = false;
+ 		let lifecycleFinished = false;
++		const startup = managedRuntime?.waitManagedStartup(proc);
++		startup?.catch((error) => {
++			result.error = `native_start_failed: ${error instanceof Error ? error.message : String(error)}`;
++			result.finalOutput = result.error;
++			try { proc.kill("SIGTERM"); } catch {}
++		});
+ 		let detached = false;
+ 		let intercomStarted = false;
+ 		let assistantError: string | undefined;
+@@ -1310,7 +1326,8 @@
+ 			childExited = true;
+ 			clearFinalDrainTimers();
+ 		});
+-		proc.on("close", (code, signal) => {
++		proc.on("close", async (code, signal) => {
++			await managedRuntime?.finishManagedProcess(proc, { exit_code: code, signal, observed_at: Date.now() });
+ 			if (lifecycleFinished) return;
+ 			processClosed = true;
+ 			clearFinalDrainTimers();
+@@ -1361,7 +1378,7 @@
+ 			stdoutReader.end();
+ 			stderrReader.end();
+ 			if (!result.error) {
+-				result.error = error instanceof Error ? error.message : String(error);
++				result.error = `native_start_failed: ${error instanceof Error ? error.message : String(error)}`;
+ 			}
+ 			finish(1);
+ 		});
+@@ -1917,7 +1934,7 @@
+ 			// Preserve the legacy intercom handoff contract: once this logical run has
+ 			// been handed to a supervisor, terminating that attempt must not launch a
+ 			// startup retry or model fallback. Explicit user detach retains fallback.
+-			if (intercomDetached || result.timedOut || result.turnBudgetExceeded) break modelAttemptsLoop;
++			if (intercomDetached || result.timedOut || result.turnBudgetExceeded || result.error?.startsWith("native_start_failed:")) break modelAttemptsLoop;
+ 			if (attemptSucceeded) break modelAttemptsLoop;
+ 
+ 			const startupFailure = isRetryableSubagentStartupFailure({
+--- a/src/runs/foreground/subagent-executor.ts
++++ b/src/runs/foreground/subagent-executor.ts
+@@ -1,3 +1,4 @@
++import { getProcessStartIdentity } from "../shared/session-lease.ts";
+ import { randomUUID } from "node:crypto";
+ import * as fs from "node:fs";
+ import * as path from "node:path";
+@@ -1585,7 +1586,7 @@
+ 		...input.baseAgentConfig,
+ 		runner: { type: "external-job", provider: runner.provider, options: runner.options },
+ 	};
+-	const result = executeAsyncSingle(runId, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
++	const result = await executeAsyncSingle(runId, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
+ 		agent: input.target.agent,
+ 		task: input.followUp,
+ 		goal: input.followUp,
+@@ -1820,7 +1821,7 @@
+ 		const chain = wrapChainTasksForFork(attachChain, contextPolicy);
+ 		const normalized = normalizeSkillInput(input.params.skill);
+ 		const parentModel = input.parentModel;
+-		const result = executeAsyncChain(runId, compactOptional<Parameters<typeof executeAsyncChain>[1]>({
++		const result = await executeAsyncChain(runId, compactOptional<Parameters<typeof executeAsyncChain>[1]>({
+ 			chain,
+ 			task: workflowTask,
+ 			goal,
+@@ -1924,7 +1925,7 @@
+ 	const availableModels = input.ctx.modelRegistry.getAvailable().map(toModelInfo);
+ 	const parentModel = input.parentModel;
+ 	const revivalAsyncDir = path.join(DIRS.async, runId);
+-	const result = executeAsyncSingle(runId, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
++	const result = await executeAsyncSingle(runId, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
+ 		agent: target.agent,
+ 		task: buildRevivedAsyncTask(target as Parameters<typeof buildRevivedAsyncTask>[0], effectiveFollowUp),
+ 		goal: effectiveFollowUp,
+@@ -3157,7 +3158,7 @@
+ 			? params.model ?? (externalRunnerWithoutExplicitModel ? undefined : a.model)
+ 			: resolveEffectiveSubagentModel(params.model as string | undefined, a.model, parentModel, availableModels, a.modelProvider ?? currentProvider, modelScopes.length === 0 ? {} : { scope: modelScopes });
+ 		const modelOverrideFromParent = inheritsParentModel(params.model as string | undefined, a.model, parentModel);
+-		const asyncResult = executeAsyncSingle(id, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
++		const asyncResult = await executeAsyncSingle(id, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
+ 			agent: params.agent!,
+ 			task: shouldForkAgent(contextPolicy, params.agent!) ? wrapForkTask(params.task ?? "") : (params.task ?? ""),
+ 			goal: params.task ?? "",
+@@ -4429,6 +4430,7 @@
+ 					...(workflowSessionRoot ? { sessionRoot: workflowSessionRoot } : {}),
+ 					...(requestParams.scheduleOrigin ? { scheduleOrigin: requestParams.scheduleOrigin } : {}),
+ 					pid: process.pid,
++					processStartIdentity: getProcessStartIdentity(process.pid),
+ 					steps: [],
+ 					workflow: { trace: [], emits: [], console: [] },
+ 					runFanoutBudget: getRunFanoutBudgetSnapshot(workflowFanoutBudget),
+--- a/src/runs/shared/model-exclusions.ts
++++ b/src/runs/shared/model-exclusions.ts
+@@ -176,6 +176,31 @@
+ }
+ 
+ /**
++ * Return the active exclusion that blocks a full provider/model id.
++ * Callers use this only for diagnostics; it never clears or bypasses an exclusion.
++ */
++export function findModelExclusion(fullId: string, opts?: { now?: number }): ModelExclusion | undefined {
++	ensureLoaded();
++	const timestamp = opts?.now ?? Date.now();
++	const { provider, modelId } = parseModelKey(fullId);
++	return exclusions.find((entry) => entryMatches(entry, modelId, provider, timestamp));
++}
++
++function diagnosticReason(reason: string | undefined): string {
++	if (!reason) return "provider runtime failure";
++	if (/429|rate.?limit|quota|credit|balance/i.test(reason)) return "provider rate/quota failure";
++	if (/401|auth|api.?key|unauthori[sz]ed/i.test(reason)) return "provider authentication failure";
++	return "provider runtime failure";
++}
++
++/** Format an active exclusion without exposing stored provider error text. */
++export function describeModelExclusion(fullId: string, opts?: { now?: number }): string | undefined {
++	const entry = findModelExclusion(fullId, opts);
++	if (!entry) return undefined;
++	return `model '${fullId}' is excluded until ${new Date(entry.expiresAt).toISOString()} (${diagnosticReason(entry.reason)}).`;
++}
++
++/**
+  * Number of live (non-expired) exclusions.
+  */
+ export function getExcludedCount(): number {
+--- a/src/runs/shared/model-fallback.ts
++++ b/src/runs/shared/model-fallback.ts
+@@ -1,6 +1,6 @@
+ import { splitKnownThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
+ import type { Usage } from "../../shared/types.ts";
+-import { filterFallbackCandidates, parseModelKey, recordModelFailure } from "./model-exclusions.ts";
++import { describeModelExclusion, filterFallbackCandidates, parseModelKey, recordModelFailure } from "./model-exclusions.ts";
+ import { checkModelScope, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
+ 
+ export type { AvailableModelInfo };
+@@ -394,7 +394,15 @@
+ 		seen.add(normalized);
+ 		candidates.push(normalized);
+ 	}
+-	return filterFallbackCandidates(candidates);
++	const filtered = filterFallbackCandidates(candidates);
++	if (candidates.length > 0 && filtered.length === 0) {
++		const details = candidates
++			.map((candidate) => describeModelExclusion(candidate))
++			.filter((detail): detail is string => detail !== undefined)
++			.join(" ");
++		throw new Error(`All requested subagent model candidates are temporarily excluded; refusing ambient provider fallback. ${details}`.trim());
++	}
++	return filtered;
+ }
+ 
+ const RETRYABLE_MODEL_FAILURE_PATTERNS = [
+--- a/src/runs/shared/pi-args.ts
++++ b/src/runs/shared/pi-args.ts
+@@ -453,7 +453,9 @@
+ 					? ["read", ...requestedBuiltinTools]
+ 					: requestedBuiltinTools
+ 				).filter((tool) => !allowedToolSet || allowedToolSet.has(tool));
+-	const fanoutAuthorized = declaredBuiltinTools.includes("subagent");
++	const fanoutAuthorized =
++		declaredBuiltinTools.includes("subagent") ||
++		(input.tools === undefined && allowedToolSet === undefined);
+ 	const toolExtensionPaths: string[] = capabilityCeiling?.denyExtensions
+ 		? []
+ 		: (input.tools ?? []).filter(
+--- a/src/runs/shared/session-lease.ts
++++ b/src/runs/shared/session-lease.ts
+@@ -1,4 +1,5 @@
+ import { createHash, randomUUID } from "node:crypto";
++import { execFileSync } from "node:child_process";
+ import * as fs from "node:fs";
+ import * as os from "node:os";
+ import * as path from "node:path";
+@@ -65,7 +66,7 @@
+ 	}
+ }
+ 
+-function getProcessStartIdentity(pid: number): string | undefined {
++export function getProcessStartIdentity(pid: number): string | undefined {
+ 	if (process.platform === "linux") {
+ 		try {
+ 			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+@@ -77,6 +78,12 @@
+ 		} catch {
+ 			return undefined;
+ 		}
++	}
++	if (process.platform === "darwin") {
++		try {
++			const birth = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf-8", timeout: 2000 }).trim();
++			return birth ? `darwin:${birth}` : undefined;
++		} catch { return undefined; }
+ 	}
+ 	return undefined;
+ }
+--- a/src/shared/types.ts
++++ b/src/shared/types.ts
+@@ -1450,6 +1450,8 @@
+ 	runId: string;
+ 	/** Parent Pi process/window that owns local completion delivery. */
+ 	completionOwnerId?: string;
++	/** OS process birth identity, never PID liveness alone. */
++	processStartIdentity?: string;
+ 	/** Host tool-call id retained when it differs from the internal run id. */
+ 	toolCallId?: string;
+ 	sessionId?: string;
+--- a/src/shared/utils.ts
++++ b/src/shared/utils.ts
+@@ -307,6 +307,10 @@
+  * Get the final text output from a list of messages
+  */
+ export function getFinalOutput(messages: Message[]): string {
++	const lastAssistant = messages.findLast((message) => message.role === "assistant");
++	if (lastAssistant?.role === "assistant" && lastAssistant.stopReason === "length") {
++		return `[结果不完整：stopReason=length，回答因长度限制截断。保留以下部分内容；按需仅补缺失部分，不必重做已完成工作。]\n\n${extractTextFromContent(lastAssistant.content)}`;
++	}
+ 	const validTextParts: string[] = [];
+ 	for (let i = messages.length - 1; i >= 0; i--) {
+ 		const msg = messages[i];
+@@ -509,6 +513,15 @@
+  * Detect errors in subagent execution from messages (only errors with no subsequent success)
+  */
+ export function detectSubagentError(messages: Message[]): ErrorInfo {
++	const lastAssistant = messages.findLast((message) => message.role === "assistant");
++	if (lastAssistant?.role === "assistant" && lastAssistant.stopReason === "length") {
++		return {
++			hasError: true,
++			exitCode: 1,
++			errorType: "response",
++			details: "stopReason=length：回答因长度限制截断，已有部分内容已保留；是否补齐缺失内容由调用者决定。",
++		};
++	}
+ 	let lastAssistantTextIndex = -1;
+ 	for (let i = messages.length - 1; i >= 0; i--) {
+ 		const msg = messages[i];
+--- a/src/runs/shared/external-job-bridge.ts
++++ b/src/runs/shared/external-job-bridge.ts
+@@ -1,3 +1,4 @@
++import { getProcessStartIdentity as sharedProcessStartIdentity } from "./session-lease.ts";
+ import { randomUUID } from "node:crypto";
+ import * as fs from "node:fs";
+ import * as os from "node:os";
+@@ -127,6 +128,7 @@
+ }
+ 
+ function processStartIdentity(pid: number): string | undefined {
++	if (process.platform === "darwin") return sharedProcessStartIdentity(pid);
+ 	if (process.platform === "linux") {
+ 		try {
+ 			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+--- a/src/runs/background/async-retention.ts
++++ b/src/runs/background/async-retention.ts
+@@ -1,3 +1,4 @@
++import { getProcessStartIdentity as sharedProcessStartIdentity } from "../shared/session-lease.ts";
+ import { spawnSync } from "node:child_process";
+ import * as fs from "node:fs";
+ import * as os from "node:os";
+@@ -318,6 +319,7 @@
+ }
+ 
+ function processStartIdentity(pid: number): string | undefined {
++	if (process.platform === "darwin") return sharedProcessStartIdentity(pid);
+ 	if (process.platform === "linux") {
+ 		try {
+ 			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+--- a/src/missions/workflow-state.ts
++++ b/src/missions/workflow-state.ts
+@@ -1,3 +1,4 @@
++import { getProcessStartIdentity } from "../runs/shared/session-lease.ts";
+ import { execFileSync } from "node:child_process";
+ import { randomUUID } from "node:crypto";
+ import * as fs from "node:fs";
+@@ -67,6 +68,7 @@
+ }
+ 
+ function processStartKey(pid: number): string | undefined {
++	if (process.platform === "darwin") return getProcessStartIdentity(pid);
+ 	if (process.platform === "linux") return linuxProcessStartKey(pid) ?? psProcessStartKey(pid);
+ 	if (process.platform === "win32") return windowsProcessStartKey(pid);
+ 	return undefined;

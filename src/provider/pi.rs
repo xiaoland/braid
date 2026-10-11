@@ -3,6 +3,9 @@ use super::*;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
+#[path = "pi_runtime.rs"]
+mod runtime;
+
 struct PiRequest {
     response: oneshot::Sender<Result<Value, ProviderError>>,
     turn_id: Option<String>,
@@ -17,6 +20,7 @@ struct PiProcess {
     stdout_handle: tokio::task::JoinHandle<()>,
     #[allow(dead_code)]
     stderr_handle: tokio::task::JoinHandle<()>,
+    execution: Option<runtime::Execution>,
 }
 
 struct PiState {
@@ -41,6 +45,10 @@ pub struct PiProvider {
 }
 
 impl PiProvider {
+    pub(crate) fn validate_material(config: &PiConfig) -> Result<(), ProviderError> {
+        runtime::load(config).map(|_| ())
+    }
+
     pub fn connect(config: &PiConfig) -> Self {
         let (notifications, _) = broadcast::channel(512);
         let (closed, _) = watch::channel(false);
@@ -70,8 +78,29 @@ impl PiProvider {
         workspace: &Path,
         session: Option<&str>,
     ) -> Result<(), ProviderError> {
-        let mut cmd = Command::new(&state.config.executable);
+        let material = runtime::load(&state.config)?;
+        let execution =
+            material.as_ref().map(|material| material.execution(workspace)).transpose()?;
+        let mut cmd = if let Some(execution) = &execution {
+            execution.command(&state.config.executable)
+        } else {
+            Command::new(&state.config.executable)
+        };
         cmd.args(["--mode", "rpc"]);
+        if execution.is_none() {
+            // External Pi is a base adapter; unmanaged ambient plugins cannot
+            // satisfy Braid's background result and owned-stop contract.
+            cmd.arg("--no-extensions");
+            for key in [
+                "BRAID_NATIVE_RUNTIME_MODULE",
+                "BRAID_NATIVE_EXECUTION_DIR",
+                "BRAID_NATIVE_EXECUTION_ID",
+                "BRAID_NATIVE_START_ID",
+                "BRAID_NATIVE_LAUNCH_START_ID",
+            ] {
+                cmd.env_remove(key);
+            }
+        }
         let session_dir = workspace.join(".braid").join("pi-sessions");
         std::fs::create_dir_all(&session_dir).map_err(|error| {
             ProviderError::Protocol(format!(
@@ -91,38 +120,17 @@ impl PiProvider {
         }
         if let Some(home) = &state.config.home {
             cmd.env("PI_CODING_AGENT_DIR", home);
+        } else if execution.is_some() {
+            let home = workspace.join(".braid/pi-home");
+            std::fs::create_dir_all(&home)?;
+            cmd.env("PI_CODING_AGENT_DIR", home);
         }
         if let Ok(api_key) = state.config.api_key()
             && let Some(api_key_env) = &state.config.api_key_environment
         {
             cmd.env(api_key_env, api_key);
         }
-        // Native shell commands must reach the same Braid binary as this runtime.
-        if let Ok(current_exe) = std::env::current_exe()
-            && let Some(exe_dir) = current_exe.parent()
-        {
-            let mut path_parts: Vec<PathBuf> =
-                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
-            if !path_parts.iter().any(|p| p == exe_dir) {
-                path_parts.insert(0, exe_dir.to_path_buf());
-            }
-            cmd.env(
-                "PATH",
-                std::env::join_paths(path_parts).map_err(|error| {
-                    ProviderError::Protocol(format!("cannot build native Pi PATH: {error}"))
-                })?,
-            );
-        }
-        if let Some(braid_config) = &state.config.braid_config_path {
-            let braid_config = if braid_config.is_absolute() {
-                braid_config.clone()
-            } else {
-                std::env::current_dir()?.join(braid_config)
-            };
-            cmd.env("BRAID_CONFIG", braid_config).env("BRAID_AGENT", "1");
-        } else if let Ok(braid_config) = std::env::var("BRAID_CONFIG") {
-            cmd.env("BRAID_CONFIG", braid_config);
-        }
+        configure_braid_environment(&mut cmd, &state.config)?;
         if let Some(session_path) = session {
             cmd.args(["--session", session_path]);
         }
@@ -155,9 +163,63 @@ impl PiProvider {
         );
         let stderr_handle =
             spawn_pi_stderr(stderr, Arc::clone(&self.thread_id), Arc::clone(&self.turn_id));
-        state.process =
-            Some(PiProcess { writer: Some(writer), child, stdout_handle, stderr_handle });
+        state.process = Some(PiProcess {
+            writer: Some(writer),
+            child,
+            stdout_handle,
+            stderr_handle,
+            execution,
+        });
         Ok(())
+    }
+
+    async fn prepare_native_close(
+        state: &mut PiState,
+        confirmed_idle: bool,
+    ) -> Result<bool, ProviderError> {
+        let managed = state.process.as_ref().is_some_and(|process| process.execution.is_some());
+        if managed {
+            // The live RPC fences spawning and drains registered plugin work;
+            // offline verification after EOF is the authoritative final scope.
+            let stopped = Self::request(state, json!({"type":"stop_owned_execution"})).await;
+            match stopped {
+                Ok(receipt) => {
+                    let execution = state
+                        .process
+                        .as_ref()
+                        .and_then(|process| process.execution.as_ref())
+                        .expect("managed execution");
+                    tracing::info!(name = "braid.provider.execution", provider.execution.id = %execution.id, receipt = %receipt,
+                            "Pi live owned execution stop receipt; offline verification follows");
+                    if receipt["data"]["execution_id"] != execution.id {
+                        tracing::warn!(provider.execution.id = %execution.id, receipt = %receipt,
+                                "Pi live stop receipt has mismatched identity; not accepted as stop proof");
+                    }
+                }
+                Err(error) => tracing::warn!(error.reason = %error,
+                        "Pi live owned execution stop unavailable; EOF and offline verification required"),
+            }
+            if !confirmed_idle {
+                for operation in ["clear_queue", "abort"] {
+                    if let Err(error) = Self::request(state, json!({"type": operation})).await {
+                        tracing::warn!(error.reason = %error, provider.process.operation = operation,
+                                "Pi native cancellation unavailable before owned cleanup");
+                    }
+                }
+            }
+        } else if !confirmed_idle {
+            let cleared = Self::request(state, json!({"type":"clear_queue"})).await?;
+            Self::success_or_protocol(&cleared, "clear_queue")?;
+            let aborted = Self::request(state, json!({"type":"abort"})).await?;
+            Self::success_or_protocol(&aborted, "abort")?;
+            let native = Self::request(state, json!({"type":"get_state"})).await?;
+            if native_is_busy(&native)? {
+                return Err(ProviderError::Protocol(
+                    "Pi remains busy after abort; replacement is blocked".into(),
+                ));
+            }
+        }
+        Ok(managed)
     }
 
     async fn request(state: &mut PiState, frame: Value) -> Result<Value, ProviderError> {
@@ -268,6 +330,7 @@ impl AgentProvider for PiProvider {
         Self::success_or_protocol(&result, "new_session")?;
 
         let state_resp = Self::request(&mut state, json!({"type": "get_state"})).await?;
+        validate_started_runtime(&mut state, &state_resp).await?;
         let session_file = state_resp
             .get("data")
             .and_then(|data| data.get("sessionFile"))
@@ -324,6 +387,7 @@ impl AgentProvider for PiProvider {
         state.process = None;
         self.spawn(&mut state, profile.workspace(), Some(thread_id))?;
         let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
+        validate_started_runtime(&mut state, &native).await?;
         let resumed_path = required_string(&native["data"], "sessionFile", "Pi get_state")?;
         if Path::new(&resumed_path) != Path::new(thread_id) {
             return Err(ProviderError::Protocol("Pi resumed a different session path".into()));
@@ -364,6 +428,7 @@ impl AgentProvider for PiProvider {
         }
 
         let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
+        validate_managed_state(&state, &native)?;
         if native_is_busy(&native)? {
             return Err(ProviderError::Deferred(
                 "Pi is streaming, compacting or has queued input".into(),
@@ -444,23 +509,14 @@ impl AgentProvider for PiProvider {
         }
         let native_session_id = state.native_session_id.clone();
         let mut result = async {
-            if !confirmed_idle {
-                let cleared = Self::request(&mut state, json!({"type":"clear_queue"})).await?;
-                Self::success_or_protocol(&cleared, "clear_queue")?;
-                let aborted = Self::request(&mut state, json!({"type":"abort"})).await?;
-                Self::success_or_protocol(&aborted, "abort")?;
-                let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
-                if native_is_busy(&native)? {
-                    return Err(ProviderError::Protocol(
-                        "Pi remains busy after abort; replacement is blocked".into(),
-                    ));
-                }
-            }
+            let managed = Self::prepare_native_close(&mut state, confirmed_idle).await?;
             if let Some(process) = state.process.as_mut() {
                 // Unix pipe shutdown is a no-op; dropping stdin delivers Pi's EOF shutdown.
                 drop(process.writer.take());
-                wait_for_pi_child(process, thread_id, native_session_id.as_deref(), "graceful_eof")
-                    .await?;
+                let status = wait_for_pi_child(process, thread_id, native_session_id.as_deref(), "graceful_eof").await?;
+                if !managed && !status.success() {
+                    return Err(ProviderError::Unknown(format!("External Pi parent exited with {status}; no owned execution cleanup contract is available")));
+                }
             }
             Ok(())
         }
@@ -506,6 +562,15 @@ impl AgentProvider for PiProvider {
                 )));
             }
         }
+        if let Some(execution) =
+            state.process.as_ref().and_then(|process| process.execution.as_ref())
+            && let Err(error) = execution.cleanup().await
+        {
+            result = Err(ProviderError::Unknown(match result {
+                Ok(()) => error.to_string(),
+                Err(previous) => format!("{previous}; owned cleanup: {error}"),
+            }));
+        }
         state.close_result = Some(result.as_ref().copied().map_err(ToString::to_string));
         if result.is_ok() {
             state.process = None;
@@ -544,6 +609,7 @@ async fn wait_for_pi_child(
         process.pid = pid,
         provider.process.operation = "wait",
         provider.process.stage = stage,
+        provider.process.kind = if process.execution.is_some() { "managed_launcher" } else { "pi" },
         braid.outcome = if result.is_ok() { "exited" } else { "unconfirmed" },
         process.exit.status = exit_status.as_deref().unwrap_or(""),
         process.exit.code = exit_code,
@@ -566,6 +632,7 @@ fn spawn_pi_stdout(
         let mut lines = BufReader::new(stdout).lines();
         let mut last_stop = None;
         let mut last_error = None;
+        let mut extension_errors = Vec::new();
         while let Ok(Some(line)) = lines.next_line().await {
             let current_thread = thread_id.lock().await.clone();
             let current_turn = turn_id.lock().await.clone();
@@ -610,6 +677,9 @@ fn spawn_pi_stdout(
                                     frame["data"]
                                 )))
                             } else {
+                                last_stop = None;
+                                last_error = None;
+                                extension_errors.clear();
                                 *turn_id.lock().await = candidate;
                                 Ok(frame)
                             }
@@ -626,6 +696,7 @@ fn spawn_pi_stdout(
                 &current_turn,
                 &mut last_stop,
                 &mut last_error,
+                &mut extension_errors,
             ) {
                 let settled = matches!(notification, ProviderNotification::TurnCompleted { .. });
                 let _ = notifications.send(notification);
@@ -671,11 +742,22 @@ fn parse_pi_event(
     turn_id: &str,
     last_stop: &mut Option<String>,
     last_error: &mut Option<String>,
+    extension_errors: &mut Vec<String>,
 ) -> Option<ProviderNotification> {
     let event_type = frame.get("type")?.as_str()?;
     if event_type == "agent_start" {
         *last_stop = None;
         *last_error = None;
+    }
+    if event_type == "extension_error"
+        && matches!(
+            frame["event"].as_str(),
+            Some("agent_end" | "agent_before_settle" | "agent_settled")
+        )
+    {
+        let path = frame["extensionPath"].as_str().unwrap_or("unknown extension");
+        let detail = frame["error"].as_str().unwrap_or("extension reported no error detail");
+        extension_errors.push(format!("Pi {path} {} failed: {detail}", frame["event"]));
     }
     if event_type == "message_end" {
         let message = &frame["message"];
@@ -691,21 +773,39 @@ fn parse_pi_event(
         }),
         // Pi may persist, compact, or retry after message_end. Only settled
         // closes this physical run; a transient error must not abort recovery.
-        "agent_settled" => Some(ProviderNotification::TurnCompleted {
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            status: match last_stop.as_deref() {
-                Some("stop") => "completed",
-                Some("aborted") => "interrupted",
-                _ => "failed",
-            }
-            .into(),
-            error: if matches!(last_stop.as_deref(), Some("stop" | "aborted")) {
-                None
+        "agent_settled" => {
+            // Patched native calls carry cancellation; external Pi uses the
+            // final assistant's aborted reason. Extension failure wins over both.
+            let interrupted = frame["cancelled"].as_bool() == Some(true)
+                || last_stop.as_deref() == Some("aborted");
+            let completed = last_stop.as_deref() == Some("stop") && !interrupted;
+            let failed = !extension_errors.is_empty() || (!interrupted && !completed);
+            let error = if failed {
+                let mut reasons = extension_errors.clone();
+                if let Some(error) = last_error {
+                    reasons.insert(0, error.clone());
+                }
+                if reasons.is_empty() {
+                    reasons.push(format!("Pi settled with {last_stop:?}"));
+                }
+                Some(reasons.join("; "))
             } else {
-                Some(last_error.clone().unwrap_or_else(|| format!("Pi settled with {last_stop:?}")))
-            },
-        }),
+                None
+            };
+            Some(ProviderNotification::TurnCompleted {
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                status: if failed {
+                    "failed"
+                } else if interrupted {
+                    "interrupted"
+                } else {
+                    "completed"
+                }
+                .into(),
+                error,
+            })
+        }
         _ => None,
     }
 }
@@ -723,4 +823,79 @@ fn native_is_busy(response: &Value) -> Result<bool, ProviderError> {
         ProviderError::Protocol("Pi get_state missing pendingMessageCount".into())
     })?;
     Ok(streaming || compacting || pending != 0)
+}
+
+fn validate_managed_state(state: &PiState, response: &Value) -> Result<(), ProviderError> {
+    if let Some(execution) = state.process.as_ref().and_then(|process| process.execution.as_ref()) {
+        let managed = execution.state(response)?;
+        tracing::info!(name = "braid.provider.execution", provider.kind = "pi",
+            provider.execution.id = %execution.id, provider.managed.state = ?managed.status,
+            error.reason = managed.reason.as_deref().unwrap_or(""),
+            "Pi native managed state observation");
+    }
+    Ok(())
+}
+
+async fn validate_started_runtime(
+    state: &mut PiState,
+    response: &Value,
+) -> Result<(), ProviderError> {
+    let validation = validate_managed_state(state, response).and_then(|()| {
+        if let Some(execution) =
+            state.process.as_ref().and_then(|process| process.execution.as_ref())
+        {
+            let managed = execution.state(response)?;
+            if matches!(managed.status, runtime::ManagedStatus::Unknown) {
+                return Err(ProviderError::Protocol(format!(
+                    "Pi managed execution is unavailable at startup: {}",
+                    managed.reason.as_deref().unwrap_or("native returned unknown without a reason")
+                )));
+            }
+        }
+        Ok(())
+    });
+    let Err(error) = validation else { return Ok(()) };
+    let mut reasons = vec![error.to_string()];
+    if let Some(process) = state.process.as_mut() {
+        drop(process.writer.take());
+        if let Err(error) = wait_for_pi_child(process, "", None, "rejected_runtime").await {
+            reasons.push(error.to_string());
+        }
+        if let Some(execution) = &process.execution
+            && let Err(error) = execution.cleanup().await
+        {
+            reasons.push(error.to_string());
+        }
+    }
+    Err(ProviderError::Unknown(reasons.join("; ")))
+}
+
+fn configure_braid_environment(cmd: &mut Command, config: &PiConfig) -> Result<(), ProviderError> {
+    // Native shell commands must reach the same Braid binary as this runtime.
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(exe_dir) = current_exe.parent()
+    {
+        let mut path_parts: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        if !path_parts.iter().any(|p| p == exe_dir) {
+            path_parts.insert(0, exe_dir.to_path_buf());
+        }
+        cmd.env(
+            "PATH",
+            std::env::join_paths(path_parts).map_err(|error| {
+                ProviderError::Protocol(format!("cannot build native Pi PATH: {error}"))
+            })?,
+        );
+    }
+    if let Some(braid_config) = &config.braid_config_path {
+        let braid_config = if braid_config.is_absolute() {
+            braid_config.clone()
+        } else {
+            std::env::current_dir()?.join(braid_config)
+        };
+        cmd.env("BRAID_CONFIG", braid_config).env("BRAID_AGENT", "1");
+    } else if let Ok(braid_config) = std::env::var("BRAID_CONFIG") {
+        cmd.env("BRAID_CONFIG", braid_config);
+    }
+    Ok(())
 }

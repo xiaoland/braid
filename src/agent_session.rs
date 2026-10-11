@@ -69,8 +69,8 @@ pub enum SessionEvent {
 pub enum SessionError {
     #[error("session failed: {0}")]
     Failed(String),
-    #[error("session is unavailable")]
-    Unavailable,
+    #[error("session runtime is unavailable: {0}")]
+    Unavailable(String),
     #[error("session reception is unknown: {0}")]
     Unknown(String),
 }

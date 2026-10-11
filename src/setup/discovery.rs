@@ -54,8 +54,7 @@ pub async fn discover(adapter_type: &str) -> Result<Vec<DiscoveredRuntime>> {
 }
 
 /// Verify a discovered or manually supplied runtime and return a populated
-/// `RuntimeEntry`. For Codex this runs the schema handshake; for Pi it just
-/// re-runs --version.
+/// `RuntimeEntry`. For Codex this runs the schema handshake; for Pi it records an adjacent locked material manifest when present.
 pub async fn verify(runtime: DiscoveredRuntime) -> Result<RuntimeEntry> {
     if runtime.adapter_type == "codex" {
         let temp_config = CodexConfig {
@@ -73,6 +72,7 @@ pub async fn verify(runtime: DiscoveredRuntime) -> Result<RuntimeEntry> {
             version: identity.version,
             executable: runtime.executable,
             api_url: None,
+            native_runtime: None,
             home: Some(temp_config.home),
             stable_schema_sha256: Some(identity.stable_schema_sha256),
             experimental_schema_sha256: Some(identity.experimental_schema_sha256),
@@ -80,11 +80,17 @@ pub async fn verify(runtime: DiscoveredRuntime) -> Result<RuntimeEntry> {
     }
 
     if runtime.adapter_type == "pi" {
+        let native_runtime = runtime
+            .executable
+            .parent()
+            .map(|directory| directory.join("runtime-manifest.json"))
+            .filter(|manifest| manifest.is_file());
         return Ok(RuntimeEntry {
             adapter_type: runtime.adapter_type,
             version: runtime.version,
             executable: runtime.executable,
             api_url: None,
+            native_runtime,
             home: None,
             stable_schema_sha256: None,
             experimental_schema_sha256: None,
@@ -123,6 +129,7 @@ pub fn from_api_url(adapter_type: &str, api_url: String) -> Result<RuntimeEntry>
         version: "manual".to_owned(),
         executable: PathBuf::from("n/a"),
         api_url: Some(api_url),
+        native_runtime: None,
         home: None,
         stable_schema_sha256: None,
         experimental_schema_sha256: None,
@@ -132,8 +139,8 @@ pub fn from_api_url(adapter_type: &str, api_url: String) -> Result<RuntimeEntry>
 pub fn install_hint(adapter_type: &str) -> String {
     match adapter_type {
         "pi" => "Install the Pi CLI:\n\
-            pnpm add -g @anthropic-ai/pi-cli   # preferred\n\
-            # or: npm install -g @anthropic-ai/pi-cli\n\
+            npm install -g @earendil-works/pi-coding-agent\n\
+            # Managed plugins: see native/pi/README.md\n\
             # Then re-run `braid setup`."
             .to_owned(),
         "codex" => "Install the Codex CLI:\n\

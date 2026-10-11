@@ -150,11 +150,14 @@ replacement comment.
 canonical Event References；这不保证旧执行的 GitHub、Git 或 shell 副作用只发生一次。
 冷启动缺少原句柄时，遗留 starting、running 或 Unknown 也不能自动恢复。
 
-Context reset 可以记录待物化状态，但只有旧执行停止成功才创建替代会话。Pi 先等待
-原生 abort 收口，再释放 stdin 管道句柄以发送 EOF，并等待进程退出。Unix 管道的
+Context reset 可以记录待物化状态，但只有旧执行停止成功才创建替代会话。Pi 锁定材料先
+收口 owned 执行，再释放 stdin 管道句柄以发送 EOF，等待父进程退出并核对离线后代清理
+回执；外部基础 Pi 等待原生 abort 和父进程退出。Unix 管道的
 异步 shutdown 不会关闭该句柄，不能代替释放。进程观测记录实际 PID、原生会话、
 runtime generation、退出状态或具体等待错误；失败后的强制清理保留原失败和清理
 结果，不将父进程退出追认为工具停止成功。单独杀父进程不证明其工具已停止。
+Core idle 表示 turn 与 Wake batch 状态，不能推导插件后台结果已消费或进程静止；
+managed 执行状态由 Pi 材料独立记录，生命周期边界见 [provider 合同](app-server.md)。
 Codex 保留共享连接，等待目标 turn 的真实终态；连接丢失或通知缺失时不杀其它健康
 会话来换取恢复。停止不能撤销已经发出的外部请求或收回脱离原生管理的后台服务。
 

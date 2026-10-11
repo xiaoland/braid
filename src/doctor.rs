@@ -14,6 +14,7 @@ use crate::{
     github::{GitHubClient, RepositoryName},
     home::{self, UserHome},
     protocol::{inspect_codex, verify_identity},
+    provider::PiProvider,
     store::StoreActor,
 };
 
@@ -103,6 +104,20 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
                 });
             }
             if let Some(pi) = provider_config.pi {
+                if pi.native_runtime.is_some() {
+                    checks.push(match PiProvider::validate_material(&pi) {
+                        Ok(()) => Check {
+                            name: "Pi native material".into(),
+                            state: CheckState::Pass,
+                            detail: "locked file identities verified; live capabilities checked at session startup".into(),
+                        },
+                        Err(error) => Check {
+                            name: "Pi native material".into(),
+                            state: CheckState::Fail,
+                            detail: error.to_string(),
+                        },
+                    });
+                }
                 checks.push(match command_version("Pi CLI", &pi.executable).await {
                     check if check.state == CheckState::Pass => match pi.api_key() {
                         Ok(_) => Check {

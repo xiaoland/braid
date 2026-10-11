@@ -200,7 +200,7 @@ impl GroupDriver<'_> {
                         "resumed compatible Issue Agent provider session"
                     );
                 }
-                Err(error @ crate::agent_session::SessionError::Unavailable) => {
+                Err(error @ crate::agent_session::SessionError::Unavailable(_)) => {
                     unavailable = Some(error);
                 }
                 Err(error) => {

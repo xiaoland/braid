@@ -262,7 +262,7 @@ impl GroupDriver<'_> {
                         "resumed compatible PR Implementation Agent session"
                     );
                 }
-                Err(error @ crate::agent_session::SessionError::Unavailable) => {
+                Err(error @ crate::agent_session::SessionError::Unavailable(_)) => {
                     unavailable = Some(error);
                 }
                 Err(error) => {

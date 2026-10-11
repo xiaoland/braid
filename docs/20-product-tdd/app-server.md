@@ -128,7 +128,7 @@ Pi 通过 `--append-system-prompt` 注入 Braid 与 Profile 指令，保留核�
 持久化、压缩或重试。Adapter 等待 `agent_settled`，只有最终 `stopReason=stop` 才报告
 completed；`length`、错误或缺少停止原因均报告 failed。每次 `agent_start` 清空上一轮
 停止原因，避免沿用旧 turn 的成功状态。
-`stopReason=aborted` 报告 interrupted，供关闭和 Context reset 保存实际中断结果。
+Pi 1.0.2 的 settled `cancelled=true` 与旧 `stopReason=aborted` 都报告 interrupted，供关闭和 Context reset 保存实际中断结果。
 
 Pi 的初始 GitHub Context 是用户数据，仅在尚未进入原生历史时随首条输入送入；
 后续 turn 不重复拼接 Braid/Profile 指令或这份 Context。由于 Pi 的 RPC 没有持久
@@ -138,10 +138,31 @@ session 身份和 `get_entries` 的当前分支祖先中的实际 user message�
 注入。工具引用、其它分支或 ACK 本身都不证明消费；无法核对时明确失败。旁文件
 不是新的当前 Context 权威，也不据此重发结果未知的事件输入。
 
-Pi 关闭由原生 abort 收口及 child 退出共同确认；Codex 关闭保留共享 app-server，
-只接受目标 turn 的确定终态作为停止依据。停止失败向 Group 返回具体错误，不能
-吞掉错误后仅凭数据库 fence 启动替代会话。已脱离原生管理的后台服务和已发出的
-外部请求不在这些停止回执的保证范围内。
+Pi 的锁定原生材料由 `native/pi/` 交付，CLI 与 RPC 使用同一安装入口。
+`RuntimeEntry.native_runtime` 指向相邻 `runtime-manifest.json`；adapter 在启动前
+核对所有声明文件、入口与固定 Node 的 SHA-256，启动后通过 `get_state` 核对当前
+execution ID 和实际生命周期能力。`doctor` 的静态材料检查不能代替这个 live 握手。
+外部 Pi 保留基础接入，关闭环境自动扩展发现；需要插件共同合同时必须使用声明材料，
+不能继承宿主的未锁定插件。
+
+原生材料在 awaited extension hook 前传播唯一的重试意图，保留 extension_error，
+在结果交接结束后发布 settled。插件不能自行越过 Braid 发起下一轮推理；后台有限工作
+和长期服务分别登记，结果未被消费时仍属于 busy。异步 subagent 的返回必须等待
+真实 child 启动回执；runner PID 不等于 child 已启动，启动失败保留具体原因和
+清理结果。Core 的 turn idle 不代表 managed
+execution 静止，长期服务 busy 也不统一阻断普通输入。
+
+每次 Pi 物理启动取得新的 execution/start ID，所属工作目录下的
+`.braid/native-executions/<execution-id>` 保存进程登记、结果和停止回执。
+锁定材料关闭先请求 owned stop，再释放 stdin 发送 EOF、等待父进程，最后用固定 Node
+执行同一材料的离线清理并核对 exact execution 回执。Mac 与 Linux 都核对 OS 出生身份、
+登记进程组和继承 execution 标记；身份或停止范围不明时返回 unknown。
+这不构成安全沙箱，也不追踪主动擦除标记、脱离登记范围的进程或撤销已发出的外部请求。
+外部基础 Pi 仍使用 abort 与父退出依据，不声称具备插件后代清理合同。
+
+Codex 关闭保留共享 app-server，只接受目标 turn 的确定终态作为停止依据。
+停止失败向 Group 返回具体错误，不能吞掉错误后仅凭数据库 fence 启动替代会话。
+强制清理成功保留原关闭失败，不能改写为正常停止。
 
 Braid does not publish item/delta/tool/reasoning/assistant activity to GitHub.
 Those protocol events are retained only in sampled full-fidelity telemetry and

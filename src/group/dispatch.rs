@@ -590,7 +590,7 @@ impl GroupDriver<'_> {
             }
             Err(error) => {
                 let lifecycle: String = match error {
-                    crate::agent_session::SessionError::Unavailable
+                    crate::agent_session::SessionError::Unavailable(_)
                     | crate::agent_session::SessionError::Unknown(_) => "unknown".into(),
                     crate::agent_session::SessionError::Failed(_) => "failed".into(),
                 };
