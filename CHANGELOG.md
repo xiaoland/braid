@@ -5,6 +5,12 @@ Versioning once release artifacts are published.
 
 ## [Unreleased]
 
+- 内置本地 OTLP Collector 与 Web Console，直接查询/控制 Local 对象及托管 runtime，
+  保存原始批次、具体接收错误与明确会话/轮次证据。
+- 停止失败向监督器传播，不再把未确认的原生停止当作成功；替代启动受停止证明约束。
+- 数据库 schema 5 增加持久控制回执。使用新版本须先迁移；旧二进制不可读取 schema 5。
+
+
 - 新增内建协作空间：本地 Issue、讨论、指派、正文、生命周期和关联 PR，复用
   Context、调度及原生执行。`braid init` 不需要 GitHub App，Local serve 持续运行。
 - 新增真实 Git 候选发布、diff 与手工合并；持久合并意图和引用比较更新支持失败后

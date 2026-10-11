@@ -39,3 +39,56 @@ network error；没有用此现场宣称 telemetry 或模型全链路验收。�
 旧 GitHub config.example.toml 通过公开 config check；Local 实例的 github probe
 在连接之前明确拒绝，未借此访问 GitHub。最终 build、严格 Clippy、fmt 和 diff
 空白检查通过，未运行测试。
+
+## Web Console 与可观测性反哺（2026-10-11）
+
+独立 Braid 增加 Console 的 OTLP 接收/证据数据库/查询/可视化与直接控制接口，
+未迁入 Factory 的实验或赛事生命周期。所有新现场在 WorkSSD；没有模型、外部
+GitHub、测试或额外自检运行。当前产品和操作合同见 docs/user-manual/console.md、
+docs/20-product-tdd/README.md 与 docs/40-deployment/README.md。
+
+实际 SDK 三信号已通过公开诊断命令发送，Collector 保留完整原始批次、属性、
+资源身份和纳秒发生时间。原样和 gzip 重发保留各自接收事实与重复标记；gzip
+原件下载 687 字节 SHA-256 与发送原件一致，不被浏览器 HTTP 自动解压。游标
+分页、trace 过滤、正常重启保留旧批次均实际确认。最终版本的坏 protobuf 400、
+错误方法 405、跨 Origin 403 和真实 SQLite 写锁 503 均为 protobuf Status，保留
+具体错误及 SQLite code 5。Web 查询错误仍为 JSON。先前 500/JSON 的回执保留为
+修复前事实，不能作为最终行为。超限 413 明确说明正文未捕获。原件在 collector/。
+
+浏览器实际完成 Issue #1 创建、评论、编辑、指派 default、关闭和重开；评论中的
+script 以文本显示。双页面旧 revision 6 与新增评论后的 revision 7 冲突，HTTP 409
+返回具体实际/期望 revision，旧草稿保留。导航取消也保留草稿，操作中阻止切换。
+独立 HTTP 操作确认重复 request ID 不重复创建、不同 payload 复用 ID 返回 409、
+两个同 revision 编辑只有一个被接受；正常进程重启后持久回执不变。对象 raw
+回执在 objects/http-*，浏览器回执与截图在 console/。
+
+浏览器真实建立 PR #2 并关联 Issue #1，读取 README 的实际 diff，发布配置 source
+当前已提交候选，再通过 DOM 确认层合并。持久意图与 Git 一致：
+
+- base：`700afd192d26fc8bcd3223892db9819c1e28b1e5`。
+- head：`ae2e3dd18694621cd52f829dfa095fecc99744b2`。
+- merge：`77288eed6e7d495130927d476a1a2c0a06f57915`，有上述两个父提交及候选正文。
+
+同请求回执查询仍返回相同合并提交。控制候选只接受固定 source 或该 PR 当前
+责任登记的 worktree；浏览器无任意路径或 shell 入口。并发 canonical merge
+意图/CAS 防护已实现，未做强制崩溃资格验证。
+
+Console 的仅传输 runtime 经浏览器启动、停止并重启，provider 始终 disabled。
+DOM 停止请求先返回 accepted/stopping，再查询取得 stopped、无错误，Collector
+保持在线。最终实际操作 generation 为
+`01a1299c-9a6c-7980-ac8a-3221d3b49b3c`；停止前后接收真实 runtime/control/ingest/ACK
+日志与 runtime transition metric。发生时间为 0 的日志使用 observedTime 展示，
+不会显示 Unix epoch。代次指标最后改为 generation_started/generation_ended，
+明确观察代次结束不证明原生执行已停止；具体停止证明来自 supervisor。
+
+复制前轮真实 schema 4 数据库后，通过公开 migrate apply 升至 schema 5，并取得
+迁移前备份。前后 local_items=1、local_comments=2、local_events=4、deliveries=4、
+events=4、wake_batch_events=3，历史对象和事件数量保持；原现场未修改，见
+console/upgrade/upgrade-observed.json。原迁移 1–4 没有改动。
+
+严格 Clippy、编译、格式与最终嵌入资源浏览器回读通过。已合并 PR 显示候选操作
+结束，移除来源、发布和合并控件，保留真实 Diff 与持久合并记录。最终隔离 Console
+由 SIGINT 正常退出（exit 0），本轮服务全部关闭。没有证明 SDK
+自动重试、真实模型 provider/session/turn 全链路或 Console 崩溃后的完整恢复。
+Collector 与 managed runtime 同进程，不提供进程级故障隔离；未确认停止会阻断
+替代启动。采样证据不能替代 SQLite/provider 权威或产品完成。

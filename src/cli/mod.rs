@@ -79,6 +79,8 @@ enum Command {
         command: TunnelCommand,
     },
     Serve(ServeArguments),
+    /// Local OTLP collector, browser Console, and optional managed runtime.
+    Console(crate::console::ConsoleArgs),
 }
 
 #[derive(Debug, Args)]
@@ -410,6 +412,7 @@ pub async fn run() -> Result<()> {
             let config = helpers::load(&arguments.source.resolve_config_path()?)?;
             crate::local::cli::run(arguments.command, &config)?;
         }
+        Command::Console(arguments) => crate::console::serve(arguments).await?,
         Command::Setup(arguments) => {
             setup::run(arguments).await?;
         }

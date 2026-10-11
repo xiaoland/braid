@@ -189,6 +189,15 @@ impl ProviderAgentSession {
         if !inner.stopped {
             self.unavailable.store(true, Ordering::SeqCst);
         }
+        if let Some(thread) = inner.thread_id.as_deref() {
+            crate::telemetry::lifecycle_event(
+                thread,
+                Some(&turn_id),
+                "terminal",
+                status,
+                error.as_deref(),
+            );
+        }
         let _ = self.events.send(SessionEvent::TurnTerminal {
             provider_turn_id: turn_id,
             outcome,
@@ -202,6 +211,14 @@ impl ProviderAgentSession {
             ProviderNotification::TurnStarted { thread_id, turn_id } => {
                 if inner.thread_id.as_ref() == Some(&thread_id) && inner.note_turn_started(&turn_id)
                 {
+                    crate::telemetry::bind_provider_turn(&thread_id, &turn_id);
+                    crate::telemetry::lifecycle_event(
+                        &thread_id,
+                        Some(&turn_id),
+                        "prompt",
+                        "accepted",
+                        None,
+                    );
                     let _ = self
                         .events
                         .send(SessionEvent::TurnStarted { provider_turn_id: turn_id.clone() });
@@ -243,6 +260,15 @@ impl ProviderAgentSession {
                 // session. Availability remains observable even without a turn
                 // subscription; the group can recover this handle while idle.
                 if let Some(turn_id) = inner.current_turn_id.clone() {
+                    if let Some(thread) = inner.thread_id.as_deref() {
+                        crate::telemetry::lifecycle_event(
+                            thread,
+                            Some(&turn_id),
+                            "terminal",
+                            "unknown",
+                            Some("provider disconnected"),
+                        );
+                    }
                     inner.last_terminal_turn_id = Some(turn_id.clone());
                     let _ = self.events.send(SessionEvent::TurnTerminal {
                         provider_turn_id: turn_id,
@@ -282,9 +308,10 @@ impl AgentSession for ProviderAgentSession {
         };
         let result = async {
             let thread = thread
+                .clone()
                 .ok_or_else(|| SessionError::Failed("no provider session to close".into()))?;
             let mut interruption_error = None;
-            if let Some(turn) = turn {
+            if let Some(turn) = turn.as_ref() {
                 let interruption = self.provider.interrupt(&thread, &turn).await;
                 interruption_error = interruption.as_ref().err().map(ToString::to_string);
                 if interruption.is_ok() && !self.inner.lock().await.stopped {
@@ -312,6 +339,15 @@ impl AgentSession for ProviderAgentSession {
             })
         }
         .await;
+        if let Some(thread) = thread.as_deref() {
+            crate::telemetry::lifecycle_event(
+                thread,
+                turn.as_deref(),
+                "stop",
+                if result.is_ok() { "confirmed" } else { "unconfirmed" },
+                result.as_ref().err().map(ToString::to_string).as_deref(),
+            );
+        }
         if result.is_ok() {
             if let Some(listener) = self.listener.get() {
                 listener.abort();
@@ -333,6 +369,15 @@ impl AgentSession for ProviderAgentSession {
         let (thread, previous_terminal) = {
             let mut inner = self.inner.lock().await;
             if self.is_unavailable() || inner.status != SessionStatus::Idle {
+                if let Some(thread) = inner.thread_id.as_deref() {
+                    crate::telemetry::lifecycle_event(
+                        thread,
+                        None,
+                        "prompt",
+                        "deferred",
+                        Some("session is unavailable or not idle"),
+                    );
+                }
                 return Ok(SendResult::Deferred);
             }
             if msg.is_empty() {
@@ -355,6 +400,7 @@ impl AgentSession for ProviderAgentSession {
             inner.current_turn_id.is_some() || inner.last_terminal_turn_id != previous_terminal;
         match result {
             Ok(turn) => {
+                crate::telemetry::bind_provider_turn(&thread, &turn.turn_id);
                 if inner.current_turn_id.is_none()
                     && inner.early_terminal.as_ref().is_some_and(|(id, _, _)| id == &turn.turn_id)
                 {
@@ -366,6 +412,13 @@ impl AgentSession for ProviderAgentSession {
                     ));
                 }
                 if inner.note_turn_started(&turn.turn_id) {
+                    crate::telemetry::lifecycle_event(
+                        &thread,
+                        Some(&turn.turn_id),
+                        "prompt",
+                        "accepted",
+                        None,
+                    );
                     let _ = self
                         .events
                         .send(SessionEvent::TurnStarted { provider_turn_id: turn.turn_id.clone() });
@@ -378,18 +431,48 @@ impl AgentSession for ProviderAgentSession {
                 }
                 Ok(SendResult::Started)
             }
-            Err(_) if observed => Ok(SendResult::Started),
-            Err(ProviderError::Deferred(_)) => {
+            Err(error) if observed => {
+                crate::telemetry::lifecycle_event(
+                    &thread,
+                    inner.current_turn_id.as_deref().or(inner.last_terminal_turn_id.as_deref()),
+                    "prompt_response",
+                    "late_error",
+                    Some(&format!("native lifecycle confirmed despite late response: {error}")),
+                );
+                Ok(SendResult::Started)
+            }
+            Err(ProviderError::Deferred(reason)) => {
+                crate::telemetry::lifecycle_event(
+                    &thread,
+                    None,
+                    "prompt",
+                    "deferred",
+                    Some(&reason),
+                );
                 inner.status = SessionStatus::Idle;
                 inner.stopped = true;
                 Ok(SendResult::Deferred)
             }
             Err(error @ ProviderError::Protocol(_)) => {
+                crate::telemetry::lifecycle_event(
+                    &thread,
+                    None,
+                    "prompt",
+                    "failed",
+                    Some(&error.to_string()),
+                );
                 inner.status = SessionStatus::Idle;
                 inner.stopped = true;
                 Err(map_provider_error(error))
             }
             Err(error) => {
+                crate::telemetry::lifecycle_event(
+                    &thread,
+                    None,
+                    "prompt",
+                    "unknown",
+                    Some(&error.to_string()),
+                );
                 inner.status = SessionStatus::Failed;
                 self.unavailable.store(true, Ordering::SeqCst);
                 Err(map_provider_error(error))
@@ -409,6 +492,15 @@ impl AgentSession for ProviderAgentSession {
                 || inner.status != SessionStatus::Running
                 || inner.current_turn_id.as_deref() != Some(expected_turn_id)
             {
+                if let Some(thread) = inner.thread_id.as_deref() {
+                    crate::telemetry::lifecycle_event(
+                        thread,
+                        Some(expected_turn_id),
+                        "steer",
+                        "deferred",
+                        Some("expected active turn is unavailable"),
+                    );
+                }
                 return Ok(SendResult::Deferred);
             }
             inner
@@ -417,13 +509,47 @@ impl AgentSession for ProviderAgentSession {
                 .ok_or_else(|| SessionError::Failed("no provider session".into()))?
         };
         match self.provider.steer(&thread, expected_turn_id, &msg).await {
-            Ok(()) => Ok(SendResult::Acknowledged),
-            Err(ProviderError::Deferred(_)) => Ok(SendResult::Deferred),
+            Ok(()) => {
+                crate::telemetry::lifecycle_event(
+                    &thread,
+                    Some(expected_turn_id),
+                    "steer",
+                    "accepted",
+                    None,
+                );
+                Ok(SendResult::Acknowledged)
+            }
+            Err(ProviderError::Deferred(reason)) => {
+                crate::telemetry::lifecycle_event(
+                    &thread,
+                    Some(expected_turn_id),
+                    "steer",
+                    "deferred",
+                    Some(&reason),
+                );
+                Ok(SendResult::Deferred)
+            }
             Err(ProviderError::Protocol(reason)) => {
+                crate::telemetry::lifecycle_event(
+                    &thread,
+                    Some(expected_turn_id),
+                    "steer",
+                    "deferred",
+                    Some(&reason),
+                );
                 tracing::warn!(%reason, %expected_turn_id, "active turn refused steering; retain input for next turn");
                 Ok(SendResult::Deferred)
             }
-            Err(error) => Err(map_provider_error(error)),
+            Err(error) => {
+                crate::telemetry::lifecycle_event(
+                    &thread,
+                    Some(expected_turn_id),
+                    "steer",
+                    "unknown",
+                    Some(&error.to_string()),
+                );
+                Err(map_provider_error(error))
+            }
         }
     }
 

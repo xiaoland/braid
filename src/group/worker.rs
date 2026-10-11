@@ -91,7 +91,7 @@ pub(crate) async fn agent_group_worker(
     factory: Arc<dyn SessionFactory>,
     reports: tokio::sync::mpsc::Sender<crate::health::ProviderHealthUpdate>,
     shutdown: watch::Receiver<bool>,
-) {
+) -> Result<()> {
     agent_group_worker_backend(
         store,
         Arc::new(CollaborationBackend::GitHub(github)),
@@ -101,7 +101,7 @@ pub(crate) async fn agent_group_worker(
         reports,
         shutdown,
     )
-    .await;
+    .await
 }
 
 pub(crate) async fn agent_group_worker_backend(
@@ -112,7 +112,7 @@ pub(crate) async fn agent_group_worker_backend(
     factory: Arc<dyn SessionFactory>,
     reports: tokio::sync::mpsc::Sender<crate::health::ProviderHealthUpdate>,
     mut shutdown: watch::Receiver<bool>,
-) {
+) -> Result<()> {
     let driver = GroupDriver {
         store: &store,
         collaboration: &collaboration,
@@ -121,9 +121,11 @@ pub(crate) async fn agent_group_worker_backend(
         sessions: SessionManager::new(factory),
     };
     driver.drive(&reports, &mut shutdown).await;
-    if let Err(error) = driver.sessions.retain(&std::collections::HashSet::new()).await {
-        tracing::error!(%error, "shutdown did not confirm all executions stopped");
-    }
+    driver
+        .sessions
+        .retain(&std::collections::HashSet::new())
+        .await
+        .context("shutdown did not confirm all executions stopped")
 }
 
 impl GroupDriver<'_> {

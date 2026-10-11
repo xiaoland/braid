@@ -224,3 +224,24 @@ Local 后端的操作验收从公开 `init/local/serve` 入口进行：没有 Gi
 多 Agent 协作效果；需要判断完整 Agent 工作经历时，应在获授权的真实模型任务上
 沿同一流程取证，不构造 provider 或修改私有执行状态。当前隔离操作结果归任务
 记录，不据此宣称完成下述 GitHub campaign 或完整模型验收。
+
+## Local Console 的实际验收
+
+Local Console 不依赖 GitHub App 或 Factory。使用独立真实 Git checkout 和 Local
+配置打开页面，在仅传输模式下实际创建并讨论 Issue，核对对象 revision、事件和
+命令回执；两个页面并发编辑时旧 revision 必须明确冲突且保留草稿。同一 request
+ID 取回同一结果，不重复创建；不同命令不能复用该 ID。
+
+通过页面从真实候选分支建立关联 PR，阅读实际 diff，明确发布配置 source 或
+登记 worktree 的已提交候选，再合并至未被 checkout 的 base。核对发布 OID、
+持久合并意图、base 新提交及具体失败；对象关闭和原生执行停止分别取证。
+
+由真实 OpenTelemetry SDK 向 Console 发送三信号，核对原始封包、解码属性、
+采样边界、接收与发生时间，以及原件下载。重发保留传输事实；坏 protobuf、gzip
+和超限请求保留具体状态与原因，Collector 重启后仍可按游标阅读旧记录。真实
+存储不可用返回可重试 503，不把正常遥测批次误判为坏数据。
+
+通过页面启动和停止 runtime，接受回执不能代替就绪或停止确认。runtime 已停
+时 Collector 与对象接口继续可用；未确认停止不可启动替代执行。完整 Agent
+验收还需获授权的真实 provider/session/turn 运行，编译及无模型操作不替代这一
+证明。本轮不推导新的模型、GitHub 或发布授权。

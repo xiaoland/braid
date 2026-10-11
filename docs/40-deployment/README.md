@@ -205,3 +205,25 @@ Agent 子进程取得 `BRAID_CONFIG` 与 `BRAID_AGENT`，CLI 通过专属 cwd、
 责任、会话与 turn 校验写入来源；失效调用明确失败。环境与 SQLite 检查防止正常
 执行串写，不能作为恶意本机进程或用户的权限沙箱。对象、provider history 与 Git
 资料均须随所属实例保留，停止 daemon 不删除空间。
+
+## 内置 Collector 与 Console
+
+`braid console` 提供 loopback OTLP HTTP/protobuf 接收、独立 SQLite 原始批次与记录
+读模型，以及内嵌 Web 资源。Local 配置可接入直接对象控制与长期存活的 runtime
+监督器；停止 runtime 不关闭 Collector。数据库 schema 5 增加对象及启停命令的
+持久回执，旧迁移不变。编辑 revision 与对象写入原子检查，Git 操作保留各自意图
+与失败边界。具体使用和未确认停止的处置见[Console 指南](../user-manual/console.md)。
+
+Console 的 Collector 保存接收事实，不反推业务完成。runtime generation、明确的
+provider session/turn 关联和证据缺口用于诊断；Console 的当前状态来自应用模块与
+实际任务句柄，不从 OTLP 到达顺序重建权威状态。所有停止错误向监督器传播，
+未确认停止会阻止替代启动。此模式与外部 Collector 并存，不改变 GitHub 权威。
+
+真实指标使用低基数标签：runtime 观察代次开始/结束次数、provider 生命周期事件计数、接纳到
+终态的单调时钟观察时长，以及 provider payload 的采样和关联覆盖计数。时长是
+观察区间，Unknown 不是停止证明；没有原生 usage 事实时不推测 token 或费用。
+
+OTLP 信号接口的失败响应按[协议规范](https://opentelemetry.io/docs/specs/otlp/#failures)
+使用 protobuf Status；正常批次因存储不可用不能接受时返回 503，让 exporter 可以
+重试。成功响应只表示持久接收，不承诺 Exactly Once；Web 查询和控制错误另用
+JSON，避免浏览器把诊断响应当作业务回执。

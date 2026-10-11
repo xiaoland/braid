@@ -288,3 +288,20 @@ are outside it and converge only when GitHub reports them.
 - Packaging, OTel, tunnel, migration, and operation:
   [`../40-deployment/README.md`](../40-deployment/README.md)
 - External acceptance oracle: [`../10-prd/acceptance.md`](../10-prd/acceptance.md)
+
+## Console 与控制边界
+
+Console 的 OTLP Collector 保存原始传输批次与完整解码记录，使用独立数据库，
+不能写回对象或执行权威。资源身份、runtime generation、session、turn 与原生
+协议身份显式关联；采样和未关联记录是证据缺口，不是空闲状态。Web 查询分页
+读取该读模型，当前对象与执行状态则直接查询 LocalObjects 与 runtime manager。
+
+`control` 通过有类型的应用命令调用本地对象方法。命令 request ID、内容摘要、
+预期 revision 与回执持久保存在 schema 5；普通对象变更与事件、回执一起提交，
+并发正文修改不会覆盖新 revision。发布和合并保留 Git/SQLite 意图边界，不能用
+外层数据库事务假装跨系统原子化。浏览器只能引用固定配置 source 或登记的 worktree 身份。
+
+`console::runtime` 持有实际 runtime task、停止通道与启动 generation。Collector
+和控制端点持续存活，runtime 可单独停止。请求接受不等于任务已就绪或已停止；
+监督器等待所有 Group/provider 停止结果，失败进入 blocked 并禁止新执行覆盖。
+Console 不调用 CLI，也不复制 Factory 的实验、赛事或容器生命周期。

@@ -109,6 +109,12 @@ impl GroupDriver<'_> {
                 enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
                 continue;
             }
+            if let Err(error) = crate::telemetry::register_session_from_store(
+                config.runtime.database(),
+                &candidate.provider_session_id,
+            ) {
+                tracing::warn!(%error, braid.provider_session.id = %candidate.provider_session_id, "restored session observation identity registration failed");
+            }
             let instructions = issue_system_prompt(config, profile, candidate.number);
             let instruction_revision = hex::encode(Sha256::digest(instructions.as_bytes()));
             // A lost session handle can leave an in-flight turn behind; fence it before
@@ -429,10 +435,16 @@ impl GroupDriver<'_> {
                 let thread_id = session;
                 store.complete_agent_assignment(
                     materialization.clone(),
-                    thread_id,
+                    thread_id.clone(),
                     rendered.revision.clone(),
                     instruction_revision,
                 )?;
+                if let Err(error) = crate::telemetry::register_session_from_store(
+                    config.runtime.database(),
+                    &thread_id,
+                ) {
+                    tracing::warn!(%error, braid.provider_session.id = %thread_id, "new session observation identity registration failed");
+                }
                 if rendered.pressure == ContextPressure::Soft {
                     enqueue_context_pressure_status(
                         store,

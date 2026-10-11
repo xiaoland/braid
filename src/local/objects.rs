@@ -1,9 +1,11 @@
 //! Braid-owned collaboration objects and their atomic event outbox.
+mod commands;
+pub use commands::{CommandFailure, CommandRequest, ControlPolicy, ControlReceipt};
 use std::{path::Path, time::Duration};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    Connection, OpenFlags, OptionalExtension, Savepoint, Transaction, TransactionBehavior, params,
 };
 use serde::Serialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -65,6 +67,8 @@ pub struct LocalObjects {
     connection: Connection,
     repository: String,
     writer: Option<Writer>,
+    revision_guard: Option<(u64, u64)>,
+    candidate_guard: Option<(String, String)>,
 }
 
 pub fn repository_node(repository: &str) -> String {
@@ -123,7 +127,58 @@ impl LocalObjects {
             "local database belongs to repository {bound}, not {repository}"
         );
         tx.commit()?;
-        Ok(Self { connection, repository: repository.into(), writer: None })
+        Ok(Self {
+            connection,
+            repository: repository.into(),
+            writer: None,
+            revision_guard: None,
+            candidate_guard: None,
+        })
+    }
+
+    pub fn open_read_only(database: &Path, repository: &str) -> Result<Self> {
+        let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let version: u32 = connection.query_row(
+            "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            version == crate::store::DATABASE_SCHEMA_VERSION,
+            "database schema is not current; apply migrations before HTTP control"
+        );
+        let bound: String = connection.query_row(
+            "SELECT repository FROM local_space WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            bound == repository,
+            "local database belongs to repository {bound}, not {repository}"
+        );
+        Ok(Self {
+            connection,
+            repository: repository.into(),
+            writer: None,
+            revision_guard: None,
+            candidate_guard: None,
+        })
+    }
+
+    pub fn verify_source(&self, source: &Path) -> Result<()> {
+        let source = source.canonicalize()?;
+        git2::Repository::open(&source)?;
+        let bound: Option<String> = self.connection.query_row(
+            "SELECT source FROM local_space WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            bound.as_deref() == source.to_str(),
+            "Git source does not match this local collaboration space"
+        );
+        Ok(())
     }
 
     pub fn bind_source(&self, source: &Path) -> Result<()> {
@@ -238,8 +293,9 @@ impl LocalObjects {
     ) -> Result<Item> {
         nonempty(title, "title")?;
         nonempty(author, "author")?;
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
+        validate_revision(&tx, &self.repository, self.revision_guard)?;
         let at = now();
         let kind = if pr.is_some() { "pr" } else { "issue" };
         let (head, base, hc, bc, issue) = pr
@@ -304,8 +360,9 @@ impl LocalObjects {
         self.item(number)?;
         nonempty(body, "comment body")?;
         nonempty(author, "author")?;
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
+        validate_revision(&tx, &self.repository, self.revision_guard)?;
         if let Some(parent) = reply_to {
             let same:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM local_comments WHERE comment_id=?1 AND item_number=?2)",params![sql_id(parent)?,sql_id(number)?],|r|r.get(0))?;
             ensure!(same, "reply target #{parent} is not a comment on this object");
@@ -345,8 +402,9 @@ impl LocalObjects {
         if title.unwrap_or(&old.title) == old.title && body.unwrap_or(&old.body) == old.body {
             return Ok(old);
         }
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
+        validate_revision(&tx, &self.repository, self.revision_guard)?;
         tx.execute("UPDATE local_items SET title=COALESCE(?1,title),body=COALESCE(?2,body) WHERE number=?3",params![title,body,sql_id(number)?])?;
         bump(&tx, number)?;
         emit(&tx, number, "invalidate", Some("edited"), author, body, self.writer.as_ref())?;
@@ -366,8 +424,9 @@ impl LocalObjects {
         if old.desired_profile.as_deref() == profile {
             return Ok(old);
         }
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
+        validate_revision(&tx, &self.repository, self.revision_guard)?;
         tx.execute(
             "UPDATE local_items SET desired_profile=?1 WHERE number=?2",
             params![profile, sql_id(number)?],
@@ -394,8 +453,9 @@ impl LocalObjects {
         if old.state == state {
             return Ok(old);
         }
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
+        validate_revision(&tx, &self.repository, self.revision_guard)?;
         tx.execute(
             "UPDATE local_items SET state=?1 WHERE number=?2",
             params![state, sql_id(number)?],
@@ -418,8 +478,9 @@ impl LocalObjects {
         ensure!(self.item(issue)?.kind == "issue", "#{issue} is not an Issue");
         ensure!(self.item(pr)?.kind == "pr", "#{pr} is not a PR");
         nonempty(author, "author")?;
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
+        validate_revision(&tx, &self.repository, self.revision_guard)?;
         if tx.execute(
             "INSERT OR IGNORE INTO local_links VALUES(?1,?2)",
             params![sql_id(issue)?, sql_id(pr)?],
@@ -601,7 +662,7 @@ fn reference(item: Item) -> WorkItemReference {
 fn read_item(connection: &Connection, repository: &str, number: u64) -> Result<Item> {
     connection.query_row("SELECT number,repository,kind,title,body,author,state,desired_profile,head_ref,base_ref,head_commit,base_commit,revision,created_at,updated_at,published FROM local_items WHERE number=?1 AND repository=?2",params![sql_id(number)?,repository],|r|Ok(Item {number:row_id(r,0)?,repository:r.get(1)?,kind:r.get(2)?,title:r.get(3)?,body:r.get(4)?,author:r.get(5)?,state:r.get(6)?,desired_profile:r.get(7)?,head_ref:r.get(8)?,base_ref:r.get(9)?,head_commit:r.get(10)?,base_commit:r.get(11)?,published:r.get(15)?,revision:row_id(r,12)?,created_at:r.get(13)?,updated_at:r.get(14)?})).optional()?.with_context(||format!("local object {repository}#{number} does not exist"))
 }
-fn bump(tx: &Transaction<'_>, number: u64) -> Result<()> {
+fn bump(tx: &Connection, number: u64) -> Result<()> {
     tx.execute(
         "UPDATE local_items SET revision=revision+1,updated_at=?1 WHERE number=?2",
         params![now(), sql_id(number)?],
@@ -609,7 +670,7 @@ fn bump(tx: &Transaction<'_>, number: u64) -> Result<()> {
     Ok(())
 }
 fn emit(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     number: u64,
     kind: &str,
     detail: Option<&str>,
@@ -636,7 +697,7 @@ fn emit(
     Ok(())
 }
 fn invalidate_links(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     issue: u64,
     author: &str,
     writer: Option<&Writer>,
@@ -652,7 +713,7 @@ fn invalidate_links(
     Ok(())
 }
 
-fn validate_writer(tx: &Transaction<'_>, writer: Option<&Writer>) -> Result<()> {
+fn validate_writer(tx: &Connection, writer: Option<&Writer>) -> Result<()> {
     if let Some(w) = writer {
         let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM turns t JOIN provider_sessions s ON s.session_id=t.session_id JOIN agent_instances g ON g.agent_id=s.agent_id JOIN assignments a ON a.assignment_id=g.assignment_id WHERE t.turn_id=?1 AND s.session_id=?2 AND t.lifecycle IN ('starting','running') AND s.lifecycle='running' AND g.lifecycle IN ('idle','finalizing') AND a.lifecycle IN ('active','finalizing') AND a.work_item_node_id=?3)",params![w.turn,w.session,w.item],|r|r.get(0))?;
         ensure!(valid, "Agent writer assignment/session/turn is no longer active");
@@ -675,7 +736,7 @@ impl LocalObjects {
     }
 
     pub fn diff(&self, number: u64, source: &Path) -> Result<String> {
-        self.bind_source(source)?;
+        self.verify_source(source)?;
         let item = self.item(number)?;
         ensure!(item.kind == "pr", "#{number} is not a PR");
         let git = git2::Repository::open(source)?;
@@ -761,10 +822,31 @@ impl LocalObjects {
         } else {
             self.prepare_merge(&git, &item, expected_base, expected_head)?
         };
+        self.adopt_merge_ref(&git, &item, &base_ref, merge_commit, expected_base, expected_head)?;
+        self.finish_merge(number, &merge_commit.to_string(), author)?;
+        Ok(MergeResult {
+            number,
+            merge_commit: merge_commit.to_string(),
+            base_ref,
+            recovered: false,
+        })
+    }
+
+    fn adopt_merge_ref(
+        &mut self,
+        git: &git2::Repository,
+        item: &Item,
+        base_ref: &str,
+        merge_commit: git2::Oid,
+        expected_base: git2::Oid,
+        expected_head: git2::Oid,
+    ) -> Result<()> {
+        let number = item.number;
         // The durable intent precedes Git CAS; restart recognizes only its exact commit.
         let updated = {
-            let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = write_transaction(&mut self.connection)?;
             validate_writer(&tx, self.writer.as_ref())?;
+            validate_revision(&tx, &self.repository, self.revision_guard)?;
             let current = read_item(&tx, &self.repository, number)?;
             ensure!(
                 current.state == "open"
@@ -772,13 +854,18 @@ impl LocalObjects {
                     && current.base_commit == item.base_commit,
                 "PR candidate changed before Git adoption"
             );
-            let result = git.reference_matching(
-                &base_ref,
-                merge_commit,
-                true,
-                expected_base,
-                "Braid local PR merge",
-            );
+            let result = if git.refname_to_id(base_ref)? == merge_commit {
+                Ok(())
+            } else {
+                git.reference_matching(
+                    base_ref,
+                    merge_commit,
+                    true,
+                    expected_base,
+                    "Braid local PR merge",
+                )
+                .map(|_| ())
+            };
             tx.commit()?;
             result
         };
@@ -793,13 +880,7 @@ impl LocalObjects {
             )?;
             return Err(error).context("base ref compare-and-swap failed; merge intent preserved");
         }
-        self.finish_merge(number, &merge_commit.to_string(), author)?;
-        Ok(MergeResult {
-            number,
-            merge_commit: merge_commit.to_string(),
-            base_ref,
-            recovered: false,
-        })
+        Ok(())
     }
 
     fn prepare_merge(
@@ -855,7 +936,17 @@ impl LocalObjects {
             "prepared",
             None,
         )?;
-        Ok(commit)
+        let (stored_base,stored_head,stored_commit,state):(String,String,Option<String>,String)=self.connection.query_row("SELECT expected_base,expected_head,merge_commit,lifecycle FROM local_merges WHERE pr_number=?1",[sql_id(item.number)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        ensure!(
+            stored_base == expected_base.to_string() && stored_head == expected_head.to_string(),
+            "another merge intent already owns a different candidate"
+        );
+        ensure!(
+            matches!(state.as_str(), "prepared" | "applied"),
+            "canonical merge intent is {state}; inspect its persisted failure"
+        );
+        git2::Oid::from_str(&stored_commit.context("canonical merge intent lacks a commit")?)
+            .map_err(Into::into)
     }
 
     fn record_merge(
@@ -867,18 +958,25 @@ impl LocalObjects {
         state: &str,
         error: Option<&str>,
     ) -> Result<()> {
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
-        tx.execute("INSERT INTO local_merges(pr_number,expected_base,expected_head,merge_commit,lifecycle,error,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7) ON CONFLICT(pr_number) DO UPDATE SET lifecycle=excluded.lifecycle,error=excluded.error,updated_at=excluded.updated_at",params![sql_id(number)?,base,head,commit,state,error,now()])?;
+        validate_revision(&tx, &self.repository, self.revision_guard)?;
+        tx.execute("INSERT INTO local_merges(pr_number,expected_base,expected_head,merge_commit,lifecycle,error,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7) ON CONFLICT(pr_number) DO UPDATE SET lifecycle=excluded.lifecycle,error=excluded.error,updated_at=excluded.updated_at WHERE local_merges.lifecycle='prepared'",params![sql_id(number)?,base,head,commit,state,error,now()])?;
         tx.commit()?;
         Ok(())
     }
 
     fn finish_merge(&mut self, number: u64, commit: &str, author: &str) -> Result<()> {
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
+        validate_revision(&tx, &self.repository, self.revision_guard)?;
         let applied=tx.execute("UPDATE local_merges SET lifecycle='applied',error=NULL,updated_at=?1 WHERE pr_number=?2 AND merge_commit=?3 AND lifecycle='prepared'",params![now(),sql_id(number)?,commit])?;
-        ensure!(applied == 1, "prepared merge intent no longer matches this commit");
+        if applied == 0 {
+            let complete:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM local_merges WHERE pr_number=?1 AND merge_commit=?2 AND lifecycle='applied')",params![sql_id(number)?,commit],|r|r.get(0))?;
+            ensure!(complete, "prepared merge intent no longer matches this commit");
+            tx.commit()?;
+            return Ok(());
+        }
         tx.execute("UPDATE local_items SET state='closed' WHERE number=?1", [sql_id(number)?])?;
         bump(&tx, number)?;
         emit(&tx, number, "lifecycle", Some("merged"), author, None, self.writer.as_ref())?;
@@ -894,7 +992,7 @@ impl LocalObjects {
             intent.repository == self.repository,
             "outbox intent belongs to another repository"
         );
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = write_transaction(&mut self.connection)?;
         let existing = tx
             .query_row(
                 "SELECT database_id,node_id FROM local_write_receipts WHERE intent_id=?1",
@@ -1037,11 +1135,20 @@ impl LocalObjects {
             commit != item.base_commit.as_deref().unwrap_or_default(),
             "candidate is identical to the frozen base"
         );
+        let tx = write_transaction(&mut self.connection)?;
+        validate_writer(&tx, self.writer.as_ref())?;
+        validate_revision(&tx, &self.repository, self.revision_guard)?;
+        if let Some((worktree, node)) = &self.candidate_guard {
+            let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM worktrees w JOIN agent_instances g ON g.agent_id=w.agent_id JOIN assignments a ON a.assignment_id=g.assignment_id WHERE w.worktree_id=?1 AND a.work_item_node_id=?2 AND a.lifecycle IN ('active','finalizing') AND w.lifecycle='active')",params![worktree,node],|r|r.get(0))?;
+            ensure!(
+                current,
+                "candidate worktree no longer belongs to this PR's current assignment"
+            );
+        }
         if item.head_commit.as_deref() == Some(&commit) && item.published {
+            tx.commit()?;
             return Ok(item);
         }
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_writer(&tx, self.writer.as_ref())?;
         let merging: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM local_merges WHERE pr_number=?1)",
             [sql_id(number)?],
@@ -1065,4 +1172,47 @@ impl LocalObjects {
         tx.commit()?;
         self.item(number)
     }
+}
+
+enum WriteTransaction<'a> {
+    Top(Transaction<'a>),
+    Nested(Savepoint<'a>),
+}
+impl std::ops::Deref for WriteTransaction<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Top(t) => t,
+            Self::Nested(t) => t,
+        }
+    }
+}
+impl WriteTransaction<'_> {
+    fn commit(self) -> rusqlite::Result<()> {
+        match self {
+            Self::Top(t) => t.commit(),
+            Self::Nested(t) => t.commit(),
+        }
+    }
+}
+fn write_transaction(connection: &mut Connection) -> rusqlite::Result<WriteTransaction<'_>> {
+    if connection.is_autocommit() {
+        connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map(WriteTransaction::Top)
+    } else {
+        connection.savepoint().map(WriteTransaction::Nested)
+    }
+}
+
+fn validate_revision(
+    connection: &Connection,
+    repository: &str,
+    guard: Option<(u64, u64)>,
+) -> Result<()> {
+    if let Some((number, expected)) = guard {
+        let actual = read_item(connection, repository, number)?.revision;
+        ensure!(actual == expected, "object #{number} revision is {actual}, expected {expected}");
+    }
+    Ok(())
 }

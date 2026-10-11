@@ -240,6 +240,12 @@ impl GroupDriver<'_> {
             }
             let mut effective_profile = profile.clone();
             effective_profile.workspace = Some(worktree_path);
+            if let Err(error) = crate::telemetry::register_session_from_store(
+                config.runtime.database(),
+                &candidate.provider_session_id,
+            ) {
+                tracing::warn!(%error, braid.provider_session.id = %candidate.provider_session_id, "restored session observation identity registration failed");
+            }
             match sessions
                 .resume(
                     candidate.provider_session_id.clone(),
@@ -396,10 +402,16 @@ impl GroupDriver<'_> {
                 let thread_id = session;
                 store.complete_agent_assignment(
                     materialization.clone(),
-                    thread_id,
+                    thread_id.clone(),
                     prepared.rendered.revision.clone(),
                     instruction_revision,
                 )?;
+                if let Err(error) = crate::telemetry::register_session_from_store(
+                    config.runtime.database(),
+                    &thread_id,
+                ) {
+                    tracing::warn!(%error, braid.provider_session.id = %thread_id, "new session observation identity registration failed");
+                }
                 if prepared.rendered.pressure == ContextPressure::Soft {
                     enqueue_context_pressure_status(
                         store,

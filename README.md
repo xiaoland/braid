@@ -104,3 +104,9 @@ does not require Python, PDM, Cargo, or a source checkout.
 
 Braid 使用编译、实际操作及获授权实验取得反馈，不维护或运行测试代码、模拟提供方、
 包 smoke 或自检入口。GitHub、provider 和 OTel 原始证据及人工判断构成产品验收依据。
+
+## 本地 Web Console
+
+内置 Console 接收 OTLP HTTP/protobuf，持久保存 traces、logs、metrics 的原始证据，
+并提供浏览器可视化。连接 Local 配置时可直接管理对象与启停 runtime，不经 CLI
+子进程。操作方法和数据边界见[Console 指南](docs/user-manual/console.md)。

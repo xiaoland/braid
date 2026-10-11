@@ -152,7 +152,8 @@ impl PiProvider {
             Arc::clone(&self.thread_id),
             Arc::clone(&self.turn_id),
         );
-        let stderr_handle = spawn_pi_stderr(stderr);
+        let stderr_handle =
+            spawn_pi_stderr(stderr, Arc::clone(&self.thread_id), Arc::clone(&self.turn_id));
         state.process = Some(PiProcess { writer, child, stdout_handle, stderr_handle });
         Ok(())
     }
@@ -174,6 +175,16 @@ impl PiProvider {
         }
 
         let (sender, receiver) = oneshot::channel();
+        if let (Some(thread), Some(turn)) = (state.session.as_deref(), turn_id.as_deref()) {
+            telemetry::bind_provider_turn(thread, turn);
+        }
+        telemetry::emit_provider_payload(
+            "pi",
+            state.session.as_deref().unwrap_or(""),
+            turn_id.as_deref(),
+            "request",
+            &frame.to_string(),
+        );
         state.pending.lock().await.insert(id, PiRequest { response: sender, turn_id });
 
         let process = state.process.as_mut().ok_or(ProviderError::Disconnected)?;
@@ -305,6 +316,7 @@ impl AgentProvider for PiProvider {
         developer_instructions.clone_into(&mut state.developer_instructions);
         state.context.clear();
         state.session = Some(thread_id.to_owned());
+        *self.thread_id.lock().await = thread_id.to_owned();
         state.close_result = None;
         state.process = None;
         self.spawn(&mut state, profile.workspace(), Some(thread_id))?;
@@ -479,15 +491,23 @@ fn spawn_pi_stdout(
         let mut last_stop = None;
         let mut last_error = None;
         while let Ok(Some(line)) = lines.next_line().await {
-            telemetry::emit_payload_event(&PayloadEvidence {
-                github_body: "",
-                github_summary: "",
-                credential: "",
-                provider_transcript: &line,
-                webhook_payload: "",
-                local_path: "",
-            });
-            let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+            let current_thread = thread_id.lock().await.clone();
+            let current_turn = turn_id.lock().await.clone();
+            let parsed = serde_json::from_str::<Value>(&line);
+            let response_turn = if let Ok(frame) = &parsed {
+                if let Some(id) = frame.get("id").and_then(Value::as_i64) {
+                    pending.lock().await.get(&id).and_then(|request| request.turn_id.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let evidence_turn = response_turn
+                .as_deref()
+                .or_else(|| (!current_turn.is_empty()).then_some(current_turn.as_str()));
+            telemetry::emit_provider_payload("pi", &current_thread, evidence_turn, "stdout", &line);
+            let Ok(frame) = parsed else {
                 tracing::warn!("pi emitted non-JSON stdout");
                 continue;
             };
@@ -524,8 +544,6 @@ fn spawn_pi_stdout(
                 }
                 continue;
             }
-            let current_thread = thread_id.lock().await.clone();
-            let current_turn = turn_id.lock().await.clone();
             if let Some(notification) = parse_pi_event(
                 &frame,
                 &current_thread,
@@ -549,18 +567,23 @@ fn spawn_pi_stdout(
     })
 }
 
-fn spawn_pi_stderr(stderr: tokio::process::ChildStderr) -> tokio::task::JoinHandle<()> {
+fn spawn_pi_stderr(
+    stderr: tokio::process::ChildStderr,
+    thread_id: Arc<Mutex<String>>,
+    turn_id: Arc<Mutex<String>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            telemetry::emit_payload_event(&PayloadEvidence {
-                github_body: "",
-                github_summary: "",
-                credential: "",
-                provider_transcript: &line,
-                webhook_payload: "",
-                local_path: "",
-            });
+            let thread = thread_id.lock().await.clone();
+            let turn = turn_id.lock().await.clone();
+            telemetry::emit_provider_payload(
+                "pi",
+                &thread,
+                (!turn.is_empty()).then_some(turn.as_str()),
+                "stderr",
+                &line,
+            );
             tracing::debug!(provider = "pi", output = %line, "provider diagnostic");
         }
     })

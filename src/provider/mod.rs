@@ -20,7 +20,7 @@ pub use tokio::{
 
 pub(crate) use crate::{
     config::{CodexConfig, PiConfig, Profile},
-    telemetry::{self, PayloadEvidence},
+    telemetry,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);

@@ -247,11 +247,17 @@ impl GroupDriver<'_> {
                 store.complete_work_item_reactivation(
                     candidate.event_id,
                     materialization.clone(),
-                    thread_id,
+                    thread_id.clone(),
                     rendered.revision.clone(),
                     instruction_revision,
                     policy,
                 )?;
+                if let Err(error) = crate::telemetry::register_session_from_store(
+                    config.runtime.database(),
+                    &thread_id,
+                ) {
+                    tracing::warn!(%error, braid.provider_session.id = %thread_id, "reactivated session observation identity registration failed");
+                }
                 if rendered.pressure == ContextPressure::Soft {
                     enqueue_context_pressure_status(
                         store,
@@ -428,6 +434,14 @@ impl GroupDriver<'_> {
             rendered.revision.clone(),
             instruction_revision,
         )?;
+        if let Err(error) =
+            crate::telemetry::register_session_from_store(config.runtime.database(), &thread_id)
+        {
+            tracing::warn!(%error, braid.provider_session.id = %thread_id, "replacement session observation identity registration failed");
+        }
+        tracing::info!(name = "braid.context.reset", braid.provider_session.id = %thread_id,
+            braid.context.reset.id = %reset.reset_id, braid.context.revision = %rendered.revision,
+            braid.assignment.id = %reset.assignment_id, "context reset completed");
         if rendered.pressure == ContextPressure::Soft {
             enqueue_context_pressure_status(store, profile, &reset.assignment_id, &rendered)?;
         }
@@ -500,6 +514,13 @@ impl GroupDriver<'_> {
             }
         }?;
         let reference = render_event_references(self.config, &claim);
+        if let Err(error) = crate::telemetry::register_session_from_store(
+            self.config.runtime.database(),
+            &claim.provider_session_id,
+        ) {
+            tracing::warn!(%error, braid.provider_session.id = %claim.provider_session_id, "session evidence identity registration failed");
+        }
+        crate::telemetry::begin_turn(&claim.provider_session_id, &claim.turn_id);
 
         // Every assignment materialization and resume path now populates the
         // SessionManager, so a missing session is a genuine error.
@@ -575,6 +596,7 @@ impl GroupDriver<'_> {
                 return None;
             }
         };
+        crate::telemetry::bind_provider_turn(&claim.provider_session_id, &provider_turn_id);
         if let Err(error) = store.mark_turn_started(claim.turn_id.clone(), provider_turn_id.clone())
         {
             tracing::error!(%error, "cannot record provider turn start");
@@ -639,6 +661,10 @@ impl GroupDriver<'_> {
             return;
         }
         active.reset_id = Some(reset.reset_id.clone());
+        tracing::info!(name = "braid.context.reset", braid.provider_session.id = %active.claim.provider_session_id,
+            braid.turn.id = %active.claim.turn_id, provider.turn.id = %active.provider_turn_id,
+            braid.context.reset.id = %reset.reset_id, braid.assignment.id = %reset.assignment_id,
+            "context reset began");
         match sessions.get(&active.claim.provider_session_id).await {
             Some(session) => {
                 if let Err(error) = session.interrupt().await {

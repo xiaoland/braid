@@ -19,3 +19,10 @@ provider itself has lost.
 的本地 Git 仓库持续协作。PR 对应真实 Git 候选，候选发布与手工合并独立于模型
 终态或产品验收。当前入口是 CLI；不承诺 GitHub HTTP API 全兼容、平台用户权限
 系统、Web UI、GitHub/Local 双向同步或自动验收。
+
+## 本地 Console
+
+独立 Braid 提供本地 Web Console，负责接收 OTLP、保存并可视化观测证据，
+并通过直接应用接口管理 Local 对象和启停 runtime。对象和执行结果保留自己的
+权威，不把遥测缺失当作工作完成。Console 不依赖 Factory，不执行 Braid CLI
+作为后端桥，也不承担实验/赛事调度。

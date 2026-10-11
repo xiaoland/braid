@@ -49,9 +49,32 @@ impl Drop for RuntimeLeaseGuard {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -> Result<()> {
     let telemetry = TelemetryGuard::install(&config.telemetry, config.instance_key())?;
+    let generation = Uuid::now_v7().to_string();
+    crate::telemetry::set_runtime_generation(Some(generation.clone()));
+    let result = serve_inner(config, quick_tunnel, provider_enabled).await;
+    tracing::info!(
+        name="braid.runtime.stop",
+        braid.runtime.generation=%generation,
+        braid.runtime.stop_confirmed=result.is_ok(),
+        braid.runtime.error=result.as_ref().err().map(|error|format!("{error:#}")).as_deref().unwrap_or(""),
+        "standalone GitHub runtime ended"
+    );
+    crate::telemetry::set_runtime_generation(None);
+    let telemetry_result = telemetry.shutdown();
+    match (result, telemetry_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Err(error), Err(exporter)) => {
+            Err(error.context(format!("telemetry shutdown also failed: {exporter}")))
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn serve_inner(config: Config, quick_tunnel: bool, provider_enabled: bool) -> Result<()> {
     let store = Arc::new(StoreActor::start(
         config.runtime.database().to_path_buf(),
         config.runtime.backups().to_path_buf(),
@@ -137,26 +160,30 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     let health_server =
         spawn_health(config.server.health, Arc::clone(&health), shutdown_receiver.clone()).await?;
     let mut workers = JoinSet::new();
-    workers.spawn(queue_worker(Arc::clone(&store), shutdown_receiver.clone()));
-    workers.spawn(mention_worker(
+    workers.spawn(worker_result(queue_worker(Arc::clone(&store), shutdown_receiver.clone())));
+    workers.spawn(worker_result(mention_worker(
         Arc::clone(&store),
         Arc::clone(&github),
         policy,
         shutdown_receiver.clone(),
-    ));
-    workers.spawn(outbox_worker(
+    )));
+    workers.spawn(worker_result(outbox_worker(
         Arc::clone(&store),
         Arc::clone(&github),
         shutdown_receiver.clone(),
-    ));
-    workers.spawn(reconciliation_worker(
+    )));
+    workers.spawn(worker_result(reconciliation_worker(
         Arc::clone(&store),
         Arc::clone(&github),
         config.clone(),
         Arc::clone(&health),
         shutdown_receiver.clone(),
-    ));
-    workers.spawn(lease_worker(Arc::clone(&store), Arc::clone(&lease), shutdown_receiver.clone()));
+    )));
+    workers.spawn(worker_result(lease_worker(
+        Arc::clone(&store),
+        Arc::clone(&lease),
+        shutdown_receiver.clone(),
+    )));
 
     if provider_enabled {
         let factories = crate::provider::session_factories(&config)?;
@@ -165,11 +192,11 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
             .map(|kind| GroupSpec::new(kind, &config, &store))
             .collect::<Result<Vec<_>>>()?;
         let (reports, receiver) = tokio::sync::mpsc::channel(8);
-        workers.spawn(crate::health::provider_health_worker(
+        workers.spawn(worker_result(crate::health::provider_health_worker(
             Arc::clone(&health),
             receiver,
             shutdown_receiver.clone(),
-        ));
+        )));
         for spec in specs {
             let factory = factories
                 .get(spec.profile_id())
@@ -238,7 +265,8 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
             }
             worker = workers.join_next() => {
                 let message = match worker {
-                    Some(Ok(())) => "a supervised runtime worker stopped unexpectedly".to_owned(),
+                    Some(Ok(Ok(()))) => "a supervised runtime worker stopped unexpectedly".to_owned(),
+                    Some(Ok(Err(error))) => format!("a supervised runtime worker failed: {error:#}"),
                     Some(Err(error)) => format!("a supervised runtime worker failed: {error}"),
                     None => "all supervised runtime workers stopped unexpectedly".to_owned(),
                 };
@@ -290,17 +318,39 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
         tracing::error!(%error, "cannot stop Wrangler Quick Tunnel");
     }
     let _ = shutdown_sender.send(true);
-    let workers_stopped = tokio::time::timeout(Duration::from_secs(15), async {
-        while let Some(worker) = workers.join_next().await {
-            if let Err(error) = worker {
-                tracing::error!(%error, "runtime worker did not stop cleanly");
+    let workers_stopped =
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(worker) = workers.join_next().await {
+                match worker {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        let reason = format!("runtime worker did not confirm shutdown: {error:#}");
+                        runtime_failure =
+                            Some(runtime_failure.take().map_or(reason.clone(), |previous| {
+                                format!("{previous}\n{reason}")
+                            }));
+                    }
+                    Err(error) => {
+                        let reason = format!("runtime worker did not stop cleanly: {error}");
+                        runtime_failure =
+                            Some(runtime_failure.take().map_or(reason.clone(), |previous| {
+                                format!("{previous}\n{reason}")
+                            }));
+                    }
+                }
             }
-        }
-    })
-    .await
-    .is_ok();
+        })
+        .await
+        .is_ok();
     if !workers_stopped {
-        tracing::error!("runtime workers exceeded the shutdown deadline; aborting them");
+        let reason =
+            "runtime workers exceeded the shutdown deadline; execution stop is unconfirmed";
+        runtime_failure = Some(
+            runtime_failure
+                .take()
+                .map_or(reason.to_owned(), |previous| format!("{previous}\n{reason}")),
+        );
+        tracing::error!("{reason}");
         workers.abort_all();
         while workers.join_next().await.is_some() {}
     }
@@ -316,10 +366,14 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     let _ = tokio::time::timeout(Duration::from_secs(5), ingress).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), health_server).await;
     drop(store);
-    telemetry.shutdown()?;
     if let Some(error) = runtime_failure {
         bail!(error);
     }
+    Ok(())
+}
+
+pub(crate) async fn worker_result(future: impl std::future::Future<Output = ()>) -> Result<()> {
+    future.await;
     Ok(())
 }
 
