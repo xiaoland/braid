@@ -16,6 +16,55 @@ pub(crate) fn operational_status_unknown_profile(profile_id: &str) -> String {
     )
 }
 
+fn public_error_summary(config: &Config, profile: &Profile, reason: &str) -> String {
+    let mut reason = reason.to_owned();
+    if let Ok(settings) = config.provider_config_for_profile(profile)
+        && let Some(pi) = settings.pi
+        && let Ok(key) = pi.api_key()
+        && !key.is_empty()
+    {
+        reason = reason.replace(&key, "[redacted provider key]");
+    }
+    let mut summary: String = reason.chars().take(3000).collect();
+    if reason.chars().count() > 3000 {
+        summary.push_str("\n[摘要截断；完整错误保留在本地运行记录。]");
+    }
+    summary
+        .lines()
+        .map(|line| format!("> {}", line.replace('<', "&lt;").replace('>', "&gt;")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn operational_status_turn_error(
+    config: &Config,
+    profile: &Profile,
+    claim: &TurnClaim,
+    lifecycle: &str,
+    reason: &str,
+) -> String {
+    let quoted = public_error_summary(config, profile, reason);
+    format!(
+        "> **Braid Operational Status · `{}`**\n\n\
+         **执行状态：{lifecycle}**\n\n\
+         Braid turn：`{}`\n\n原生会话：`{}`\n\n{quoted}\n\n\
+         此状态描述执行结果，不代表工作项验收结论。",
+        profile.id, claim.turn_id, claim.provider_session_id,
+    )
+}
+
+pub(crate) fn operational_status_stop_error(
+    config: &Config,
+    profile: &Profile,
+    reason: &str,
+) -> String {
+    format!(
+        "> **Braid Operational Status · `{}`**\n\n**执行恢复已阻断**\n\n{}\n\n旧执行停止未获确认；Braid 未启动替代执行。",
+        profile.id,
+        public_error_summary(config, profile, reason)
+    )
+}
+
 pub(crate) fn materialized_profile(profile: &Profile) -> Result<ProfileRecord> {
     let bytes = serde_json::to_vec(profile)?;
     let digest = hex::encode(Sha256::digest(bytes));

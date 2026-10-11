@@ -7,10 +7,7 @@ use tokio::{
     time::{Duration, MissedTickBehavior},
 };
 
-use super::{
-    SessionManager,
-    provider::{materialized_profile, operational_status_unknown_profile},
-};
+use super::{SessionManager, provider::materialized_profile};
 use crate::{
     agent_session::SessionFactory,
     config::{Config, Profile},
@@ -102,11 +99,95 @@ pub(crate) async fn agent_group_worker(
         sessions: SessionManager::new(factory),
     };
     driver.drive(&reports, &mut shutdown).await;
-    driver.sessions.retain(&std::collections::HashSet::new()).await;
+    if let Err(error) = driver.sessions.retain(&std::collections::HashSet::new()).await {
+        tracing::error!(%error, "shutdown did not confirm all executions stopped");
+    }
 }
 
 impl GroupDriver<'_> {
-    async fn fence_running(&self, running: &mut Option<RunningAgentTurn>) {
+    pub(super) fn publish_turn_error(&self, claim: &TurnClaim, lifecycle: &str, reason: &str) {
+        if let Err(error) = self.store.record_turn_error(claim.turn_id.clone(), reason.to_owned()) {
+            tracing::error!(%error, turn = %claim.turn_id, "cannot retain complete turn error");
+        }
+        if self.spec.profile.status_surfaces.is_empty() {
+            return;
+        }
+        if let Err(error) = self.store.enqueue_operational_status(
+            claim.turn_id.clone(),
+            super::provider::operational_status_turn_error(
+                self.config,
+                &self.spec.profile,
+                claim,
+                lifecycle,
+                reason,
+            ),
+        ) {
+            tracing::error!(%error, turn = %claim.turn_id, "cannot publish turn error status");
+        }
+    }
+
+    async fn shutdown_running(&self, running: &mut Option<RunningAgentTurn>) {
+        let Some(mut active) = running.take() else {
+            return;
+        };
+        let closed = self.sessions.remove(&active.claim.provider_session_id).await;
+        let mut terminal = None;
+        while let Ok(event) = active.events.try_recv() {
+            if let crate::agent_session::SessionEvent::TurnTerminal {
+                provider_turn_id,
+                outcome,
+                error,
+            } = event
+                && provider_turn_id == active.provider_turn_id
+            {
+                terminal = Some((outcome, error));
+            }
+        }
+        let (outcome, error) = terminal.unwrap_or((
+            crate::agent_session::TurnOutcome::Unknown,
+            Some("shutdown did not observe the active turn terminal".into()),
+        ));
+        if let Some(reset_id) = active.reset_id {
+            let _ = self.store.mark_context_reset_turn_terminal(
+                reset_id,
+                active.claim.turn_id.clone(),
+                outcome.lifecycle().into(),
+            );
+        } else {
+            let _ = self
+                .store
+                .mark_turn_terminal(active.claim.turn_id.clone(), outcome.lifecycle().into());
+            if active.claim.trusted_mention && outcome != crate::agent_session::TurnOutcome::Unknown
+            {
+                let reaction = if outcome == crate::agent_session::TurnOutcome::Completed {
+                    "+1"
+                } else {
+                    "confused"
+                };
+                let _ =
+                    self.store.enqueue_turn_reaction(active.claim.turn_id.clone(), reaction.into());
+            }
+        }
+        if matches!(
+            outcome,
+            crate::agent_session::TurnOutcome::Failed | crate::agent_session::TurnOutcome::Unknown
+        ) {
+            self.publish_turn_error(
+                &active.claim,
+                outcome.lifecycle(),
+                error.as_deref().unwrap_or("provider did not supply a terminal reason"),
+            );
+        }
+        if let Err(stop_error) = closed {
+            self.publish_turn_error(
+                &active.claim,
+                "unknown",
+                &format!("shutdown could not confirm execution stop: {stop_error}"),
+            );
+        }
+    }
+
+    async fn fence_running(&self, running: &mut Option<RunningAgentTurn>, reason: &str) {
         if let Some(active) = running.take() {
             if let Some(reset_id) = active.reset_id {
                 let _ = self.store.mark_context_reset_turn_terminal(
@@ -118,11 +199,15 @@ impl GroupDriver<'_> {
                 let _ =
                     self.store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
             }
-            let _ = self.store.enqueue_operational_status(
-                active.claim.turn_id,
-                super::provider::operational_status_unknown_profile(&active.claim.profile_id),
-            );
-            self.sessions.remove(&active.claim.provider_session_id).await;
+            self.publish_turn_error(&active.claim, "unknown", reason);
+            if let Err(error) = self.sessions.remove(&active.claim.provider_session_id).await {
+                tracing::error!(%error, "old execution stop remains unconfirmed");
+                self.publish_turn_error(
+                    &active.claim,
+                    "unknown",
+                    &format!("{reason}; old execution stop failed: {error}"),
+                );
+            }
         }
     }
 
@@ -141,7 +226,10 @@ impl GroupDriver<'_> {
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown.changed() => return,
+                _ = shutdown.changed() => {
+                    self.shutdown_running(&mut running).await;
+                    return;
+                },
                 event = async {
                     if let Some(ref mut active) = running {
                         active.events.recv().await
@@ -176,37 +264,39 @@ impl GroupDriver<'_> {
                                         let _ = store.enqueue_turn_reaction(active.claim.turn_id.clone(), reaction.into());
                                     }
                                 }
-                                if lifecycle == "unknown" {
-                                    let _ = store.enqueue_operational_status(
-                                        active.claim.turn_id.clone(),
-                                        operational_status_unknown_profile(&active.claim.profile_id),
-                                    );
-                                    self.sessions.remove(&active.claim.provider_session_id).await;
+                                if matches!(lifecycle, "failed" | "unknown") {
+                                    let reason = format!("provider turn {provider_turn_id}: {}", error.as_deref().unwrap_or("provider did not supply a terminal reason"));
+                                    self.publish_turn_error(&active.claim, lifecycle, &reason);
+                                }
+                                if lifecycle == "unknown"
+                                    && let Err(stop_error) = self.sessions.remove(&active.claim.provider_session_id).await {
+                                    tracing::error!(%stop_error, "old execution stop remains unconfirmed");
+                                    self.publish_turn_error(&active.claim, "unknown", &format!("{}; old execution stop failed: {stop_error}", error.as_deref().unwrap_or("provider outcome unknown")));
                                 }
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             tracing::warn!(skipped, "AgentSession event consumer lagged");
-                            self.fence_running(&mut running).await;
+                            self.fence_running(&mut running, &format!("AgentSession event consumer lagged by {skipped} lifecycle events")).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            self.fence_running(&mut running).await;
+                            self.fence_running(&mut running, "AgentSession event stream closed").await;
                         }
                     }
                 }
                 _ = tick.tick() => {
                     if running.as_ref().is_some_and(|active| active.events.is_closed()) {
-                        self.fence_running(&mut running).await;
+                        self.fence_running(&mut running, "AgentSession event stream closed").await;
                     }
                     if running.is_none() && tokio::time::Instant::now() >= recovery {
                         // Resume only absent or failed handles; a sibling's recovery must
                         // not fence healthy turns or rebuild their sessions.
                         let readiness = self.sessions.check().await;
-                        available = readiness.is_ok();
                         let result = match readiness {
                             Ok(()) => self.resume().await,
                             Err(error) => Err(error.into()),
                         };
+                        available = result.is_ok();
                         let error = result.err().map(|error| error.to_string());
                         if let Some(error) = &error { tracing::warn!(%error, kind = self.spec.kind.as_str(), "session recovery unavailable"); }
                         if reports.send(crate::health::ProviderHealthUpdate {
@@ -216,8 +306,9 @@ impl GroupDriver<'_> {
                     }
                     if let Some(active) = &mut running {
                         self.begin_active_context_reset(active).await;
-                        if active.reset_id.is_none() {
-                            self.forward_urgent_steer(active).await;
+                        if active.reset_id.is_none()
+                            && let Some(reason) = self.forward_urgent_steer(active).await {
+                            self.fence_running(&mut running, &reason).await;
                         }
                         continue;
                     }

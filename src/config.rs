@@ -889,35 +889,3 @@ pub fn agent_attributions(config: &Config) -> Vec<String> {
     }
     attributions
 }
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::Config;
-
-    #[test]
-    fn pi_settings_follow_the_requested_profile() {
-        let mut config = Config::load(Path::new("config.example.toml")).unwrap();
-        config.runtimes[0].adapter_type = "pi".into();
-        for profile in &mut config.profiles {
-            profile.adapter_type = "pi".into();
-        }
-        config.profiles[0].model = Some("issue-model".into());
-        config.profiles[0].reasoning = Some("low".into());
-        config.profiles[1].model = Some("pr-model".into());
-        let settings = config.provider_config_for_profile(&config.profiles[0]).unwrap().pi.unwrap();
-        assert_eq!(settings.model.as_deref(), Some("issue-model"));
-        assert_eq!(settings.thinking.as_deref(), Some("low"));
-    }
-
-    /// `config.example.toml` is the canonical starter template, not a loose
-    /// documentation snippet. It must parse and validate against the canonical
-    /// `Config` type so that it cannot drift from the real schema. Partial
-    /// examples in runbooks are not required to pass this test.
-    #[test]
-    fn example_config_matches_schema() {
-        Config::load(Path::new("config.example.toml"))
-            .expect("config.example.toml must match the Config schema");
-    }
-}

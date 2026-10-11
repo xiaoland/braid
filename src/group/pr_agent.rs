@@ -104,13 +104,21 @@ impl GroupDriver<'_> {
         let candidates = store.provider_resume_candidates(profile.id.clone(), "pr".into())?;
         let retained =
             candidates.iter().map(|candidate| candidate.provider_session_id.clone()).collect();
-        sessions.retain(&retained).await;
+        sessions.retain(&retained).await?;
         let mut unavailable = None;
         for candidate in candidates {
             if sessions.is_live(&candidate.provider_session_id).await {
                 continue;
             }
-            sessions.remove(&candidate.provider_session_id).await;
+            if let Err(error) = sessions.remove(&candidate.provider_session_id).await {
+                store.block_provider_session(
+                    candidate.provider_session_id.clone(),
+                    error.to_string(),
+                )?;
+                enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
+                tracing::error!(%error, provider_session = %candidate.provider_session_id, "old execution could not be stopped");
+                continue;
+            }
             // Fence a lost handle's in-flight turn before any compatibility
             // verdict so a blocked session never leaks a 'running' turn.
             if candidate
@@ -124,6 +132,12 @@ impl GroupDriver<'_> {
                     turn_id.clone(),
                     operational_status_unknown_profile(&profile.id),
                 )?;
+                let reason = "previous execution has no confirmed terminal; automatic resume is blocked until it is stopped";
+                store
+                    .block_provider_session(candidate.provider_session_id.clone(), reason.into())?;
+                enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
+                tracing::error!(provider_session = %candidate.provider_session_id, "{reason}");
+                continue;
             }
             let Some(worktree_path) = candidate.worktree_path.clone() else {
                 let message = "persisted PR provider session has no active worktree";
@@ -145,6 +159,27 @@ impl GroupDriver<'_> {
                 enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
                 continue;
             };
+            if candidate.has_started_turn
+                && profile.adapter_type == "pi"
+                && !std::path::Path::new(&candidate.provider_session_id).is_file()
+            {
+                let reason = "Pi native history is missing after a previously started execution; refusing an empty resume";
+                store
+                    .block_provider_session(candidate.provider_session_id.clone(), reason.into())?;
+                enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
+                continue;
+            }
+            if candidate.session_lifecycle == "unknown" {
+                if sessions.confirmed_stopped(&candidate.provider_session_id).await {
+                    // The existing reset owns replacement; never resume the uncertain old history.
+                    continue;
+                }
+                let reason = "previous execution outcome is unknown; automatic resume cannot prove it stopped";
+                store
+                    .block_provider_session(candidate.provider_session_id.clone(), reason.into())?;
+                enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
+                continue;
+            }
             let instructions = pr_system_prompt(config, profile, candidate.number, head_ref);
             let instruction_revision = hex::encode(Sha256::digest(instructions.as_bytes()));
             let incompatible_reason = if candidate.repository != config.github.repository {

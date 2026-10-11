@@ -117,6 +117,26 @@ Only `turn/completed` is terminal. Its status is
 retryable and is not terminal. Disconnect without a terminal leaves the turn
 unknown. Provider terminal state never proves product success.
 
+Pi 通过 `--append-system-prompt` 注入 Braid 与 Profile 指令，保留核心默认系统提示。
+`message_end` 只更新最近一条 assistant 消息的 `stopReason`，不结束 turn；Pi 仍可能
+持久化、压缩或重试。Adapter 等待 `agent_settled`，只有最终 `stopReason=stop` 才报告
+completed；`length`、错误或缺少停止原因均报告 failed。每次 `agent_start` 清空上一轮
+停止原因，避免沿用旧 turn 的成功状态。
+`stopReason=aborted` 报告 interrupted，供关闭和 Context reset 保存实际中断结果。
+
+Pi 的初始 GitHub Context 是用户数据，仅在尚未进入原生历史时随首条输入送入；
+后续 turn 不重复拼接 Braid/Profile 指令或这份 Context。由于 Pi 的 RPC 没有持久
+注入接口，会话路径也可能在首次 prompt 前尚未落盘，Braid 在原生 session 文件旁
+保存 `.braid-context` 固定初始输入。保存成功才完成 Context 物化；恢复时核对原生
+session 身份和 `get_entries` 的当前分支祖先中的实际 user message，决定是否仍需
+注入。工具引用、其它分支或 ACK 本身都不证明消费；无法核对时明确失败。旁文件
+不是新的当前 Context 权威，也不据此重发结果未知的事件输入。
+
+Pi 关闭由原生 abort 收口及 child 退出共同确认；Codex 关闭保留共享 app-server，
+只接受目标 turn 的确定终态作为停止依据。停止失败向 Group 返回具体错误，不能
+吞掉错误后仅凭数据库 fence 启动替代会话。已脱离原生管理的后台服务和已发出的
+外部请求不在这些停止回执的保证范围内。
+
 Braid does not publish item/delta/tool/reasoning/assistant activity to GitHub.
 Those protocol events are retained only in sampled full-fidelity telemetry and
 provider-owned history. Agent public prose is created by the Agent through

@@ -88,7 +88,5 @@ replace every placeholder path before running diagnostics, or let `braid setup`
 generate an instance config for you. A packaged release
 does not require Python, PDM, Cargo, or a source checkout.
 
-Braid deliberately avoids a large internal fake/unit-test surface while the
-workflow is being established. Diagnostic and real black-box campaign helpers
-belong under [`scripts/tests/`](scripts/tests/), but retained GitHub/provider/
-OTel evidence and Human verdicts remain the acceptance oracle.
+Braid 使用编译、实际操作及获授权实验取得反馈，不维护或运行测试代码、模拟提供方、
+包 smoke 或自检入口。GitHub、provider 和 OTel 原始证据及人工判断构成产品验收依据。

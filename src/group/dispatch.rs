@@ -285,7 +285,34 @@ impl GroupDriver<'_> {
             }
         };
         let Some(reset) = reset else { return false };
-        self.sessions.remove(&reset.old_provider_session_id).await;
+        let uncertain =
+            matches!(reset.old_session_lifecycle.as_str(), "unknown" | "blocked" | "running")
+                || reset
+                    .active_turn_lifecycle
+                    .as_deref()
+                    .is_some_and(|state| matches!(state, "starting" | "running" | "unknown"));
+        let stop = if uncertain
+            && self.sessions.get(&reset.old_provider_session_id).await.is_none()
+            && !self.sessions.confirmed_stopped(&reset.old_provider_session_id).await
+        {
+            Err(crate::agent_session::SessionError::Failed(
+                "old execution has no stop evidence after restart; replacement is blocked".into(),
+            ))
+        } else {
+            self.sessions.remove(&reset.old_provider_session_id).await
+        };
+        if let Err(error) = stop {
+            let reason = error.to_string();
+            let _ = store.fail_context_reset(reset.reset_id.clone(), reason.clone());
+            if !profile.status_surfaces.is_empty() {
+                let _ = store.enqueue_assignment_operational_status(
+                    reset.assignment_id.clone(),
+                    super::provider::operational_status_stop_error(self.config, profile, &reason),
+                );
+            }
+            tracing::error!(%error, reset = %reset.reset_id, "replacement blocked by unconfirmed stop");
+            return true;
+        }
         let reset_id = reset.reset_id.clone();
         let assignment_id = reset.assignment_id.clone();
         if let Err(error) = Box::pin(self.materialize_context_reset(reset)).await {
@@ -391,31 +418,44 @@ impl GroupDriver<'_> {
         Ok(())
     }
 
-    pub(super) async fn forward_urgent_steer(&self, active: &RunningAgentTurn) {
-        let store = self.store;
-        let sessions = &self.sessions;
-        let steer = match store.claim_urgent_steer(active.claim.turn_id.clone()) {
-            Ok(steer) => steer,
+    pub(super) async fn forward_urgent_steer(&self, active: &RunningAgentTurn) -> Option<String> {
+        let steer = match self.store.claim_urgent_steer(active.claim.turn_id.clone()) {
+            Ok(Some(steer)) => steer,
+            Ok(None) => return None,
             Err(error) => {
                 tracing::error!(%error, "cannot inspect urgent steer batch");
-                return;
+                return None;
             }
         };
-        let Some(steer) = steer else { return };
-        let reference = render_event_references(&steer);
-        let Some(session) = sessions.get(&active.claim.provider_session_id).await else {
-            tracing::warn!(
-                provider_session = %active.claim.provider_session_id,
-                "no AgentSession for steer; batch remains runnable"
-            );
-            return;
+        let Some(session) = self.sessions.get(&active.claim.provider_session_id).await else {
+            return None;
         };
-        if let Err(error) = session.send_user_msg(reference, true).await {
-            tracing::warn!(%error, "active turn did not accept urgent steer; batch remains runnable");
-            return;
-        }
-        if let Err(error) = store.consume_steer_batch(steer.batch_id) {
-            tracing::error!(%error, "cannot acknowledge urgent steer batch");
+        match session
+            .steer_user_msg(render_event_references(&steer), &active.provider_turn_id)
+            .await
+        {
+            Ok(SendResult::Acknowledged) => {
+                if let Err(error) = self.store.consume_steer_batch(steer.batch_id) {
+                    // The input was sent: a ledger failure cannot make it safe to resend.
+                    return Some(format!("accepted steer could not be recorded: {error}"));
+                }
+                None
+            }
+            Ok(SendResult::Deferred) => None,
+            Ok(SendResult::Started) => Some("steer unexpectedly started a new turn".into()),
+            Err(error @ crate::agent_session::SessionError::Failed(_)) => {
+                let _ = self.store.settle_steer_batch(steer.batch_id.clone(), "failed".into());
+                self.publish_turn_error(
+                    &steer,
+                    "input_failed",
+                    &format!("steer batch {} rejected: {error}", steer.batch_id),
+                );
+                None
+            }
+            Err(error) => {
+                let _ = self.store.settle_steer_batch(steer.batch_id.clone(), "unknown".into());
+                Some(format!("steer batch {} reception is unknown: {error}", steer.batch_id))
+            }
         }
     }
 
@@ -445,7 +485,7 @@ impl GroupDriver<'_> {
                 provider_session = %claim.provider_session_id,
                 "no AgentSession found for claimed turn"
             );
-            let _ = store.mark_turn_terminal(claim.turn_id.clone(), "failed".into());
+            let _ = store.defer_turn_claim(claim.turn_id.clone());
             return None;
         };
         // Subscribe before sending so the `TurnStarted` event — the single
@@ -453,23 +493,38 @@ impl GroupDriver<'_> {
         let mut events = session.events();
         match session.send_user_msg(reference, false).await {
             Ok(SendResult::Started) => {}
+            Ok(SendResult::Deferred) => {
+                if let Err(error) = store.defer_turn_claim(claim.turn_id.clone()) {
+                    tracing::error!(%error, "cannot restore unsent turn claim");
+                }
+                return None;
+            }
             Ok(SendResult::Acknowledged) => {
                 tracing::error!(turn = %claim.turn_id, "AgentSession did not start a turn");
                 let _ = store.mark_turn_terminal(claim.turn_id.clone(), "failed".into());
+                self.publish_turn_error(
+                    &claim,
+                    "failed",
+                    "AgentSession acknowledged a start request without creating a turn",
+                );
                 return None;
             }
             Err(error) => {
                 let lifecycle: String = match error {
-                    crate::agent_session::SessionError::Unavailable => "unknown".into(),
+                    crate::agent_session::SessionError::Unavailable
+                    | crate::agent_session::SessionError::Unknown(_) => "unknown".into(),
                     crate::agent_session::SessionError::Failed(_) => "failed".into(),
                 };
                 let _ = store.mark_turn_terminal(claim.turn_id.clone(), lifecycle.clone());
+                self.publish_turn_error(&claim, &lifecycle, &error.to_string());
                 if lifecycle == "unknown" {
-                    let _ = store.enqueue_operational_status(
-                        claim.turn_id.clone(),
-                        super::provider::operational_status_unknown_profile(&claim.profile_id),
-                    );
-                    sessions.remove(&claim.provider_session_id).await;
+                    if let Err(stop_error) = sessions.remove(&claim.provider_session_id).await {
+                        self.publish_turn_error(
+                            &claim,
+                            "unknown",
+                            &format!("{error}; old execution stop failed: {stop_error}"),
+                        );
+                    }
                 }
                 if claim.trusted_mention && lifecycle == "failed" {
                     let _ = store.enqueue_turn_reaction(claim.turn_id, "confused".into());
@@ -486,16 +541,34 @@ impl GroupDriver<'_> {
             }
             other => {
                 tracing::error!(?other, turn = %claim.turn_id, "AgentSession stream did not begin with TurnStarted");
-                let _ = store.mark_turn_terminal(claim.turn_id.clone(), "failed".into());
+                let _ = store.mark_turn_terminal(claim.turn_id.clone(), "unknown".into());
+                self.publish_turn_error(
+                    &claim,
+                    "unknown",
+                    &format!("AgentSession did not expose the accepted start identity: {other:?}"),
+                );
+                let _ = sessions.remove(&claim.provider_session_id).await;
                 return None;
             }
         };
         if let Err(error) = store.mark_turn_started(claim.turn_id.clone(), provider_turn_id.clone())
         {
             tracing::error!(%error, "cannot record provider turn start");
-            // The provider turn is running but unrecorded; the contract has no
-            // interrupt-only message, so the orphan turn is left to the provider's
-            // own lifecycle rather than fencing it here.
+            self.publish_turn_error(
+                &claim,
+                "unknown",
+                &format!(
+                    "accepted provider turn {provider_turn_id} could not be recorded: {error}"
+                ),
+            );
+            let _ = store.mark_turn_terminal(claim.turn_id.clone(), "unknown".into());
+            if let Err(stop_error) = sessions.remove(&claim.provider_session_id).await {
+                self.publish_turn_error(
+                    &claim,
+                    "unknown",
+                    &format!("{error}; old execution stop failed: {stop_error}"),
+                );
+            }
             return None;
         }
         if claim.trusted_mention
@@ -508,7 +581,8 @@ impl GroupDriver<'_> {
 
     /// Fence the active turn with a DB reset claim, then best-effort interrupt it.
     ///
-    /// The fence is the correctness mechanism: the turn's terminal is attributed
+    /// The fence attributes lifecycle events; stopping the old execution is
+    /// a separate prerequisite for replacement: the turn's terminal is attributed
     /// to the reset (no success/failure) and `materialize_context_reset` starts a
     /// fresh session with the rebuilt context. The interrupt is the documented
     /// latency/resource optimization on top of the fence — the turn stops now

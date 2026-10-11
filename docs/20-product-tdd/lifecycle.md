@@ -139,11 +139,17 @@ replacement comment.
 ## Provider and Transport Unknown
 
 连接丢失只证明旧执行结果未知，不能据此生成成功/失败 reaction。Core 将旧 turn
-记为 Unknown 并 fence 旧会话，发布 Operational Status；随后物化完整当前 Context，
-保留 assignment 和 worktree，将已接收输入重新送入调度。它不会盲目重发未知结果的
-provider RPC，也不承诺任意外部副作用 exactly-once。历史 Unknown 记录不因恢复成功消失。
-若断连发生在已经 interrupting 的 Context reset 中，Unknown 同样使 reset 进入
-materializing，继续既有 continuation 规则，不能让 reset 永久等待。
+记为 Unknown 并发布 Operational Status。账本 fence 不能阻止旧执行通过 Git、GitHub
+或 shell 继续产生副作用；替代执行启动前必须取得 adapter 的停止成功结果。停止失败
+或无法确认时保留旧句柄和现场，将工作项阻断并公开原因，不重发结果未知的原生 RPC。
+同一进程内已取得停止成功回执时，现有 Context reset 可以重建当前依据并重新调度
+canonical Event References；这不保证旧执行的 GitHub、Git 或 shell 副作用只发生一次。
+冷启动缺少原句柄时，遗留 starting、running 或 Unknown 也不能自动恢复。
+
+Context reset 可以记录待物化状态，但只有旧执行停止成功才创建替代会话。Pi 先等待
+原生 abort 收口再关闭 stdin 并等待进程退出；单独杀父进程不证明其工具已停止。
+Codex 保留共享连接，等待目标 turn 的真实终态；连接丢失或通知缺失时不杀其它健康
+会话来换取恢复。停止不能撤销已经发出的外部请求或收回脱离原生管理的后台服务。
 
 ## AgentSession Event Stream
 
@@ -158,6 +164,11 @@ event stream, not raw provider notifications. Each active session yields a
 
 Delivery semantics are part of the contract:
 
+普通 Failed 与 Unknown 都沿配置的 Operational Status surface 发布故障记录，包含
+对应 turn、原生会话和具体原因。完整错误先存入 `turns.error`，再生成有界公开摘要；
+公开内容移除配置中实际使用的 provider key，本地原始错误仍属于敏感运行材料。
+数据库 schema 3 通过新增迁移保存该字段，旧的已发布迁移保持不变。
+
 - **Exactly-once per fact.** One `TurnStarted`, then exactly one
   `TurnTerminal` — including session death, where the adapter synthesizes
   `Unknown` for the in-flight turn before going quiet. There is no second
@@ -170,7 +181,7 @@ Delivery semantics are part of the contract:
   Core 使用句柄的 latched `is_unavailable()`，包括 idle 与晚订阅情形。
   一个句柄失效不触发全局 epoch，也不重建健康的同类会话。
 - **持久化恢复兜底。** 恢复缺失/失效句柄之前，Group 将遗留的 starting/running
-  turn 记为 Unknown。只向具备可用句柄的 opaque session ID 领取 runnable turn；
+  turn 记为 Unknown 并阻断缺少停止依据的恢复。只向具备可用句柄的 opaque session ID 领取 runnable turn；
   不可用会话的输入保留待处理，不占住其他可用会话。
 
 Responsibilities do not overlap:
@@ -179,8 +190,9 @@ Responsibilities do not overlap:
   debounce, batching, urgency, and retry — an unsent batch simply remains
   runnable.
 - **`AgentSession`** only dispatches: idle, it starts a new turn; running and
-  `steering`, it forwards the steer; running and not steering, it drops the
-  message. It never queues; redelivery is the queue's job. `interrupt()` is
+  `steering`, it forwards input only to the expected active turn; running and
+  not steering, it defers without accepting the message. It never queues;
+  redelivery is the queue's job. `interrupt()` is
   the control-plane sibling of steering — an immediate operation on the
   observed in-flight turn that carries termination rather than input; the
   terminal still arrives via the event stream.
@@ -188,4 +200,5 @@ Responsibilities do not overlap:
   `SessionManager` 只索引中立句柄。替换完整 Context 不等于创建新的逻辑 Agent；
   adapter 的物理 ID 是可替换的执行绑定。
 - **Adapter** 管理进程、连接、物理会话和通知翻译，不读取 GitHub、不操作业务 store。
-  Group 释放旧句柄时，adapter 清理其资源；Codex 共享连接和 Pi 独立进程都服从同一契约。
+  Group 释放旧句柄时，adapter 必须报告停止是否成功；失败不删除句柄、不启动替代执行。
+  Codex 共享连接和 Pi 独立进程都服从同一契约。

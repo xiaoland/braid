@@ -29,9 +29,10 @@ impl TurnOutcome {
 pub enum SendResult {
     /// A new turn was accepted; observe `SessionEvent::TurnStarted` next.
     Started,
-    /// The message was accepted but does not create a new turn (steering, or
-    /// dropped while a turn is running).
+    /// The message was accepted by the observed active turn.
     Acknowledged,
+    /// No input was sent. The caller retains the batch for a safe boundary.
+    Deferred,
 }
 
 /// Lifecycle events that the core needs to react to.
@@ -64,12 +65,14 @@ pub enum SessionEvent {
     TurnTerminal { provider_turn_id: String, outcome: TurnOutcome, error: Option<String> },
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum SessionError {
     #[error("session failed: {0}")]
     Failed(String),
     #[error("session is unavailable")]
     Unavailable,
+    #[error("session reception is unknown: {0}")]
+    Unknown(String),
 }
 
 /// The core-facing Agent Session handle.
@@ -88,15 +91,21 @@ pub trait AgentSession: Send + Sync {
     /// imply that the provider's persisted session has been deleted.
     fn is_unavailable(&self) -> bool;
 
-    /// Release this handle's execution resources, best-effort interrupting
-    /// its active turn. Other sessions must remain usable.
+    /// Stop this handle's execution before releasing its resources. A failure
+    /// blocks replacement; other sessions must remain usable.
     async fn close(&self) -> Result<(), SessionError>;
 
     /// Send a user message batch. `steering` selects the provider steer path
     /// for a running turn; a non-steering message while a turn runs is
-    /// dropped (`Acknowledged`) because the caller is expected to route it
-    /// through the event queue debounce instead.
+    /// deferred without sending; the caller retains it in the event queue.
     async fn send_user_msg(&self, msg: String, steering: bool) -> Result<SendResult, SessionError>;
+
+    /// Forward only to this observed active turn; never start a new turn.
+    async fn steer_user_msg(
+        &self,
+        msg: String,
+        expected_turn_id: &str,
+    ) -> Result<SendResult, SessionError>;
 
     /// Best-effort termination of the in-flight turn — the control-plane
     /// sibling of steering: both are immediate operations addressed to the

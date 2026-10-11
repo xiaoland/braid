@@ -108,8 +108,12 @@ impl CodexProvider {
             .map_err(|error| ProviderError::Protocol(error.to_string()))?;
         bytes.push(b'\n');
         let mut writer = self.writer.lock().await;
-        writer.write_all(&bytes).await.map_err(|_| ProviderError::Disconnected)?;
-        writer.flush().await.map_err(|_| ProviderError::Disconnected)
+        writer.write_all(&bytes).await.map_err(|error| {
+            ProviderError::Unknown(format!("Codex app-server write failed: {error}"))
+        })?;
+        writer.flush().await.map_err(|error| {
+            ProviderError::Unknown(format!("Codex app-server flush failed: {error}"))
+        })
     }
 }
 
@@ -269,13 +273,7 @@ fn spawn_codex_stdout(
             if let Some(id) = frame.get("id").and_then(Value::as_i64) {
                 if let Some(sender) = pending.lock().await.remove(&id) {
                     let response = if let Some(error) = frame.get("error") {
-                        Err(ProviderError::Protocol(
-                            error
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown app-server error")
-                                .to_owned(),
-                        ))
+                        Err(ProviderError::Protocol(error.to_string()))
                     } else {
                         Ok(frame.get("result").cloned().unwrap_or(Value::Null))
                     };
@@ -337,6 +335,6 @@ fn parse_codex_notification(frame: &Value) -> Option<ProviderNotification> {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
         }),
-        _ => Some(ProviderNotification::Activity { method, thread_id, turn_id }),
+        _ => None,
     }
 }

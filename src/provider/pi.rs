@@ -1,9 +1,16 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
 
+struct PiRequest {
+    response: oneshot::Sender<Result<Value, ProviderError>>,
+    turn_id: Option<String>,
+}
+
+type PiPendingRequests = BTreeMap<i64, PiRequest>;
+
 struct PiProcess {
     writer: ChildStdin,
-    _child: Child,
+    child: Child,
     #[allow(dead_code)]
     stdout_handle: tokio::task::JoinHandle<()>,
     #[allow(dead_code)]
@@ -12,13 +19,14 @@ struct PiProcess {
 
 struct PiState {
     config: PiConfig,
-    pending: Arc<Mutex<PendingRequests>>,
+    pending: Arc<Mutex<PiPendingRequests>>,
     next_request_id: Arc<AtomicI64>,
     process: Option<PiProcess>,
     session: Option<String>,
     developer_instructions: String,
     context: String,
-    current_turn_id: Option<String>,
+    native_session_id: Option<String>,
+    close_result: Option<Result<(), String>>,
 }
 
 #[derive(Clone)]
@@ -42,7 +50,8 @@ impl PiProvider {
             session: None,
             developer_instructions: String::new(),
             context: String::new(),
-            current_turn_id: None,
+            native_session_id: None,
+            close_result: None,
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -108,7 +117,7 @@ impl PiProvider {
             cmd.args(["--session", session_path]);
         }
         if !state.developer_instructions.is_empty() {
-            cmd.args(["--system-prompt", &state.developer_instructions]);
+            cmd.args(["--append-system-prompt", &state.developer_instructions]);
         }
         cmd.current_dir(workspace);
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
@@ -135,19 +144,28 @@ impl PiProvider {
             Arc::clone(&self.turn_id),
         );
         let stderr_handle = spawn_pi_stderr(stderr);
-        state.process = Some(PiProcess { writer, _child: child, stdout_handle, stderr_handle });
+        state.process = Some(PiProcess { writer, child, stdout_handle, stderr_handle });
         Ok(())
     }
 
     async fn request(state: &mut PiState, frame: Value) -> Result<Value, ProviderError> {
+        Self::request_with_turn(state, frame, None).await
+    }
+
+    async fn request_with_turn(
+        state: &mut PiState,
+        frame: Value,
+        turn_id: Option<String>,
+    ) -> Result<Value, ProviderError> {
         let id = state.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let method = frame.get("type").and_then(Value::as_str).unwrap_or("unknown").to_owned();
         let mut frame = frame;
         if let Some(obj) = frame.as_object_mut() {
             obj.insert("id".to_string(), json!(id));
         }
 
         let (sender, receiver) = oneshot::channel();
-        state.pending.lock().await.insert(id, sender);
+        state.pending.lock().await.insert(id, PiRequest { response: sender, turn_id });
 
         let process = state.process.as_mut().ok_or(ProviderError::Disconnected)?;
         let bytes = {
@@ -158,11 +176,15 @@ impl PiProvider {
         };
         if let Err(error) = process.writer.write_all(&bytes).await {
             state.pending.lock().await.remove(&id);
-            return Err(ProviderError::Start(error));
+            return Err(ProviderError::Unknown(format!(
+                "Pi {method} request {id} write failed: {error}"
+            )));
         }
         if let Err(error) = process.writer.flush().await {
             state.pending.lock().await.remove(&id);
-            return Err(ProviderError::Start(error));
+            return Err(ProviderError::Unknown(format!(
+                "Pi {method} request {id} flush failed: {error}"
+            )));
         }
 
         match timeout(REQUEST_TIMEOUT, receiver).await {
@@ -170,7 +192,7 @@ impl PiProvider {
             Ok(Err(_)) => Err(ProviderError::Disconnected),
             Err(_) => {
                 state.pending.lock().await.remove(&id);
-                Err(ProviderError::Timeout { method: "pi_rpc".into() })
+                Err(ProviderError::Timeout { method: format!("Pi {method} request {id}") })
             }
         }
     }
@@ -212,7 +234,7 @@ impl AgentProvider for PiProvider {
         developer_instructions.clone_into(&mut state.developer_instructions);
         state.context.clear();
         state.session = None;
-        state.current_turn_id = None;
+        state.close_result = None;
         state.process = None;
 
         self.spawn(&mut state, profile.workspace(), None)?;
@@ -229,12 +251,27 @@ impl AgentProvider for PiProvider {
             .and_then(Value::as_str)
             .ok_or_else(|| ProviderError::Protocol("get_state missing sessionFile".into()))?;
         state.session = Some(session_file.to_owned());
+        state.native_session_id =
+            Some(required_string(&state_resp["data"], "sessionId", "Pi get_state")?);
+        *self.thread_id.lock().await = session_file.to_owned();
 
         Ok(ProviderSession { thread_id: session_file.to_owned() })
     }
 
-    async fn inject_context(&self, _thread_id: &str, context: &str) -> Result<(), ProviderError> {
+    async fn inject_context(&self, thread_id: &str, context: &str) -> Result<(), ProviderError> {
         let mut state = self.state.lock().await;
+        if state.session.as_deref() != Some(thread_id) {
+            return Err(ProviderError::Protocol("Context session identity mismatch".into()));
+        }
+        super::pi_context::save(
+            thread_id,
+            &super::pi_context::PendingContext {
+                native_session_id: state.native_session_id.clone().ok_or_else(|| {
+                    ProviderError::Protocol("Pi omitted native session identity".into())
+                })?,
+                context: context.to_owned(),
+            },
+        )?;
         context.clone_into(&mut state.context);
         Ok(())
     }
@@ -245,15 +282,48 @@ impl AgentProvider for PiProvider {
         profile: &Profile,
         developer_instructions: &str,
     ) -> Result<ProviderSession, ProviderError> {
+        let mut pending = super::pi_context::load(thread_id)?;
+        let has_history = Path::new(thread_id).is_file();
+        if has_history {
+            super::pi_context::validate_history(thread_id)?;
+        }
+        if !has_history && pending.is_none() {
+            return Err(ProviderError::Protocol(
+                "Pi native history and startup Context are both missing".into(),
+            ));
+        }
         let mut state = self.state.lock().await;
         developer_instructions.clone_into(&mut state.developer_instructions);
         state.context.clear();
         state.session = Some(thread_id.to_owned());
-        state.current_turn_id = None;
+        state.close_result = None;
         state.process = None;
-
         self.spawn(&mut state, profile.workspace(), Some(thread_id))?;
-
+        let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
+        let resumed_path = required_string(&native["data"], "sessionFile", "Pi get_state")?;
+        if Path::new(&resumed_path) != Path::new(thread_id) {
+            return Err(ProviderError::Protocol("Pi resumed a different session path".into()));
+        }
+        let native_id = required_string(&native["data"], "sessionId", "Pi get_state")?;
+        if let Some(initial) = pending.as_mut() {
+            if has_history && initial.native_session_id != native_id {
+                return Err(ProviderError::Protocol(
+                    "Pi startup Context belongs to a different native session".into(),
+                ));
+            }
+            let history = Self::request(&mut state, json!({"type":"get_entries"})).await?;
+            if !super::pi_context::consumed(initial, &history)? {
+                initial.context.clone_into(&mut state.context);
+            }
+            if !has_history {
+                // No prior user history exists: Pi recreated only the empty
+                // native header behind the same Braid execution identity.
+                native_id.clone_into(&mut initial.native_session_id);
+                super::pi_context::save(thread_id, initial)?;
+            }
+        }
+        state.native_session_id = Some(native_id);
+        *self.thread_id.lock().await = thread_id.to_owned();
         Ok(ProviderSession { thread_id: thread_id.to_owned() })
     }
 
@@ -269,55 +339,127 @@ impl AgentProvider for PiProvider {
             self.spawn(&mut state, profile.workspace(), session.as_deref())?;
         }
 
-        let mut message = String::new();
-        if !state.developer_instructions.is_empty() {
-            message.push_str(&state.developer_instructions);
-            message.push_str("\n\n");
+        let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
+        if native_is_busy(&native)? {
+            return Err(ProviderError::Deferred(
+                "Pi is streaming, compacting or has queued input".into(),
+            ));
         }
+        let mut message = String::new();
         if !state.context.is_empty() {
             message.push_str(&state.context);
             message.push_str("\n\n");
         }
         message.push_str(event_references);
-
         let turn_id = uuid::Uuid::now_v7().to_string();
-        state.current_turn_id = Some(turn_id.clone());
-        *self.turn_id.lock().await = turn_id.clone();
-        *self.thread_id.lock().await = state.session.clone().unwrap_or_default();
-
-        let result =
-            Self::request(&mut state, json!({"type": "prompt", "message": message})).await?;
-        Self::success_or_protocol(&result, "prompt")?;
-
+        let result = Self::request_with_turn(
+            &mut state,
+            json!({"type":"prompt","message":message}),
+            Some(turn_id.clone()),
+        )
+        .await;
+        match result {
+            Ok(result) => Self::success_or_protocol(&result, "prompt")?,
+            Err(ProviderError::Protocol(reason)) => {
+                let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
+                if native_is_busy(&native)? {
+                    return Err(ProviderError::Deferred(reason));
+                }
+                return Err(ProviderError::Protocol(reason));
+            }
+            Err(error) => return Err(error),
+        }
+        // ACK clears only this process's staging buffer. The immutable startup
+        // artifact survives until native history can establish consumption.
+        state.context.clear();
         Ok(ProviderTurn { turn_id })
     }
 
     async fn steer(
         &self,
         _thread_id: &str,
-        _expected_turn_id: &str,
+        expected_turn_id: &str,
         event_references: &str,
     ) -> Result<(), ProviderError> {
         let mut state = self.state.lock().await;
+        if self.turn_id.lock().await.as_str() != expected_turn_id {
+            return Err(ProviderError::Deferred("Pi active turn changed before steering".into()));
+        }
+        let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
+        if !required_native_bool(&native, "isStreaming")? {
+            return Err(ProviderError::Deferred("Pi is no longer streaming".into()));
+        }
         let result =
-            Self::request(&mut state, json!({"type": "steer", "message": event_references}))
-                .await?;
+            Self::request(&mut state, json!({"type":"steer","message":event_references})).await?;
         Self::success_or_protocol(&result, "steer")?;
+        if self.turn_id.lock().await.as_str() != expected_turn_id {
+            return Err(ProviderError::Unknown(
+                "Pi accepted steering at a changing turn boundary".into(),
+            ));
+        }
         Ok(())
     }
 
-    async fn interrupt(&self, _thread_id: &str, _turn_id: &str) -> Result<(), ProviderError> {
+    async fn interrupt(&self, _thread_id: &str, turn_id: &str) -> Result<(), ProviderError> {
         let mut state = self.state.lock().await;
-        let result = Self::request(&mut state, json!({"type": "abort"})).await?;
-        Self::success_or_protocol(&result, "abort")?;
-        Ok(())
+        if self.turn_id.lock().await.as_str() != turn_id {
+            return Ok(());
+        }
+        let result = Self::request(&mut state, json!({"type":"abort"})).await?;
+        Self::success_or_protocol(&result, "abort")
+    }
+
+    async fn close_session(
+        &self,
+        _thread_id: &str,
+        confirmed_idle: bool,
+    ) -> Result<(), ProviderError> {
+        let mut state = self.state.lock().await;
+        if let Some(result) = &state.close_result {
+            return result.clone().map_err(ProviderError::Protocol);
+        }
+        let result = async {
+            if !confirmed_idle {
+                let cleared = Self::request(&mut state, json!({"type":"clear_queue"})).await?;
+                Self::success_or_protocol(&cleared, "clear_queue")?;
+                let aborted = Self::request(&mut state, json!({"type":"abort"})).await?;
+                Self::success_or_protocol(&aborted, "abort")?;
+                let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
+                if native_is_busy(&native)? {
+                    return Err(ProviderError::Protocol(
+                        "Pi remains busy after abort; replacement is blocked".into(),
+                    ));
+                }
+            }
+            if let Some(process) = state.process.as_mut() {
+                process.writer.shutdown().await?;
+                timeout(REQUEST_TIMEOUT, process.child.wait()).await.map_err(|_| {
+                    ProviderError::Timeout { method: "Pi child exit after stop".into() }
+                })??;
+            }
+            Ok(())
+        }
+        .await;
+        if result.is_err()
+            && let Some(process) = state.process.as_mut()
+        {
+            // Reclaim the parent, but never promote a forced kill into a
+            // claim that detached tools have stopped.
+            let _ = process.child.start_kill();
+            let _ = timeout(REQUEST_TIMEOUT, process.child.wait()).await;
+        }
+        state.close_result = Some(result.as_ref().copied().map_err(ToString::to_string));
+        if result.is_ok() {
+            state.process = None;
+        }
+        result
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_pi_stdout(
     stdout: tokio::process::ChildStdout,
-    pending: Arc<Mutex<PendingRequests>>,
+    pending: Arc<Mutex<PiPendingRequests>>,
     notifications: broadcast::Sender<ProviderNotification>,
     closed: watch::Sender<bool>,
     thread_id: Arc<Mutex<String>>,
@@ -325,6 +467,8 @@ fn spawn_pi_stdout(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
+        let mut last_stop = None;
+        let mut last_error = None;
         while let Ok(Some(line)) = lines.next_line().await {
             telemetry::emit_payload_event(&PayloadEvidence {
                 github_body: "",
@@ -339,7 +483,7 @@ fn spawn_pi_stdout(
                 continue;
             };
             if let Some(id) = frame.get("id").and_then(Value::as_i64) {
-                if let Some(sender) = pending.lock().await.remove(&id) {
+                if let Some(request) = pending.lock().await.remove(&id) {
                     let response = if frame.get("success").and_then(Value::as_bool) == Some(false) {
                         let message = frame
                             .get("error")
@@ -350,19 +494,46 @@ fn spawn_pi_stdout(
                     } else {
                         Ok(frame)
                     };
-                    let _ = sender.send(response);
+                    let response = match (response, request.turn_id) {
+                        (Ok(frame), Some(candidate)) => {
+                            if frame["data"]["disposition"]
+                                .as_str()
+                                .is_some_and(|value| value != "started")
+                            {
+                                Err(ProviderError::Unknown(format!(
+                                    "Pi prompt accepted without immediate execution: {}",
+                                    frame["data"]
+                                )))
+                            } else {
+                                *turn_id.lock().await = candidate;
+                                Ok(frame)
+                            }
+                        }
+                        (response, _) => response,
+                    };
+                    let _ = request.response.send(response);
                 }
                 continue;
             }
             let current_thread = thread_id.lock().await.clone();
             let current_turn = turn_id.lock().await.clone();
-            if let Some(notification) = parse_pi_event(&frame, &current_thread, &current_turn) {
+            if let Some(notification) = parse_pi_event(
+                &frame,
+                &current_thread,
+                &current_turn,
+                &mut last_stop,
+                &mut last_error,
+            ) {
+                let settled = matches!(notification, ProviderNotification::TurnCompleted { .. });
                 let _ = notifications.send(notification);
+                if settled {
+                    turn_id.lock().await.clear();
+                }
             }
         }
         let drained = std::mem::take(&mut *pending.lock().await);
-        for sender in drained.into_values() {
-            let _ = sender.send(Err(ProviderError::Disconnected));
+        for request in drained.into_values() {
+            let _ = request.response.send(Err(ProviderError::Disconnected));
         }
         let _ = notifications.send(ProviderNotification::Disconnected);
         closed.send_replace(true);
@@ -386,59 +557,62 @@ fn spawn_pi_stderr(stderr: tokio::process::ChildStderr) -> tokio::task::JoinHand
     })
 }
 
-fn parse_pi_event(frame: &Value, thread_id: &str, turn_id: &str) -> Option<ProviderNotification> {
+fn parse_pi_event(
+    frame: &Value,
+    thread_id: &str,
+    turn_id: &str,
+    last_stop: &mut Option<String>,
+    last_error: &mut Option<String>,
+) -> Option<ProviderNotification> {
     let event_type = frame.get("type")?.as_str()?;
+    if event_type == "agent_start" {
+        *last_stop = None;
+        *last_error = None;
+    }
+    if event_type == "message_end" {
+        let message = &frame["message"];
+        if message["role"] == "assistant" {
+            *last_stop = message["stopReason"].as_str().map(str::to_owned);
+            *last_error = message["errorMessage"].as_str().map(str::to_owned);
+        }
+    }
     match event_type {
         "turn_start" => Some(ProviderNotification::TurnStarted {
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
         }),
+        // Pi may persist, compact, or retry after message_end. Only settled
+        // closes this physical run; a transient error must not abort recovery.
         "agent_settled" => Some(ProviderNotification::TurnCompleted {
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
-            status: "completed".into(),
-            error: None,
-        }),
-        "message_end" => {
-            // Fallback for Pi sessions that emit the final assistant message without a
-            // following turn_end (for example, when the model stops cleanly but the
-            // session remains open for follow-ups). Only treat a stopReason of "stop"
-            // as terminal; toolUse means more tool calls are expected.
-            let message = frame.get("message")?;
-            if message.get("role").and_then(Value::as_str) != Some("assistant") {
-                return Some(ProviderNotification::Activity {
-                    method: event_type.into(),
-                    thread_id: None,
-                    turn_id: None,
-                });
+            status: match last_stop.as_deref() {
+                Some("stop") => "completed",
+                Some("aborted") => "interrupted",
+                _ => "failed",
             }
-            let stop_reason = message.get("stopReason").and_then(Value::as_str)?;
-            if stop_reason == "stop" {
-                Some(ProviderNotification::TurnCompleted {
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    status: "completed".into(),
-                    error: None,
-                })
-            } else if stop_reason == "error" || stop_reason == "aborted" {
-                Some(ProviderNotification::TurnCompleted {
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    status: "failed".into(),
-                    error: Some(format!("pi assistant message ended with {stop_reason}")),
-                })
+            .into(),
+            error: if matches!(last_stop.as_deref(), Some("stop" | "aborted")) {
+                None
             } else {
-                Some(ProviderNotification::Activity {
-                    method: event_type.into(),
-                    thread_id: None,
-                    turn_id: None,
-                })
-            }
-        }
-        _ => Some(ProviderNotification::Activity {
-            method: event_type.into(),
-            thread_id: None,
-            turn_id: None,
+                Some(last_error.clone().unwrap_or_else(|| format!("Pi settled with {last_stop:?}")))
+            },
         }),
+        _ => None,
     }
+}
+
+fn required_native_bool(response: &Value, field: &str) -> Result<bool, ProviderError> {
+    response["data"][field]
+        .as_bool()
+        .ok_or_else(|| ProviderError::Protocol(format!("Pi get_state missing boolean {field}")))
+}
+
+fn native_is_busy(response: &Value) -> Result<bool, ProviderError> {
+    let streaming = required_native_bool(response, "isStreaming")?;
+    let compacting = required_native_bool(response, "isCompacting")?;
+    let pending = response["data"]["pendingMessageCount"].as_u64().ok_or_else(|| {
+        ProviderError::Protocol("Pi get_state missing pendingMessageCount".into())
+    })?;
+    Ok(streaming || compacting || pending != 0)
 }
