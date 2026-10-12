@@ -1,19 +1,29 @@
 # Braid 的 Pi 原生材料
 
-本目录提供独立 Braid 的锁定 Pi 1.0.2 材料。插件按安装时的明确选择启用，
+本目录提供独立 Braid 的锁定 Pi 1.1.0 材料。插件按安装时的明确选择安装和启用，
 不读取系统全局 Pi 扩展；CLI 和 RPC 使用同一入口。共同生命周期与停止合同归
 [provider 技术说明](../../docs/20-product-tdd/app-server.md)。
+
+`pi.mjs` 准备隔离环境与显式材料；`sdk-host.mjs` 使用 Pi 根包公开导出的 SDK
+构造会话、资源和工具，复用公开的 RPC/print 实现；`rpc-adapter.mjs` 增加 Braid
+停止、服务交接和实际运行身份。Braid 不再修改 Pi CLI/RPC bundle、会话生命周期、
+资源加载器和 Bash 实现来注入这些策略。
+受管入口支持 Braid 使用的 RPC，以及子 Agent 使用的 JSON/text print、文本任务
+文件和图片附件。它不是完整交互式 Pi CLI；未实现的原生 CLI 选项明确报错，
+不能忽略选项后开始另一种模型操作。
 
 在有 Node、npm、curl 与 tar 的开发宿主安装到新的绝对目录。不要覆盖正在使用的安装，
 保留旧版本和执行回执。Mac 本项目的目录必须位于 WorkSSD。
 
 ```sh
-node native/pi/install.mjs /Volumes/WorkSSD/Development/braid-runtime/pi-1.0.2 \
+node native/pi/install.mjs /Volumes/WorkSSD/Development/braid-runtime/pi-1.1.0 \
   --plugins subagents,background
-/Volumes/WorkSSD/Development/braid-runtime/pi-1.0.2/pi --version
+/Volumes/WorkSSD/Development/braid-runtime/pi-1.1.0/pi --version
 ```
 
-安装使用锁定依赖并应用有序补丁，下载 Node 官方 24.15.0 对应平台发行包，
+安装使用同一份锁定依赖图，以 npm workspace 选择基础 SDK 和指定插件，
+仅应用基础补丁与所选插件补丁。未选择的插件不安装、不修改；插件之间不隐含绑定，
+例如 background 可单独选择。安装下载 Node 官方 24.15.0 对应平台发行包，
 核对内置 archive SHA-256 后交付独立的 `bin/node`、许可证、`pi` 入口和
 `runtime-manifest.json`。支持 macOS/Linux 的 arm64 与 x64；manifest 保留发行身份
 和实际文件哈希。安装器不复制可能依赖 Homebrew 动态库的宿主 Node。
@@ -21,6 +31,14 @@ node native/pi/install.mjs /Volumes/WorkSSD/Development/braid-runtime/pi-1.0.2 \
 Pi 的实际能力仍须通过 doctor 与运行核实。
 可选插件名称为 subagents、background、context7、fff、mcporter；默认不启用插件。
 FFF 使用平台原生依赖，安装失败应保留原始错误，不降级为不可用的工具。
+
+基础发行保留两类小范围上游补丁：`compaction.thresholdTokens` 提供提前压缩触发点，
+计算为它与真实模型容量减 reserve 的较小值，不伪造模型容量或改变总结预算；
+pi-ai 的连接重置错误分类保留已观察到的 `connection reset by peer` 重试行为。
+对应的公开设置或错误分类被上游提供并取得实际反馈后，再退役这些补丁。
+subagents、background、Context7 和 MCPorter 的局部补丁仅随相应插件安装，
+仍包含尚无公开接线点的插件内部修复及 owned process/service 登记。
+它们不是无补丁上游发行，不应删掉停止或交接能力来换取零补丁。
 
 锁定的 pi-subagents 0.56.0 对自定义角色 frontmatter 使用字符串列表解析，
 `fallbackModels: []` 和 `fallbackModels: false` 都会成为模型名称，不能用于禁用回退。

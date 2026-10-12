@@ -36,7 +36,13 @@ if (fs.existsSync(destination) && fs.readdirSync(destination).length) throw new 
 fs.mkdirSync(destination, { recursive: true });
 for (const name of ['.cache', '.tmp', '.install-home']) fs.mkdirSync(path.join(destination, name), { recursive: true });
 const env = { ...process.env, HOME: path.join(destination, '.install-home'), TMPDIR: path.join(destination, '.tmp'), npm_config_cache: path.join(destination, '.cache') };
-for (const name of ['package.json', 'package-lock.json', 'pi', 'pi.mjs', 'managed.mjs', 'process-owner.mjs']) fs.copyFileSync(path.join(source, name), path.join(destination, name));
+const runtimeFiles = ['package.json', 'package-lock.json', 'pi', ...fs.readdirSync(source).filter(name => name.endsWith('.mjs') && name !== 'install.mjs')];
+for (const name of runtimeFiles) fs.copyFileSync(path.join(source, name), path.join(destination, name));
+for (const name of Object.keys(catalog)) {
+  const directory = path.join(destination, 'plugins', name);
+  fs.mkdirSync(directory, { recursive: true });
+  fs.copyFileSync(path.join(source, 'plugins', name, 'package.json'), path.join(directory, 'package.json'));
+}
 fs.chmodSync(path.join(destination, 'pi'), 0o755);
 fs.mkdirSync(path.join(destination, 'bin'));
 const sha = filename => crypto.createHash('sha256').update(fs.readFileSync(filename)).digest('hex');
@@ -53,8 +59,17 @@ fs.copyFileSync(path.join(destination, '.tmp', nodeDirectory, 'LICENSE'), path.j
 fs.chmodSync(path.join(destination, 'bin/node'), 0o755);
 const installedNodeVersion = execFileSync(path.join(destination, 'bin/node'), ['--version'], { env, encoding: 'utf8' }).trim();
 if (installedNodeVersion !== `v${nodeVersion}`) throw new Error(`Installed Node did not report v${nodeVersion}: ${installedNodeVersion}.`);
-execFileSync('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: destination, env, stdio: 'inherit' });
-const patches = JSON.parse(fs.readFileSync(path.join(source, 'patches.json'), 'utf8'));
+const workspaceArgs = selected.length
+  ? ['--include-workspace-root', ...selected.map(name => `--workspace=plugins/${name}`)]
+  : ['--workspaces=false'];
+execFileSync('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund', ...workspaceArgs], { cwd: destination, env, stdio: 'inherit' });
+// Workspace wrappers select dependencies at installation; they are not runtime packages.
+for (const name of Object.keys(catalog)) {
+  const link = path.join(destination, 'node_modules', '@braid', `pi-runtime-${name}`);
+  if (fs.existsSync(link)) fs.unlinkSync(link);
+}
+const patches = JSON.parse(fs.readFileSync(path.join(source, 'patches.json'), 'utf8'))
+  .filter(item => !item.plugin || selected.includes(item.plugin));
 for (const item of patches) {
   execFileSync('patch', ['--batch', '--fuzz=0', '-p1', '-d', path.join(destination, 'node_modules', item.package), '-i', path.join(source, item.path)], { env, stdio: 'inherit' });
 }
@@ -77,11 +92,12 @@ function record(directory, relative = '') {
 }
 record(path.join(destination, 'node_modules'), 'node_modules');
 record(path.join(destination, 'bin'), 'bin');
-for (const name of ['package.json', 'package-lock.json', 'pi', 'pi.mjs', 'managed.mjs', 'process-owner.mjs']) files[name] = sha(path.join(destination, name));
+for (const name of runtimeFiles) files[name] = sha(path.join(destination, name));
+record(path.join(destination, 'plugins'), 'plugins');
 const member = relative => ({ path: relative, sha256: files[relative] });
 const manifest = {
   schema_version: 1,
-  pi_version: '1.0.2',
+  pi_version: JSON.parse(fs.readFileSync(path.join(destination, 'node_modules/@earendil-works/pi-coding-agent/package.json'))).version,
   capabilities: ['retry_intent', 'settle_extensions', 'owned_inference', 'managed_execution', 'owned_stop'],
   entrypoint: member('pi'),
   managed_module: member('managed.mjs'),
@@ -90,7 +106,10 @@ const manifest = {
   node_distribution: { version: nodeVersion, platform: process.platform, arch: process.arch, url: nodeUrl, archive_sha256: nodeDistribution[1] },
   plugins: selected.map(name => ({ name, executable_paths: [], ...catalog[name] })),
   npm_lock_sha256: files['package-lock.json'],
-  packages: Object.fromEntries(Object.keys(JSON.parse(fs.readFileSync(path.join(source, 'package.json'))).dependencies).map(name => [name, JSON.parse(fs.readFileSync(path.join(destination, 'node_modules', name, 'package.json'))).version])),
+  packages: Object.fromEntries([
+    ...Object.keys(JSON.parse(fs.readFileSync(path.join(source, 'package.json'))).dependencies),
+    ...selected.flatMap(name => Object.keys(JSON.parse(fs.readFileSync(path.join(source, 'plugins', name, 'package.json'))).dependencies)),
+  ].map(name => [name, JSON.parse(fs.readFileSync(path.join(destination, 'node_modules', name, 'package.json'))).version])),
   patches: patches.map(({ package: name, path: relative }) => ({ package: name, path: relative, sha256: sha(path.join(source, relative)) })),
   files,
 };

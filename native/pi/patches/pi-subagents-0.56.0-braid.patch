@@ -48,20 +48,21 @@
  	const asyncRetentionAbort = new AbortController();
  	const asyncRetentionTimer = setTimeout(async () => {
  		try {
-@@ -717,8 +735,36 @@
+@@ -717,8 +735,37 @@
  
  	registerWaitTool(pi, state, waitToolConfig.enabled, waitSubscriptionManager);
  
 -	pi.on("agent_end", async (_event, ctx) => {
 -		if (!ctx.hasUI) await drainOutstandingWork({ state, events: pi.events });
-+	pi.on("agent_end", async (event, ctx) => {
-+		if (event.willRetry) return;
-+		const lastAssistant = [...event.messages].reverse().find((message) => message.role === "assistant");
-+		if (lastAssistant?.stopReason === "error") {
-+			// Result files and active work keep their ownership; failed inference is not a completion acknowledgement.
-+			pi.sendMessage({ customType: "subagent-terminal-background", content: "Model inference failed; background work and saved results remain available for recovery.", display: false,
-+				details: { sessionId: state.currentSessionId, active: snapshotBackgroundWork(state.currentSessionId ?? "", Date.now()).items,
-+					retained: state.currentSessionId ? listRetainedChildren(DIRS.async, state.currentSessionId) : [] } }, { triggerTurn: false });
++	const retainTerminalBackground = (outcome: "error" | "aborted") => {
++		pi.sendMessage({ customType: "subagent-terminal-background", content: "Inference did not complete; background work and saved results remain available for recovery.", display: false,
++			details: { outcome, sessionId: state.currentSessionId, active: snapshotBackgroundWork(state.currentSessionId ?? "", Date.now()).items,
++				retained: state.currentSessionId ? listRetainedChildren(DIRS.async, state.currentSessionId) : [] } }, { triggerTurn: false });
++	};
++	// Pi's public boundary runs after automatic retry and compaction, before final settlement.
++	pi.on("agent_before_settle", async (event, ctx) => {
++		if (event.outcome !== "completed") {
++			retainTerminalBackground(event.outcome);
 +			return;
 +		}
 +		if (ctx.mode !== "tui") {
@@ -87,7 +88,18 @@
  		const ownerSessionId = state.currentSessionId;
  		if (!ownerSessionId) return;
  		goalTurnId += 1;
-@@ -1031,6 +1077,7 @@
+@@ -736,6 +783,10 @@
+ 		} catch (error) {
+ 			console.error("Failed to evaluate goal missions:", error);
+ 		}
++	});
++
++	pi.on("agent_settled", (event) => {
++		if (event.aborted) retainTerminalBackground("aborted");
+ 	});
+ 
+ 	registerSlashCommands(pi, state, {
+@@ -1031,6 +1082,7 @@
  	});
  
  	pi.on("session_shutdown", async () => {

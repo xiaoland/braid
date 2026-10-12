@@ -1,0 +1,60 @@
+--- a/dist/core/compaction/compaction.js
++++ b/dist/core/compaction/compaction.js
+@@ -173,7 +173,8 @@
+ export function shouldCompact(contextTokens, contextWindow, settings) {
+     if (!settings.enabled)
+         return false;
+-    return contextTokens > contextWindow - settings.reserveTokens;
++    const capacityThreshold = Math.max(0, contextWindow - settings.reserveTokens);
++    return contextTokens > Math.min(settings.thresholdTokens ?? Infinity, capacityThreshold);
+ }
+ // ============================================================================
+ // Cut point detection
+--- a/dist/core/compaction/compaction.d.ts
++++ b/dist/core/compaction/compaction.d.ts
+@@ -29,6 +29,8 @@
+     enabled: boolean;
+     reserveTokens: number;
+     keepRecentTokens: number;
++    /** Operational trigger; does not change model capacity or summary reserve. */
++    thresholdTokens?: number;
+ }
+ export declare const DEFAULT_COMPACTION_SETTINGS: CompactionSettings;
+ /**
+--- a/dist/core/settings-manager.js
++++ b/dist/core/settings-manager.js
+@@ -654,10 +654,15 @@
+     }
+     /** Resolve each token setting through model override, ordinary setting, then built-in default. */
+     getCompactionSettings(model) {
++        const thresholdTokens = this.settings.compaction?.thresholdTokens;
++        if (thresholdTokens !== undefined && (!Number.isSafeInteger(thresholdTokens) || thresholdTokens <= 0)) {
++            throw new Error("compaction.thresholdTokens must be a positive safe integer");
++        }
+         return {
+             enabled: this.getCompactionEnabled(),
+             reserveTokens: this.getCompactionReserveTokens(model),
+             keepRecentTokens: this.getCompactionKeepRecentTokens(model),
++            thresholdTokens,
+         };
+     }
+     getBranchSummarySettings() {
+--- a/dist/core/settings-manager.d.ts
++++ b/dist/core/settings-manager.d.ts
+@@ -6,6 +6,8 @@
+     keepRecentTokens?: number;
+ }
+ export interface CompactionSettings {
++    /** Operational trigger; does not change model capacity or summary reserve. */
++    thresholdTokens?: number;
+     enabled?: boolean;
+     reserveTokens?: number;
+     keepRecentTokens?: number;
+@@ -269,6 +271,7 @@
+     getCompactionKeepRecentTokens(model?: Pick<Model<string>, "provider" | "id">): number;
+     /** Resolve each token setting through model override, ordinary setting, then built-in default. */
+     getCompactionSettings(model?: Pick<Model<string>, "provider" | "id">): {
++        thresholdTokens: number | undefined;
+         enabled: boolean;
+         reserveTokens: number;
+         keepRecentTokens: number;

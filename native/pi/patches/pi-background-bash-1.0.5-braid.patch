@@ -155,15 +155,7 @@
  import { homedir } from "node:os";
  import { dirname, join } from "node:path";
  import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
-@@ -8,6 +8,7 @@
- import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
- import { Box, Container, Text } from "@earendil-works/pi-tui";
- import { createPiPending } from "pi-pending";
-+import { registerBackgroundWorkProvider } from "pi-subagents/background-work";
- import { formatTruncationNotice, piContext, truncateContextText } from "./pi-context-utils.ts";
- import { Type } from "typebox";
- 
-@@ -20,6 +21,7 @@
+@@ -20,6 +20,7 @@
  type Outcome = "running" | "exit" | "timeout" | "abort" | "error";
  
  type BackgroundBashDetails = BashToolDetails & {
@@ -171,7 +163,7 @@
  	jobId: string;
  	command: string;
  	outcome: Outcome;
-@@ -41,6 +43,7 @@
+@@ -41,6 +42,7 @@
  	command: string;
  	timeout?: number;
  	background?: boolean;
@@ -179,7 +171,7 @@
  };
  
  type CompletedBashRun =
-@@ -59,6 +62,7 @@
+@@ -59,6 +61,7 @@
  			details: BashToolDetails | undefined;
  			outcome: Outcome;
  			exitCode: number | null;
@@ -187,7 +179,7 @@
  	  };
  
  type PbbIdentity = {
-@@ -85,6 +89,11 @@
+@@ -85,6 +88,11 @@
  	id: string;
  	command: string;
  	toolCallId: string;
@@ -199,7 +191,7 @@
  	abortController: AbortController;
  	startedAt: number;
  	cwd?: string;
-@@ -107,6 +116,7 @@
+@@ -107,6 +115,7 @@
  	command: Type.String({ description: "Bash command to execute" }),
  	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
  	background: Type.Optional(Type.Boolean({ description: "Run immediately in the background and return a job id" })),
@@ -207,7 +199,7 @@
  });
  
  const JOB_ID_PREFIX = "bg";
-@@ -214,6 +224,12 @@
+@@ -214,6 +223,12 @@
  		laneRoot: process.env.PI_LANE_ROOT,
  		root: process.env.PBB_ROOT || join(homedir(), ".pi", "pbb"),
  	};
@@ -220,7 +212,7 @@
  }
  
  function asRecord(value: unknown): Record<string, unknown> | undefined {
-@@ -427,6 +443,7 @@
+@@ -427,6 +442,7 @@
  		lane: job.pbb.lane,
  		jobId: job.id,
  		globalJobId: `${job.pbb.instanceId}:${job.id}`,
@@ -228,7 +220,7 @@
  		...data,
  	})}\n`);
  	return eventId;
-@@ -440,6 +457,7 @@
+@@ -440,6 +456,7 @@
  		schemaVersion: 1,
  		jobId: job.id,
  		globalJobId: `${job.pbb.instanceId}:${job.id}`,
@@ -236,7 +228,7 @@
  		command: job.command,
  		toolCallId: job.toolCallId,
  		cwd: patch.cwd ?? job.cwd,
-@@ -503,6 +521,7 @@
+@@ -503,6 +520,7 @@
  		status: completed.outcome === "exit" ? "exited" : completed.outcome,
  		outcome: completed.outcome,
  		exitCode: completed.exitCode,
@@ -244,7 +236,7 @@
  		completedAt: new Date().toISOString(),
  		durationMs,
  		lastEventId: job.lastEventId,
-@@ -571,15 +590,29 @@
+@@ -571,15 +589,29 @@
  			resolve(completed);
  		};
  
@@ -276,7 +268,7 @@
  		writePbbJob(job, { pid: child.pid, pgid: child.pid, runner: "pbb" });
  
  		const append = (chunk: Buffer) => {
-@@ -616,15 +649,16 @@
+@@ -616,15 +648,16 @@
  			finish({ status: "error", error, body: error.message, details: undefined, outcome: "error", exitCode: null });
  		});
  
@@ -296,7 +288,7 @@
  				return;
  			}
  			if (code === 0) {
-@@ -682,7 +716,7 @@
+@@ -682,7 +715,7 @@
  }
  
  function writeForegroundFullOutput(body: string): string {
@@ -305,7 +297,7 @@
  	mkdirSync(dir, { recursive: true });
  	const path = join(dir, `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}.log`);
  	writeFileSync(path, body);
-@@ -743,7 +777,7 @@
+@@ -743,7 +776,7 @@
  
  const pendingBackgroundResultFollowUps: PendingBackgroundResultFollowUp[] = [];
  
@@ -314,7 +306,7 @@
  	if (shuttingDown) return;
  	repairDetachedBackgroundToolResults(item.job.repairContext, item.job.toolCallId, { rewriteFile: item.job.repairContext?.isIdle?.() === true });
  	pi.sendMessage(
-@@ -753,14 +787,25 @@
+@@ -753,14 +786,25 @@
  			display: true,
  			details: item.details,
  		},
@@ -343,7 +335,7 @@
  }
  
  function sendBackgroundResultFollowUp(pi: ExtensionAPI, job: ActiveJob, content: string, details: BackgroundBashDetails): void {
-@@ -783,12 +828,11 @@
+@@ -783,12 +827,11 @@
  }
  
  function deliverBackgroundResult(pi: ExtensionAPI, job: ActiveJob, completed: CompletedBashRun, cwd: string) {
@@ -359,7 +351,7 @@
  	const body = truncateBackgroundBody(job, completed.body);
  	const content = buildXmlResult(job, completed.outcome, completed.exitCode, durationMs, body);
  	const details: BackgroundBashDetails = {
-@@ -809,6 +853,7 @@
+@@ -809,6 +852,7 @@
  					instanceId: job.pbb.instanceId,
  					lane: job.pbb.lane,
  					globalJobId: `${job.pbb.instanceId}:${job.id}`,
@@ -367,7 +359,7 @@
  					pbbCursor: job.lastEventId,
  				}
  			: {}),
-@@ -884,6 +929,7 @@
+@@ -884,6 +928,7 @@
  					instanceId: job.pbb.instanceId,
  					lane: job.pbb.lane,
  					globalJobId: `${job.pbb.instanceId}:${job.id}`,
@@ -375,7 +367,7 @@
  					pbbCursor: job.lastEventId,
  				}
  			: {}),
-@@ -898,8 +944,6 @@
+@@ -898,8 +943,6 @@
  		job.abortController.abort();
  		if (job.runner === "pbb") killProcessGroup(job.pgid ?? job.pid, "SIGTERM");
  	}
@@ -384,7 +376,7 @@
  }
  
  function installProcessHooks() {
-@@ -908,7 +952,17 @@
+@@ -908,7 +951,17 @@
  	// Best-effort last resort. Normal cleanup happens on Pi's session_shutdown event;
  	// do not install SIGINT/SIGTERM handlers here because that would interfere with
  	// Pi's own process-level signal handling.
@@ -403,7 +395,7 @@
  }
  
  function restoreJobCounterFromSession(ctx: { sessionManager?: { getEntries?: () => unknown[] } }) {
-@@ -917,7 +971,8 @@
+@@ -917,7 +970,8 @@
  	for (const entry of entries as Array<Record<string, unknown>>) {
  		const details = entry.details as Record<string, unknown> | undefined;
  		const content = typeof entry.content === "string" ? entry.content : undefined;
@@ -413,15 +405,16 @@
  		for (const candidate of candidates) {
  			const n = parseJobNumber(candidate);
  			if (n !== undefined) max = Math.max(max, n);
-@@ -926,8 +981,37 @@
+@@ -926,8 +980,40 @@
  	nextJobNumber = Math.max(nextJobNumber, max + 1);
  }
  
+-export default function backgroundBashExtension(pi: ExtensionAPI) {
 +function pendingCompletionJobs(): ActiveJob[] {
 +	return [...activeJobs.values()].filter((job) => job.ownerSessionId && !job.service);
 +}
 +
- export default function backgroundBashExtension(pi: ExtensionAPI) {
++export default async function backgroundBashExtension(pi: ExtensionAPI) {
  	installProcessHooks();
 +	const managedRuntime = (globalThis as any)[Symbol.for("braid.native-runtime.v1")];
 +	const unregisterManaged = managedRuntime?.registerManagedProvider("pi-background-bash", () => {
@@ -444,14 +437,17 @@
 +			await job.completion;
 +		}
 +	});
-+	const unregisterBackgroundWork = registerBackgroundWorkProvider({
-+		name: "pi-background-bash",
-+		listActiveWork: () => pendingCompletionJobs().map((job) => ({ id: job.id, sessionId: job.ownerSessionId! })),
-+	});
++	// PBB drains its own finite jobs; the cross-plugin API is only needed when subagents is selected.
++	const unregisterBackgroundWork = process.env.BRAID_NATIVE_SUBAGENTS_ENABLED === "1"
++		? (await import("pi-subagents/background-work")).registerBackgroundWorkProvider({
++			name: "pi-background-bash",
++			listActiveWork: () => pendingCompletionJobs().map((job) => ({ id: job.id, sessionId: job.ownerSessionId! })),
++		})
++		: undefined;
  
  	pi.registerMessageRenderer<BackgroundBashDetails>(CUSTOM_TYPE, (message, options, theme) => {
  		const details = message.details;
-@@ -949,16 +1033,36 @@
+@@ -949,16 +1035,41 @@
  	});
  
  	pi.on("session_shutdown", async () => {
@@ -459,7 +455,7 @@
  		abortAllJobs();
 +		const outcomes = await Promise.allSettled(jobs.map((job) => job.completion ??
 +			Promise.reject(new Error(`Background bash job ${job.id} has no completion promise.`))));
-+		unregisterBackgroundWork();
++		unregisterBackgroundWork?.();
 +		unregisterManaged?.();
 +		// Completion callbacks have persisted their results before notifications are discarded.
  		pendingBackgroundResultFollowUps.length = 0;
@@ -474,14 +470,15 @@
 +		for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
 +	});
 +
-+	pi.on("agent_end", async (event, ctx) => {
-+		if (event.willRetry) return;
-+		const lastAssistant = [...event.messages].reverse().find((message) => message.role === "assistant");
-+		if (lastAssistant?.stopReason === "error" || lastAssistant?.stopReason === "aborted") {
-+			// Persist completed results without scheduling another inference; active jobs keep their original ownership.
-+			flushPendingBackgroundResultFollowUps(pi, false);
-+			pi.sendMessage({ customType: "background-bash-terminal-work", content: "Model inference failed; active bash jobs remain available for recovery.", display: false,
-+				details: { jobs: [...activeJobs.values()].map((job) => ({ id: job.id, sessionId: job.ownerSessionId, service: job.service === true })) } }, { triggerTurn: false });
++	const retainTerminalBackground = (outcome: "error" | "aborted") => {
++		// Preserve results without scheduling inference or changing active job ownership.
++		flushPendingBackgroundResultFollowUps(pi, false);
++		pi.sendMessage({ customType: "background-bash-terminal-work", content: "Inference did not complete; active bash jobs remain available for recovery.", display: false,
++			details: { outcome, jobs: [...activeJobs.values()].map((job) => ({ id: job.id, sessionId: job.ownerSessionId, service: job.service === true })) } }, { triggerTurn: false });
++	};
++	pi.on("agent_before_settle", async (event, ctx) => {
++		if (event.outcome !== "completed") {
++			retainTerminalBackground(event.outcome);
 +			return;
 +		}
 +		// Child Pi sessions may load PBB without pi-subagents. Await their own
@@ -492,10 +489,14 @@
 +		}));
 +		// Queue completions in Pi's native follow-up loop before agent_settled.
 +		flushPendingBackgroundResultFollowUps(pi);
++	});
++
++	pi.on("agent_settled", (event) => {
++		if (event.aborted) retainTerminalBackground("aborted");
  	});
  
  	pi.on("context", (event) => {
-@@ -966,19 +1070,84 @@
+@@ -966,19 +1077,84 @@
  		if (messages) return { messages };
  	});
  
@@ -590,7 +591,7 @@
  		parameters: schema,
  		async execute(toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<BashToolDetails | BackgroundBashDetails>> {
  			const autoAfterSeconds = getAutoBackgroundAfterSeconds(ctx.cwd);
-@@ -987,7 +1156,7 @@
+@@ -987,7 +1163,7 @@
  				throw new Error("Command aborted");
  			}
  
@@ -599,7 +600,7 @@
  				if (activeJobs.size >= MAX_ACTIVE_JOBS) {
  					throw new Error(`Too many bash jobs running (${activeJobs.size}/${MAX_ACTIVE_JOBS}). Wait for one to finish before starting another.`);
  				}
-@@ -996,6 +1165,8 @@
+@@ -996,6 +1172,8 @@
  					id: formatJobId(nextJobNumber++),
  					command: params.command,
  					toolCallId,
@@ -608,7 +609,7 @@
  					abortController: new AbortController(),
  					startedAt: Date.now(),
  					cwd: ctx.cwd,
-@@ -1009,20 +1180,32 @@
+@@ -1009,20 +1187,32 @@
  					id: job.id,
  					text: job.command,
  					startedAt: job.startedAt,
@@ -644,7 +645,7 @@
  					details: runningJobDetails(job, ctx.cwd),
  				};
  			}
-@@ -1041,7 +1224,8 @@
+@@ -1041,7 +1231,8 @@
  				if (signal?.aborted) forwardAbort();
  				else signal?.addEventListener("abort", forwardAbort, { once: true });
  				try {
@@ -654,7 +655,7 @@
  					if (completed.status === "success") return truncateForegroundResult(job, completed);
  					rethrowBashError(completed, job);
  				} finally {
-@@ -1078,6 +1262,7 @@
+@@ -1078,6 +1269,7 @@
  				latestBody = getText(update);
  				if (!backgrounded) onUpdate?.(update);
  			});
@@ -662,7 +663,7 @@
  
  			const winner = await Promise.race([completedPromise, waitForBackgroundThreshold(autoAfterSeconds)]);
  			if (winner !== "background") {
-@@ -1093,6 +1278,8 @@
+@@ -1093,6 +1285,8 @@
  			job.id = formatJobId(nextJobNumber++);
  			job.cwd = ctx.cwd;
  			job.pbb = pbbIdentity(ctx);
@@ -671,7 +672,7 @@
  			activeJobs.set(job.id, job);
  			recordPbbJobStarted(job, ctx.cwd);
  			appendPbbLogDelta(job, latestBody);
-@@ -1100,19 +1287,20 @@
+@@ -1100,19 +1294,20 @@
  				id: job.id,
  				text: job.command,
  				startedAt: job.startedAt,

@@ -895,9 +895,10 @@ fn parse_pi_event(
         // Pi may persist, compact, or retry after message_end. Only settled
         // closes this physical run; a transient error must not abort recovery.
         "agent_settled" => {
-            // Patched native calls carry cancellation; external Pi uses the
-            // final assistant's aborted reason. Extension failure wins over both.
-            let interrupted = frame["cancelled"].as_bool() == Some(true)
+            // The SDK settled flag is authoritative; retained older materials
+            // and external Pi may carry the final assistant's aborted reason.
+            let interrupted = frame["aborted"].as_bool() == Some(true)
+                || frame["cancelled"].as_bool() == Some(true)
                 || last_stop.as_deref() == Some("aborted");
             let completed = last_stop.as_deref() == Some("stop") && !interrupted;
             let failed = !extension_errors.is_empty() || (!interrupted && !completed);

@@ -1,5 +1,17 @@
 # Braid 真实模型验收
 
+## 当前实施：Pi 交付收敛
+
+2026-10-12 实施授权：用户回复“是的，我们先来收敛 pi 交付”。按调查建议升级锁定 Pi、使用公开 SDK 收敛核心补丁，将 Braid 专属接线保留在自有模块，并让可选插件安装及补丁只随明确选择发生。不引入 OAR/Pi Durable，不启动付费模型或旧验收，不编写/运行测试、自检、包 smoke；旧发行及原证据保留。profile_feedback_owner稳定拥有核心SDK/RPC与执行接线，pi_plugin_feedback稳定拥有插件补丁收敛，root拥有安装/锁定材料、Rust消费、正式文档、编译和无模型实际操作。证据、安装、cache/HOME/temp全部位于WorkSSD的braid-pi-delivery-20261012；按低并发执行。当前是实施阶段，下列只读调查的授权限制为历史，不再阻止上述源码修改。
+
+前置调查来自用户：“考虑接入一下 Open Agent Runtime ? （而且我看到 native/pi 下面一堆 patch，这在 braid 这样要交付出去的软件似乎不合适）”。按 botiverse/oar 完成源码核对；当时没有修改运行时。保留现运行合同和全部历史资格事实，不联系独立Codex聊天。
+
+判断依据是实际能力与维护责任：统一会话、模型/推理/材料选择、原始事件、turn终态、后台结果交接、owned停止、恢复身份及可交付安装。调查产物位于 WorkSSD 的 braid-runtime-evaluation-20261012；源码与上游spec支持结论，不能以支持Pi或dispose方法存在替代能力等价证明。
+
+调查已完成，详见 [oar-integration-design.md](oar-integration-design.md)。核对 OAR 0.59.1/7a981975，普通Pi内嵌SDK1.1.0，能接替部分会话事件/取消适配，但公开接口缺少通用资源、扩展及工具接线；dispose不提供外部后代停止证明。profile_feedback_owner完成六包补丁职责梳理，advisor独立建议先升级Pi、将Braid策略移至自有integration，暂缓直接采用OAR，避免新增私有发行版。OAR作为后续provider层候选，以公开接口能承载选定材料及受控工具执行为采用闸门；不采用Pi Durable改变宿主职责。直接Pi路线已获实施授权。
+
+Pi 交付收敛已完成，详见 [pi-delivery.md](pi-delivery.md)。SDK1.1.0公开host、标准RPC/print复用、自有owned控制、模型/RPC Bash登记、长任务文件和终态错误门控已落地，旧296行综合核心补丁删除；阈值补丁收敛至60行，连接重置及所选插件内部补丁明确保留。基础实际安装124包，双插件134包，未选网络插件均不安装。两份最终发行完成公开new_session/state/commands/Bash/history/yield/stop，SDK实际1.1.0、minimax/MiniMax-M3 medium、零模型turn、退出0；出生登记、停止及离线cleanup均确定。Rust fmt/check/Clippy-Dwarnings/build通过；doctor的Pi两项通过，整体唯一剩余前提为Collector未启动。最初编译、可选数组及手工启动marker错误均保留，未放宽检查。代码及正式说明已提交，候选由Git记录与冻结manifest共同定位；当前远端PR148实际为OPEN/非Draft，保持用户当前状态，不自动改回Draft。所有本轮进程已退出，没有模型、测试或监听服务；旧真实模型资格结论不变。
+
 ## 当前反哺：协作技能与 Agent Profile
 
 2026-10-12 CI 修复：用户指出“ci / rust 没有通过”。PR148 run38231440673 在 Rust1.93 Clippy `-D warnings` 失败，共26条诊断；此前仅构建通过不等于CI通过。profile_feedback_owner稳定处理材料/Pi三个模块，其余由主Agent处理。已完成等价写法修正、Pi材料装配提取和复杂元组命名；Serde回调引用及内聚事务/生命周期函数采用有说明的函数级lint例外，workflow与全局规则保持。Rust1.93本地 fmt/check/clippy 全部通过，check3.61s、Clippy14.46s，单任务离线执行，无设施测试或模型调用。原始失败日志及复验原件保留在本轮证据目录 raw/ci-rust-failed.log、ci-check-final.log、ci-clippy-final.log；提交后须以PR当前HEAD的GitHub rust回执判定CI结果，不以本地通过替代。

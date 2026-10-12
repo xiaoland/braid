@@ -4,11 +4,9 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "1.0.2",
-    "pi-subagents": "0.56.0",
-    "pi-background-bash": "1.0.5",
-    "@upstash/context7-pi": "0.1.2",
-    "@ff-labs/pi-fff": "0.11.0",
-    "mcporter": "0.14.0"
-  }
+    "@earendil-works/pi-coding-agent": "1.1.0"
+  },
+  "workspaces": [
+    "plugins/*"
+  ]
 }

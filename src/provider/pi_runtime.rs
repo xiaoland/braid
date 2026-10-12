@@ -31,6 +31,7 @@ struct Plugin {
 #[derive(Deserialize)]
 struct Manifest {
     schema_version: u32,
+    pi_version: String,
     capabilities: Vec<String>,
     entrypoint: Artifact,
     managed_module: Artifact,
@@ -41,6 +42,7 @@ struct Manifest {
 }
 
 pub(super) struct Material {
+    pi_version: String,
     extensions: BTreeSet<PathBuf>,
     node: PathBuf,
     module: PathBuf,
@@ -48,6 +50,7 @@ pub(super) struct Material {
 }
 
 pub(super) struct Execution {
+    pi_version: String,
     pub id: String,
     pub directory: PathBuf,
     extensions: BTreeSet<PathBuf>,
@@ -126,6 +129,7 @@ pub(super) fn load(config: &PiConfig) -> Result<Option<Material>, ProviderError>
     let manifest: Manifest = serde_json::from_slice(&bytes)
         .map_err(|error| protocol(format!("Pi runtime manifest {}: {error}", path.display())))?;
     if manifest.schema_version != 1
+        || manifest.pi_version.trim().is_empty()
         || CAPABILITIES
             .iter()
             .any(|capability| !manifest.capabilities.iter().any(|value| value == capability))
@@ -156,6 +160,7 @@ pub(super) fn load(config: &PiConfig) -> Result<Option<Material>, ProviderError>
         node: verify_artifact(&root, &manifest, &manifest.node)?,
         module: verify_artifact(&root, &manifest, &manifest.managed_module)?,
         owner: verify_artifact(&root, &manifest, &manifest.process_owner)?,
+        pi_version: manifest.pi_version,
     }))
 }
 
@@ -266,6 +271,7 @@ impl Material {
         let directory = workspace.join(".braid/native-executions").join(&id);
         std::fs::create_dir_all(&directory)?;
         Ok(Execution {
+            pi_version: self.pi_version.clone(),
             id,
             directory: directory.canonicalize()?,
             extensions: self.extensions.clone(),
@@ -299,7 +305,7 @@ impl Execution {
             protocol(format!("Pi omitted native runtime capabilities: {response}"))
         })?;
         if runtime["schema_version"] != 1
-            || runtime["pi_version"] != "1.0.2"
+            || runtime["pi_version"] != self.pi_version
             || runtime["execution_id"] != self.id
             || CAPABILITIES
                 .iter()

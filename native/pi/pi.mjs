@@ -6,7 +6,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const informational = args.includes('--version') || args.includes('-v') || args.includes('--help') || args.includes('-h');
-if (!informational) {
+if (informational) {
+  const pi = await import('@earendil-works/pi-coding-agent');
+  if (args.includes('--version') || args.includes('-v')) process.stdout.write(`${pi.VERSION}\n`);
+  else process.stdout.write(`Pi coding agent\n\nUsage: pi [options] [messages...]\n\n  --mode <text|json|rpc>  Select output mode\n  -p, --print             Run one non-interactive prompt\n  -c, --continue          Continue the most recent session\n  -r, --resume            Resume the most recent session\n  --session <path|id>     Open a saved session\n  --session-dir <dir>     Set session storage\n  --model <model>         Select a model\n  --provider <provider>   Select a provider\n  --thinking <level>      Set reasoning level\n  -e, --extension <path>  Load an extension\n  --skill <path>          Load a skill\n  --no-extensions         Disable extension discovery\n  --no-skills             Disable skill discovery\n  -h, --help              Show this help\n  -v, --version           Show the Pi version\n`);
+} else {
   // Native tools consume the configured environment, not ambient shell startup files.
   delete process.env.BASH_ENV;
   delete process.env.ENV;
@@ -29,10 +33,12 @@ if (!informational) {
   process.env.PI_CODING_AGENT_PACKAGE_ROOT = path.join(directory, 'node_modules/@earendil-works/pi-coding-agent');
   process.env.PATH = `${path.join(directory, 'bin')}${path.delimiter}${path.join(directory, 'node_modules/.bin')}${path.delimiter}${process.env.PATH ?? ''}`;
   process.env.BRAID_SUBAGENT_CATALOG = manifest.plugins.some(plugin => plugin.name === 'subagents') ? '1' : '0';
+  process.env.BRAID_NATIVE_SUBAGENTS_ENABLED = manifest.plugins.some(plugin => plugin.name === 'subagents') ? '1' : '0';
   process.env.BRAID_NATIVE_MCPORTER_ENABLED = manifest.plugins.some(plugin => plugin.name === 'mcporter') ? '1' : '0';
   await import(process.env.BRAID_NATIVE_RUNTIME_MODULE);
   const selected = manifest.plugins.flatMap(plugin => plugin.extension_paths.flatMap(relative => ['-e', path.join(directory, relative)]));
   const skills = manifest.plugins.flatMap(plugin => plugin.skill_paths.flatMap(relative => ['--skill', path.join(directory, relative)]));
   process.argv.splice(2, 0, '--no-extensions', ...selected, ...skills);
+  const sdk = await import('./sdk-host.mjs');
+  await sdk.main();
 }
-await import('./node_modules/@earendil-works/pi-coding-agent/dist/cli.js');

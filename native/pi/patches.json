@@ -1,24 +1,17 @@
 [
   {
     "package": "@earendil-works/pi-coding-agent",
-    "path": "patches/pi-1.0.2-braid.patch",
+    "path": "patches/pi-1.1.0-compaction-threshold.patch",
     "targets": [
-      "dist/bundle/cli.js",
-      "dist/bundle/rpc-entry.js",
-      "dist/core/agent-session.js",
-      "dist/core/compaction/compaction.d.ts",
       "dist/core/compaction/compaction.js",
-      "dist/core/extensions/types.d.ts",
-      "dist/core/resource-loader.js",
-      "dist/core/settings-manager.d.ts",
+      "dist/core/compaction/compaction.d.ts",
       "dist/core/settings-manager.js",
-      "dist/core/tools/bash.js",
-      "dist/modes/rpc/rpc-mode.js"
+      "dist/core/settings-manager.d.ts"
     ]
   },
   {
     "package": "@earendil-works/pi-ai",
-    "path": "patches/pi-ai-1.0.2-connection-reset.patch",
+    "path": "patches/pi-ai-1.1.0-connection-reset.patch",
     "targets": [
       "dist/utils/retry.js"
     ]
@@ -45,7 +38,8 @@
       "src/runs/shared/external-job-bridge.ts",
       "src/runs/background/async-retention.ts",
       "src/missions/workflow-state.ts"
-    ]
+    ],
+    "plugin": "subagents"
   },
   {
     "package": "pi-background-bash",
@@ -54,20 +48,23 @@
       "bin/pbb.js",
       "extensions/background-bash.ts",
       "skills/pbb/SKILL.md"
-    ]
+    ],
+    "plugin": "background"
   },
   {
     "package": "@upstash/context7-pi",
     "path": "patches/context7-pi-0.1.2-errors.patch",
     "targets": [
       "lib/api.ts"
-    ]
+    ],
+    "plugin": "context7"
   },
   {
     "package": "mcporter",
     "path": "patches/mcporter-0.14.0-owned-service.patch",
     "targets": [
       "dist/daemon/launch.js"
-    ]
+    ],
+    "plugin": "mcporter"
   }
 ]

@@ -128,7 +128,8 @@ Pi 通过 `--append-system-prompt` 注入 Braid 与 Profile 指令，保留核�
 持久化、压缩或重试。Adapter 等待 `agent_settled`，只有最终 `stopReason=stop` 才报告
 completed；`length`、错误或缺少停止原因均报告 failed。每次 `agent_start` 清空上一轮
 停止原因，避免沿用旧 turn 的成功状态。
-Pi 1.0.2 的 settled `cancelled=true` 与旧 `stopReason=aborted` 都报告 interrupted，供关闭和 Context reset 保存实际中断结果。
+Pi 1.1.0 的原生 settled `aborted=true` 报告 interrupted；消费端也识别保留的旧材料
+`cancelled=true` 与外部 Pi 的 `stopReason=aborted`，供关闭和 Context reset 保存实际中断结果。
 
 Pi 的初始 GitHub Context 是用户数据，仅在尚未进入原生历史时随首条输入送入；
 后续 turn 不重复拼接 Braid/Profile 指令或这份 Context。由于 Pi 的 RPC 没有持久
@@ -139,6 +140,10 @@ session 身份和 `get_entries` 的当前分支祖先中的实际 user message�
 不是新的当前 Context 权威，也不据此重发结果未知的事件输入。
 
 Pi 的锁定原生材料由 `native/pi/` 交付，CLI 与 RPC 使用同一安装入口。
+受管材料通过 Pi 根包的公开 SDK 创建 runtime，Braid 自有 host 接线负责材料边界、
+受控 Bash 和推理交接；标准 RPC 与 print 仍由 Pi 的公开实现处理。
+实际运行握手的版本来自已加载 SDK 的 VERSION，能力来自 host 实现，不能回显
+manifest 的声明来冒充实际能力。Rust 将实际版本与冻结 manifest 核对。
 周期 readiness 仅检查可执行入口与凭据，不重复遍历整份安装的文件哈希。
 每次新建或恢复物理 Pi 前，以及显式 doctor，仍完整校验材料；readiness 成功
 不能当作安装目录当前完整性证明。
@@ -148,8 +153,14 @@ execution ID 和实际生命周期能力。`doctor` 的静态材料检查不能�
 外部 Pi 保留基础接入，关闭环境自动扩展发现；需要插件共同合同时必须使用声明材料，
 不能继承宿主的未锁定插件。
 
-原生材料在 awaited extension hook 前传播唯一的重试意图，保留 extension_error，
-在结果交接结束后发布 settled。插件不能自行越过 Braid 发起下一轮推理；后台有限工作
+Pi 1.1.0 的 session observer 提供 `agent_end.willRetry`；扩展不依赖该字段，
+改在公开的 `agent_before_settle` 边界完成结果交接，该边界位于自动重试和压缩之后。
+自有接线保留 extension_error，最终终态仍以原生 settled 为准。
+最终模型错误后，尚未消费的 steering/follow-up 输入先保存到原生历史的 Braid
+custom entry，再从 Pi 队列移出，阻止错误后自主推理；下次明确输入前恢复这些义务。
+保存或恢复失败须报告具体错误并阻断继续。终态扩展 hook 失败会请求公开 abort，
+保留错误触发停止的独立事实；原始 aborted 标记不改写，错误事实仍优先判 failed。
+插件不能自行越过 Braid 发起下一轮推理；后台有限工作
 和长期服务分别登记，结果未被消费时仍属于 busy。异步 subagent 的返回必须等待
 真实 child 启动回执；runner PID 不等于 child 已启动，启动失败保留具体原因和
 清理结果。Core 的 turn idle 不代表 managed
