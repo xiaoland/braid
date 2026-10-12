@@ -7,6 +7,9 @@ const directory = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const informational = args.includes('--version') || args.includes('-v') || args.includes('--help') || args.includes('-h');
 if (!informational) {
+  // Native tools consume the configured environment, not ambient shell startup files.
+  delete process.env.BASH_ENV;
+  delete process.env.ENV;
   const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'runtime-manifest.json'), 'utf8'));
   for (const name of ['BRAID_NATIVE_EXECUTION_DIR', 'BRAID_NATIVE_EXECUTION_ID', 'BRAID_NATIVE_START_ID']) {
     if (!process.env[name]) throw new Error(`${name} is required: launch this Pi runtime through Braid's native execution owner.`);

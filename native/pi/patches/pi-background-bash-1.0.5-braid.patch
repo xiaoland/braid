@@ -253,7 +253,7 @@
 +		let child: ChildProcess;
 +		let managedStartup: Promise<unknown> | undefined;
 +		try {
-+		child = (managedRuntime?.spawnManaged ?? spawn)("bash", ["-lc", params.command], {
++		child = (managedRuntime?.spawnManaged ?? spawn)("bash", ["-c", params.command], {
  			cwd,
  			env: process.env,
  			detached: true,
