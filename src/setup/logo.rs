@@ -105,19 +105,3 @@ fn draw_ring(image: &mut RgbaImage, cx: u32, cy: u32, radius: u32, color: Rgba<u
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use super::*;
-
-    #[test]
-    #[ignore = "requires network access to GitHub avatar"]
-    fn generate_logo_for_xiaoland() {
-        let path = PathBuf::from("/tmp/braid-of-xiaoland-logo-test.png");
-        let _ = std::fs::remove_file(&path);
-        generate("xiaoland", &path).expect("should generate logo");
-        assert!(path.is_file());
-    }
-}

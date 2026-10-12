@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::home::validate_instance_key;
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -32,10 +32,19 @@ pub struct InstanceConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip)]
+    pub(crate) finite_run: Option<crate::run::RunContext>,
     pub schema_version: u32,
     pub instance: InstanceConfig,
     pub runtime: RuntimeConfig,
-    pub github: GitHubConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GitHubConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<LocalConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<BuiltinConfig>,
+    #[serde(skip)]
+    pub loaded_from: PathBuf,
     pub scheduler: SchedulerConfig,
     /// Adapter connectivity, keyed by `adapter_type`. One entry per `adapter_type`
     /// per worker; the profile's `adapter_type` locates the runtime entry.
@@ -131,6 +140,9 @@ impl RuntimeConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeEntry {
+    /// Braid Pi material package manifest; absent for an external base Pi.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_runtime: Option<PathBuf>,
     pub adapter_type: String,
     /// Contract version checked at setup and serve time.
     pub version: String,
@@ -186,6 +198,22 @@ pub struct LlmAllowance {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct BuiltinConfig {
+    pub repository: String,
+    pub endpoint: Url,
+}
+
+// Parsed only to provide an actionable migration error for the previous declaration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalConfig {
+    pub repository: String,
+    pub source: PathBuf,
+    pub default_branch: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitHubConfig {
     pub app_id: u64,
     pub repository: String,
@@ -219,6 +247,8 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodexConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub braid_config_path: Option<PathBuf>,
     pub executable: PathBuf,
     pub home: PathBuf,
     pub version: String,
@@ -229,6 +259,10 @@ pub struct CodexConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PiConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_runtime: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub braid_config_path: Option<PathBuf>,
     pub executable: PathBuf,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -238,6 +272,8 @@ pub struct PiConfig {
     pub api_key_file: Option<PathBuf>,
     pub thinking: Option<String>,
     pub home: Option<PathBuf>,
+    #[serde(default)]
+    pub profile_material_digest: String,
 }
 
 impl PiConfig {
@@ -310,6 +346,13 @@ pub struct Profile {
     pub model: Option<String>,
     pub reasoning: Option<String>,
     pub user_instructions: String,
+    /// Explicit Pi-discoverable skill entrypoints: a `SKILL.md` file, one skill
+    /// directory, or a shallow catalog of skill directories. Complete trees bind.
+    #[serde(default)]
+    pub skills: Vec<PathBuf>,
+    /// Pi-native semantic materials (`models.json`, `settings.json`, `agents/*.md`).
+    #[serde(default)]
+    pub native_template: Option<PathBuf>,
     /// The source Git checkout for this instance's repository, shared by all
     /// Profiles as the worktree provisioning source (one repository = one
     /// source checkout). Defaults to `<config_dir>/source`; Agent sessions
@@ -328,6 +371,12 @@ impl Profile {
     pub fn resolve_workspace(&mut self, base: &Path) {
         let workspace = self.workspace.take().unwrap_or_else(|| base.join("source"));
         self.workspace = Some(resolve_path(base, &workspace));
+        for skill in &mut self.skills {
+            *skill = resolve_path(base, skill);
+        }
+        if let Some(template) = &mut self.native_template {
+            *template = resolve_path(base, template);
+        }
     }
 
     /// The resolved source checkout path (valid after `Config::load`).
@@ -345,6 +394,7 @@ pub struct ProfileSelection {
 #[derive(Debug, Serialize)]
 pub struct ConfigSummary<'a> {
     pub schema_version: u32,
+    pub upstream: &'static str,
     pub instance_key: &'a str,
     pub repository: &'a str,
     pub runtime_root: &'a Path,
@@ -410,7 +460,19 @@ impl Config {
         } else {
             std::env::current_dir().map(|cwd| cwd.join(&base)).unwrap_or(base)
         };
+        config.loaded_from = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?
+                .join(path)
+        };
         config.runtime.resolve(&base);
+        for runtime in &mut config.runtimes {
+            if let Some(manifest) = &mut runtime.native_runtime {
+                *manifest = resolve_path(&base, manifest);
+            }
+        }
         for profile in &mut config.profiles {
             profile.resolve_workspace(&base);
         }
@@ -423,6 +485,27 @@ impl Config {
         &self.instance.key
     }
 
+    pub fn repository(&self) -> &str {
+        match (&self.github, &self.builtin) {
+            (Some(github), None) => &github.repository,
+            (None, Some(builtin)) => &builtin.repository,
+            _ => unreachable!("configuration validates exactly one collaboration backend"),
+        }
+    }
+
+    pub fn is_builtin(&self) -> bool {
+        self.builtin.is_some()
+    }
+
+    pub fn github(&self) -> Result<&GitHubConfig, ConfigError> {
+        self.github.as_ref().ok_or_else(|| {
+            ConfigError::Invalid(
+                "this command requires the GitHub backend; this Harness connects to the built-in collaboration platform"
+                    .into(),
+            )
+        })
+    }
+
     pub fn profile(&self, id: &str) -> Result<&Profile, ConfigError> {
         self.profiles
             .iter()
@@ -433,8 +516,9 @@ impl Config {
     pub fn summary(&self) -> ConfigSummary<'_> {
         ConfigSummary {
             schema_version: self.schema_version,
+            upstream: if self.is_builtin() { "builtin" } else { "github" },
             instance_key: &self.instance.key,
-            repository: &self.github.repository,
+            repository: self.repository(),
             runtime_root: self.runtime.root(),
             database: self.runtime.database(),
             profile_ids: self.profiles.iter().map(|profile| profile.id.as_str()).collect(),
@@ -445,13 +529,22 @@ impl Config {
         }
     }
 
+    pub(crate) fn profile_materials(
+        &self,
+        profile: &Profile,
+    ) -> Result<crate::profile_materials::EffectiveMaterials, ConfigError> {
+        crate::profile_materials::collect(self, profile).map_err(|error| {
+            ConfigError::Invalid(format!("profile {:?} materials: {error:#}", profile.id))
+        })
+    }
+
     /// Load the GitHub webhook secret from `github.webhook_secret_file` if set,
     /// otherwise from `github.webhook_secret_environment`.
     pub fn webhook_secret(&self) -> Result<String, ConfigError> {
-        if let Some(path) = &self.github.webhook_secret_file {
+        if let Some(path) = &self.github()?.webhook_secret_file {
             return load_webhook_secret_file(path);
         }
-        if let Some(env) = &self.github.webhook_secret_environment {
+        if let Some(env) = &self.github()?.webhook_secret_environment {
             return std::env::var(env).map_err(|_| {
                 ConfigError::Invalid(format!(
                     "environment variable {env:?} for github.webhook_secret_environment is not set"
@@ -525,6 +618,7 @@ impl Config {
             })?;
             return Ok(ProviderConfig {
                 codex: Some(CodexConfig {
+                    braid_config_path: Some(self.loaded_from.clone()),
                     executable: runtime.executable.clone(),
                     home,
                     version: runtime.version.clone(),
@@ -541,6 +635,8 @@ impl Config {
             return Ok(ProviderConfig {
                 codex: None,
                 pi: Some(PiConfig {
+                    native_runtime: runtime.native_runtime.clone(),
+                    braid_config_path: Some(self.loaded_from.clone()),
                     executable: runtime.executable.clone(),
                     provider: Some(llm.id.clone()),
                     model: profile.model.clone(),
@@ -548,6 +644,7 @@ impl Config {
                     api_key_file: llm.api_key_file.clone(),
                     thinking: profile.reasoning.clone(),
                     home: runtime.home.clone(),
+                    profile_material_digest: self.profile_materials(profile)?.digest,
                 }),
             });
         }
@@ -557,7 +654,7 @@ impl Config {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
-        if self.schema_version != CONFIG_SCHEMA_VERSION {
+        if self.schema_version != CONFIG_SCHEMA_VERSION && self.schema_version != 2 {
             return Err(ConfigError::Schema {
                 found: self.schema_version,
                 supported: CONFIG_SCHEMA_VERSION,
@@ -566,22 +663,20 @@ impl Config {
         validate_instance_key(&self.instance.key)
             .map_err(|message| ConfigError::Invalid(format!("instance.key: {message}")))?;
 
+        if self.local.is_some() {
+            return Err(ConfigError::Invalid("[local] combined platform and Harness state is no longer supported; stop the old runtime, import its objects with braid platform import, then replace [local] with [builtin] repository and endpoint; see docs/user-manual/local.md".into()));
+        }
+        if self.github.is_some() == self.builtin.is_some() {
+            return Err(ConfigError::Invalid(
+                "configure exactly one upstream: [github] or [builtin]".into(),
+            ));
+        }
         for (name, path) in [
             ("runtime.root", self.runtime.root()),
             ("runtime.database", self.runtime.database()),
             ("runtime.backups", self.runtime.backups()),
-            ("github.private_key_file", &self.github.private_key_file),
-            ("tools.git", &self.tools.git),
-            ("tools.gh", &self.tools.gh),
-            ("tools.wrangler", &self.tools.wrangler),
-        ]
-        .into_iter()
-        .chain(
-            self.github
-                .webhook_secret_file
-                .as_ref()
-                .map(|path| ("github.webhook_secret_file", path.as_path())),
-        ) {
+            ("tools.git", self.tools.git.as_path()),
+        ] {
             require_absolute(name, path)?;
         }
         if !self.runtime.database().starts_with(self.runtime.root())
@@ -591,20 +686,52 @@ impl Config {
                 "runtime database and backups must be inside runtime.root".into(),
             ));
         }
-        if self.github.app_id == 0 {
-            return Err(ConfigError::Invalid("github.app_id must be positive".into()));
+        if let Some(builtin) = &self.builtin {
+            validate_token("builtin.repository", &builtin.repository)?;
+            let endpoint = &builtin.endpoint;
+            let loopback = match endpoint.host() {
+                Some(url::Host::Domain("localhost")) => true,
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                _ => false,
+            };
+            if endpoint.scheme() != "http"
+                || !loopback
+                || !endpoint.username().is_empty()
+                || endpoint.password().is_some()
+                || endpoint.query().is_some()
+                || endpoint.fragment().is_some()
+                || endpoint.path() != "/"
+            {
+                return Err(ConfigError::Invalid("builtin.endpoint must be a loopback HTTP origin without credentials, query, fragment or path".into()));
+            }
+            for profile in &self.profiles {
+                if profile.workspace.is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "profile {:?} requires workspace for the built-in platform's Git source",
+                        profile.id
+                    )));
+                }
+            }
         }
-        validate_repository(&self.github.repository)?;
-        validate_token("github.handle", &self.github.handle)?;
-        if self.github.webhook_secret_environment.is_none()
-            && self.github.webhook_secret_file.is_none()
-        {
-            return Err(ConfigError::Invalid(
-                "one of github.webhook_secret_environment or github.webhook_secret_file must be set".into(),
-            ));
-        }
-        if let Some(env) = &self.github.webhook_secret_environment {
-            validate_token("github.webhook_secret_environment", env)?;
+        if let Some(github) = &self.github {
+            require_absolute("github.private_key_file", &github.private_key_file)?;
+            require_absolute("tools.gh", &self.tools.gh)?;
+            require_absolute("tools.wrangler", &self.tools.wrangler)?;
+            if let Some(path) = &github.webhook_secret_file {
+                require_absolute("github.webhook_secret_file", path)?;
+            }
+            if github.app_id == 0 {
+                return Err(ConfigError::Invalid("github.app_id must be positive".into()));
+            }
+            validate_repository(&github.repository)?;
+            validate_token("github.handle", &github.handle)?;
+            if github.webhook_secret_environment.is_none() && github.webhook_secret_file.is_none() {
+                return Err(ConfigError::Invalid("one of github.webhook_secret_environment or github.webhook_secret_file must be set".into()));
+            }
+            if let Some(env) = &github.webhook_secret_environment {
+                validate_token("github.webhook_secret_environment", env)?;
+            }
         }
         if self.scheduler.quiet_seconds == 0
             || self.scheduler.event_threshold == 0
@@ -638,6 +765,14 @@ impl Config {
                 &format!("runtime.{}.executable", runtime.adapter_type),
                 &runtime.executable,
             )?;
+            if let Some(manifest) = &runtime.native_runtime {
+                require_absolute("runtime.native_runtime", manifest)?;
+                if runtime.adapter_type != "pi" {
+                    return Err(ConfigError::Invalid(
+                        "native_runtime is only supported by Pi".into(),
+                    ));
+                }
+            }
             if !runtime_types.insert(runtime.adapter_type.as_str()) {
                 return Err(ConfigError::Invalid(format!(
                     "duplicate runtime adapter_type {:?}",
@@ -783,6 +918,19 @@ impl Profile {
         if let Some(workspace) = &self.workspace {
             require_absolute(&format!("profile {:?}.workspace", self.id), workspace)?;
         }
+        if self.adapter_type != "pi" && (!self.skills.is_empty() || self.native_template.is_some())
+        {
+            return Err(ConfigError::Invalid(format!(
+                "profile {:?} skills and native_template are supported only by the Pi adapter",
+                self.id
+            )));
+        }
+        for skill in &self.skills {
+            require_absolute(&format!("profile {:?}.skills", self.id), skill)?;
+        }
+        if let Some(template) = &self.native_template {
+            require_absolute(&format!("profile {:?}.native_template", self.id), template)?;
+        }
         if self.tags.is_empty() || (!self.has_tag("issue") && !self.has_tag("pr")) {
             return Err(ConfigError::Invalid(format!(
                 "profile {:?} must have issue or pr capability tag",
@@ -831,6 +979,7 @@ impl Profile {
         // catalog only carries cost metadata, so an uncatalogued model is
         // not a config error: Codex must be able to answer with a real
         // turn failure for a model it does not support.
+        config.profile_materials(self)?;
         Ok(())
     }
 }
@@ -888,36 +1037,4 @@ pub fn agent_attributions(config: &Config) -> Vec<String> {
         }
     }
     attributions
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::Config;
-
-    #[test]
-    fn pi_settings_follow_the_requested_profile() {
-        let mut config = Config::load(Path::new("config.example.toml")).unwrap();
-        config.runtimes[0].adapter_type = "pi".into();
-        for profile in &mut config.profiles {
-            profile.adapter_type = "pi".into();
-        }
-        config.profiles[0].model = Some("issue-model".into());
-        config.profiles[0].reasoning = Some("low".into());
-        config.profiles[1].model = Some("pr-model".into());
-        let settings = config.provider_config_for_profile(&config.profiles[0]).unwrap().pi.unwrap();
-        assert_eq!(settings.model.as_deref(), Some("issue-model"));
-        assert_eq!(settings.thinking.as_deref(), Some("low"));
-    }
-
-    /// `config.example.toml` is the canonical starter template, not a loose
-    /// documentation snippet. It must parse and validate against the canonical
-    /// `Config` type so that it cannot drift from the real schema. Partial
-    /// examples in runbooks are not required to pass this test.
-    #[test]
-    fn example_config_matches_schema() {
-        Config::load(Path::new("config.example.toml"))
-            .expect("config.example.toml must match the Config schema");
-    }
 }

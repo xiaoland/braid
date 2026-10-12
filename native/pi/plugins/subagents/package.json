@@ -1,0 +1,8 @@
+{
+  "name": "@braid/pi-runtime-subagents",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "pi-subagents": "0.56.0"
+  }
+}

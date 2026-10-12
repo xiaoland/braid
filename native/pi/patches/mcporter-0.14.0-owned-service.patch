@@ -1,0 +1,24 @@
+--- a/dist/daemon/launch.js
++++ b/dist/daemon/launch.js
+@@ -4,16 +4,18 @@
+ import { fileURLToPath } from 'node:url';
+ export async function launchDaemonDetached(options, launch = spawn) {
+     const invocation = buildDaemonLaunchInvocation(options);
++    const managed = process.env.BRAID_NATIVE_RUNTIME_MODULE ? await import(process.env.BRAID_NATIVE_RUNTIME_MODULE) : undefined;
+     try {
+         await new Promise((resolve, reject) => {
+-            const child = launch(invocation.command, invocation.args, {
++            const child = (managed?.spawnManaged ?? launch)(invocation.command, invocation.args, {
+                 detached: true,
+                 stdio: 'ignore',
+                 env: invocation.env,
+-            });
++            }, { kind: 'mcp-daemon', service: true });
+             // Keep handling late errors after spawn; readiness is checked by the caller.
+             child.on('error', reject);
+-            child.once('spawn', resolve);
++            if (managed) managed.waitManagedStartup(child).then(resolve, reject);
++            else child.once('spawn', resolve);
+             child.unref();
+         });
+     }

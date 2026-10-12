@@ -36,9 +36,11 @@ experimental_schema_sha256 = "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b
 # Alternative: Pi runtime with DeepSeek
 # [[runtimes]]
 # adapter_type = "pi"
-# version = "0.84.3"
+# version = "1.0.2"
 # executable = "/usr/local/bin/pi"
 # home = "/absolute/path/to/instance/provider/pi"
+# For the locked native material, select <install>/pi above and declare:
+# native_runtime = "/absolute/path/to/install/runtime-manifest.json"
 
 [[llm_providers]]
 id = "openai"

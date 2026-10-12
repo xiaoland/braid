@@ -9,4 +9,4 @@ mod session_manager;
 
 mod worker;
 use session_manager::SessionManager;
-pub(crate) use worker::{GroupKind, GroupSpec, agent_group_worker};
+pub(crate) use worker::{GroupKind, GroupSpec, agent_group_worker, agent_group_worker_backend};
