@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 612" role="img" aria-labelledby="svg-title svg-desc">
+  <title id="svg-title">Two models for a changing task</title>
+  <desc id="svg-desc">On the left, append-only chat retains an old decision followed by corrections. On the right, Braid rebuilds the agent context from the current GitHub Issue state so a new provider session sees the current decision instead of stale history.</desc>
+  <defs>
+    <linearGradient id="panelGradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#14203b"/>
+      <stop offset="1" stop-color="#101933"/>
+    </linearGradient>
+    <linearGradient id="accentLine" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#745cff"/>
+      <stop offset="1" stop-color="#39d8f8"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7.6" refY="4.5" orient="auto">
+      <path d="M1 1 L7.7 4.5 L1 8" fill="none" stroke="#7f90b8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="arrowCyan" markerWidth="9" markerHeight="9" refX="7.6" refY="4.5" orient="auto">
+      <path d="M1 1 L7.7 4.5 L1 8" fill="none" stroke="#35d9f8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <rect width="1080" height="612" rx="24" fill="#080f25"/>
+  <rect x="0.6" y="0.6" width="1078.8" height="610.8" rx="23.4" fill="none" stroke="#26314f" stroke-width="1.2"/>
+  <path d="M0 0 H1080" stroke="url(#accentLine)" stroke-width="6"/>
+
+  <text x="50" y="65" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="29" font-weight="720" fill="#f7f9ff">When the work changes, the context should too.</text>
+  <text x="50" y="100" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="17" fill="#a1b0d0">The same changing requirement, two different memory models.</text>
+
+  <rect x="40" y="136" width="482" height="431" rx="18" fill="url(#panelGradient)" stroke="#2d3959"/>
+  <rect x="558" y="136" width="482" height="431" rx="18" fill="url(#panelGradient)" stroke="#2d3959"/>
+
+  <circle cx="73" cy="175" r="6" fill="#ff636b"/>
+  <text x="93" y="181" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="18" font-weight="700" fill="#f4f6ff" letter-spacing=".5">APPEND-ONLY CHAT</text>
+  <text x="72" y="211" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="15.5" fill="#adb8d5">New messages correct previous messages.</text>
+
+  <path d="M98 263 V458" stroke="#64728f" stroke-width="2" stroke-dasharray="4 7"/>
+  <circle cx="98" cy="268" r="6" fill="#657391"/>
+  <circle cx="98" cy="354" r="6" fill="#ff636b"/>
+  <circle cx="98" cy="440" r="6" fill="#ff636b"/>
+
+  <rect x="124" y="240" width="363" height="62" rx="12" fill="#222c45" stroke="#3c4967"/>
+  <text x="144" y="263" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="13.5" fill="#b4c1df">Earlier message</text>
+  <text x="144" y="287" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="20" fill="#edf0fb" font-weight="590">Decision: A</text>
+
+  <rect x="124" y="326" width="363" height="62" rx="12" fill="#222c45" stroke="#3c4967"/>
+  <text x="144" y="349" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="13.5" fill="#b4c1df">Later correction</text>
+  <text x="144" y="373" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="20" fill="#edf0fb" font-weight="590">Decision changed to B</text>
+
+  <rect x="124" y="412" width="363" height="62" rx="12" fill="#222c45" stroke="#3c4967"/>
+  <text x="144" y="435" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="13.5" fill="#b4c1df">Additional instruction</text>
+  <text x="144" y="459" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="20" fill="#edf0fb" font-weight="590">Ignore the earlier A</text>
+  <text x="75" y="531" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="16" fill="#ff999f">Old assumptions remain in the history.</text>
+
+  <circle cx="592" cy="175" r="6" fill="#40d8f6"/>
+  <text x="612" y="181" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="18" font-weight="700" fill="#f4f6ff" letter-spacing=".3">BRAID · CURRENT STATE</text>
+  <text x="590" y="211" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="15.5" fill="#adb8d5">Changes are reflected in the next context.</text>
+
+  <rect x="590" y="239" width="419" height="92" rx="12" fill="#1c2a47" stroke="#5368a0"/>
+  <rect x="897" y="256" width="87" height="24" rx="12" fill="#273957"/>
+  <text x="940" y="273" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="12.5" font-weight="650" fill="#9bb3e6">edited</text>
+  <text x="610" y="268" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="14.5" fill="#b2c1e2">GitHub Issue · current description</text>
+  <text x="610" y="306" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="23" font-weight="690" fill="#ffffff">Decision: B</text>
+
+  <path d="M800 335 V368" stroke="#40d8f6" stroke-width="2.2" marker-end="url(#arrowCyan)"/>
+  <rect x="649" y="379" width="303" height="63" rx="12" fill="#1b324d" stroke="#31718b"/>
+  <text x="801" y="405" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="17" font-weight="650" fill="#7de6fd">Rebuild context</text>
+  <text x="801" y="427" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="13.5" fill="#c1d2ea">from the current GitHub state</text>
+
+  <path d="M800 447 V475" stroke="#40d8f6" stroke-width="2.2" marker-end="url(#arrowCyan)"/>
+  <rect x="634" y="486" width="333" height="58" rx="12" fill="#25304d" stroke="#6375af"/>
+  <text x="801" y="511" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="16" font-weight="650" fill="#f7f9ff">New provider session</text>
+  <text x="801" y="532" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" font-size="14" fill="#aebfda">Sees B, not the stale A</text>
+</svg>
