@@ -134,8 +134,8 @@ pub async fn serve(args: ConsoleArgs) -> Result<()> {
         // This process owns the collector, so its managed runtime exports to this listener.
         config.telemetry.endpoint = url::Url::parse(&format!("http://{address}"))?;
         telemetry = Some(TelemetryGuard::install(&config.telemetry, config.instance_key())?);
-        app = app.merge(harness::router(&config));
-        let runtime = runtime::Manager::new(config)?;
+        let runtime = runtime::Manager::new(config.clone())?;
+        app = app.merge(harness::router(&config, runtime.clone()));
         app = app.merge(runtime.router());
         manager = Some(runtime);
     }

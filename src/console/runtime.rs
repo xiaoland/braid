@@ -1,5 +1,9 @@
 //! Owns actual runtime tasks; OTLP observations never drive these transitions.
-use crate::{config::Config, health::HealthSnapshot};
+use crate::{
+    config::Config,
+    health::HealthSnapshot,
+    run::{RunRequest, RunResult, RunState},
+};
 use anyhow::{Context as _, Result, bail};
 use axum::{
     Json, Router,
@@ -27,6 +31,9 @@ struct Execution {
     state: &'static str,
     error: Option<String>,
     provider_enabled: bool,
+    stop_confirmed: bool,
+    run_request: Option<RunRequest>,
+    run_result: Option<RunResult>,
     stop: Option<watch::Sender<bool>>,
     monitor: Option<tokio::task::JoinHandle<()>>,
 }
@@ -38,6 +45,8 @@ struct Command {
     expected_generation: Option<String>,
     #[serde(default)]
     transport_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_request: Option<RunRequest>,
 }
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +63,13 @@ impl IntoResponse for ApiError {
 fn internal(error: impl std::fmt::Display) -> ApiError {
     ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
+fn run_error(result: &RunResult) -> Option<String> {
+    if !result.stop_confirmed || matches!(result.state, RunState::Blocked | RunState::Failed) {
+        result.reason.clone()
+    } else {
+        None
+    }
+}
 
 impl Manager {
     pub fn new(config: Config) -> Result<Self> {
@@ -63,14 +79,41 @@ impl Manager {
             config.runtime.database(),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
-        let unresolved:Option<String>=db.query_row("SELECT response_json FROM control_receipts WHERE scope='runtime' AND json_extract(response_json,'$.result.state') IN ('starting','running','stopping','blocked') ORDER BY created_at DESC LIMIT 1",[],|row|row.get(0)).optional()?;
-        let generation = unresolved
+        let previous: Option<String> = db.query_row("SELECT response_json FROM control_receipts WHERE scope='runtime' ORDER BY created_at DESC,rowid DESC LIMIT 1", [], |row| row.get(0)).optional()?.flatten();
+        let previous =
+            previous.map(|response| serde_json::from_str::<Value>(&response)).transpose()?;
+        let generation = previous
             .as_ref()
-            .map(|response| serde_json::from_str::<Value>(response))
-            .transpose()?
             .and_then(|response| response["result"]["generation"].as_str().map(str::to_owned));
-        let error=unresolved.map(|_|"previous Console ended without a persisted stop confirmation; verify its native executions before replacing this runtime".to_owned());
-        let state = if error.is_some() { "blocked" } else { "stopped" };
+        let run_request = previous
+            .as_ref()
+            .and_then(|response| response["result"].get("run_request"))
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value::<RunRequest>(value.clone()))
+            .transpose()?;
+        let run_result = previous
+            .as_ref()
+            .and_then(|response| response["result"].get("run"))
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value::<RunResult>(value.clone()))
+            .transpose()?;
+        let unconfirmed = previous.as_ref().is_some_and(|response| {
+            response["result"]["stop_confirmed"]
+                .as_bool()
+                .map(|confirmed| !confirmed)
+                .unwrap_or_else(|| {
+                    matches!(
+                        response["result"]["state"].as_str(),
+                        Some("starting" | "running" | "stopping" | "blocked")
+                    )
+                })
+        });
+        let error = if unconfirmed {
+            Some("previous Console ended without a persisted stop confirmation; verify its native executions before replacing this runtime".to_owned())
+        } else {
+            run_result.as_ref().and_then(run_error)
+        };
+        let state = if unconfirmed { "blocked" } else { "stopped" };
         initial.last_error.clone_from(&error);
         let health = Arc::new(RwLock::new(initial));
         Ok(Self(Arc::new(Inner {
@@ -81,10 +124,24 @@ impl Manager {
                 state,
                 error,
                 provider_enabled: false,
+                stop_confirmed: state == "stopped",
+                run_request,
+                run_result,
                 stop: None,
                 monitor: None,
             }),
         })))
+    }
+    pub(super) async fn harness_source(&self) -> Result<(PathBuf, Option<String>)> {
+        let state = self.0.state.lock().await;
+        if let Some(request) = &state.run_request {
+            Ok((
+                crate::run::run_database(&self.0.config, &request.run_id)?,
+                Some(request.run_id.clone()),
+            ))
+        } else {
+            Ok((self.0.config.runtime.database().into(), None))
+        }
     }
     pub fn router(&self) -> Router {
         Router::new()
@@ -109,7 +166,7 @@ impl Manager {
                 .context("runtime supervisor failed")?;
         }
         let state = self.0.state.lock().await;
-        if state.state == "blocked" {
+        if !state.stop_confirmed {
             bail!(
                 "runtime stop is unconfirmed: {}",
                 state.error.as_deref().unwrap_or("unknown failure")
@@ -119,13 +176,20 @@ impl Manager {
     }
 }
 
-async fn status(State(manager): State<Manager>) -> Json<Value> {
+async fn status(State(manager): State<Manager>) -> Result<Json<Value>, ApiError> {
     let state = manager.0.state.lock().await;
     let health = manager.0.health.read().await.clone();
     let config = &manager.0.config;
-    Json(
-        json!({"instance":config.instance_key(),"repository":config.repository(),"generation":state.generation,"state":state.state,"error":state.error,"provider_enabled":state.provider_enabled,"health":health,"authority":"in-process runtime supervisor","evidence":crate::telemetry::evidence_health(),"telemetry":{"endpoint":config.telemetry.endpoint,"sample_ratio":config.telemetry.sample_ratio,"incident_mode":config.telemetry.incident_mode}}),
-    )
+    let run = if let Some(result) = &state.run_result {
+        Some(result.clone())
+    } else if let Some(request) = &state.run_request {
+        crate::run::run_snapshot(config, &request.run_id).map_err(internal)?
+    } else {
+        None
+    };
+    Ok(Json(
+        json!({"instance":config.instance_key(),"repository":config.repository(),"upstream":if config.is_builtin(){"builtin"}else{"github"},"generation":state.generation,"state":state.state,"error":state.error,"provider_enabled":state.provider_enabled,"health":health,"authority":"in-process runtime supervisor","mode":if state.run_request.is_some() {"run"} else {"serve"},"stop_confirmed":state.stop_confirmed,"run_request":state.run_request,"run":run,"evidence":crate::telemetry::evidence_health(),"telemetry":{"endpoint":config.telemetry.endpoint,"sample_ratio":config.telemetry.sample_ratio,"incident_mode":config.telemetry.incident_mode}}),
+    ))
 }
 
 async fn receipt(
@@ -166,8 +230,19 @@ async fn command(
             format!("runtime generation changed; current generation is {:?}", state.generation),
         ));
     }
+    if let Some(request) = &command.run_request {
+        if !matches!(command.operation, Operation::Start) || command.transport_only {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "run_request requires start with Provider enabled".into(),
+            ));
+        }
+        request
+            .validate(&manager.0.config)
+            .map_err(|error| ApiError(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    }
     match command.operation {
-        Operation::Start if state.state != "stopped" => {
+        Operation::Start if state.state != "stopped" || !state.stop_confirmed => {
             return Err(ApiError(
                 StatusCode::CONFLICT,
                 format!(
@@ -195,7 +270,7 @@ async fn command(
         Operation::Start => "starting",
         Operation::Stop => "stopping",
     };
-    let response = json!({"request_id":command.request_id,"state":"applied","result":{"accepted":true,"generation":generation,"state":next_state}});
+    let response = json!({"request_id":command.request_id,"state":"applied","result":{"accepted":true,"generation":generation,"state":next_state,"stop_confirmed":false,"run_request":match command.operation { Operation::Start => &command.run_request, Operation::Stop => &state.run_request }}});
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     db.execute("INSERT INTO control_receipts(scope,request_id,payload_sha256,request_json,state,response_json,created_at,updated_at) VALUES('runtime',?1,?2,?3,'applied',?4,?5,?5)",params![command.request_id,sha,payload,response.to_string(),now]).map_err(internal)?;
     drop(db);
@@ -204,7 +279,14 @@ async fn command(
         braid.outcome="accepted", "runtime command accepted by supervisor");
     match command.operation {
         Operation::Start => {
-            start_runtime(&manager, &mut state, generation, !command.transport_only).await;
+            start_runtime(
+                &manager,
+                &mut state,
+                generation,
+                !command.transport_only,
+                command.run_request,
+            )
+            .await;
         }
         Operation::Stop => {
             state
@@ -230,7 +312,14 @@ fn read_receipt(path: PathBuf, id: &str) -> Result<Option<Value>> {
     .map(|s| serde_json::from_str(&s).map_err(anyhow::Error::new))
     .transpose()
 }
-fn save_outcome(config: &Config, generation: &str, state: &str, error: Option<&str>) -> Result<()> {
+fn save_outcome(
+    config: &Config,
+    generation: &str,
+    state: &str,
+    error: Option<&str>,
+    stop_confirmed: bool,
+    run: Option<&RunResult>,
+) -> Result<()> {
     let db = Connection::open(config.runtime.database())?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     let mut query=db.prepare("SELECT request_id,response_json FROM control_receipts WHERE scope='runtime' AND json_extract(response_json,'$.result.generation')=?1")?;
@@ -242,6 +331,8 @@ fn save_outcome(config: &Config, generation: &str, state: &str, error: Option<&s
         let mut response: Value = serde_json::from_str(&response)?;
         response["result"]["state"] = json!(state);
         response["result"]["error"] = json!(error);
+        response["result"]["stop_confirmed"] = json!(stop_confirmed);
+        response["result"]["run"] = json!(run);
         db.execute("UPDATE control_receipts SET response_json=?1,error=?2,updated_at=?3 WHERE scope='runtime' AND request_id=?4",params![response.to_string(),error,time::OffsetDateTime::now_utc().unix_timestamp(),id])?;
     }
     Ok(())
@@ -252,32 +343,43 @@ async fn start_runtime(
     state: &mut Execution,
     generation: String,
     provider_enabled: bool,
+    run_request: Option<RunRequest>,
 ) {
     let (stop, receiver) = watch::channel(false);
     state.generation = Some(generation.clone());
     state.state = "starting";
     state.error = None;
     state.provider_enabled = provider_enabled;
+    state.stop_confirmed = false;
+    state.run_request = run_request.clone();
+    state.run_result = None;
     state.stop = Some(stop);
     *manager.0.health.write().await =
         crate::runtime::initial_health(&manager.0.config, provider_enabled);
     crate::telemetry::set_runtime_generation(Some(generation.clone()));
     let task_manager = manager.clone();
-    let task = tokio::spawn(crate::runtime::serve_managed(
-        manager.0.config.clone(),
-        provider_enabled,
-        receiver,
-        Arc::clone(&manager.0.health),
-    ));
+    let config = manager.0.config.clone();
+    let health = Arc::clone(&manager.0.health);
+    let task = tokio::spawn(async move {
+        if let Some(request) = run_request {
+            crate::run::run_managed(config, request, receiver, health).await.map(Some)
+        } else {
+            crate::runtime::serve_managed(config, provider_enabled, receiver, health)
+                .await
+                .map(|()| None)
+        }
+    });
     state.state = "running";
     state.monitor = Some(tokio::spawn(async move {
         let result = task.await.map_err(anyhow::Error::new).and_then(std::convert::identity);
         let mut state = task_manager.0.state.lock().await;
         state.stop = None;
         match result {
-            Ok(()) => {
-                state.state = "stopped";
-                state.error = None;
+            Ok(run) => {
+                state.stop_confirmed = run.as_ref().is_none_or(|result| result.stop_confirmed);
+                state.state = if state.stop_confirmed { "stopped" } else { "blocked" };
+                state.error = run.as_ref().and_then(run_error);
+                state.run_result = run;
             }
             Err(error) => {
                 state.state = "blocked";
@@ -288,16 +390,20 @@ async fn start_runtime(
             braid.outcome=state.state, error.reason=state.error.as_deref().unwrap_or(""),
             "runtime supervision completed");
         crate::telemetry::set_runtime_generation(None);
-        if let Err(error) =
-            save_outcome(&task_manager.0.config, &generation, state.state, state.error.as_deref())
-        {
+        if let Err(error) = save_outcome(
+            &task_manager.0.config,
+            &generation,
+            state.state,
+            state.error.as_deref(),
+            state.stop_confirmed,
+            state.run_result.as_ref(),
+        ) {
             state.state = "blocked";
+            state.stop_confirmed = false;
             state.error = Some(format!("runtime outcome persistence failed: {error:#}"));
         }
         let mut health = task_manager.0.health.write().await;
         health.ready = false;
-        if state.error.is_some() {
-            health.last_error.clone_from(&state.error);
-        }
+        health.last_error.clone_from(&state.error);
     }));
 }

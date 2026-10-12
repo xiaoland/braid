@@ -9,6 +9,7 @@ use super::worker::{GroupDriver, RunningAgentTurn};
 
 use anyhow::{Context as _, Result, bail};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 use crate::{
     agent_session::SendResult,
@@ -503,6 +504,11 @@ impl GroupDriver<'_> {
         let sessions = &self.sessions;
         let profile = &self.spec.profile;
         let work_item_kind = self.spec.kind.as_str();
+        let admission = if let Some(run) = &self.config.finite_run {
+            Some(Arc::clone(&run.admission).try_acquire_owned().ok()?)
+        } else {
+            None
+        };
         let claim = match store.claim_runnable_turn(
             work_item_kind.into(),
             profile.id.clone(),
@@ -656,7 +662,13 @@ impl GroupDriver<'_> {
         {
             tracing::error!(%error, "cannot enqueue trusted-mention start reaction");
         }
-        Some(RunningAgentTurn { claim, provider_turn_id, reset_id: None, events })
+        Some(RunningAgentTurn {
+            claim,
+            provider_turn_id,
+            reset_id: None,
+            events,
+            _admission: admission,
+        })
     }
 
     /// Fence the active turn with a DB reset claim, then best-effort interrupt it.

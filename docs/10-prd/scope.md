@@ -28,3 +28,14 @@ Web Console 属于整个 Braid，接收 OTLP、保存并可视化观测证据，
 内建平台可独立启动，也可由 Console 便捷装配。对象、执行和观测分别保留
 权威，不把遥测缺失当作工作完成。Console 不依赖 Factory，不执行 Braid CLI
 作为后端桥，也不承担实验/赛事调度。
+
+## Root 驱动的自主运行
+
+`serve` 常驻处理协作输入；`run` 以一个 root Issue 或 description 为业务输入，
+由 root Agent 自主拆分 Issue、指派、创建 PR、消费成果并组织交付。run 属于 Harness，
+首版接入 built-in 平台；平台仍与 GitHub 同层，不被重新定义为运行模式。
+
+完成以 root 的交付声明、范围内义务收敛、真实交付 commit 和执行停止确认为依据。
+无新事件或模型轮次结束不等于完成；提前关闭 root 不能忽略未完成子项。
+运行结果不代替应用验收。运行权限限定当前 root 后代与关联 PR 和明确交付分支，
+不默认合并用户主分支，也不将 Factory 的业务阶段、模型配方或评分流程内置。

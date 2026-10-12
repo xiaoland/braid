@@ -1,15 +1,17 @@
 //! Braid-owned collaboration objects and their atomic event outbox.
 mod commands;
+mod scope;
 pub use commands::{
     CandidateLocation, CommandFailure, CommandRequest, ControlPolicy, ControlReceipt, ObjectCommand,
 };
+pub use scope::ScopeSnapshot;
 use std::{path::Path, time::Duration};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Savepoint, Transaction, TransactionBehavior, params,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -21,7 +23,7 @@ use crate::{
     store::{EventKind, IngressEvent},
 };
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
     pub number: u64,
     pub repository: String,
@@ -179,8 +181,14 @@ impl PlatformObjects {
         ids.into_iter().map(|id| self.item(id)).collect()
     }
 
-    pub fn create_issue(&mut self, title: &str, body: &str, author: &str) -> Result<Item> {
-        self.create(title, body, author, None)
+    pub fn create_child_issue(
+        &mut self,
+        title: &str,
+        body: &str,
+        author: &str,
+        parent: Option<u64>,
+    ) -> Result<Item> {
+        self.create(title, body, author, None, parent)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -204,6 +212,12 @@ impl PlatformObjects {
         git.find_commit(git2::Oid::from_str(&base_commit)?)?;
         ensure!(head_commit != base_commit, "PR head and base resolve to the same commit");
         if let Some(number) = issue {
+            if let Some(policy) = self.run_policy(number)? {
+                ensure!(
+                    base_branch == policy.delivery_ref,
+                    "run PR base must equal its registered deliveryRef"
+                );
+            }
             ensure!(
                 self.item(number)?.kind == "issue",
                 "associated object #{number} is not an Issue"
@@ -214,6 +228,7 @@ impl PlatformObjects {
             body,
             author,
             Some((head, base, &head_commit, &base_commit, issue)),
+            None,
         )?;
         pin_commit(&self.connection, &git, item.number, "heads", &head_commit)?;
         pin_commit(&self.connection, &git, item.number, "bases", &base_commit)?;
@@ -226,12 +241,17 @@ impl PlatformObjects {
         body: &str,
         author: &str,
         pr: Option<(&str, &str, &str, &str, Option<u64>)>,
+        parent: Option<u64>,
     ) -> Result<Item> {
         nonempty(title, "title")?;
         nonempty(author, "author")?;
         let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
         validate_revision(&tx, &self.repository, self.revision_guard)?;
+        if let Some(parent) = parent {
+            let item = read_item(&tx, &self.repository, parent)?;
+            ensure!(item.kind == "issue" && item.state == "open", "parent must be an open Issue");
+        }
         let at = now();
         let kind = if pr.is_some() { "pr" } else { "issue" };
         let (head, base, hc, bc, issue) = pr
@@ -240,6 +260,22 @@ impl PlatformObjects {
             });
         tx.execute("INSERT INTO local_items(repository,kind,title,body,author,head_ref,base_ref,head_commit,base_commit,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)",params![self.repository,kind,title,body,author,head,base,hc,bc,at])?;
         let id = u64::try_from(tx.last_insert_rowid())?;
+        if let Some(parent) = parent {
+            tx.execute(
+                "INSERT INTO local_issue_parents(child_number,parent_number) VALUES(?1,?2)",
+                params![sql_id(id)?, sql_id(parent)?],
+            )?;
+            bump(&tx, parent)?;
+            emit(
+                &tx,
+                parent,
+                "invalidate",
+                Some("child_created"),
+                author,
+                None,
+                self.writer.as_ref(),
+            )?;
+        }
         if let Some(issue) = issue {
             tx.execute(
                 "INSERT INTO local_links(issue_number,pr_number) VALUES(?1,?2)",
@@ -401,6 +437,9 @@ impl PlatformObjects {
         )?;
         bump(&tx, number)?;
         revoke_item_grants(&tx, number)?;
+        if !open {
+            tx.execute("WITH RECURSIVE descendants(number) AS (SELECT root_number FROM run_root_policies WHERE root_number=?2 UNION SELECT p.child_number FROM local_issue_parents p JOIN descendants d ON p.parent_number=d.number), covered(number) AS (SELECT number FROM descendants UNION SELECT l.pr_number FROM local_links l JOIN descendants d ON l.issue_number=d.number) UPDATE platform_grants SET epoch=epoch+1,lifecycle='revoked',updated_at=?1 WHERE item_number IN (SELECT number FROM covered) AND lifecycle='active'",params![now(),sql_id(number)?])?;
+        }
         emit(
             &tx,
             number,
@@ -418,6 +457,11 @@ impl PlatformObjects {
         ensure!(self.item(issue)?.kind == "issue", "#{issue} is not an Issue");
         ensure!(self.item(pr)?.kind == "pr", "#{pr} is not a PR");
         nonempty(author, "author")?;
+        let issue_policy = self.run_policy(issue)?;
+        let pr_policy = self.run_policy(pr)?;
+        if issue_policy.is_some() || pr_policy.is_some() {
+            ensure!(issue_policy == pr_policy, "PR links cannot cross a registered run scope");
+        }
         let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
         validate_revision(&tx, &self.repository, self.revision_guard)?;
@@ -476,8 +520,8 @@ impl PlatformObjects {
             milestone: None,
             projects: vec![],
             linked_branches: vec![],
-            parent: None,
-            sub_issues: vec![],
+            parent: self.parent(item.number)?.map(reference),
+            sub_issues: self.children(item.number)?.into_iter().map(reference).collect(),
             blocked_by: vec![],
             blocking: vec![],
             duplicate_pairs: vec![],
@@ -622,6 +666,12 @@ fn emit(
         [sql_id(number)?],
         |r| r.get(0),
     )?;
+    let progress = match (kind, detail) {
+        ("wake", Some("comment")) => Some("discussion changed"),
+        ("invalidate", Some("edited")) => Some("design changed"),
+        (_, Some("closed" | "reopened" | "merged" | "head_published")) => detail,
+        _ => None,
+    };
     let own = writer.is_some_and(|w| w.item == item_node(&repository, number));
     let kind = if own && matches!(kind, "wake" | "invalidate") && detail != Some("cross_surface") {
         "origin_echo"
@@ -629,6 +679,27 @@ fn emit(
         kind
     };
     tx.execute("INSERT INTO local_events(item_number,kind,detail,actor,body,revision,item_state,created_at,origin) SELECT number,?1,?2,?3,?4,revision,state,?5,?7 FROM local_items WHERE number=?6",params![kind,detail,author,body,now(),sql_id(number)?,origin])?;
+    if let Some(progress) = progress {
+        let mut stmt = tx.prepare("WITH RECURSIVE ancestors(number) AS (SELECT parent_number FROM local_issue_parents WHERE child_number=?1 UNION SELECT issue_number FROM local_links WHERE pr_number=?1 UNION SELECT p.parent_number FROM local_issue_parents p JOIN ancestors a ON p.child_number=a.number) SELECT number FROM ancestors ORDER BY number")?;
+        let parents = stmt
+            .query_map([sql_id(number)?], |r| row_id(r, 0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for parent in parents {
+            if writer.is_some_and(|w| w.item == item_node(&repository, parent)) {
+                continue;
+            }
+            let summary = format!(
+                "Object #{number}: {}{}",
+                progress,
+                if detail == Some("head_published") {
+                    body.map(|commit| format!(" ({commit})")).unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            );
+            tx.execute("INSERT INTO local_events(item_number,kind,detail,actor,body,revision,item_state,created_at,origin) SELECT number,'wake','child_progress',?1,?2,revision,state,?3,?4 FROM local_items WHERE number=?5 AND state='open'",params![author,summary,now(),origin,sql_id(parent)?])?;
+        }
+    }
     Ok(())
 }
 fn invalidate_links(
@@ -712,6 +783,12 @@ impl PlatformObjects {
         ensure!(item.kind == "pr", "#{number} is not a PR");
         let git = git2::Repository::open(source)?;
         let base_ref = full_branch(item.base_ref.as_deref().context("PR lacks base ref")?)?;
+        if let Some(policy) = self.run_policy(number)? {
+            ensure!(
+                base_ref == policy.delivery_ref,
+                "run merge base must equal its registered deliveryRef"
+            );
+        }
         let head_ref = item.head_ref.as_deref().context("PR lacks head ref")?;
         let expected_base =
             git2::Oid::from_str(item.base_commit.as_deref().context("PR lacks base commit")?)?;

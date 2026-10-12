@@ -16,6 +16,8 @@ use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_kn
 use uuid::Uuid;
 
 mod builtin;
+mod runs;
+pub use runs::RunCommand;
 mod gh_writes;
 pub use builtin::{BuiltinBinding, BuiltinCommand, BuiltinGrant, BuiltinReply};
 
@@ -28,7 +30,7 @@ use gh_writes::{
     prepare_gh_write, prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 6;
+pub const DATABASE_SCHEMA_VERSION: u32 = 7;
 
 const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
 const EVENT_KINDS_SQL: &str = include_str!("../../migrations/0002_event_kinds.sql");
@@ -54,6 +56,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 6,
         name: "builtin_harness",
         sql: include_str!("../../migrations/0006_builtin_harness.sql"),
+    },
+    Migration {
+        version: 7,
+        name: "harness_runs",
+        sql: include_str!("../../migrations/0007_harness_runs.sql"),
     },
 ];
 
@@ -547,6 +554,12 @@ impl StoreActor {
             .spawn(move || actor_loop(&database, &backups, receiver))
             .map_err(|source| StoreError::Io { path: PathBuf::from("<database-actor>"), source })?;
         Ok(Self { sender, join: Some(join) })
+    }
+
+    pub fn run_record(&self, command: RunCommand) -> Result<Option<String>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender.send(Command::Run(command, reply)).map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
     pub fn builtin(&self, command: BuiltinCommand) -> Result<BuiltinReply, StoreError> {
@@ -1316,6 +1329,7 @@ impl Drop for StoreActor {
 }
 
 enum Command {
+    Run(RunCommand, Sender<Result<Option<String>, StoreError>>),
     Builtin(BuiltinCommand, Sender<Result<BuiltinReply, StoreError>>),
     Plan(Sender<Result<MigrationPlan, StoreError>>),
     Apply(Sender<Result<MigrationResult, StoreError>>),
@@ -1474,6 +1488,9 @@ struct LedgerEntry {
 fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
     for command in receiver {
         match command {
+            Command::Run(command, reply) => {
+                let _ = reply.send(runs::execute(database, command));
+            }
             Command::Builtin(command, reply) => {
                 let _ = reply.send(builtin::execute(database, command));
             }

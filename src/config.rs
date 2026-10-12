@@ -32,6 +32,8 @@ pub struct InstanceConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip)]
+    pub(crate) finite_run: Option<crate::run::RunContext>,
     pub schema_version: u32,
     pub instance: InstanceConfig,
     pub runtime: RuntimeConfig,

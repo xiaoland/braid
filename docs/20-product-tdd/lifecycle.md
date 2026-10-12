@@ -212,3 +212,20 @@ Responsibilities do not overlap:
 - **Adapter** 管理进程、连接、物理会话和通知翻译，不读取 GitHub、不操作业务 store。
   Group 释放旧句柄时，adapter 必须报告停止是否成功；失败不删除句柄、不启动替代执行。
   Codex 共享连接和 Pi 独立进程都服从同一契约。
+
+## 有限 root 运行
+
+`run` 复用 built-in workers、provider、撤权与 shutdown，独立的 Harness ledger
+隔离当前 run 与常驻 serve 的旧指派。平台原子保存父子 Issue，固定 root 的 run ID、Harness client 身份和交付 ref，
+并据此扩展协调 writer 的范围；执行身份和终态仍归 Harness，平台没有第二份运行工作图。
+仅注册 run root 的关闭会立即撤销整个后代范围 grants，普通 serve 的对象关系保持原合同。
+
+root 的职责只在 run 中显式注入。子项生命周期、候选发布、讨论和设计更新回流到祖先；讨论和设计通知只携带对象及变化类型，不复制正文。
+以 writer 对象识别自身回流，不能用 profile 判断，因为 root 与子项可能共用 profile。普通 Agent 评论
+仍不要求公开应答或制造新一轮循环。统一准入在认领 turn 之前取得许可，并持续持有至
+真实 terminal、reset 或停止；限制的是在途 Braid turns，不是物理会话总数。
+
+root 开放时静默不形成终态。root 关闭后不再创建新的模型轮次，运行依据对象、交付 ref、
+未决写入和合并事实决定 completed 或具体 blocked，并使用现有停止屏障确认原生收尾。
+failed、stopped、blocked 与完成分开，停止确认不完整禁止覆盖执行。输入及解析配置
+绑定 run ID；接续不得借同一身份更换需求、创建重复 root 或隐式接管无关工作。

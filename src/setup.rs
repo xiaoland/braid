@@ -575,6 +575,7 @@ fn build_config(
 ) -> anyhow::Result<Config> {
     let runtime_version = runtime.version.clone();
     let mut config = Config {
+        finite_run: None,
         schema_version: CONFIG_SCHEMA_VERSION,
         instance: crate::config::InstanceConfig {
             key: instance_key.to_owned(),

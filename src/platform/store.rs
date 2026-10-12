@@ -2,9 +2,10 @@ use super::config::PlatformConfig;
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, params};
 use std::path::Path;
-const MIGRATIONS: [(u32, &str, &str); 2] = [
+const MIGRATIONS: [(u32, &str, &str); 3] = [
     (1, "initial", include_str!("schema.sql")),
     (2, "schema_checksums", include_str!("migrations/0002_schema_checksums.sql")),
+    (3, "issue_tree", include_str!("migrations/0003_issue_tree.sql")),
 ];
 fn checksum(sql: &str) -> String {
     use sha2::Digest as _;
@@ -34,13 +35,17 @@ fn upgrade_schema(connection: &Connection) -> Result<()> {
         connection.query_row("SELECT MAX(version) FROM platform_schema_migrations", [], |row| {
             row.get(0)
         })?;
-    ensure!((1..=2).contains(&version), "unsupported platform database schema {version}");
+    ensure!((1..=3).contains(&version), "unsupported platform database schema {version}");
     if version == 1 {
         connection.execute_batch(MIGRATIONS[1].2)?;
         let now = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)?;
         connection.execute("UPDATE platform_schema_migrations SET name=?1,checksum=?2,applied_at=?3 WHERE version=1",params![MIGRATIONS[0].1,checksum(MIGRATIONS[0].2),now])?;
         connection.execute("INSERT INTO platform_schema_migrations(version,name,checksum,applied_at) VALUES(2,?1,?2,?3)",params![MIGRATIONS[1].1,checksum(MIGRATIONS[1].2),now])?;
+    }
+    if version < 3 {
+        connection.execute_batch(MIGRATIONS[2].2)?;
+        connection.execute("INSERT INTO platform_schema_migrations(version,name,checksum,applied_at) VALUES(3,?1,?2,datetime('now'))",params![MIGRATIONS[2].1,checksum(MIGRATIONS[2].2)])?;
     }
     verify_schema(connection)
 }
@@ -62,10 +67,14 @@ pub fn initialize(config: &PlatformConfig) -> Result<()> {
     } else {
         None
     };
-    if old_version == Some(1) {
+    if old_version.is_some_and(|version| version < 3) {
         connection.backup(
             rusqlite::MAIN_DB,
-            config.backups.join(format!("platform-schema1-{}.sqlite3", uuid::Uuid::now_v7())),
+            config.backups.join(format!(
+                "platform-schema{}-{}.sqlite3",
+                old_version.unwrap(),
+                uuid::Uuid::now_v7()
+            )),
             None,
         )?;
     }

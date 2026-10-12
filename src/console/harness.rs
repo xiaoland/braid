@@ -12,13 +12,17 @@ use crate::config::Config;
 #[derive(Clone)]
 struct SnapshotState {
     database: PathBuf,
+    run_id: Option<String>,
+    manager: super::runtime::Manager,
     repository: String,
     profiles: Value,
 }
 
-pub(super) fn router(config: &Config) -> Router {
+pub(super) fn router(config: &Config, manager: super::runtime::Manager) -> Router {
     Router::new().route("/api/harness/snapshot", get(snapshot)).with_state(SnapshotState {
         database: config.runtime.database().into(),
+        run_id: None,
+        manager,
         repository: config.repository().into(),
         profiles: serde_json::json!({
             "issue":config.profiles.iter().find(|p|p.tags.iter().any(|t|t=="issue")).map(|p|&p.id),
@@ -28,8 +32,11 @@ pub(super) fn router(config: &Config) -> Router {
 }
 
 async fn snapshot(
-    State(state): State<SnapshotState>,
+    State(mut state): State<SnapshotState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    (state.database, state.run_id) = state.manager.harness_source().await.map_err(|error| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":format!("{error:#}")})))
+    })?;
     tokio::task::spawn_blocking(move || read_snapshot(&state))
         .await
         .context("Harness snapshot task failed")
@@ -59,7 +66,7 @@ fn read_snapshot(state: &SnapshotState) -> Result<Value> {
     );
     let result = serde_json::json!({
         "source":"braid_harness", "observedAt":OffsetDateTime::now_utc().format(&Rfc3339)?,
-        "repository":state.repository,"profileSuggestions":state.profiles,
+        "repository":state.repository,"runId":state.run_id,"profileSuggestions":state.profiles,
         "upstream":rows(&transaction,"SELECT space_id,repository,client_id,cursor FROM builtin_upstream WHERE singleton=1")?,
         "sessions":rows(&transaction,"SELECT session_id,agent_id,provider_kind,provider_session_id,lifecycle,started_at,resume_count,last_resumed_at,last_resume_error FROM provider_sessions ORDER BY started_at")?,
         "turns":rows(&transaction,"SELECT turn_id,session_id,provider_turn_id,trigger_kind,lifecycle,started_at,ended_at,error FROM turns ORDER BY started_at")?,

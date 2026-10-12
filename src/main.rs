@@ -17,6 +17,7 @@ mod producer;
 mod protocol;
 mod provider;
 mod queue;
+mod run;
 mod runtime;
 mod setup;
 mod store;

@@ -17,6 +17,7 @@ pub(crate) struct BuiltinClient {
     endpoint: url::Url,
     pub binding: BuiltinBinding,
     pub store: Arc<StoreActor>,
+    run_id: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -147,6 +148,10 @@ struct Revoked {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GrantRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "crate::platform::grants::is_false")]
+    pending: bool,
     request_id: &'a str,
     client_id: &'a str,
     item_number: u64,
@@ -199,7 +204,13 @@ impl BuiltinClient {
         else {
             unreachable!()
         };
-        Ok(Arc::new(Self { http, endpoint: settings.endpoint.clone(), binding, store }))
+        Ok(Arc::new(Self {
+            http,
+            endpoint: settings.endpoint.clone(),
+            binding,
+            store,
+            run_id: config.finite_run.as_ref().map(|run| run.run_id.clone()),
+        }))
     }
     pub(crate) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         decode(self.http.get(self.endpoint.join(path)?).send().await?).await
@@ -253,6 +264,8 @@ impl BuiltinClient {
     }
     async fn activate(&self, grant: &BuiltinGrant) -> Result<()> {
         let request = GrantRequest {
+            run_id: self.run_id.as_deref(),
+            pending: false,
             request_id: &grant.request_id,
             client_id: &self.binding.client_id,
             item_number: grant.item_number,
@@ -269,7 +282,7 @@ impl BuiltinClient {
         Ok(())
     }
     pub(crate) async fn revoke_session(&self, session_id: &str) -> Result<()> {
-        let BuiltinReply::Grant(Some(mut grant)) =
+        let BuiltinReply::Grant(Some(grant)) =
             self.store.builtin(BuiltinCommand::Grant(session_id.into()))?
         else {
             return Ok(());
@@ -277,17 +290,10 @@ impl BuiltinClient {
         if grant.lifecycle == "revoked" {
             return Ok(());
         }
-        if grant.lifecycle == "pending" {
-            self.activate(&grant).await?;
-            let BuiltinReply::Grant(Some(active)) =
-                self.store.builtin(BuiltinCommand::Grant(session_id.into()))?
-            else {
-                unreachable!()
-            };
-            grant = active;
-        }
         let request_id = format!("{}:revoke", grant.request_id);
         let request = GrantRequest {
+            run_id: self.run_id.as_deref(),
+            pending: grant.lifecycle == "pending",
             request_id: &request_id,
             client_id: &self.binding.client_id,
             item_number: grant.item_number,

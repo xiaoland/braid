@@ -317,3 +317,11 @@ Console 的 OTLP Collector 保存原始传输批次与完整解码记录，使�
 、平台和控制端点持续存活，Harness 可单独停止。GitHub 与内建上游通过统一 runtime 接口托管。请求接受不等于任务已就绪或已停止；
 监督器等待所有 Group/provider 停止结果，失败进入 blocked 并禁止新执行覆盖。
 Console 不调用 CLI，也不复制 Factory 的实验、赛事或容器生命周期。
+
+## Root 运行入口
+
+有限 `run` 与常驻 `serve` 是 Harness 的运行方式，平台仍是独立上游。`run`
+复用调度、原生 provider 和停止屏障，以独立 ledger 隔离一项 root 工作。父子 Issue、
+关联 PR、交付 ref 和 grant 边界由平台保存；输入绑定、执行状态和终态由 Harness 保存。
+Console 调用同一应用入口并读取当前 run ledger，OTLP 不承担终态权威。
+具体准入、关闭及接续合同见[生命周期说明](lifecycle.md#有限-root-运行)，输入与操作见[run 指南](../user-manual/run.md)。

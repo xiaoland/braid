@@ -81,3 +81,16 @@ revision 前提，采纳前应重新核对当前候选。
 页面以文本呈现不可信内容，不执行记录中的 HTML。HTTP 接口校验 loopback Host
 和写操作 Origin，浏览器不能提供任意 shell 命令、PID 或文件根目录。这些措施
 防止网页误驱动本机接口，不把拥有本机账户权限的进程视为隔离的对手。
+
+## 选择常驻服务或 root 运行
+
+配置 built-in 上游后，运行方式可以选择常驻 `serve` 或有限 `run`。run 输入为已有
+root 编号或 description（二者择一），并声明 run ID、交付 ref 和最大并发 Braid 轮次。
+首版 GitHub 上游仍使用 serve；run 不能与“仅传输”同时启用。
+
+`POST /api/runtime/commands` 保持原 request_id、operation、expected_generation 合同，
+启动 run 时附 `run_request`，其字段为 runId、rootIssue 或 description、deliveryRef 和
+maxConcurrency。状态与回执分别展示 run 结果和 stop_confirmed；确认停止后的 blocked/failed
+结果可以由明确新启动接续，不确定停止仍禁止覆盖。run 的确定交付 commit 不等于应用验收通过。
+`/api/harness/snapshot` 阅读当前 run 的真实 ledger，平台对象和 OTLP 保持各自权威。
+完整输入、配置冻结、交付和接续方法见[自主运行指南](run.md)。

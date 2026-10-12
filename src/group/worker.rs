@@ -233,6 +233,9 @@ impl GroupDriver<'_> {
             }
             self.publish_turn_error(&active.claim, "unknown", reason);
             if let Err(error) = self.sessions.remove(&active.claim.provider_session_id).await {
+                if let Some(run) = &self.config.finite_run {
+                    run.admission.close();
+                }
                 tracing::error!(%error, "old execution stop remains unconfirmed");
                 self.publish_turn_error(
                     &active.claim,
@@ -290,6 +293,7 @@ impl GroupDriver<'_> {
                                         lifecycle.into(),
                                     );
                                     if let Err(error) = self.sessions.remove(&active.claim.provider_session_id).await {
+                                        if let Some(run)=&self.config.finite_run {run.admission.close();}
                                         let reason = format!("Context reset could not confirm old writer revocation and execution stop: {error}");
                                         if let Err(error) = store.fail_context_reset(reset_id.clone(), reason.clone()) {
                                             tracing::error!(%error, "cannot block Context reset after unconfirmed stop");
@@ -310,6 +314,7 @@ impl GroupDriver<'_> {
                                 if lifecycle == "unknown"
                                     && active.reset_id.is_none()
                                     && let Err(stop_error) = self.sessions.remove(&active.claim.provider_session_id).await {
+                                    if let Some(run)=&self.config.finite_run {run.admission.close();}
                                     tracing::error!(%stop_error, "old execution stop remains unconfirmed");
                                     self.publish_turn_error(&active.claim, "unknown", &format!("{}; old execution stop failed: {stop_error}", error.as_deref().unwrap_or("provider outcome unknown")));
                                 }
@@ -327,6 +332,10 @@ impl GroupDriver<'_> {
                 _ = tick.tick() => {
                     if running.as_ref().is_some_and(|active| active.events.is_closed()) {
                         self.fence_running(&mut running, "AgentSession event stream closed").await;
+                    }
+                    // A closed finite root fences new execution; shutdown owns physical cleanup.
+                    if self.config.finite_run.as_ref().is_some_and(|run|run.admission.is_closed()) {
+                        continue;
                     }
                     if running.is_none() && tokio::time::Instant::now() >= recovery {
                         // Resume only absent or failed handles; a sibling's recovery must
@@ -383,4 +392,6 @@ pub(crate) struct RunningAgentTurn {
     /// the send and handed off with the turn, so the drive loop consumes the
     /// terminal with no subscription-timing gap.
     pub(crate) events: tokio::sync::broadcast::Receiver<crate::agent_session::SessionEvent>,
+    /// Shared run admission is held until this actual turn reaches terminal or stop.
+    pub(crate) _admission: Option<tokio::sync::OwnedSemaphorePermit>,
 }

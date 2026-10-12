@@ -1,6 +1,6 @@
 # GitHub + Pi 真实模型重新验收
 
-状态：2026-10-11，按用户性能反馈降载收尾当前运行；第二候选应用复验通过，剩余生命周期资格保留接续，未判全项通过。用户指示：“好的，现在继续重新验收，先仅验收 GitHub + Pi；全部用 minimax 模型。”沿用已知 `xiaoland/braid-poc-test` 和官方 MiniMax `minimax-m3`（wire MiniMax-M3），凭据只从 ../agentic26/.env 加载，不输出或复制。真实官方按量调用获授权，无人为费用停止线，无备用模型。
+状态：2026-10-12，root 自主 run 实现、编译及无模型实际操作已完成，真实自主运行资格未执行；原 GitHub+Pi 第二候选应用复验通过，但剩余生命周期资格保留接续，未判全项通过。用户指示：“好的，现在继续重新验收，先仅验收 GitHub + Pi；全部用 minimax 模型。”沿用已知 `xiaoland/braid-poc-test` 和官方 MiniMax `minimax-m3`（wire MiniMax-M3），凭据只从 ../agentic26/.env 加载，不输出或复制。真实官方按量调用获授权，无人为费用停止线，无备用模型。
 
 目标：判断反哺后的独立 Braid 能否在 GitHub 中完成真实 Issue→PR 实现与更新，并在真实 Pi/subagents/background 运行下交接结果及停止，不以编译替代。候选源码 `1394319`，冻结binary与锁定Pi1.0.2材料SHA；只启用subagents/background，不装可选网络工具。所有根／子模型必须 minimax/MiniMax-M3，显式角色材料与模型路由禁止ambient fallback。
 
@@ -45,3 +45,17 @@
 接续入口：候选95fa固定archive及本轮全部ledger/native/observations原件均保留，配置与材料身份见run.md。恢复前采用readiness修复并以受控单任务方式构建/实际核对；新运行身份和可能恢复输入先冻结。关闭/重开、重启不重复输入、活动公开stop以及最终merge尚未跑；自然限流后恢复已观察，精确retry-intent合同证据不足，不人为制造失败。用户“悠着点”优先于启动更多轮次，当前不新增模型。任务范围未被宣告完整结束，保留此唯一active packet供低负载接续。
 
 最终进程收尾已确认：Console/tunnel正常Ctrl-C exit0，ports26318/18380/18381无LISTEN、knownPID24988/65289/65611均不存在，`raw/final-port-process-checks.json`；无在途操作/新增模型。metadata轻量汇总10物理JSONL（3root+7child、排除transcript、sessionID+entryID去重重复0），root/child actualmodels均唯一M3；recorded totalTokens15193632，input515803/output161755/cacheRead14516074/cacheWrite0/reasoning22833，SDKcost0非免费，账单未取得。自然HTTP429 TPM rate limit(1039)实际出现两次(14:07:52/55)，随后同turncompleted；owner定向核对已存原生JSONL，没有显式retry/willRetry/auto_retry条目；自然429后同turn恢复已观察，精确retry-intent事件合同证据不足，不判完整通过或完全未运行。没有新增探针/模型。
+
+2026-10-12 新增设计前沿：用户要求考虑将 Factory 的 root Issue/description 自主拆分、建 PR 和实现闭环保留为与 serve 并列模式，built-in 仍是同层 minimal GitHub。当前只调查/设计，不改源码、不启动运行。提案见 [autonomous-mode-design.md](autonomous-mode-design.md)，主 Agent拥有边界与采用，内部 autonomous_mode_advisor 只读核对旧运行生命周期。旧验收剩余义务保留，不被新模式提案覆盖。已创建 PR148；本提案尚未提交或推送。下一步收敛有限运行的权限、终态及资源准入合同，交用户评估。
+
+advisor 返回已采用：Factory 旧 local 区分 quiescent/delivery_complete/execution_settled，variant 又检查 root CLOSED；静默不能自动完成或判 blocked。根关闭继续撤销 writer，提前关闭且子项未完返回 blocked，需外部明确重开；父子关系应在创建子项时原子建立，范围不能通过任意链接扩大。基础/最终整合 PR 等固定阶段留给调用方配方，不作为 run 必经路径。提案已同步，当前只有任务材料改动，无源码/运行/远端变更。
+
+2026-10-12 开工：用户明确“是的，开始。”授权上述自主 run 设计的必要源码、文档和验证。当前实现不启动新付费模型，也不改 GitHub 对象。分工：run_platform_owner 拥有 platform 与对象 CLI 的父子关系、范围读取、grant、结果回流；run_runtime_owner 拥有 run 入口、执行身份/范围、有限终态、调度准入及恢复；run_console_owner 拥有 Console 共享控制及展示；主 Agent 拥有跨边界采用、文档、单任务构建与真实无模型平台操作。禁止设施测试/自检，所有产物存 WorkSSD。
+
+当前技术选择：每 run 使用独立 Harness ledger/config 和 run_id，平台仍持有唯一工作图，避免 serve 旧 assignment 在恢复时进入新 run。run 接续复用本 run ledger，不能只过滤新事件却恢复无关旧 session。实施发现总物理 session 限2会因 root+idle子Issue占槽阻断PR；该并发合同由advisor核对原生恢复后收敛，暂不宣称 active-turn 限制等于总物理资源限制。下一步完成平台/运行/Console共享接口，串行编译并以实际对象操作验父子权限及幂等，保留真实模型资格缺口。
+
+实施收敛：统一 active-turn 准入默认2，原描述“实际资源占用”收窄为在途 Braid轮次；不承诺 idle/Pi内部子任务资源上限，不引入自动闲置驱逐。平台注册root绑定run_id、已存在的Harness client_id及delivery_ref，拒绝其它run/ledger/serve误接管；Root关闭后不新开模型收口，正常执行关闭屏障。发现pending grant网络回执与root关闭竞态，正在平台普通revoke以具体generation/tombstone收敛，不能重新mint已关闭root权限，也不能将撤权当物理停止证明。第二轮单任务cargo check8.71s通过，待最后接口落地后构建实际操作binary。
+
+本轮实现收尾见 [autonomous-mode-results.md](autonomous-mode-results.md)：真实无模型平台/CLI/Console操作、旧平台副本升级及浏览器表单核对通过，所有本轮服务退出。源码和正式文档已完成；必要失败保持原件。旧GitHub+Pi剩余资格及新run真实模型资格未转写为通过，保留这一packet供后续资格工作。
+
+最终收尾：单任务离线构建17.17s、JS语法与diff检查通过。旧平台真实回执重试的409兼容缺陷已修复，原请求公开API回读200/applied且无重复对象；成员讨论/设计回流也完成实际操作。最终证据与限定见 autonomous-mode-results.md，所有本轮监听已关闭。下一步提交本轮改动并更新现有Draft PR#148；不将编译及无模型操作扩大为真实自主模型验收。

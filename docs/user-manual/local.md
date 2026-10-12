@@ -83,3 +83,5 @@ braid platform import --config /absolute/path/to/platform.toml --from-runtime-db
 没有模型调用时，`serve --transport-only` 可实际核对上游接入、事件和队列，
 不能证明 Agent 已完成产品工作。当前不提供 GitHub API 全兼容、双向同步、
 远程多人权限系统或完整跨进程崩溃恢复。
+
+平台也可为[自主 run](run.md)提供 root、父子 Issue 和关联 PR。run 是 Harness 的运行方式；不启动 run 仍可完整使用平台对象与常驻 serve。

@@ -81,6 +81,8 @@ enum Command {
         command: TunnelCommand,
     },
     Serve(ServeArguments),
+    /// Complete one root task using the built-in collaboration platform.
+    Run(RunArguments),
     /// Local OTLP collector, browser Console, and optional managed runtime.
     Console(crate::console::ConsoleArgs),
 }
@@ -332,6 +334,23 @@ struct ServeArguments {
     transport_only: bool,
 }
 
+#[derive(Debug, Args)]
+struct RunArguments {
+    #[command(flatten)]
+    source: ConfigSource,
+    #[arg(long)]
+    run_id: String,
+    #[arg(long, conflicts_with = "description_file", required_unless_present = "description_file")]
+    root_issue: Option<u64>,
+    #[arg(long, conflicts_with = "root_issue", required_unless_present = "root_issue")]
+    description_file: Option<PathBuf>,
+    #[arg(long)]
+    delivery_ref: String,
+    /// Maximum simultaneously active Braid turns, including the root (not a process limit).
+    #[arg(long, default_value_t = 2)]
+    max_concurrency: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct ContextReport<'a> {
     target: &'a WorkItemLocator,
@@ -407,6 +426,40 @@ pub async fn run() -> Result<()> {
             let config_path = arguments.source.resolve_config_path()?;
             let config = helpers::load(&config_path)?;
             crate::runtime::serve(config, arguments.tunnel, !arguments.transport_only).await?;
+        }
+        Command::Run(arguments) => {
+            let config = helpers::load(&arguments.source.resolve_config_path()?)?;
+            let request = crate::run::RunRequest {
+                run_id: arguments.run_id,
+                root_issue: arguments.root_issue,
+                description: arguments.description_file.map(fs::read_to_string).transpose()?,
+                delivery_ref: arguments.delivery_ref,
+                max_concurrency: arguments.max_concurrency,
+            };
+            request.validate(&config)?;
+            let telemetry = crate::telemetry::TelemetryGuard::install(
+                &config.telemetry,
+                config.instance_key(),
+            )?;
+            let generation = uuid::Uuid::now_v7().to_string();
+            crate::telemetry::set_runtime_generation(Some(generation));
+            let health = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::runtime::initial_health(&config, true),
+            ));
+            let (stop, shutdown) = tokio::sync::watch::channel(false);
+            let mut runtime = Box::pin(crate::run::run_managed(config, request, shutdown, health));
+            let result = tokio::select! {result=&mut runtime=>result, signal=crate::runtime::wait_for_shutdown_signal()=> {let _=stop.send(true);signal?;runtime.await}};
+            crate::telemetry::set_runtime_generation(None);
+            telemetry.shutdown()?;
+            let result = result?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            if result.state != crate::run::RunState::Completed {
+                bail!(
+                    "finite run ended as {:?}: {}",
+                    result.state,
+                    result.reason.as_deref().unwrap_or("no detail")
+                );
+            }
         }
         Command::Init(arguments) => crate::local::init::run(arguments).await?,
         Command::Object(arguments) => {

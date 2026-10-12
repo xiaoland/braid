@@ -123,6 +123,7 @@ GitHub 或内建上游，不经 CLI 子进程；停止 Harness 后 Collector 和
 | --- | --- |
 | [Setup guide](docs/user-manual/setup.md) | GitHub App bootstrap, provider credentials, activation, and local runtime. |
 | [Built-in platform](docs/user-manual/local.md) | Platform and Harness setup, objects, candidate publication, and migration. |
+| [自主 root 运行](docs/user-manual/run.md) | One root Issue or description drives Agent decomposition, implementation, and a bounded delivery lifecycle. |
 | [Web Console](docs/user-manual/console.md) | OTLP collection, visualization, and Harness control for either upstream. |
 | [Product model](docs/10-prd/README.md) | Purpose, working memory, Issue/PR collaboration, and current product scope. |
 | [Context design](docs/20-product-tdd/context.md) | Current-state projection, revisions, invalidation, and replacement. |

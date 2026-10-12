@@ -31,6 +31,10 @@ pub enum ObjectCommand {
     CreateIssue {
         title: String,
         body: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_revision: Option<u64>,
     },
     #[serde(rename = "createPR")]
     CreatePr {
@@ -40,6 +44,12 @@ pub enum ObjectCommand {
         base: String,
         issue: Option<u64>,
         issue_revision: Option<u64>,
+    },
+    ConfigureRunRoot {
+        number: u64,
+        delivery_ref: String,
+        run_id: String,
+        client_id: String,
     },
     Comment {
         number: u64,
@@ -95,7 +105,8 @@ impl ObjectCommand {
     pub(crate) fn target(&self) -> Option<u64> {
         match self {
             Self::CreateIssue { .. } | Self::CreatePr { .. } => None,
-            Self::Comment { number, .. }
+            Self::ConfigureRunRoot { number, .. }
+            | Self::Comment { number, .. }
             | Self::Edit { number, .. }
             | Self::Assign { number, .. }
             | Self::Unassign { number }
@@ -110,6 +121,7 @@ impl ObjectCommand {
         match self {
             Self::CreateIssue { .. } => "createIssue",
             Self::CreatePr { .. } => "createPR",
+            Self::ConfigureRunRoot { .. } => "configureRunRoot",
             Self::Comment { .. } => "comment",
             Self::Edit { .. } => "edit",
             Self::Assign { .. } => "assign",
@@ -122,7 +134,7 @@ impl ObjectCommand {
         }
     }
     fn has_external_effect(&self) -> bool {
-        matches!(self, Self::Merge { .. } | Self::Publish { .. })
+        matches!(self, Self::Merge { .. } | Self::Publish { .. } | Self::ConfigureRunRoot { .. })
     }
 }
 
@@ -192,6 +204,11 @@ impl PlatformObjects {
         match prepared {
             Ok(Some(receipt)) => {
                 self.connection.execute_batch("COMMIT").map_err(CommandFailure::rejected)?;
+                if matches!(receipt.state.as_str(), "prepared" | "blocked")
+                    && matches!(request.command, ObjectCommand::ConfigureRunRoot { .. })
+                {
+                    return self.apply_external_request(request, policy);
+                }
                 return Ok(receipt);
             }
             Ok(None) => {}
@@ -256,11 +273,34 @@ impl PlatformObjects {
         }
         self.check_request_revision(request)?;
         super::nonempty(&request.actor, "actor")?;
+        if request.writer.is_some()
+            && matches!(request.command, ObjectCommand::ConfigureRunRoot { .. })
+        {
+            return Err(CommandFailure::rejected("run scope policy is operator-only"));
+        }
         if let Some(grant) = &request.writer {
             let target = match &request.command {
                 ObjectCommand::CreatePr { issue, .. } => *issue,
+                ObjectCommand::CreateIssue { parent, .. } => *parent,
                 _ => request.command.target(),
             };
+            if matches!(
+                &request.command,
+                ObjectCommand::CreateIssue { parent: None, .. }
+                    | ObjectCommand::CreatePr { issue: None, .. }
+            ) {
+                return Err(CommandFailure::rejected(
+                    "Agent creation requires an in-scope parent Issue",
+                ));
+            }
+            if let ObjectCommand::Link { pr, .. } = &request.command {
+                super::super::grants::validate(
+                    &self.connection,
+                    grant,
+                    &request.actor,
+                    &super::item_node(&self.repository, *pr),
+                )?;
+            }
             let item = target.map_or_else(
                 || super::super::grants::item_node(&self.connection, grant),
                 |number| Ok(super::item_node(&self.repository, number)),
@@ -283,6 +323,21 @@ impl PlatformObjects {
             return Err(CommandFailure::rejected("creation does not accept expectedRevision"));
         }
         match &request.command {
+            ObjectCommand::CreateIssue { parent: Some(parent), parent_revision, .. } => {
+                let expected = parent_revision.ok_or_else(|| {
+                    CommandFailure::conflict(
+                        "parentRevision is required when creating a child Issue",
+                    )
+                })?;
+                self.expect_revision(*parent, expected)?;
+                let item = self.item(*parent)?;
+                if item.kind != "issue" || item.state != "open" {
+                    return Err(CommandFailure::rejected("parent must be an open Issue"));
+                }
+            }
+            ObjectCommand::CreateIssue { parent: None, parent_revision: Some(_), .. } => {
+                return Err(CommandFailure::rejected("parentRevision requires a parent Issue"));
+            }
             ObjectCommand::Link { pr, expected_pr_revision, .. } => {
                 self.expect_revision(*pr, *expected_pr_revision)?;
             }
@@ -319,8 +374,8 @@ impl PlatformObjects {
         author: &str,
     ) -> Result<Value> {
         Ok(match command {
-            ObjectCommand::CreateIssue { title, body } => {
-                serde_json::to_value(self.create_issue(title, body, author)?)?
+            ObjectCommand::CreateIssue { title, body, parent, .. } => {
+                serde_json::to_value(self.create_child_issue(title, body, author, *parent)?)?
             }
             ObjectCommand::CreatePr { title, body, head, base, issue, .. } => serde_json::to_value(
                 self.create_pr(title, body, author, &policy.source, head, base, *issue)?,
@@ -350,7 +405,9 @@ impl PlatformObjects {
                 self.link(*issue, *pr, author)?;
                 serde_json::json!({"issue":issue,"pr":pr})
             }
-            ObjectCommand::Merge { .. } | ObjectCommand::Publish { .. } => {
+            ObjectCommand::Merge { .. }
+            | ObjectCommand::Publish { .. }
+            | ObjectCommand::ConfigureRunRoot { .. } => {
                 anyhow::bail!("external command requires its durable preparation boundary")
             }
         })
@@ -363,6 +420,7 @@ impl PlatformObjects {
     ) -> Result<ControlReceipt, CommandFailure> {
         self.revision_guard = request.command.target().zip(request.expected_revision);
         let result = match &request.command {
+            ObjectCommand::ConfigureRunRoot { number, delivery_ref, run_id, client_id } => self.configure_run_root(*number, delivery_ref, run_id, client_id, &request.actor, &policy.source).map(|()| serde_json::json!({"root":number,"deliveryRef":delivery_ref,"runId":run_id,"clientId":client_id})),
             ObjectCommand::Merge { number } => self
                 .merge(*number, &policy.source, &request.actor)
                 .and_then(|r| serde_json::to_value(r).map_err(Into::into)),
@@ -433,14 +491,14 @@ impl PlatformObjects {
 
     pub fn control_item(&self, number: u64) -> Result<Value> {
         let transaction = self.connection.unchecked_transaction()?;
-        let item = serde_json::json!({"item":self.item(number)?,"comments":self.comments(number)?,"merge":self.merge_status(number)?});
+        let item = serde_json::json!({"item":self.item(number)?,"comments":self.comments(number)?,"merge":self.merge_status(number)?,"parent":self.parent(number)?,"subIssues":self.children(number)?});
         transaction.commit()?;
         Ok(item)
     }
 
     pub fn control_snapshot(&self) -> Result<Value> {
         let transaction = self.connection.unchecked_transaction()?;
-        let items=self.list()?.into_iter().map(|i|Ok(serde_json::json!({"item":i,"comments":self.comments(i.number)?,"merge":self.merge_status(i.number)?}))).collect::<Result<Vec<_>>>()?;
+        let items=self.list()?.into_iter().map(|i|Ok(serde_json::json!({"item":i,"comments":self.comments(i.number)?,"merge":self.merge_status(i.number)?,"parent":self.parent(i.number)?,"subIssues":self.children(i.number)?}))).collect::<Result<Vec<_>>>()?;
         let snapshot =
             serde_json::json!({"source":"braid_platform","observedAt":now(),"items":items});
         transaction.commit()?;

@@ -5,6 +5,10 @@ Versioning once release artifacts are published.
 
 ## [Unreleased]
 
+- 新增与常驻 `serve` 并列的 `braid run`：从顶层 root Issue 或 description 驱动自主拆分、指派、PR 实现与交付，首版接入独立 built-in 平台。
+- 平台原子保存父子 Issue，冻结 run/client/交付分支边界；范围关闭和 pending 授权撤销保留停止门控。Console 通过共享接口控制 run，支持原输入接续与独立终态展示。
+- Harness schema 7 保存有限运行身份和结果，平台 schema 3 增加任务树与范围授权。配置 schema 保持 3，旧迁移不改写。
+
 - 内建协作平台与 GitHub 作为 Harness 的同层上游。平台独立配置、schema、对象库
   与 HTTP API，不再依赖 Harness 会话表或 `local` 运行模式。
 - Web Console 属于整个 Braid，集成 OTLP 三信号原始证据与可视化，直接控制任一
@@ -13,7 +17,7 @@ Versioning once release artifacts are published.
   Git 候选意图保留并发和停止边界，过期执行不能继续发布。
 - 配置 schema 3 使用互斥 `[github]` / `[builtin]`；原 GitHub schema 2 配置可继续
   读取。旧 `[local]` 必须停止后显式导入平台，保留原对象身份、历史与回执。
-- Harness 数据库 schema 6 增加接入状态，平台 schema 独立演进。旧迁移保持不可变，
+- Harness 数据库 schema 6 曾增加接入状态，平台 schema 独立演进。旧迁移保持不可变，
   新版本使用前须迁移，旧二进制不能读取更新后的 Harness 数据库。
 - 修复输入接纳、首次 Context 持久化、完整错误保存与停止证明不足时的恢复门控。
 
@@ -347,6 +351,10 @@ Versioning once release artifacts are published.
   `40_context_lifecycle.sh` for the collapsed schema version 1.
 
 ## [Unreleased]
+
+- 新增与常驻 `serve` 并列的 `braid run`：从顶层 root Issue 或 description 驱动自主拆分、指派、PR 实现与交付，首版接入独立 built-in 平台。
+- 平台原子保存父子 Issue，冻结 run/client/交付分支边界；范围关闭和 pending 授权撤销保留停止门控。Console 通过共享接口控制 run，支持原输入接续与独立终态展示。
+- Harness schema 7 保存有限运行身份和结果，平台 schema 3 增加任务树与范围授权。配置 schema 保持 3，旧迁移不改写。
 
 ### Changed
 

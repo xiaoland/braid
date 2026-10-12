@@ -62,6 +62,7 @@ pub(crate) async fn run(a: InitArguments) -> Result<()> {
         github_context_hard_bytes: 100_000,
     };
     let mut config = Config {
+        finite_run: None,
         schema_version: CONFIG_SCHEMA_VERSION,
         instance: InstanceConfig { key: a.name.clone() },
         local: None,

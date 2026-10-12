@@ -40,6 +40,7 @@ pub fn router(config: &PlatformConfig) -> Result<Router> {
         .route("/api/control/items", get(items))
         .route("/api/platform/repository", get(repository))
         .route("/api/platform/context/{number}", get(context))
+        .route("/api/platform/scope/{number}", get(scope))
         .route("/api/platform/events", get(events))
         .route("/api/platform/writes", post(writes))
         .route("/api/platform/grants", post(grant))
@@ -243,4 +244,11 @@ async fn loopback_gate(
         return (StatusCode::FORBIDDEN,Json(serde_json::json!({"error":{"code":"forbidden","message":"platform Host/Origin must match its declared loopback listener"}}))).into_response();
     }
     next.run(request).await
+}
+
+async fn scope(
+    State(state): State<Arc<ControlState>>,
+    Path(number): Path<u64>,
+) -> Result<Json<super::objects::ScopeSnapshot>, HttpError> {
+    run_read(state, move |o| o.scope(number)).await.map(Json)
 }

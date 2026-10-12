@@ -50,17 +50,60 @@ pub(crate) fn initial_health(config: &Config, provider_enabled: bool) -> HealthS
 pub(crate) async fn serve_managed(
     config: Config,
     provider_enabled: bool,
-    mut external_stop: watch::Receiver<bool>,
+    external_stop: watch::Receiver<bool>,
     health: Arc<RwLock<HealthSnapshot>>,
 ) -> Result<()> {
+    managed(config, provider_enabled, external_stop, health, None).await.map(|_| ())
+}
+
+pub(crate) async fn finite_managed(
+    config: Config,
+    request: crate::run::RunRequest,
+    store: Arc<StoreActor>,
+    external_stop: watch::Receiver<bool>,
+    health: Arc<RwLock<HealthSnapshot>>,
+) -> Result<crate::run::RunResult> {
+    let root = config.finite_run.as_ref().context("finite context missing")?.root;
+    let run_id = request.run_id.clone();
+    match managed(config, true, external_stop, health, Some((request, store))).await {
+        Ok(result) => result.context("finite runtime did not return a result"),
+        Err(error) => Ok(crate::run::RunResult {
+            run_id,
+            root_issue: root,
+            state: crate::run::RunState::Failed,
+            delivery_commit: None,
+            reason: Some(format!("runtime startup failed before execution: {error:#}")),
+            stop_confirmed: true,
+        }),
+    }
+}
+
+async fn managed(
+    config: Config,
+    provider_enabled: bool,
+    mut external_stop: watch::Receiver<bool>,
+    health: Arc<RwLock<HealthSnapshot>>,
+    finite: Option<(crate::run::RunRequest, Arc<StoreActor>)>,
+) -> Result<Option<crate::run::RunResult>> {
     if *external_stop.borrow() {
-        return Ok(());
+        return Ok(finite.as_ref().map(|(request, _)| crate::run::RunResult {
+            run_id: request.run_id.clone(),
+            root_issue: config.finite_run.as_ref().expect("finite context").root,
+            state: crate::run::RunState::Stopped,
+            delivery_commit: None,
+            reason: Some("stopped before execution".into()),
+            stop_confirmed: true,
+        }));
     }
     *health.write().await = initial_health(&config, provider_enabled);
-    let store = Arc::new(StoreActor::start(
-        config.runtime.database().to_path_buf(),
-        config.runtime.backups().to_path_buf(),
-    )?);
+    let store = if let Some((_, store)) = &finite {
+        Arc::clone(store)
+    } else {
+        Arc::new(StoreActor::start(
+            config.runtime.database().to_path_buf(),
+            config.runtime.backups().to_path_buf(),
+        )?)
+    };
     if !store.plan()?.pending.is_empty() {
         if config.runtime.auto_migrate {
             store.apply()?;
@@ -131,8 +174,17 @@ pub(crate) async fn serve_managed(
         drop(reports);
     }
     tracing::info!(repository = %config.repository(), "Braid built-in Harness runtime is ready");
+    let mut outcome = None;
     let result = tokio::select! {
-        _ = external_stop.changed() => Ok(()),
+        _ = external_stop.changed() => {
+            if let Some((request,_))=&finite {
+                outcome=Some(crate::run::RunResult {run_id:request.run_id.clone(),root_issue:config.finite_run.as_ref().expect("finite context").root,state:crate::run::RunState::Stopped,delivery_commit:None,reason:Some("external stop requested".into()),stop_confirmed:false});
+            }
+            Ok(())
+        },
+        next = finite_outcome(&config,&client,&store,&health), if finite.is_some() => {
+            match next {Ok(result)=> {outcome=Some(result);Ok(())}, Err(error)=>Err(error)}
+        },
         worker = workers.join_next() => match worker {
             Some(Ok(Err(error))) => Err(error.context("built-in collaboration worker failed")),
             Some(Err(error)) => Err(anyhow::Error::new(error).context("built-in Harness worker failed")),
@@ -148,15 +200,63 @@ pub(crate) async fn serve_managed(
         }
     }
     let _ = shutdown.send(true);
+    let runtime_error = result.err().map(|error| format!("{error:#}"));
     let mut failures = Vec::new();
-    if let Err(error) = result {
-        failures.push(format!("{error:#}"));
+    let cleanup = async {
+        while let Some(worker) = workers.join_next().await {
+            match worker {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(format!("{error:#}")),
+                Err(error) => {
+                    failures.push(format!("runtime worker failed during shutdown: {error}"))
+                }
+            }
+        }
+    };
+    if finite.is_some() {
+        if tokio::time::timeout(Duration::from_secs(15), cleanup).await.is_err() {
+            failures.push("finite runtime shutdown exceeded its deadline; physical execution stop is unconfirmed".into());
+            workers.abort_all();
+            while workers.join_next().await.is_some() {}
+        }
+    } else {
+        cleanup.await;
     }
-    while let Some(worker) = workers.join_next().await {
-        match worker {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => failures.push(format!("{error:#}")),
-            Err(error) => failures.push(format!("runtime worker failed during shutdown: {error}")),
+    if finite.is_some() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let status = match store.runtime_status() {
+                Ok(status) => status,
+                Err(error) => {
+                    failures.push(format!("shutdown ledger status failed: {error:#}"));
+                    break;
+                }
+            };
+            if status.pending_writes == 0 {
+                break;
+            }
+            if let Err(error) = advance_objects(&store, &client, &config).await {
+                if let Some(result) = &mut outcome {
+                    result.state = crate::run::RunState::Blocked;
+                    result.reason = Some(format!("shutdown outbox failed: {error:#}"));
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let status = store.runtime_status();
+        if let Ok(status) = status {
+            if status.pending_writes > 0 || status.uncertain_writes > 0 {
+                if let Some(result) = &mut outcome {
+                    result.state = crate::run::RunState::Blocked;
+                    result.reason = Some(format!(
+                        "shutdown left {} pending and {} uncertain platform writes",
+                        status.pending_writes, status.uncertain_writes
+                    ));
+                }
+            }
+        } else if let Err(error) = status {
+            failures.push(format!("shutdown ledger status failed: {error:#}"));
         }
     }
     if let Err(error) = client.revoke_all().await {
@@ -176,8 +276,28 @@ pub(crate) async fn serve_managed(
         braid.runtime.error=%failures.join("\n"),
         "built-in Harness runtime stopped"
     );
+    if let Some((request, _)) = &finite {
+        let mut result = outcome.unwrap_or(crate::run::RunResult {
+            run_id: request.run_id.clone(),
+            root_issue: config.finite_run.as_ref().expect("finite context").root,
+            state: crate::run::RunState::Failed,
+            delivery_commit: None,
+            reason: runtime_error.clone(),
+            stop_confirmed: false,
+        });
+        result.stop_confirmed = failures.is_empty();
+        if !failures.is_empty() {
+            result.state = crate::run::RunState::Blocked;
+            result.reason =
+                Some([result.reason.unwrap_or_default(), failures.join("\n")].join("\n"));
+        }
+        return Ok(Some(result));
+    }
+    if let Some(error) = runtime_error {
+        failures.insert(0, error);
+    }
     if failures.is_empty() {
-        Ok(())
+        Ok(None)
     } else {
         let error = failures.join("\n");
         snapshot.last_error = Some(error.clone());
@@ -221,6 +341,32 @@ async fn advance_objects(
     let feed: EventFeed = client
         .get(&format!("api/platform/events?after={}&limit=100", client_cursor(store)?))
         .await?;
+    let scope = if let Some(run) = &config.finite_run
+        && !feed.events.is_empty()
+    {
+        let scope: crate::platform::objects::ScopeSnapshot =
+            client.get(&format!("api/platform/scope/{}", run.root)).await?;
+        anyhow::ensure!(
+            scope.root.number == run.root
+                && scope.run_id.as_deref() == Some(&run.run_id)
+                && scope.client_id.as_deref() == Some(&client.binding.client_id)
+                && scope.delivery_ref.as_deref() == Some(&run.delivery_ref),
+            "platform finite-run identity or delivery policy changed"
+        );
+        if scope.root.state != "open" {
+            run.admission.close();
+        }
+        Some(
+            scope
+                .issues
+                .iter()
+                .chain(&scope.pull_requests)
+                .map(|item| item.number)
+                .collect::<std::collections::HashSet<_>>(),
+        )
+    } else {
+        None
+    };
     let mut cursor = client_cursor(store)?;
     anyhow::ensure!(
         feed.last_sequence >= cursor,
@@ -237,6 +383,13 @@ async fn advance_objects(
                 && event.repository_node_id == format!("local:{}", config.repository()),
             "platform event belongs to a different collaboration authority"
         );
+        if scope.as_ref().is_some_and(|scope| {
+            event.work_item_number.is_none_or(|number| !scope.contains(&number))
+        }) {
+            store.builtin(crate::store::BuiltinCommand::Advance(pending.sequence))?;
+            cursor = pending.sequence;
+            continue;
+        }
         client
             .reconcile_fence(&event)
             .await
@@ -333,4 +486,146 @@ async fn advance_objects(
         }
     }
     Ok(())
+}
+
+async fn finite_outcome(
+    config: &Config,
+    client: &BuiltinClient,
+    store: &StoreActor,
+    health: &RwLock<HealthSnapshot>,
+) -> Result<crate::run::RunResult> {
+    let run = config.finite_run.as_ref().context("finite context missing")?;
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut unavailable_since = None;
+    loop {
+        tick.tick().await;
+        let scope: crate::platform::objects::ScopeSnapshot =
+            client.get(&format!("api/platform/scope/{}", run.root)).await?;
+        anyhow::ensure!(
+            scope.root.number == run.root
+                && scope.run_id.as_deref() == Some(&run.run_id)
+                && scope.client_id.as_deref() == Some(&client.binding.client_id)
+                && scope.delivery_ref.as_deref() == Some(&run.delivery_ref),
+            "platform finite-run identity or delivery policy changed"
+        );
+        if scope.root.state != "open" {
+            run.admission.close();
+        }
+        let status = store.runtime_status()?;
+        if scope.root.state == "open" {
+            let readiness = health.read().await.clone();
+            if readiness.provider == "unavailable" && readiness.last_error.is_some() {
+                let since = unavailable_since.get_or_insert_with(tokio::time::Instant::now);
+                if since.elapsed() >= Duration::from_secs(6) {
+                    return Ok(crate::run::RunResult {
+                        run_id: run.run_id.clone(),
+                        root_issue: run.root,
+                        state: crate::run::RunState::Blocked,
+                        delivery_commit: None,
+                        reason: Some(format!(
+                            "provider remained unavailable through recovery attempts: {}",
+                            readiness.last_error.as_deref().unwrap_or("no diagnostic supplied")
+                        )),
+                        stop_confirmed: false,
+                    });
+                }
+            } else {
+                unavailable_since = None;
+            }
+            if run.admission.is_closed() {
+                return Ok(crate::run::RunResult {run_id:run.run_id.clone(),root_issue:run.root,state:crate::run::RunState::Blocked,delivery_commit:None,reason:Some("execution admission fenced after an unconfirmed physical stop; inspect retained session stop evidence".into()),stop_confirmed:false});
+            }
+            if let Some(group) = status.agent_groups.iter().find(|group| {
+                group.assignment_lifecycle == "blocked"
+                    || group.session_lifecycle.as_deref() == Some("blocked")
+            }) {
+                return Ok(crate::run::RunResult {run_id:run.run_id.clone(),root_issue:run.root,state:crate::run::RunState::Blocked,delivery_commit:None,reason:Some(format!("{} #{} execution is blocked: {}",group.work_item_kind,group.work_item_number,group.context_error.as_deref().unwrap_or("provider or assignment could not recover; inspect retained execution error"))),stop_confirmed:false});
+            }
+            if let Some(reset) =
+                status.context_resets.iter().find(|reset| reset.lifecycle == "blocked")
+            {
+                return Ok(crate::run::RunResult {
+                    run_id: run.run_id.clone(),
+                    root_issue: run.root,
+                    state: crate::run::RunState::Blocked,
+                    delivery_commit: None,
+                    reason: Some(format!(
+                        "context reset {} is blocked; inspect retained reset error",
+                        reset.reset_id
+                    )),
+                    stop_confirmed: false,
+                });
+            }
+            continue;
+        }
+        let mut result = crate::run::RunResult {
+            run_id: run.run_id.clone(),
+            root_issue: run.root,
+            state: crate::run::RunState::Blocked,
+            delivery_commit: None,
+            reason: None,
+            stop_confirmed: false,
+        };
+        let unfinished: Vec<_> = scope
+            .issues
+            .iter()
+            .chain(&scope.pull_requests)
+            .filter(|item| item.state == "open")
+            .map(|item| format!("{} #{}", item.kind, item.number))
+            .collect();
+        if !unfinished.is_empty() {
+            result.reason =
+                Some(format!("root closed before obligations settled: {}", unfinished.join(", ")));
+            return Ok(result);
+        }
+        if let Some(merge) = scope.pending_merges.iter().find(|merge| {
+            matches!(merge.lifecycle.as_str(), "conflict" | "failed" | "rejected" | "uncertain")
+        }) {
+            result.reason = Some(format!(
+                "PR #{} merge {}: {}",
+                merge.number,
+                merge.lifecycle,
+                merge.error.as_deref().unwrap_or("no detailed error recorded")
+            ));
+            return Ok(result);
+        }
+        if !scope.prepared_commands.is_empty() || !scope.pending_merges.is_empty() {
+            continue;
+        }
+        let status = store.runtime_status()?;
+        if status.uncertain_writes > 0 {
+            result.reason = Some(
+                "root closed with uncertain platform writes; inspect retained outbox receipts"
+                    .into(),
+            );
+            return Ok(result);
+        }
+        if status.context_resets.iter().any(|reset| reset.lifecycle != "applied") {
+            result.reason=Some("root closed with an unresolved context reset; no replacement execution is admitted".into());
+            return Ok(result);
+        }
+        if status.pending_writes > 0 {
+            continue;
+        }
+        let Some(commit) = scope.delivery_commit else {
+            result.reason =
+                Some(format!("root closed without a commit at delivery ref {}", run.delivery_ref));
+            return Ok(result);
+        };
+        let delivered = scope.deliveries.iter().any(|delivery| {
+            delivery.merge_commit.as_deref() == Some(&commit)
+                || delivery.published && delivery.head_commit.as_deref() == Some(&commit)
+        });
+        if !delivered {
+            result.reason = Some(format!(
+                "root closed without a published or merged scoped candidate matching delivery ref {} ({commit})",
+                run.delivery_ref
+            ));
+            return Ok(result);
+        }
+        result.state = crate::run::RunState::Completed;
+        result.delivery_commit = Some(commit);
+        return Ok(result);
+    }
 }

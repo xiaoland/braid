@@ -476,3 +476,13 @@ async fn health_handler(State(state): State<Arc<RwLock<HealthSnapshot>>>) -> imp
     let status = if snapshot.ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (status, axum::Json(snapshot))
 }
+
+pub(crate) async fn builtin_run_managed(
+    config: Config,
+    request: crate::run::RunRequest,
+    store: Arc<StoreActor>,
+    stop: watch::Receiver<bool>,
+    health: Arc<RwLock<HealthSnapshot>>,
+) -> Result<crate::run::RunResult> {
+    builtin::finite_managed(config, request, store, stop, health).await
+}

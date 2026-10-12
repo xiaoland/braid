@@ -150,17 +150,60 @@ function runtimePanel(runtime){
   const transport=el('input',{
     type:'checkbox'
   }),receipt=el('div');
+  const mode=el('select',{'aria-label':'运行方式'},el('option',{value:'serve'},'serve · 常驻响应'),el('option',{value:'run',disabled:runtime.upstream==='builtin'?undefined:true},'run · 根任务自主推进（built-in）'));
+  const inputKind=el('select',{'aria-label':'根任务输入'},el('option',{value:'description'},'创建根任务'),el('option',{value:'root'},'已有根 Issue'));
+  const description=el('textarea',{'aria-label':'任务描述',placeholder:'描述要完成的任务',rows:4});
+  // Preserve the bound input until edited; textarea values normalize CRLF.
+  let recentDescription=null;
+  description.addEventListener('input',()=>{recentDescription=null;});
+  const rootIssue=el('input',{type:'number',min:1,step:1,'aria-label':'根 Issue 编号',placeholder:'根 Issue 编号'});
+  const runId=el('input',{'aria-label':'Run ID',value:requestId(),maxlength:100});
+  const deliveryRef=el('input',{'aria-label':'交付 Git ref',value:'refs/heads/braid/run/'+runId.value});
+  const concurrency=el('input',{type:'number',min:1,step:1,value:2,'aria-label':'最大并发 Braid 轮次'});
+  const runInputs=el('div',{},el('label',{},'Run ID ',runId),el('label',{},'根任务输入 ',inputKind),description,rootIssue,el('label',{},'交付 Git ref ',deliveryRef),el('label',{},'最大并发 Braid 轮次 ',concurrency));
+  function updateInputs(){
+    runInputs.hidden=mode.value!=='run';
+    transport.disabled=mode.value==='run';
+    if(transport.disabled)transport.checked=false;
+    description.hidden=inputKind.value!=='description';
+    rootIssue.hidden=inputKind.value!=='root';
+  }
+  mode.addEventListener('change',updateInputs);
+  inputKind.addEventListener('change',updateInputs);
+  updateInputs();
+  const fillRecent=runtime.run_request?button('填入最近运行参数',()=>{
+    const request=runtime.run_request;
+    mode.value='run';
+    runId.value=request.runId;
+    inputKind.value=request.rootIssue==null?'description':'root';
+    rootIssue.value=request.rootIssue??'';
+    recentDescription=request.description??null;
+    description.value=recentDescription??'';
+    deliveryRef.value=request.deliveryRef;
+    concurrency.value=request.maxConcurrency??2;
+    updateInputs();
+  }):null;
   async function command(operation){
     if(controlPending)return;
     controlPending=true;
     const id=requestId();
+    let submitted=false;
     receipt.replaceChildren(el('p',{
       class:'meta'
     },`请求 ${id} · 等待权威端受理`));
     try{
-      const result=await api('/api/runtime/commands',{
-        request_id:id,operation,expected_generation:runtime.generation,transport_only:transport.checked
-      });
+      const payload={request_id:id,operation,expected_generation:runtime.generation,transport_only:operation==='start'&&transport.checked};
+      if(operation==='start'&&mode.value==='run'){
+        const root=Number(rootIssue.value),limit=Number(concurrency.value);
+        if(!/^[A-Za-z0-9_-]{1,100}$/.test(runId.value))throw new Error('Run ID 须为 1–100 个英文字母、数字、连字符或下划线。');
+        if(inputKind.value==='root'&&(!Number.isSafeInteger(root)||root<1))throw new Error('请填写有效的根 Issue 编号。');
+        if(inputKind.value==='description'&&!description.value.trim())throw new Error('请填写任务描述。');
+        if(!deliveryRef.value.trim())throw new Error('请填写交付 Git ref。');
+        if(!Number.isSafeInteger(limit)||limit<1)throw new Error('最大并发 Braid 轮次须为正整数。');
+        payload.run_request={runId:runId.value,rootIssue:inputKind.value==='root'?root:null,description:inputKind.value==='description'?(recentDescription??description.value):null,deliveryRef:deliveryRef.value,maxConcurrency:limit};
+      }
+      submitted=true;
+      const result=await api('/api/runtime/commands',payload);
       receipt.replaceChildren(el('div',{
         class:'row'
       },badge(result.state||'未报告'),el('code',{},result.request_id||id)),raw(result,'控制受理回执'),el('p',{
@@ -169,6 +212,7 @@ function runtimePanel(runtime){
     }
     catch(e){
       showError(e);
+      if(!submitted){receipt.replaceChildren(el('p',{class:'notice error'},e.message));return;}
       receipt.replaceChildren(el('p',{
         class:'body'
       },'请求是否受理尚未确认。请查询回执，不要根据网络错误重复操作。'),el('code',{},id),button('查询回执',async()=>receipt.replaceChildren(raw(await api('/api/runtime/receipts/'+encodeURIComponent(id)),'完整运行控制回执'))));
@@ -181,7 +225,7 @@ function runtimePanel(runtime){
     class:'meta'
   },runtime.repository||'')),el('p',{
     class:'meta'
-  },`Generation ${runtime.generation||'无'} · Provider ${runtime.provider_enabled?'启用':'禁用'} · Ready ${runtime.health?.ready===true?'是':'否 / 未报告'}`),el('p',{
+  },`Generation ${runtime.generation||'无'} · Provider ${runtime.provider_enabled?'启用':'禁用'} · Ready ${runtime.health?.ready===true?'是':'否 / 未报告'} · 停止确认 ${runtime.stop_confirmed===true?'是':'否'}`),runtime.run||runtime.run_request?panel('自主运行',el('p',{},`Run ${runtime.run?.runId||runtime.run_request?.runId||'未报告'} · Root #${runtime.run?.rootIssue||runtime.run_request?.rootIssue||'待创建'} · 结果 ${runtime.run?.state||'受理中'}`),el('p',{},`交付 ref ${runtime.run_request?.deliveryRef||'未报告'} · Commit ${runtime.run?.deliveryCommit||'未交付'}`),runtime.run?.reason?el('p',{class:runtime.run.stopConfirmed===false||['blocked','failed'].includes(runtime.run.state)?'notice error':'meta'},runtime.run.reason):null,el('p',{class:'meta'},'运行结果与 Harness 停止状态分别显示；completed 不等于应用需求验收通过。')):null,el('p',{
     class:'meta'
   },`OTLP ${runtime.telemetry?.endpoint||'未配置'} · 采样 ${runtime.telemetry?.sample_ratio??'未报告'} · Incident ${runtime.telemetry?.incident_mode?'开启':'关闭'}`),runtime.evidence?el('p',{
     class:'meta'
@@ -191,7 +235,7 @@ function runtimePanel(runtime){
     class:'notice error'
   },text(runtime.health.last_error)):null,el('label',{
     class:'row'
-  },transport,'仅运行传输与调度，不启动 Provider / 模型'),el('div',{
+  },transport,'仅运行传输与调度，不启动 Provider / 模型'),el('label',{},'运行方式 ',mode),fillRecent,runInputs,el('div',{
     class:'actions'
   },button('启动 Braid',()=>command('start'),'primary'),button('停止 Braid',async()=>{
     if(await confirmAction('停止本实例 Harness？平台和 Collector 保持服务。'))await command('stop');

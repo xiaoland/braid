@@ -65,6 +65,8 @@ impl Body {
 #[derive(Debug, Args)]
 pub struct CreateIssue {
     #[arg(long)]
+    pub parent: Option<u64>,
+    #[arg(long)]
     pub title: String,
     #[command(flatten)]
     pub body: Body,
@@ -198,9 +200,16 @@ pub async fn run_options(
         | LocalCommand::Show(_)
         | LocalCommand::Context(_)
         | LocalCommand::Diff(_) => unreachable!("public reads handled before writer admission"),
-        LocalCommand::Issue(a) => {
-            ObjectCommand::CreateIssue { title: a.title, body: a.body.read()?.unwrap_or_default() }
-        }
+        LocalCommand::Issue(a) => ObjectCommand::CreateIssue {
+            title: a.title,
+            body: a.body.read()?.unwrap_or_default(),
+            parent: a.parent,
+            parent_revision: if let Some(parent) = a.parent {
+                Some(client.item(parent).await?.revision)
+            } else {
+                None
+            },
+        },
         LocalCommand::Pr(a) => ObjectCommand::CreatePr {
             title: a.title,
             body: a.body.read()?.unwrap_or_default(),
