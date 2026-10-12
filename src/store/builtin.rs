@@ -61,7 +61,14 @@ pub(super) fn execute(
     require_current_schema(database)?;
     let mut connection = open_read_write(database)?;
     configure_connection(&connection)?;
-    let tx = connection.transaction()?;
+    // CLI callers share this ledger with the runtime; reserve writes before reading their snapshot.
+    let behavior = match &command {
+        BuiltinCommand::State | BuiltinCommand::Grants | BuiltinCommand::Grant(_) => {
+            rusqlite::TransactionBehavior::Deferred
+        }
+        _ => rusqlite::TransactionBehavior::Immediate,
+    };
+    let tx = connection.transaction_with_behavior(behavior)?;
     let reply = match command {
         BuiltinCommand::State => BuiltinReply::Binding(tx.query_row(
             "SELECT space_id,repository,client_id,cursor FROM builtin_upstream WHERE singleton=1",

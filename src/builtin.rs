@@ -196,11 +196,24 @@ impl BuiltinClient {
             "built-in upstream returned inconsistent repository identity"
         );
         ensure!(!info.space_id.is_empty(), "built-in upstream has no durable space identity");
-        let BuiltinReply::Binding(binding) = store.builtin(BuiltinCommand::Bind {
-            space_id: info.space_id,
-            repository: info.repository,
-            instance: config.instance_key().into(),
-        })?
+        let BuiltinReply::Binding(binding) = store
+            .builtin(BuiltinCommand::Bind {
+                space_id: info.space_id,
+                repository: info.repository,
+                instance: config.instance_key().into(),
+            })
+            .map_err(|error| {
+                let extended_code = match &error {
+                    crate::store::StoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _)) => {
+                        Some(code.extended_code)
+                    }
+                    _ => None,
+                };
+                anyhow::Error::new(error).context(format!(
+                    "bind built-in upstream to Harness ledger {} (SQLite extended code {extended_code:?})",
+                    config.runtime.database().display()
+                ))
+            })?
         else {
             unreachable!()
         };
