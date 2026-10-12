@@ -14,6 +14,7 @@ mod local;
 mod outbox;
 mod platform;
 mod producer;
+mod profile_materials;
 mod protocol;
 mod provider;
 mod queue;

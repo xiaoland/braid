@@ -52,7 +52,7 @@ impl GroupSpec {
             GroupKind::Pr => config.profile(&config.profile_selection.default_pr_profile)?,
         }
         .clone();
-        let profile_record = materialized_profile(&profile)?;
+        let profile_record = materialized_profile(config, &profile)?;
         store.register_profile(profile_record.clone())?;
         Ok(Self { kind, profile, profile_record })
     }

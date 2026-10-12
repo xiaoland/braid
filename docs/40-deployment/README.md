@@ -49,6 +49,9 @@ its static invariants. `braid doctor` runs filesystem, SQLite, GitHub, Codex
 schema, Git/gh, OTLP, and Wrangler precondition probes. Profiles expose
 their effective mapped provider settings through `braid profile inspect`.
 
+Pi Profile 的可选技能、原生模板、独立 home 和有效身份操作见
+[Profile 指南](../user-manual/profiles.md)。协作技能包独立交付，不属于默认运行材料。
+
 ## Filesystem Layout
 
 Braid keeps one user root outside repository worktrees, default `~/.braid`.

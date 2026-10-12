@@ -27,12 +27,18 @@ The exact projection is the [Context contract](../20-product-tdd/context.md).
 
 An Agent Profile is a versioned Braid configuration containing a provider,
 model, reasoning setting, Profile User Instructions, cwd/workspace policy,
-sandbox/approval settings, and optional tools, skills, MCP, or other
-provider-specific resources. Tags declare whether it can serve `issue`, `pr`,
+and supported provider resources. Tags declare whether it can serve `issue`, `pr`,
 or both. The Profile `workspace` names a clean source checkout, never the
 Agent's cwd: every Agent Group session runs in a dedicated generation-scoped
 Braid worktree (the Issue's sole Development branch when unambiguous,
 otherwise the default branch; the PR head for a PR Agent).
+
+Pi Profile 可以明确选择独立技能和原生角色材料。根会话模型与推理仍由 Profile
+决定，Pi 内部 subagent 角色不是可指派的 Braid Profile。材料安装、Profile 选择
+与会话实际装载分别需要依据；材料变化不得在保持旧 Profile 身份的情况下恢复
+原生历史。工具和 MCP 由已支持的原生安装能力提供，目前没有跨 provider 的
+tools/MCP 或 sandbox/approval Profile 配置接口。Factory preset 与 variant 属于
+消费方的装配，不属于 Braid 的 Profile 对象。
 
 Braid adds its own versioned System Prompt when materializing a Provider
 Session. It explains GitHub Working Memory, Braid and `braid gh`, concise public

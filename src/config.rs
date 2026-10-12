@@ -272,6 +272,8 @@ pub struct PiConfig {
     pub api_key_file: Option<PathBuf>,
     pub thinking: Option<String>,
     pub home: Option<PathBuf>,
+    #[serde(default)]
+    pub profile_material_digest: String,
 }
 
 impl PiConfig {
@@ -344,6 +346,13 @@ pub struct Profile {
     pub model: Option<String>,
     pub reasoning: Option<String>,
     pub user_instructions: String,
+    /// Explicit Pi-discoverable skill entrypoints: a `SKILL.md` file, one skill
+    /// directory, or a shallow catalog of skill directories. Complete trees bind.
+    #[serde(default)]
+    pub skills: Vec<PathBuf>,
+    /// Pi-native semantic materials (`models.json`, `settings.json`, `agents/*.md`).
+    #[serde(default)]
+    pub native_template: Option<PathBuf>,
     /// The source Git checkout for this instance's repository, shared by all
     /// Profiles as the worktree provisioning source (one repository = one
     /// source checkout). Defaults to `<config_dir>/source`; Agent sessions
@@ -362,6 +371,12 @@ impl Profile {
     pub fn resolve_workspace(&mut self, base: &Path) {
         let workspace = self.workspace.take().unwrap_or_else(|| base.join("source"));
         self.workspace = Some(resolve_path(base, &workspace));
+        for skill in &mut self.skills {
+            *skill = resolve_path(base, skill);
+        }
+        if let Some(template) = &mut self.native_template {
+            *template = resolve_path(base, template);
+        }
     }
 
     /// The resolved source checkout path (valid after `Config::load`).
@@ -514,6 +529,15 @@ impl Config {
         }
     }
 
+    pub(crate) fn profile_materials(
+        &self,
+        profile: &Profile,
+    ) -> Result<crate::profile_materials::EffectiveMaterials, ConfigError> {
+        crate::profile_materials::collect(self, profile).map_err(|error| {
+            ConfigError::Invalid(format!("profile {:?} materials: {error:#}", profile.id))
+        })
+    }
+
     /// Load the GitHub webhook secret from `github.webhook_secret_file` if set,
     /// otherwise from `github.webhook_secret_environment`.
     pub fn webhook_secret(&self) -> Result<String, ConfigError> {
@@ -620,6 +644,7 @@ impl Config {
                     api_key_file: llm.api_key_file.clone(),
                     thinking: profile.reasoning.clone(),
                     home: runtime.home.clone(),
+                    profile_material_digest: self.profile_materials(profile)?.digest,
                 }),
             });
         }
@@ -893,6 +918,19 @@ impl Profile {
         if let Some(workspace) = &self.workspace {
             require_absolute(&format!("profile {:?}.workspace", self.id), workspace)?;
         }
+        if self.adapter_type != "pi" && (!self.skills.is_empty() || self.native_template.is_some())
+        {
+            return Err(ConfigError::Invalid(format!(
+                "profile {:?} skills and native_template are supported only by the Pi adapter",
+                self.id
+            )));
+        }
+        for skill in &self.skills {
+            require_absolute(&format!("profile {:?}.skills", self.id), skill)?;
+        }
+        if let Some(template) = &self.native_template {
+            require_absolute(&format!("profile {:?}.native_template", self.id), template)?;
+        }
         if self.tags.is_empty() || (!self.has_tag("issue") && !self.has_tag("pr")) {
             return Err(ConfigError::Invalid(format!(
                 "profile {:?} must have issue or pr capability tag",
@@ -941,6 +979,7 @@ impl Profile {
         // catalog only carries cost metadata, so an uncatalogued model is
         // not a config error: Codex must be able to answer with a real
         // turn failure for a model it does not support.
+        config.profile_materials(self)?;
         Ok(())
     }
 }

@@ -176,8 +176,11 @@ GitHub.
 
 `thread/resume` is used only after transport/process restart when the persisted
 physical thread ID, Context Revision, effective instruction revision, Profile
-revision, cwd, and sandbox remain compatible. If any differs, Braid executes
-the normal fresh-session Context materialization path. An empty thread that has
+revision and cwd remain compatible. A persisted Profile or instruction revision
+mismatch blocks resume with an Operational Status update; it does not silently
+start a replacement under new materials. Context changes use the normal
+fresh-session Context materialization path after the old execution is stopped.
+An empty thread that has
 not yet materialized a rollout is not considered resumable; assignment startup
 must complete context injection before the session becomes `idle`.
 

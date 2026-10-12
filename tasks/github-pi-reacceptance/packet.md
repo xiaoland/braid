@@ -1,5 +1,17 @@
 # Braid 真实模型验收
 
+## 当前反哺：协作技能与 Agent Profile
+
+2026-10-12 用户授权：“好的。现在我们继续反哺。braid-collaboration 这个技能也反哺到 braid 项目中（但是不和 braid 软件本身绑定）；此外我记得 factory26 似乎有不少关于 braid agent profile 的改进。”本轮迁移独立技能材料，并核对、融合 Profile 的通用能力与恢复身份合同；不启动新付费模型、旧验收或修改生成应用。技能不自动安装、编译嵌入、默认启用或成为运行依赖。Factory preset、variant 和实验配方保留原归属。
+
+负责人：collaboration_skill_owner 拥有 skills/ 独立材料迁移；profile_feedback_owner 拥有 Profile 差异调查及后续实现；autonomous_mode_advisor 提供材料声明与恢复边界判断；主 Agent 拥有采用、正式文档、单任务编译、实际公开操作及提交。仅使用内部 Agent 协作，不联系独立 Codex 聊天。所有产物位于 WorkSSD；不编写或运行设施测试、自检、包 smoke。
+
+已确认普通 Profile catalog 查看、当前支持的 Issue/默认 PR 指派、模型与推理唯一来源、上下文预算已经迁入，不扩展其它 Profile driver。独立协作技能与四份 reference 已迁移，包内引用不依赖完整源码 checkout。Profile 新增 Pi skills/native_template 的实际选择、独立持久会话 home、材料快照及有效身份，接入现有 revision 不兼容阻断与 OTLP 身份诊断；没有空 tools/MCP 管理器或默认技能绑定。
+
+本轮完成，结果见 [profile-feedback.md](profile-feedback.md)。最终单任务离线构建27.88s无warning通过；公开无模型指派进入idle/0 turn，同路径材料变化改变digest/revision，Collector保存真实get_commands、Profile材料回执及会话身份的原始88条records和20批protobuf。旧Collector未启动导致的导出失败、中间编译错误保留。全部本轮服务、所属进程与监听已退出；没有模型调用。原生角色实际调用、真实模型历史恢复及材料变化后的实际恢复阻断仍未验。主Agent接着提交到既有Draft PR148；旧ARC/GitHub资格结论不变。
+
+## 已完成的 ARC-bench lite 验收
+
 当前状态：2026-10-12，真实 MiniMax `braid run` 的 ARC-bench lite 两题验收及收尾已完成，结论不通过。Keep 程序 completed/停止已确认，公开 Lite 本地复现6/32；BookStack blocked/停止已确认，失败生成快照2/34。合计8/66（12.12%）。两题均只有root真实执行，没有成员分工；另有/tmp写入和按名称停止请求的纪律失败。官网两次HTTP403未创建submission/run，不存在官网分数。
 
 完整事实见 [run-arc-lite.md](run-arc-lite.md)，独立评分原件位于 `/Volumes/WorkSSD/Development/braid-run-arc-lite-20261012/evaluation/`。本轮全部进程、应用服务及远端评估容器已退出，相关端口关闭；无在途操作，不自动重新生成、补发布/合并或按评测反馈修应用。已修复有限指派吞输入、登录shell阻塞及共享ledger写事务；SQLite修复仅有编译和公开绑定操作反馈，没有进入本轮模型配方。

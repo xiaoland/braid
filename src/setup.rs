@@ -642,6 +642,8 @@ fn build_config(
             model: Some(arguments.model.clone()),
             reasoning: Some("high".to_owned()),
             user_instructions: "You are Braid, a helpful coding assistant. Work from the supplied GitHub Context, publish concise public comments, and keep descriptions and implementation state current.".to_owned(),
+            skills: Vec::new(),
+            native_template: None,
             workspace: None,
             github_actor_node_id: None,
             status_surfaces: vec!["issue".to_owned(), "pr".to_owned()],

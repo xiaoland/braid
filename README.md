@@ -125,6 +125,8 @@ GitHub 或内建上游，不经 CLI 子进程；停止 Harness 后 Collector 和
 | [Built-in platform](docs/user-manual/local.md) | Platform and Harness setup, objects, candidate publication, and migration. |
 | [自主 root 运行](docs/user-manual/run.md) | One root Issue or description drives Agent decomposition, implementation, and a bounded delivery lifecycle. |
 | [Web Console](docs/user-manual/console.md) | OTLP collection, visualization, and Harness control for either upstream. |
+| [独立协作技能](skills/README.md) | 按需采用 braid-collaboration 方法材料；不自动安装、加载或绑定软件。 |
+| [Agent Profile](docs/user-manual/profiles.md) | Pi 技能、原生角色材料的明确选择与恢复身份。 |
 | [Product model](docs/10-prd/README.md) | Purpose, working memory, Issue/PR collaboration, and current product scope. |
 | [Context design](docs/20-product-tdd/context.md) | Current-state projection, revisions, invalidation, and replacement. |
 | [Runtime lifecycle](docs/20-product-tdd/lifecycle.md) | Events, scheduling, sessions, and recoverability. |

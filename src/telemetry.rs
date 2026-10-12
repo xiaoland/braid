@@ -59,6 +59,9 @@ pub struct SessionIdentity {
     pub provider_session_id: String,
     pub provider_kind: String,
     pub context_revision: String,
+    pub profile_id: String,
+    pub profile_revision: u64,
+    pub profile_digest: String,
 }
 
 struct ObservedSession {
@@ -201,8 +204,10 @@ pub fn register_session_from_store(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
     let mut statement = connection.prepare(
-        "SELECT w.kind,w.number,a.assignment_id,a.generation,ps.provider_session_id,ps.provider_kind,ps.context_revision
+        "SELECT w.kind,w.number,a.assignment_id,a.generation,ps.provider_session_id,ps.provider_kind,ps.context_revision,
+                ai.profile_id,ai.profile_revision,p.effective_digest
          FROM provider_sessions ps JOIN agent_instances ai ON ai.agent_id=ps.agent_id
+         JOIN profiles p ON p.profile_id=ai.profile_id AND p.revision=ai.profile_revision
          JOIN assignments a ON a.assignment_id=ai.assignment_id JOIN work_items w ON w.node_id=a.work_item_node_id
          WHERE ps.provider_session_id=?1")?;
     let identities = statement
@@ -215,6 +220,9 @@ pub fn register_session_from_store(
                 provider_session_id: row.get(4)?,
                 provider_kind: row.get(5)?,
                 context_revision: row.get(6)?,
+                profile_id: row.get(7)?,
+                profile_revision: observed_u64(row, 8)?,
+                profile_digest: row.get(9)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -248,7 +256,9 @@ pub fn register_session(identity: SessionIdentity) {
         braid.work_item.kind = %identity.work_item_kind, braid.work_item.number = identity.work_item_number,
         braid.assignment.id = %identity.assignment_id, braid.assignment.generation = identity.assignment_generation,
         braid.provider_session.id = %identity.provider_session_id, provider.thread.id = %identity.provider_session_id,
-        provider.kind = %identity.provider_kind, braid.context.revision = %identity.context_revision);
+        provider.kind = %identity.provider_kind, braid.context.revision = %identity.context_revision,
+        braid.profile.id = %identity.profile_id, braid.profile.revision = identity.profile_revision,
+        braid.profile.effective_digest = %identity.profile_digest);
     let entered = span.enter();
     tracing::info!(name = "braid.session.observation", braid.provider_session.id = %identity.provider_session_id,
         observation.sampled = span.context().span().is_recording(), "session evidence sampling decision");
@@ -343,6 +353,10 @@ pub fn lifecycle_event(
         braid.assignment.id = identity.as_ref().map_or("", |i| i.assignment_id.as_str()),
         braid.assignment.generation = identity.as_ref().map(|i| i.assignment_generation),
         braid.context.revision = identity.as_ref().map_or("", |i| i.context_revision.as_str()),
+        braid.profile.id = identity.as_ref().map_or("", |i| i.profile_id.as_str()),
+        braid.profile.revision = identity.as_ref().map(|i| i.profile_revision),
+        braid.profile.effective_digest =
+            identity.as_ref().map_or("", |i| i.profile_digest.as_str()),
         braid.turn.id = braid_turn.as_str(),
         braid.provider_session.id = native_thread,
         provider.thread.id = native_thread,
@@ -428,6 +442,10 @@ pub fn emit_provider_payload(
             braid.assignment.id = identity.as_ref().map_or("", |i| i.assignment_id.as_str()),
             braid.assignment.generation = identity.as_ref().map(|i| i.assignment_generation),
             braid.context.revision = identity.as_ref().map_or("", |i| i.context_revision.as_str()),
+            braid.profile.id = identity.as_ref().map_or("", |i| i.profile_id.as_str()),
+            braid.profile.revision = identity.as_ref().map(|i| i.profile_revision),
+            braid.profile.effective_digest =
+                identity.as_ref().map_or("", |i| i.profile_digest.as_str()),
             braid.turn.id = braid_turn.as_str(),
             braid.provider_session.id = native_thread,
             provider.thread.id = native_thread,

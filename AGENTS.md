@@ -27,6 +27,9 @@ Use the installed `svc` CLI when SVC guidance or project integration is relevant
 - Project vocabulary: `docs/10-prd/glossary.md`
 - Volatile task control: `tasks/`; retain at most one active packet and delete
   it when the task closes after promoting binding truth.
+- Optional collaboration method: `skills/README.md` lists independent skills
+  with name, description and file path. Discover and read them on demand; do not
+  inline skill bodies into prompts or make them a runtime prerequisite.
 
 ## GitHub Working Memory Protocol
 

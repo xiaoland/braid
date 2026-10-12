@@ -55,6 +55,8 @@ pub(crate) async fn run(a: InitArguments) -> Result<()> {
         reasoning: Some("high".into()),
         user_instructions:
             "维护当前需求与决定，交付可采用的实现候选；只在有行动价值时发布简洁评论。".into(),
+        skills: Vec::new(),
+        native_template: None,
         workspace: Some(source.clone()),
         github_actor_node_id: None,
         status_surfaces: vec!["issue".into(), "pr".into()],

@@ -1,12 +1,10 @@
 use std::fmt::Write as _;
 
-use anyhow::Result;
-use sha2::{Digest, Sha256};
-
 use crate::{
     config::{Config, Profile},
     store::{ProfileRecord, StoreActor, TurnClaim},
 };
+use anyhow::Result;
 
 pub(crate) fn operational_status_unknown_profile(profile_id: &str) -> String {
     format!(
@@ -65,14 +63,12 @@ pub(crate) fn operational_status_stop_error(
     )
 }
 
-pub(crate) fn materialized_profile(profile: &Profile) -> Result<ProfileRecord> {
-    let bytes = serde_json::to_vec(profile)?;
-    let digest = hex::encode(Sha256::digest(bytes));
-    let revision = u64::from_str_radix(&digest[..15], 16)?.max(1);
+pub(crate) fn materialized_profile(config: &Config, profile: &Profile) -> Result<ProfileRecord> {
+    let materials = config.profile_materials(profile)?;
     Ok(ProfileRecord {
         profile_id: profile.id.clone(),
-        revision,
-        effective_digest: digest,
+        revision: materials.revision,
+        effective_digest: materials.digest,
         provider_kind: profile.adapter_type.clone(),
         tags: serde_json::to_string(&profile.tags)?,
     })

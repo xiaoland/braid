@@ -32,6 +32,8 @@ struct PiState {
     developer_instructions: String,
     context: String,
     native_session_id: Option<String>,
+    native_home_key: Option<String>,
+    expected_profile_skills: Vec<String>,
     close_result: Option<Result<(), String>>,
 }
 
@@ -61,6 +63,8 @@ impl PiProvider {
             developer_instructions: String::new(),
             context: String::new(),
             native_session_id: None,
+            native_home_key: None,
+            expected_profile_skills: Vec::new(),
             close_result: None,
         };
         Self {
@@ -75,9 +79,11 @@ impl PiProvider {
     fn spawn(
         &self,
         state: &mut PiState,
+        profile: &Profile,
         workspace: &Path,
         session: Option<&str>,
     ) -> Result<(), ProviderError> {
+        state.close_result = None;
         let material = runtime::load(&state.config)?;
         let execution =
             material.as_ref().map(|material| material.execution(workspace)).transpose()?;
@@ -86,7 +92,7 @@ impl PiProvider {
         } else {
             Command::new(&state.config.executable)
         };
-        cmd.args(["--mode", "rpc"]);
+        cmd.args(["--mode", "rpc", "--no-skills"]);
         if execution.is_none() {
             // External Pi is a base adapter; unmanaged ambient plugins cannot
             // satisfy Braid's background result and owned-stop contract.
@@ -118,12 +124,49 @@ impl PiProvider {
         if let Some(thinking) = &state.config.thinking {
             cmd.args(["--thinking", thinking]);
         }
-        if let Some(home) = &state.config.home {
-            cmd.env("PI_CODING_AGENT_DIR", home);
-        } else if execution.is_some() {
-            let home = workspace.join(".braid/pi-home");
-            std::fs::create_dir_all(&home)?;
-            cmd.env("PI_CODING_AGENT_DIR", home);
+        let config_path = state.config.braid_config_path.as_ref().ok_or_else(|| {
+            ProviderError::Protocol("Pi Profile has no resolved Braid config path".into())
+        })?;
+        let config = crate::config::Config::load(config_path).map_err(|error| {
+            ProviderError::Protocol(format!("cannot reload Pi Profile materials: {error}"))
+        })?;
+        let configured_profile = config
+            .profile(&profile.id)
+            .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+        let materials = config
+            .profile_materials(configured_profile)
+            .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+        if !state.config.profile_material_digest.is_empty()
+            && state.config.profile_material_digest != materials.digest
+        {
+            return Err(ProviderError::Protocol(format!(
+                "Pi Profile materials changed after selection: expected {}, found {}",
+                state.config.profile_material_digest, materials.digest
+            )));
+        }
+        let home_key = if let Some(session) = session {
+            crate::profile_materials::session_home_key(workspace, session).map_err(|error| {
+                ProviderError::Protocol(format!("cannot identify Pi session home: {error:#}"))
+            })?
+        } else {
+            uuid::Uuid::now_v7().to_string()
+        };
+        let home = crate::profile_materials::snapshot(
+            &config,
+            configured_profile,
+            workspace,
+            &home_key,
+            &materials.digest,
+        )
+        .map_err(|error| {
+            ProviderError::Protocol(format!("cannot materialize Pi Profile: {error:#}"))
+        })?;
+        state.native_home_key = Some(home_key);
+        state.expected_profile_skills =
+            materials.skills.iter().map(|skill| skill.name.clone()).collect();
+        cmd.env("PI_CODING_AGENT_DIR", &home);
+        for skill in &materials.skills {
+            cmd.arg("--skill").arg(home.join("braid-skills").join(&skill.name));
         }
         if let Ok(api_key) = state.config.api_key()
             && let Some(api_key_env) = &state.config.api_key_environment
@@ -297,6 +340,42 @@ impl PiProvider {
         };
         Err(ProviderError::Protocol(message))
     }
+
+    async fn reject_startup(&self, thread_id: &str, error: ProviderError) -> ProviderError {
+        match self.close_session(thread_id, true).await {
+            Ok(()) => {
+                ProviderError::Protocol(format!("Pi Profile resource handshake failed: {error}"))
+            }
+            Err(cleanup) => ProviderError::Unknown(format!(
+                "Pi Profile resource handshake failed: {error}; owned session shutdown failed: {cleanup}"
+            )),
+        }
+    }
+
+    async fn verify_profile_resources(
+        state: &mut PiState,
+        profile: &Profile,
+        thread_id: &str,
+    ) -> Result<(), ProviderError> {
+        let commands = Self::request(state, json!({"type":"get_commands"})).await?;
+        Self::success_or_protocol(&commands, "get_commands")?;
+        let home_key = state.native_home_key.as_deref().ok_or_else(|| {
+            ProviderError::Protocol("Pi startup did not retain its native home identity".into())
+        })?;
+        let home = profile.workspace().join(".braid/pi-homes").join(home_key);
+        let selected_skills =
+            validate_profile_skills(&commands, &state.expected_profile_skills, &home)?;
+        tracing::info!(
+            name = "braid.provider.profile_resources",
+            provider.kind = "pi",
+            braid.provider_session.id = thread_id,
+            braid.profile.id = %profile.id,
+            braid.profile.effective_digest = %state.config.profile_material_digest,
+            provider.profile.skills = ?selected_skills,
+            "Pi startup verified Profile skills through get_commands"
+        );
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -319,10 +398,12 @@ impl AgentProvider for PiProvider {
         developer_instructions.clone_into(&mut state.developer_instructions);
         state.context.clear();
         state.session = None;
+        state.native_session_id = None;
+        state.native_home_key = None;
         state.close_result = None;
         state.process = None;
 
-        self.spawn(&mut state, profile.workspace(), None)?;
+        self.spawn(&mut state, profile, profile.workspace(), None)?;
 
         let result =
             Self::request(&mut state, json!({"type": "new_session", "name": "braid-session"}))
@@ -336,10 +417,23 @@ impl AgentProvider for PiProvider {
             .and_then(|data| data.get("sessionFile"))
             .and_then(Value::as_str)
             .ok_or_else(|| ProviderError::Protocol("get_state missing sessionFile".into()))?;
+        let home_key = state.native_home_key.clone().ok_or_else(|| {
+            ProviderError::Protocol("Pi startup did not retain its native home identity".into())
+        })?;
+        crate::profile_materials::bind_session_home(profile.workspace(), session_file, &home_key)
+            .map_err(|error| {
+            ProviderError::Protocol(format!("cannot bind Pi session native home: {error:#}"))
+        })?;
         state.session = Some(session_file.to_owned());
         state.native_session_id =
             Some(required_string(&state_resp["data"], "sessionId", "Pi get_state")?);
         *self.thread_id.lock().await = session_file.to_owned();
+
+        if let Err(error) = Self::verify_profile_resources(&mut state, profile, &session_file).await
+        {
+            drop(state);
+            return Err(self.reject_startup(&session_file, error).await);
+        }
 
         Ok(ProviderSession { thread_id: session_file.to_owned() })
     }
@@ -385,7 +479,7 @@ impl AgentProvider for PiProvider {
         *self.thread_id.lock().await = thread_id.to_owned();
         state.close_result = None;
         state.process = None;
-        self.spawn(&mut state, profile.workspace(), Some(thread_id))?;
+        self.spawn(&mut state, profile, profile.workspace(), Some(thread_id))?;
         let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
         validate_started_runtime(&mut state, &native).await?;
         let resumed_path = required_string(&native["data"], "sessionFile", "Pi get_state")?;
@@ -393,6 +487,11 @@ impl AgentProvider for PiProvider {
             return Err(ProviderError::Protocol("Pi resumed a different session path".into()));
         }
         let native_id = required_string(&native["data"], "sessionId", "Pi get_state")?;
+        state.native_session_id = Some(native_id.clone());
+        if let Err(error) = Self::verify_profile_resources(&mut state, profile, thread_id).await {
+            drop(state);
+            return Err(self.reject_startup(thread_id, error).await);
+        }
         if let Some(initial) = pending.as_mut() {
             if has_history && initial.native_session_id != native_id {
                 return Err(ProviderError::Protocol(
@@ -422,13 +521,25 @@ impl AgentProvider for PiProvider {
         event_references: &str,
     ) -> Result<ProviderTurn, ProviderError> {
         let mut state = self.state.lock().await;
-        if state.process.is_none() {
+        let did_spawn = state.process.is_none();
+        if did_spawn {
             let session = state.session.clone();
-            self.spawn(&mut state, profile.workspace(), session.as_deref())?;
+            self.spawn(&mut state, profile, profile.workspace(), session.as_deref())?;
         }
 
         let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
         validate_managed_state(&state, &native)?;
+        if did_spawn {
+            let native_thread_id = state.session.clone().ok_or_else(|| {
+                ProviderError::Protocol("Pi physical startup has no native session identity".into())
+            })?;
+            if let Err(error) =
+                Self::verify_profile_resources(&mut state, profile, &native_thread_id).await
+            {
+                drop(state);
+                return Err(self.reject_startup(&native_thread_id, error).await);
+            }
+        }
         if native_is_busy(&native)? {
             return Err(ProviderError::Deferred(
                 "Pi is streaming, compacting or has queued input".into(),
@@ -814,6 +925,60 @@ fn required_native_bool(response: &Value, field: &str) -> Result<bool, ProviderE
     response["data"][field]
         .as_bool()
         .ok_or_else(|| ProviderError::Protocol(format!("Pi get_state missing boolean {field}")))
+}
+
+fn validate_profile_skills(
+    response: &Value,
+    expected_skills: &[String],
+    native_home: &std::path::Path,
+) -> Result<Vec<(String, String)>, ProviderError> {
+    let commands = response["data"]["commands"]
+        .as_array()
+        .ok_or_else(|| ProviderError::Protocol("Pi get_commands omitted commands".into()))?;
+    let mut selected = Vec::with_capacity(expected_skills.len());
+    for name in expected_skills {
+        let command_name = format!("skill:{name}");
+        let matches = commands
+            .iter()
+            .filter(|command| {
+                command["name"].as_str() == Some(command_name.as_str())
+                    && command["source"].as_str() == Some("skill")
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(ProviderError::Protocol(format!(
+                "Pi get_commands returned {} entries for Profile skill {name:?}",
+                matches.len()
+            )));
+        }
+        let path = matches[0]["sourceInfo"]["path"].as_str().ok_or_else(|| {
+            ProviderError::Protocol(format!(
+                "Pi get_commands omitted sourceInfo.path for Profile skill {name:?}"
+            ))
+        })?;
+        let actual_path = std::path::Path::new(path).canonicalize().map_err(|error| {
+            ProviderError::Protocol(format!(
+                "Pi Profile skill {name:?} source path {path:?}: {error}"
+            ))
+        })?;
+        let expected_path =
+            native_home.join("braid-skills").join(name).join("SKILL.md").canonicalize().map_err(
+                |error| {
+                    ProviderError::Protocol(format!(
+                        "Pi materialized Profile skill {name:?} entrypoint: {error}"
+                    ))
+                },
+            )?;
+        if actual_path != expected_path {
+            return Err(ProviderError::Protocol(format!(
+                "Pi selected Profile skill {name:?} from {} instead of the frozen Profile snapshot {}",
+                actual_path.display(),
+                expected_path.display()
+            )));
+        }
+        selected.push((name.clone(), actual_path.display().to_string()));
+    }
+    Ok(selected)
 }
 
 fn native_is_busy(response: &Value) -> Result<bool, ProviderError> {

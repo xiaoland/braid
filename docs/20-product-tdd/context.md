@@ -170,3 +170,12 @@ state and makes no replace/inject decisions.
 
 This keeps the Profile as plain configuration and avoids coupling the core
 runtime to provider-specific compaction or resume rules.
+
+有效 Profile 版本不仅覆盖 Profile 声明，还覆盖 adapter 合同、锁定原生安装
+manifest，以及选中技能与原生模板的内容身份。材料的路径相同不证明内容兼容。
+凭据值和派生 execution/worktree/home 路径不参与语义材料摘要；原生实际启动
+仍核对所选材料与物化身份一致。完整文件读取不放回周期 readiness 循环。
+
+旧会话版本与当前有效版本不同会明确 blocked，保持旧记录，不自动覆盖其材料
+或借用旧历史新开执行。所选材料身份还用于启动诊断，但它不是模型实际使用某项
+技能或原生角色的证明；后者需实际原生装载及执行记录。
