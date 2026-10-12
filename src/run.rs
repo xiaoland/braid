@@ -6,6 +6,7 @@ use crate::{
     store::{RunCommand, StoreActor},
 };
 use anyhow::{Context as _, Result, ensure};
+use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{RwLock, Semaphore, watch};
@@ -114,7 +115,6 @@ pub(crate) fn run_snapshot(config: &Config, id: &str) -> Result<Option<RunResult
     if !root.join("braid.sqlite3").is_file() {
         return Ok(None);
     }
-    use rusqlite::OptionalExtension as _;
     let connection = rusqlite::Connection::open_with_flags(
         root.join("braid.sqlite3"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -177,6 +177,8 @@ pub(crate) async fn run_managed(
     }
 }
 
+// Keep preparation, frozen identity and execution handoff in lifecycle order.
+#[allow(clippy::too_many_lines)]
 async fn run_inner(
     mut config: Config,
     request: RunRequest,

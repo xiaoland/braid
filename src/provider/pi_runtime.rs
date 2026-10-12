@@ -196,43 +196,6 @@ fn plugin_extensions(root: &Path, manifest: &Manifest) -> Result<BTreeSet<PathBu
 fn verify_skill_tree(root: &Path, manifest: &Manifest, path: &Path) -> Result<(), ProviderError> {
     let entry = package_path(root, path)?;
     let mut found = false;
-    fn walk(
-        root: &Path,
-        current: &Path,
-        manifest: &Manifest,
-        found: &mut bool,
-    ) -> Result<(), ProviderError> {
-        for item in std::fs::read_dir(current)
-            .map_err(|error| protocol(format!("cannot list {}: {error}", current.display())))?
-        {
-            let item =
-                item.map_err(|error| protocol(format!("cannot read Pi skill entry: {error}")))?;
-            let item_path = item.path();
-            let kind = item.file_type().map_err(|error| {
-                protocol(format!("cannot inspect {}: {error}", item_path.display()))
-            })?;
-            if kind.is_symlink() {
-                return Err(protocol(format!(
-                    "Pi locked skill tree contains symlink {}",
-                    item_path.display()
-                )));
-            }
-            if kind.is_dir() {
-                walk(root, &item_path, manifest, found)?;
-            } else if kind.is_file() {
-                let relative =
-                    item_path.strip_prefix(root).map_err(|error| protocol(error.to_string()))?;
-                if !manifest.files.contains_key(relative) {
-                    return Err(protocol(format!(
-                        "Pi skill file {} is absent from runtime file identities",
-                        relative.display()
-                    )));
-                }
-                *found = true;
-            }
-        }
-        Ok(())
-    }
     if entry.is_dir() {
         walk(root, &entry, manifest, &mut found)?;
     } else if entry.is_file() {
@@ -241,6 +204,44 @@ fn verify_skill_tree(root: &Path, manifest: &Manifest, path: &Path) -> Result<()
     }
     if !found {
         return Err(protocol(format!("Pi skill path {} has no locked files", path.display())));
+    }
+    Ok(())
+}
+
+fn walk(
+    root: &Path,
+    current: &Path,
+    manifest: &Manifest,
+    found: &mut bool,
+) -> Result<(), ProviderError> {
+    for item in std::fs::read_dir(current)
+        .map_err(|error| protocol(format!("cannot list {}: {error}", current.display())))?
+    {
+        let item =
+            item.map_err(|error| protocol(format!("cannot read Pi skill entry: {error}")))?;
+        let item_path = item.path();
+        let kind = item.file_type().map_err(|error| {
+            protocol(format!("cannot inspect {}: {error}", item_path.display()))
+        })?;
+        if kind.is_symlink() {
+            return Err(protocol(format!(
+                "Pi locked skill tree contains symlink {}",
+                item_path.display()
+            )));
+        }
+        if kind.is_dir() {
+            walk(root, &item_path, manifest, found)?;
+        } else if kind.is_file() {
+            let relative =
+                item_path.strip_prefix(root).map_err(|error| protocol(error.to_string()))?;
+            if !manifest.files.contains_key(relative) {
+                return Err(protocol(format!(
+                    "Pi skill file {} is absent from runtime file identities",
+                    relative.display()
+                )));
+            }
+            *found = true;
+        }
     }
     Ok(())
 }

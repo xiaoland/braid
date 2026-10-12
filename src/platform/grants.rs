@@ -22,6 +22,8 @@ pub struct GrantRequest {
     #[serde(default, skip_serializing_if = "is_false")]
     pub pending: bool,
 }
+// Serde's skip_serializing_if callback requires a borrowed field.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 pub(crate) fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -63,6 +65,8 @@ pub fn validate(
     ensure!(valid, "writer grant is stale, revoked, or does not cover this actor/item");
     Ok(())
 }
+// Keep authorization, epoch transition and receipt in one transaction.
+#[allow(clippy::too_many_lines)]
 pub fn change(
     database: &std::path::Path,
     request: &GrantRequest,
@@ -141,9 +145,7 @@ pub fn change(
                 actual.checked_add(1).ok_or_else(|| anyhow::anyhow!("grant epoch exhausted"))?
             }
             _ => anyhow::bail!(
-                "pending writer grant epoch changed; expected absent or minted {} current {:?}",
-                minted_epoch,
-                current_epoch
+                "pending writer grant epoch changed; expected absent or minted {minted_epoch} current {current_epoch:?}"
             ),
         }
     } else {

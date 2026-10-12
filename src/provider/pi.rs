@@ -124,48 +124,9 @@ impl PiProvider {
         if let Some(thinking) = &state.config.thinking {
             cmd.args(["--thinking", thinking]);
         }
-        let config_path = state.config.braid_config_path.as_ref().ok_or_else(|| {
-            ProviderError::Protocol("Pi Profile has no resolved Braid config path".into())
-        })?;
-        let config = crate::config::Config::load(config_path).map_err(|error| {
-            ProviderError::Protocol(format!("cannot reload Pi Profile materials: {error}"))
-        })?;
-        let configured_profile = config
-            .profile(&profile.id)
-            .map_err(|error| ProviderError::Protocol(error.to_string()))?;
-        let materials = config
-            .profile_materials(configured_profile)
-            .map_err(|error| ProviderError::Protocol(error.to_string()))?;
-        if !state.config.profile_material_digest.is_empty()
-            && state.config.profile_material_digest != materials.digest
-        {
-            return Err(ProviderError::Protocol(format!(
-                "Pi Profile materials changed after selection: expected {}, found {}",
-                state.config.profile_material_digest, materials.digest
-            )));
-        }
-        let home_key = if let Some(session) = session {
-            crate::profile_materials::session_home_key(workspace, session).map_err(|error| {
-                ProviderError::Protocol(format!("cannot identify Pi session home: {error:#}"))
-            })?
-        } else {
-            uuid::Uuid::now_v7().to_string()
-        };
-        let home = crate::profile_materials::snapshot(
-            &config,
-            configured_profile,
-            workspace,
-            &home_key,
-            &materials.digest,
-        )
-        .map_err(|error| {
-            ProviderError::Protocol(format!("cannot materialize Pi Profile: {error:#}"))
-        })?;
-        state.native_home_key = Some(home_key);
-        state.expected_profile_skills =
-            materials.skills.iter().map(|skill| skill.name.clone()).collect();
+        let (home, skills) = Self::materialize_profile(state, profile, workspace, session)?;
         cmd.env("PI_CODING_AGENT_DIR", &home);
-        for skill in &materials.skills {
+        for skill in &skills {
             cmd.arg("--skill").arg(home.join("braid-skills").join(&skill.name));
         }
         if let Ok(api_key) = state.config.api_key()
@@ -214,6 +175,55 @@ impl PiProvider {
             execution,
         });
         Ok(())
+    }
+
+    fn materialize_profile(
+        state: &mut PiState,
+        profile: &Profile,
+        workspace: &Path,
+        session: Option<&str>,
+    ) -> Result<(PathBuf, Vec<crate::profile_materials::SkillIdentity>), ProviderError> {
+        let config_path = state.config.braid_config_path.as_ref().ok_or_else(|| {
+            ProviderError::Protocol("Pi Profile has no resolved Braid config path".into())
+        })?;
+        let config = crate::config::Config::load(config_path).map_err(|error| {
+            ProviderError::Protocol(format!("cannot reload Pi Profile materials: {error}"))
+        })?;
+        let configured_profile = config
+            .profile(&profile.id)
+            .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+        let materials = config
+            .profile_materials(configured_profile)
+            .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+        if !state.config.profile_material_digest.is_empty()
+            && state.config.profile_material_digest != materials.digest
+        {
+            return Err(ProviderError::Protocol(format!(
+                "Pi Profile materials changed after selection: expected {}, found {}",
+                state.config.profile_material_digest, materials.digest
+            )));
+        }
+        let home_key = if let Some(session) = session {
+            crate::profile_materials::session_home_key(workspace, session).map_err(|error| {
+                ProviderError::Protocol(format!("cannot identify Pi session home: {error:#}"))
+            })?
+        } else {
+            uuid::Uuid::now_v7().to_string()
+        };
+        let home = crate::profile_materials::snapshot(
+            &config,
+            configured_profile,
+            workspace,
+            &home_key,
+            &materials.digest,
+        )
+        .map_err(|error| {
+            ProviderError::Protocol(format!("cannot materialize Pi Profile: {error:#}"))
+        })?;
+        state.native_home_key = Some(home_key);
+        state.expected_profile_skills =
+            materials.skills.iter().map(|skill| skill.name.clone()).collect();
+        Ok((home, materials.skills))
     }
 
     async fn prepare_native_close(
@@ -429,10 +439,10 @@ impl AgentProvider for PiProvider {
             Some(required_string(&state_resp["data"], "sessionId", "Pi get_state")?);
         *self.thread_id.lock().await = session_file.to_owned();
 
-        if let Err(error) = Self::verify_profile_resources(&mut state, profile, &session_file).await
+        if let Err(error) = Self::verify_profile_resources(&mut state, profile, session_file).await
         {
             drop(state);
-            return Err(self.reject_startup(&session_file, error).await);
+            return Err(self.reject_startup(session_file, error).await);
         }
 
         Ok(ProviderSession { thread_id: session_file.to_owned() })

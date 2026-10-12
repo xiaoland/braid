@@ -111,14 +111,14 @@ impl PlatformObjects {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
-            if let Some((state, error, _)) = &merge {
-                if state != "applied" {
-                    pending_merges.push(PendingMerge {
-                        number: pr.number,
-                        lifecycle: state.clone(),
-                        error: error.clone(),
-                    });
-                }
+            if let Some((state, error, _)) = &merge
+                && state != "applied"
+            {
+                pending_merges.push(PendingMerge {
+                    number: pr.number,
+                    lifecycle: state.clone(),
+                    error: error.clone(),
+                });
             }
             if pr.published || merge.as_ref().is_some_and(|(state, _, _)| state == "applied") {
                 deliveries.push(DeliveryRef {

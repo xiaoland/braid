@@ -54,6 +54,8 @@ fn grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<BuiltinGrant> {
 }
 const SELECT: &str = "SELECT session_id,item_number,actor,request_id,epoch,grant_id,token,lifecycle FROM builtin_writer_grants";
 
+// Every command uses the same transaction boundary and commits exactly once.
+#[allow(clippy::too_many_lines)]
 pub(super) fn execute(
     database: &Path,
     command: BuiltinCommand,

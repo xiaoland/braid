@@ -98,15 +98,15 @@ impl Manager {
             .map(|value| serde_json::from_value::<RunResult>(value.clone()))
             .transpose()?;
         let unconfirmed = previous.as_ref().is_some_and(|response| {
-            response["result"]["stop_confirmed"]
-                .as_bool()
-                .map(|confirmed| !confirmed)
-                .unwrap_or_else(|| {
+            response["result"]["stop_confirmed"].as_bool().map_or_else(
+                || {
                     matches!(
                         response["result"]["state"].as_str(),
                         Some("starting" | "running" | "stopping" | "blocked")
                     )
-                })
+                },
+                |confirmed| !confirmed,
+            )
         });
         let error = if unconfirmed {
             Some("previous Console ended without a persisted stop confirmation; verify its native executions before replacing this runtime".to_owned())
@@ -351,7 +351,7 @@ async fn start_runtime(
     state.error = None;
     state.provider_enabled = provider_enabled;
     state.stop_confirmed = false;
-    state.run_request = run_request.clone();
+    state.run_request.clone_from(&run_request);
     state.run_result = None;
     state.stop = Some(stop);
     *manager.0.health.write().await =

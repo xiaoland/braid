@@ -2,6 +2,8 @@
 
 ## 当前反哺：协作技能与 Agent Profile
 
+2026-10-12 CI 修复：用户指出“ci / rust 没有通过”。PR148 run38231440673 在 Rust1.93 Clippy `-D warnings` 失败，共26条诊断；此前仅构建通过不等于CI通过。profile_feedback_owner稳定处理材料/Pi三个模块，其余由主Agent处理。已完成等价写法修正、Pi材料装配提取和复杂元组命名；Serde回调引用及内聚事务/生命周期函数采用有说明的函数级lint例外，workflow与全局规则保持。Rust1.93本地 fmt/check/clippy 全部通过，check3.61s、Clippy14.46s，单任务离线执行，无设施测试或模型调用。原始失败日志及复验原件保留在本轮证据目录 raw/ci-rust-failed.log、ci-check-final.log、ci-clippy-final.log；提交后须以PR当前HEAD的GitHub rust回执判定CI结果，不以本地通过替代。
+
 2026-10-12 用户授权：“好的。现在我们继续反哺。braid-collaboration 这个技能也反哺到 braid 项目中（但是不和 braid 软件本身绑定）；此外我记得 factory26 似乎有不少关于 braid agent profile 的改进。”本轮迁移独立技能材料，并核对、融合 Profile 的通用能力与恢复身份合同；不启动新付费模型、旧验收或修改生成应用。技能不自动安装、编译嵌入、默认启用或成为运行依赖。Factory preset、variant 和实验配方保留原归属。
 
 负责人：collaboration_skill_owner 拥有 skills/ 独立材料迁移；profile_feedback_owner 拥有 Profile 差异调查及后续实现；autonomous_mode_advisor 提供材料声明与恢复边界判断；主 Agent 拥有采用、正式文档、单任务编译、实际公开操作及提交。仅使用内部 Agent 协作，不联系独立 Codex 聊天。所有产物位于 WorkSSD；不编写或运行设施测试、自检、包 smoke。

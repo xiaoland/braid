@@ -78,6 +78,8 @@ pub(crate) async fn finite_managed(
     }
 }
 
+// The shutdown barrier shares the worker resources established during startup.
+#[allow(clippy::too_many_lines)]
 async fn managed(
     config: Config,
     provider_enabled: bool,
@@ -208,7 +210,7 @@ async fn managed(
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => failures.push(format!("{error:#}")),
                 Err(error) => {
-                    failures.push(format!("runtime worker failed during shutdown: {error}"))
+                    failures.push(format!("runtime worker failed during shutdown: {error}"));
                 }
             }
         }
@@ -246,14 +248,14 @@ async fn managed(
         }
         let status = store.runtime_status();
         if let Ok(status) = status {
-            if status.pending_writes > 0 || status.uncertain_writes > 0 {
-                if let Some(result) = &mut outcome {
-                    result.state = crate::run::RunState::Blocked;
-                    result.reason = Some(format!(
-                        "shutdown left {} pending and {} uncertain platform writes",
-                        status.pending_writes, status.uncertain_writes
-                    ));
-                }
+            if (status.pending_writes > 0 || status.uncertain_writes > 0)
+                && let Some(result) = &mut outcome
+            {
+                result.state = crate::run::RunState::Blocked;
+                result.reason = Some(format!(
+                    "shutdown left {} pending and {} uncertain platform writes",
+                    status.pending_writes, status.uncertain_writes
+                ));
             }
         } else if let Err(error) = status {
             failures.push(format!("shutdown ledger status failed: {error:#}"));
@@ -488,6 +490,8 @@ async fn advance_objects(
     Ok(())
 }
 
+// Observe one bounded run's terminal decision in a single polling loop.
+#[allow(clippy::too_many_lines)]
 async fn finite_outcome(
     config: &Config,
     client: &BuiltinClient,

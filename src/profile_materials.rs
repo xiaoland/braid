@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
 };
 
@@ -29,6 +30,16 @@ struct Collected {
     identity: EffectiveMaterials,
     native_files: BTreeMap<PathBuf, Vec<u8>>,
     skill_files: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+struct CollectedSkills {
+    files: BTreeMap<PathBuf, Vec<u8>>,
+    identities: Vec<SkillIdentity>,
+}
+
+struct SkillSource {
+    name: String,
+    files: BTreeMap<PathBuf, Vec<u8>>,
 }
 
 pub(crate) fn collect(config: &Config, profile: &Profile) -> Result<EffectiveMaterials> {
@@ -120,28 +131,6 @@ pub(crate) fn snapshot(
 }
 
 fn validate_snapshot_entries(root: &Path, collected: &Collected) -> Result<()> {
-    fn visit_tree(
-        root: &Path,
-        current: &Path,
-        actual: &mut std::collections::BTreeSet<PathBuf>,
-    ) -> Result<()> {
-        for entry in fs::read_dir(current)? {
-            let entry = entry?;
-            let path = entry.path();
-            let kind = entry.file_type()?;
-            if kind.is_symlink() {
-                bail!("Pi native home snapshot contains symlink {}", path.display());
-            }
-            if kind.is_dir() {
-                visit_tree(root, &path, actual)?;
-            } else if kind.is_file() {
-                actual.insert(path.strip_prefix(root)?.to_path_buf());
-            } else {
-                bail!("Pi native home snapshot contains unsupported entry {}", path.display());
-            }
-        }
-        Ok(())
-    }
     let mut expected = std::collections::BTreeSet::new();
     expected.extend(collected.native_files.keys().cloned());
     expected
@@ -174,6 +163,29 @@ fn validate_snapshot_entries(root: &Path, collected: &Collected) -> Result<()> {
     Ok(())
 }
 
+fn visit_tree(
+    root: &Path,
+    current: &Path,
+    actual: &mut std::collections::BTreeSet<PathBuf>,
+) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            bail!("Pi native home snapshot contains symlink {}", path.display());
+        }
+        if kind.is_dir() {
+            visit_tree(root, &path, actual)?;
+        } else if kind.is_file() {
+            actual.insert(path.strip_prefix(root)?.to_path_buf());
+        } else {
+            bail!("Pi native home snapshot contains unsupported entry {}", path.display());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn bind_session_home(workspace: &Path, session: &str, home_key: &str) -> Result<()> {
     let parsed_key = uuid::Uuid::parse_str(home_key).context("Pi native home key is not a UUID")?;
     let index = workspace.join(".braid/pi-homes/index");
@@ -183,7 +195,7 @@ pub(crate) fn bind_session_home(workspace: &Path, session: &str, home_key: &str)
     if key_path.exists() {
         let existing = fs::read_to_string(&key_path)?;
         if existing.trim() != key {
-            bail!("Pi session {} is already bound to a different native home", session);
+            bail!("Pi session {session} is already bound to a different native home");
         }
         return Ok(());
     }
@@ -193,7 +205,7 @@ pub(crate) fn bind_session_home(workspace: &Path, session: &str, home_key: &str)
 pub(crate) fn session_home_key(workspace: &Path, session: &str) -> Result<String> {
     let key_path = workspace.join(".braid/pi-homes/index").join(sha(session.as_bytes()));
     let key = fs::read_to_string(&key_path).with_context(|| {
-        format!("Pi session {} has no native-home identity record; refusing to guess its prior profile materials", session)
+        format!("Pi session {session} has no native-home identity record; refusing to guess its prior profile materials")
     })?;
     let parsed =
         uuid::Uuid::parse_str(key.trim()).context("Pi native home index has an invalid UUID")?;
@@ -216,7 +228,6 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .open(path)
         .with_context(|| format!("cannot create immutable Pi material {}", path.display()))?;
-    use std::io::Write as _;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
@@ -225,7 +236,9 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
     let runtime = config.runtime_for(profile)?;
     let llm = config.llm_provider_for(profile)?;
-    let (skill_files, skill_identities) = collect_profile_skills(profile)?;
+    let skills = collect_profile_skills(profile)?;
+    let skill_files = skills.files;
+    let skill_identities = skills.identities;
     let native_source = if profile.adapter_type != "pi" {
         None
     } else if let Some(template) = &profile.native_template {
@@ -348,13 +361,11 @@ fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
     })
 }
 
-fn collect_profile_skills(
-    profile: &Profile,
-) -> Result<(BTreeMap<PathBuf, Vec<u8>>, Vec<SkillIdentity>)> {
+fn collect_profile_skills(profile: &Profile) -> Result<CollectedSkills> {
     let mut skill_files = BTreeMap::new();
     let mut skill_identities = Vec::new();
     for declared in &profile.skills {
-        for (name, files) in collect_skill_source(declared)? {
+        for SkillSource { name, files } in collect_skill_source(declared)? {
             if skill_identities.iter().any(|skill: &SkillIdentity| skill.name == name) {
                 bail!("duplicate Pi skill name {name:?} across Profile.skills sources");
             }
@@ -368,7 +379,7 @@ fn collect_profile_skills(
             }
         }
     }
-    Ok((skill_files, skill_identities))
+    Ok(CollectedSkills { files: skill_files, identities: skill_identities })
 }
 
 fn read_tree(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
@@ -396,7 +407,7 @@ fn read_tree(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
     Ok(files)
 }
 
-fn collect_skill_source(path: &Path) -> Result<Vec<(String, BTreeMap<PathBuf, Vec<u8>>)>> {
+fn collect_skill_source(path: &Path) -> Result<Vec<SkillSource>> {
     if fs::symlink_metadata(path)?.file_type().is_symlink() {
         bail!("Pi skill source cannot be a symlink: {}", path.display());
     }
@@ -411,10 +422,10 @@ fn collect_skill_source(path: &Path) -> Result<Vec<(String, BTreeMap<PathBuf, Ve
     };
     if resolved.join("SKILL.md").is_file() {
         let name = pi_skill_name(&resolved)?;
-        return Ok(vec![(name, read_tree(&resolved)?)]);
+        return Ok(vec![SkillSource { name, files: read_tree(&resolved)? }]);
     }
     let mut entries: Vec<_> = fs::read_dir(&resolved)?.collect::<std::io::Result<_>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
     let mut skills = Vec::new();
     for entry in entries {
         if entry.file_type()?.is_symlink() {
@@ -422,7 +433,7 @@ fn collect_skill_source(path: &Path) -> Result<Vec<(String, BTreeMap<PathBuf, Ve
         }
         if entry.file_type()?.is_dir() && entry.path().join("SKILL.md").is_file() {
             let name = pi_skill_name(&entry.path())?;
-            skills.push((name, read_tree(&entry.path())?));
+            skills.push(SkillSource { name, files: read_tree(&entry.path())? });
         }
     }
     if skills.is_empty() {
@@ -475,9 +486,9 @@ fn pi_skill_name(directory: &Path) -> Result<String> {
 fn sanitized_runtime_api_url(value: &str) -> Result<String> {
     let mut url = url::Url::parse(value).context("runtime api_url must be a valid URL")?;
     url.set_username("")
-        .map_err(|_| anyhow::anyhow!("runtime api_url cannot sanitize userinfo"))?;
+        .map_err(|()| anyhow::anyhow!("runtime api_url cannot sanitize userinfo"))?;
     url.set_password(None)
-        .map_err(|_| anyhow::anyhow!("runtime api_url cannot sanitize userinfo"))?;
+        .map_err(|()| anyhow::anyhow!("runtime api_url cannot sanitize userinfo"))?;
     if url.query().is_some() {
         let empty_query = url.query().is_some_and(str::is_empty);
         let query_count = url.query_pairs().count();
@@ -621,51 +632,49 @@ fn reject_ambient_authority(
         match value {
             serde_json::Value::Object(object) => {
                 for (key, value) in object {
-                    let forbidden = match path.file_name().and_then(|name| name.to_str()) {
-                        Some("models.json") => {
-                            key == "apiKey"
-                                && value.as_str().is_none_or(|key| {
-                                    !valid_environment_reference(key)
-                                        || api_key_environment.is_none_or(|environment| {
-                                            key != format!("${environment}")
+                    let forbidden = if let Some("models.json") =
+                        path.file_name().and_then(|name| name.to_str())
+                    {
+                        key == "apiKey"
+                            && value.as_str().is_none_or(|key| {
+                                !valid_environment_reference(key)
+                                    || api_key_environment
+                                        .is_none_or(|environment| key != format!("${environment}"))
+                            })
+                            || (key == "headers"
+                                && value.as_object().is_none_or(|headers| {
+                                    headers.iter().any(|(header, value)| {
+                                        value.as_str().is_none_or(|value| {
+                                            !supported_header_value(
+                                                header,
+                                                value,
+                                                api_key_environment,
+                                            )
                                         })
-                                })
-                                || (key == "headers"
-                                    && value.as_object().is_none_or(|headers| {
-                                        headers.iter().any(|(header, value)| {
-                                            value.as_str().is_none_or(|value| {
-                                                !supported_header_value(
-                                                    header,
-                                                    value,
-                                                    api_key_environment,
-                                                )
-                                            })
-                                        })
-                                    }))
-                                || (key == "baseUrl"
-                                    && value.as_str().is_some_and(|base_url| {
-                                        url::Url::parse(base_url).map_or(true, |url| {
-                                            !url.username().is_empty()
-                                                || url.password().is_some()
-                                                || url
-                                                    .query_pairs()
-                                                    .any(|(name, _)| sensitive_query_name(&name))
-                                        })
-                                    }))
-                        }
-                        _ => {
-                            let empty = value.as_array().is_some_and(Vec::is_empty)
-                                || value.as_str().is_some_and(str::is_empty);
-                            (root
-                                && reject_root_model
-                                && ["defaultModel", "defaultProvider", "defaultThinkingLevel"]
-                                    .contains(&key.as_str()))
-                                || (["extensions", "packages", "skills", "skillsDir"]
-                                    .contains(&key.as_str())
-                                    && !empty)
-                                || (key == "apiKey"
-                                    && path.file_name().is_none_or(|name| name != "models.json"))
-                        }
+                                    })
+                                }))
+                            || (key == "baseUrl"
+                                && value.as_str().is_some_and(|base_url| {
+                                    url::Url::parse(base_url).map_or(true, |url| {
+                                        !url.username().is_empty()
+                                            || url.password().is_some()
+                                            || url
+                                                .query_pairs()
+                                                .any(|(name, _)| sensitive_query_name(&name))
+                                    })
+                                }))
+                    } else {
+                        let empty = value.as_array().is_some_and(Vec::is_empty)
+                            || value.as_str().is_some_and(str::is_empty);
+                        (root
+                            && reject_root_model
+                            && ["defaultModel", "defaultProvider", "defaultThinkingLevel"]
+                                .contains(&key.as_str()))
+                            || (["extensions", "packages", "skills", "skillsDir"]
+                                .contains(&key.as_str())
+                                && !empty)
+                            || (key == "apiKey"
+                                && path.file_name().is_none_or(|name| name != "models.json"))
                     };
                     if forbidden {
                         bail!(
