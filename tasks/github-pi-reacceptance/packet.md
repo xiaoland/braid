@@ -8,7 +8,7 @@
 
 已确认普通 Profile catalog 查看、当前支持的 Issue/默认 PR 指派、模型与推理唯一来源、上下文预算已经迁入，不扩展其它 Profile driver。独立协作技能与四份 reference 已迁移，包内引用不依赖完整源码 checkout。Profile 新增 Pi skills/native_template 的实际选择、独立持久会话 home、材料快照及有效身份，接入现有 revision 不兼容阻断与 OTLP 身份诊断；没有空 tools/MCP 管理器或默认技能绑定。
 
-本轮完成，结果见 [profile-feedback.md](profile-feedback.md)。最终单任务离线构建27.88s无warning通过；公开无模型指派进入idle/0 turn，同路径材料变化改变digest/revision，Collector保存真实get_commands、Profile材料回执及会话身份的原始88条records和20批protobuf。旧Collector未启动导致的导出失败、中间编译错误保留。全部本轮服务、所属进程与监听已退出；没有模型调用。原生角色实际调用、真实模型历史恢复及材料变化后的实际恢复阻断仍未验。主Agent接着提交到既有Draft PR148；旧ARC/GitHub资格结论不变。
+本轮完成，结果见 [profile-feedback.md](profile-feedback.md)。最终单任务离线构建27.88s无warning通过；公开无模型指派进入idle/0 turn，同路径材料变化改变digest/revision，Collector保存真实get_commands、Profile材料回执及会话身份的原始88条records和20批protobuf。旧Collector未启动导致的导出失败、中间编译错误保留。全部本轮服务、所属进程与监听已退出；没有模型调用。原生角色实际调用、真实模型历史恢复及材料变化后的实际恢复阻断仍未验。源码候选 f82ee88 已提交并推送到既有 Draft PR148，PR 保持 Draft；旧 ARC/GitHub 资格结论不变。
 
 ## 已完成的 ARC-bench lite 验收
 
