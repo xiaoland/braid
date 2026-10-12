@@ -374,6 +374,11 @@ impl GroupDriver<'_> {
                         continue;
                     }
                     self.materialize_next_assignment().await;
+                    // Settle pre-activation Context changes before the finite assignment's first turn.
+                    if self.config.finite_run.is_some()
+                        && Box::pin(self.materialize_next_context_reset()).await {
+                        continue;
+                    }
                     running = self.start_next_agent_turn().await;
                 }
             }

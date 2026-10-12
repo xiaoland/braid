@@ -358,7 +358,9 @@ impl GroupDriver<'_> {
             profile.github_context_hard_bytes,
         );
         context::record_context_revision(&canonical, &rendered, store)?;
-        let preserve_wake = mention_activation && rendered.pressure != ContextPressure::Hard;
+        // Finite assignments authorize design work immediately; serve assignments remain idle.
+        let preserve_wake = (mention_activation || config.finite_run.is_some())
+            && rendered.pressure != ContextPressure::Hard;
         let Some(materialization) = store.begin_agent_assignment(
             candidate.event_id,
             profile_record.clone(),
