@@ -220,6 +220,8 @@ Responsibilities do not overlap:
 并据此扩展协调 writer 的范围；执行身份和终态仍归 Harness，平台没有第二份运行工作图。
 仅注册 run root 的关闭会立即撤销整个后代范围 grants，普通 serve 的对象关系保持原合同。
 
+有限 run 的 Issue 指派保留真实 wake 批次，直接授权设计工作；普通 serve 指派仍只创建空闲会话。新会话在首轮认领前先处理已排队的 Context reset，reset 不消费独立的指派输入。
+
 root 的职责只在 run 中显式注入。子项生命周期、候选发布、讨论和设计更新回流到祖先；讨论和设计通知只携带对象及变化类型，不复制正文。
 以 writer 对象识别自身回流，不能用 profile 判断，因为 root 与子项可能共用 profile。普通 Agent 评论
 仍不要求公开应答或制造新一轮循环。统一准入在认领 turn 之前取得许可，并持续持有至

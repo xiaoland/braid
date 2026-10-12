@@ -5,6 +5,10 @@ Versioning once release artifacts are published.
 
 ## [Unreleased]
 
+- 有限 run 的 Issue 指派保留真实执行输入，首次轮次前处理已有 Context reset；普通 serve 指派仍保持空闲会话合同。
+- 受控 Pi background Bash 使用非登录 shell，原生入口移除 BASH_ENV/ENV，工具路径与缓存由实例明确提供。
+- 内建协作的 Harness ledger 写命令先取得 IMMEDIATE 事务准入，纯读仍为 DEFERRED；绑定错误保留账本路径与 SQLite extended code。
+
 - 新增与常驻 `serve` 并列的 `braid run`：从顶层 root Issue 或 description 驱动自主拆分、指派、PR 实现与交付，首版接入独立 built-in 平台。
 - 平台原子保存父子 Issue，冻结 run/client/交付分支边界；范围关闭和 pending 授权撤销保留停止门控。Console 通过共享接口控制 run，支持原输入接续与独立终态展示。
 - Harness schema 7 保存有限运行身份和结果，平台 schema 3 增加任务树与范围授权。配置 schema 保持 3，旧迁移不改写。

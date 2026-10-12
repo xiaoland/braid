@@ -1,6 +1,12 @@
-# GitHub + Pi 真实模型重新验收
+# Braid 真实模型验收
 
-状态：2026-10-12，root 自主 run 实现、编译及无模型实际操作已完成，真实自主运行资格未执行；原 GitHub+Pi 第二候选应用复验通过，但剩余生命周期资格保留接续，未判全项通过。用户指示：“好的，现在继续重新验收，先仅验收 GitHub + Pi；全部用 minimax 模型。”沿用已知 `xiaoland/braid-poc-test` 和官方 MiniMax `minimax-m3`（wire MiniMax-M3），凭据只从 ../agentic26/.env 加载，不输出或复制。真实官方按量调用获授权，无人为费用停止线，无备用模型。
+当前状态：2026-10-12，真实 MiniMax `braid run` 的 ARC-bench lite 两题验收及收尾已完成，结论不通过。Keep 程序 completed/停止已确认，公开 Lite 本地复现6/32；BookStack blocked/停止已确认，失败生成快照2/34。合计8/66（12.12%）。两题均只有root真实执行，没有成员分工；另有/tmp写入和按名称停止请求的纪律失败。官网两次HTTP403未创建submission/run，不存在官网分数。
+
+完整事实见 [run-arc-lite.md](run-arc-lite.md)，独立评分原件位于 `/Volumes/WorkSSD/Development/braid-run-arc-lite-20261012/evaluation/`。本轮全部进程、应用服务及远端评估容器已退出，相关端口关闭；无在途操作，不自动重新生成、补发布/合并或按评测反馈修应用。已修复有限指派吞输入、登录shell阻塞及共享ledger写事务；SQLite修复仅有编译和公开绑定操作反馈，没有进入本轮模型配方。
+
+下一步由用户决定root职责与交接、执行纪律及应用交互的整改范围。本packet仍保留Braid反哺的未完成资格入口；原GitHub+Pi第二候选应用复验通过，但剩余生命周期资格仍未完成。以下保留原范围与历史事实，不启动旧GitHub运行。
+
+原 GitHub+Pi 授权：用户指示：“好的，现在继续重新验收，先仅验收 GitHub + Pi；全部用 minimax 模型。”沿用已知 `xiaoland/braid-poc-test` 和官方 MiniMax `minimax-m3`（wire MiniMax-M3），凭据只从 ../agentic26/.env 加载，不输出或复制。真实官方按量调用获授权，无人为费用停止线，无备用模型。
 
 目标：判断反哺后的独立 Braid 能否在 GitHub 中完成真实 Issue→PR 实现与更新，并在真实 Pi/subagents/background 运行下交接结果及停止，不以编译替代。候选源码 `1394319`，冻结binary与锁定Pi1.0.2材料SHA；只启用subagents/background，不装可选网络工具。所有根／子模型必须 minimax/MiniMax-M3，显式角色材料与模型路由禁止ambient fallback。
 
@@ -59,3 +65,33 @@ advisor 返回已采用：Factory 旧 local 区分 quiescent/delivery_complete/e
 本轮实现收尾见 [autonomous-mode-results.md](autonomous-mode-results.md)：真实无模型平台/CLI/Console操作、旧平台副本升级及浏览器表单核对通过，所有本轮服务退出。源码和正式文档已完成；必要失败保持原件。旧GitHub+Pi剩余资格及新run真实模型资格未转写为通过，保留这一packet供后续资格工作。
 
 最终收尾：单任务离线构建17.17s、JS语法与diff检查通过。旧平台真实回执重试的409兼容缺陷已修复，原请求公开API回读200/applied且无重复对象；成员讨论/设计回流也完成实际操作。最终证据与限定见 autonomous-mode-results.md，所有本轮监听已关闭。下一步提交本轮改动并更新现有Draft PR#148；不将编译及无模型操作扩大为真实自主模型验收。
+
+## 真实 run：ARC-bench lite
+
+2026-10-12 用户授权：“执行真实 minimax 的 braid run 整轮验收，验收题目就复用 arc-bench lite。”本轮两题 keep、bookstack 按顺序从公开需求生成，独立 Braid e7615e9 / binary2c20f706 驱动内建平台 run；全部根/子模型固定 minimax/MiniMax-M3，官方凭据仅从 agentic26/.env 加载，不输出。maxConcurrency2，不设人为费用停止线，不复用旧对象/ledger或手动API操作现场。所有Mac产物位于 /Volumes/WorkSSD/Development/braid-run-arc-lite-20261012，保留版本、输入哈希、原生会话、对象/PR、最终交付commit、OTLP及实际费用证据。
+
+完成判据：实际模型从单一root/description建立自主工作图并以真实PR候选交付；平台范围闭环及执行停止确认，结构化RunResult可追溯。每题交付立即冻结commit与应用包，独立实际验收及在可用入口取得官网self_funded非正式评分；不将 completed、上传或运行启动视为业务通过。生成只读取公开requirements/引用资产，不读取评测实现；隐藏评分不反馈仍生成中的Agent。设施可修复缺陷属于闭环，保持失败原件并修复后继续；不运行设施测试。
+
+负责人：native_local_env继续拥有运行装配、真实执行及恢复；arc_lite_evaluation_owner拥有冻结后独立评分与应用操作；主Agent采用证据、协调修复及报告。当前正在冻结配置、公开输入和评估接口，近期官网403作为待核实外部前提，不能先判零分或宣称评分可用。两题业务产物不得由开发Agent代写。支持记录 run-arc-lite.md、运行目录及evaluation/。
+
+启动事实：Keep公开CLI run-id keep-20261012、root#1、delivery refs/heads/run/keep-20261012、并发2；PID65775、工具session28195由native_local_env拥有停止/恢复。平台18582、OTLP-only Console26518，sample1.0。最终binary身份及原始公开需求SHA见raw/frozen-identities.json，运行记录见run-arc-lite.md。BookStack尚未启动；WSL固定镜像评估已准备，不把CLI启动受理视为模型/交付完成。
+
+真实启动发现设施缺陷：Keep仅握手MiniMax-M3，无prompt/原生JSONL。ConfigureRoot产生invalidate随后Assign，Context reset applied但continuation=false，初始wake已consumed，root静默。保留keep/raw/startup-otlp.json及原运行，由run_runtime_owner支持调度/reset根因修复，native_local_env持续拥有控制和部署；不以人工评论激活遮盖初始输入丢失。此时没有有效生成或业务评分，BookStack未启动。
+
+修复候选861a15d：finite Issue Assign保留真实wake，materialize后先处理已有idle Context reset；serve指派仍仅建立idle会话。单任务离线构建15.09s通过，binary d8a3342f58ed4887b5040ac179997bc95742c8e89265a263172f2e8d644482c6。native_local_env已获新候选部署入口，以新root/run v2验证真实指派触发推理，旧run保持stopped故障证据不可原生接续。
+
+修复实际采用：Keep新run keep-20261012-v2/root2已出现真实prompt→agent_start→MiniMax-M3 assistant/tool执行，keep/raw/v2-startup-evidence.json保留，不以握手代替推理。尚未交付；BookStack未启动。
+
+第二次设施故障：真实M3普通bash经PBB覆盖入口使用bash -lc；host /etc/profile的Nix source在open阻塞，连pwd/ls含60s也超时。sample和原始调用保留，无子Issue/PR/业务产物。公开stop达到15s截止后typed blocked/stopConfirmedfalse，较晚OS空快照未改写原结果。修复9e62be1仅自动PBB shell-c及原生wrapper清BASH_ENV/ENV，明确环境不依赖宿主profile。一次旧冻结公开offlinecleanup于北京时间14:44成功取得exactexecution完整scope收据，keep/raw/later-offline-cleanup.json；原deadline失败保留。新immutable材料准备后使用新root/run重新资格，不称完整恢复。已记v2实际M3 usage totalTokens558899，记录不等于供应商账单。
+
+新原生材料native/pi-nonlogin-v3 manifest989a1d3fb888b1cbb3404d8e597a88147295b5da1626c24ddae0b5c8e17fcc18，source9e62be1；实际SDK公开PBB echo/pwd/ls约200ms正常且execution停止完整。operator一次缺detached被75拒绝原件保留，没有改错误为pass。doctor新材料通过，Keep新run keep-20261012-v3/ref refs/heads/run/keep-20261012-v3已启动，binary861a/d8a保持；旧config/result未覆盖，待真实自然工具与工作图。
+
+Keep v3真实语义进展：普通M3 bash自然调用约200ms成功；root先在自身worktree写应用/做健康及CRUD操作，随后自行创建并指派后代Issue4设计架构、5backend、6frontend、7integration/delivery。scope3为父子范围权威（Item读取不包含parent字段，不将字段缺失误判无关系）；v3-scope-stage6.json保留。此时无PR、delivery仍需求基线b59c，不能把图形成判为成果采用/交付；需真实成员turn、PR候选和最终闭环。
+
+Keep v3整轮程序已exit0：completed/root3/deliveryab8c1d763f7790722938a5e0834ae2523711b6d3/stopConfirmedtrue，原stdout与scope-stage9。实际merge9→e7c8、12→ea5e、13→ab8c，未决命令/merge空、exactowned四收据均stopped/fullcoverage。自主分工不通过：仅root模型，子Issue4–7和PR8–13均由root自行收敛，无childIssue/PR模型session；不能用图和completed代替成员成果。Keep准确commit已archive冻结评分，官网self_funded lite上传实际HTTP403 Only Playground submissions and run changes are allowed，无submission/run/官网分数。WSL固定官方公开32项正在评。
+
+BookStack同配方已启动：run bookstack-20261012/root1/platform18583/CLI工具session25269，新native989a/binaryd8a未热换，无评分反馈。SQLite code5自然调用错误已定位CLI Bind的DEFERRED read→write争用结构，517不是原实测；3d7e712写事务BEGINIMMEDIATE/读DEFERRED+错误细节编译20.35s通过，候选7dd4...未进入本轮模型配方。待最终真实公开connect操作取得有限采用反馈，避免声称稀有竞态已完全验证。Keep成功轮187assistant/167tools、recorded totalTokens12797376含cacheRead12504213（实际provider仅M3），加v2失败消耗558899；SDKcost0不是账单/免费证明。
+
+BookStack自然终态：exit1/blocked/root1/deliveryCommitnull/stopConfirmedtrue，reason root closed without a published or merged scoped candidate matching delivery ref ... d0e8f98ab958d56bd3089ef357f78f9a59898095。所有对象关闭，但known deliveries=[]；root只有一个真实turn，直接写子工作树，三子及PR5均无成员模型执行。冻结d0e8仅作为失败运行生成应用快照，不称accepted delivery；评估owner开始独立34项及官网接入。禁止人工补publish/merge、重开/重复生成。当前所有生成已自然终态，剩余评分、精确资源收尾、当前源码公开绑定操作及最终报告。
+
+本轮最终采用：评分8/66（Keep6/32、BookStack失败快照2/34），官网两次403，无有效官网分数。所有actualmodels仅MiniMax-M3，含失败v2recorded totalTokens30807020，其中cacheRead30126225；SDKcost0不是账单。精确owned收据全stopped，平台/collector正常退出，声明端口无监听；独立WSL两容器已退出移除。已确认归属的5份正文、keep_backup和_server.log迁入WorkSSD并保留原路径/时间/hash；未创建_home，旧/tmp/keep-test非本轮归属未动。pkill工具整体timeout，独立exit及victim未知，不追认其合规。新3d7候选一次真实公开object show/Bind exit0；稀有锁竞争未重现、不声称完整资格。最终不通过，停止新增模型运行，等待用户下一轮决定。
