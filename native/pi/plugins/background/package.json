@@ -1,0 +1,8 @@
+{
+  "name": "@braid/pi-runtime-background",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "pi-background-bash": "1.0.5"
+  }
+}

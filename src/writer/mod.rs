@@ -42,7 +42,7 @@ pub async fn create_comment(
 ) -> Result<GhWriteReceipt> {
     helpers::require_configured_repository(config, &request.target)?;
     let profile = config.profile(&request.profile_id)?;
-    let github = GitHubClient::connect(&config.github, &request.target.repository)
+    let github = GitHubClient::connect(config.github()?, &request.target.repository)
         .await
         .context("cannot authenticate Braid App comment writer")?;
     let work_item = github.issue_or_pull_request(request.target.number).await?;
@@ -93,8 +93,8 @@ pub async fn ensure_pull_request(
     store: &StoreActor,
     request: PullRequestEnsureRequest,
 ) -> Result<ImplementationRequestReceipt> {
-    let repository = config.github.repository.parse()?;
-    let github = GitHubClient::connect(&config.github, &repository)
+    let repository = config.repository().parse()?;
+    let github = GitHubClient::connect(config.github()?, &repository)
         .await
         .context("cannot authenticate Braid App PR writer")?;
     let receipt =

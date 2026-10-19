@@ -22,7 +22,7 @@
 | Dependency Dirty | PR 的直接 Associated Issue 发生非 description 变化。它不打断当前 PR turn；Braid 在下一次 PR turn 前重新 materialize PR Context，并按规则投递 Event Reference。 |
 | Cross-surface Hard Invalidation | 非 Agent-origin 的直接 Associated Issue description 变化。Braid 先按 debounce 聚合，窗口结束后 fence/interrupt 当前 PR turn，并用最新 Issue Context 替换 PR Provider Context。 |
 | Agent-origin Event | 由当前 Agent 通过 Braid 写入关联，或由该 Agent Profile 明确配置且经 GitHub node identity 验证的独立 Agent actor 产生的变化；进入未来 canonical Context，但不反向唤醒或 reset Agent。无法可靠归因的直接写入按外部变化处理。 |
-| Agent Profile | Braid 管理的不可变 Agent 配置，包含 provider、model、reasoning、user instructions、tools、skills、MCP 等。 |
+| Agent Profile | Braid 管理的版本化 Agent 配置，包含 provider、model、reasoning、user instructions 和支持的原生材料选择。有效版本包括实际选中材料的内容身份；不是 Factory preset，也不是 Pi 内部 subagent 角色。 |
 | Profile User Instructions | Agent Profile 提供的行为、风格与专长指令。它们在创建 Provider Session 时加入 Effective Agent Instructions，并与 Braid 的工作记忆、角色和协作说明共同构成实际指令。 |
 | Profile Tag | Agent Profile 声明适用面的 tag-like 类型，例如 `issue`、`pr`；同一 Profile 可同时拥有多个 tag，也可以只适用于 Issue。 |
 | Braid System Prompt | Braid 在创建 Provider Session 时注入的高优先级、版本化指令，包括 Braid/CLI 的存在、GitHub Working Memory 协议，以及按 Issue/PR surface 选择的角色与任务说明。它帮助 Agent 使用产品能力，而不是把 Braid 变成限制 Agent 的权限沙箱。 |

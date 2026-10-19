@@ -32,7 +32,7 @@ mod status;
 mod telemetry_cmd;
 
 #[derive(Debug, Parser)]
-#[command(name = "braid", version, about = "GitHub working memory for local coding agents")]
+#[command(name = "braid", version, about = "Collaboration working memory for coding agents")]
 pub struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -41,6 +41,11 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Setup(SetupArguments),
+    Object(ObjectArguments),
+    /// Built-in collaboration platform, independent of the Agent Harness.
+    Platform(crate::platform::cli::PlatformArguments),
+    /// Initialize a Braid-owned collaboration space around a local Git checkout.
+    Init(crate::local::init::InitArguments),
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -76,6 +81,24 @@ enum Command {
         command: TunnelCommand,
     },
     Serve(ServeArguments),
+    /// Complete one root task using the built-in collaboration platform.
+    Run(RunArguments),
+    /// Local OTLP collector, browser Console, and optional managed runtime.
+    Console(crate::console::ConsoleArgs),
+}
+
+#[derive(Debug, Args)]
+struct ObjectArguments {
+    #[command(flatten)]
+    source: ConfigSource,
+    /// Reuse the original identity when recovering an uncertain object command.
+    #[arg(long, global = true)]
+    request_id: Option<String>,
+    /// Reject a mutation when the platform object has changed since this revision.
+    #[arg(long, global = true)]
+    expected_revision: Option<u64>,
+    #[command(subcommand)]
+    command: crate::local::cli::LocalCommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -145,7 +168,7 @@ enum GhPrCommand {
 /// this struct.
 #[derive(Debug, Args)]
 struct ConfigSource {
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "BRAID_CONFIG")]
     config: Option<PathBuf>,
     #[arg(long, value_name = "KEY", env = "BRAID_INSTANCE")]
     instance: Option<String>,
@@ -307,8 +330,25 @@ struct ServeArguments {
         help = "Expose ingress through a free Wrangler Quick Tunnel and own the App webhook while running"
     )]
     tunnel: bool,
-    #[arg(long, help = "Run GitHub transport without starting the configured Coding Agent")]
+    #[arg(long, help = "Run collaboration transport without starting the configured Coding Agent")]
     transport_only: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunArguments {
+    #[command(flatten)]
+    source: ConfigSource,
+    #[arg(long)]
+    run_id: String,
+    #[arg(long, conflicts_with = "description_file", required_unless_present = "description_file")]
+    root_issue: Option<u64>,
+    #[arg(long, conflicts_with = "root_issue", required_unless_present = "root_issue")]
+    description_file: Option<PathBuf>,
+    #[arg(long)]
+    delivery_ref: String,
+    /// Maximum simultaneously active Braid turns, including the root (not a process limit).
+    #[arg(long, default_value_t = 2)]
+    max_concurrency: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -387,6 +427,53 @@ pub async fn run() -> Result<()> {
             let config = helpers::load(&config_path)?;
             crate::runtime::serve(config, arguments.tunnel, !arguments.transport_only).await?;
         }
+        Command::Run(arguments) => {
+            let config = helpers::load(&arguments.source.resolve_config_path()?)?;
+            let request = crate::run::RunRequest {
+                run_id: arguments.run_id,
+                root_issue: arguments.root_issue,
+                description: arguments.description_file.map(fs::read_to_string).transpose()?,
+                delivery_ref: arguments.delivery_ref,
+                max_concurrency: arguments.max_concurrency,
+            };
+            request.validate(&config)?;
+            let telemetry = crate::telemetry::TelemetryGuard::install(
+                &config.telemetry,
+                config.instance_key(),
+            )?;
+            let generation = uuid::Uuid::now_v7().to_string();
+            crate::telemetry::set_runtime_generation(Some(generation));
+            let health = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::runtime::initial_health(&config, true),
+            ));
+            let (stop, shutdown) = tokio::sync::watch::channel(false);
+            let mut runtime = Box::pin(crate::run::run_managed(config, request, shutdown, health));
+            let result = tokio::select! {result=&mut runtime=>result, signal=crate::runtime::wait_for_shutdown_signal()=> {let _=stop.send(true);signal?;runtime.await}};
+            crate::telemetry::set_runtime_generation(None);
+            telemetry.shutdown()?;
+            let result = result?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            if result.state != crate::run::RunState::Completed {
+                bail!(
+                    "finite run ended as {:?}: {}",
+                    result.state,
+                    result.reason.as_deref().unwrap_or("no detail")
+                );
+            }
+        }
+        Command::Init(arguments) => crate::local::init::run(arguments).await?,
+        Command::Object(arguments) => {
+            let config = helpers::load(&arguments.source.resolve_config_path()?)?;
+            crate::local::cli::run_options(
+                arguments.command,
+                &config,
+                arguments.request_id,
+                arguments.expected_revision,
+            )
+            .await?;
+        }
+        Command::Platform(arguments) => crate::platform::cli::run(arguments).await?,
+        Command::Console(arguments) => crate::console::serve(arguments).await?,
         Command::Setup(arguments) => {
             setup::run(arguments).await?;
         }

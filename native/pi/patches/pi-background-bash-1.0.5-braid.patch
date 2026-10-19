@@ -1,0 +1,710 @@
+--- a/bin/pbb.js
++++ b/bin/pbb.js
+@@ -109,7 +109,7 @@
+   }
+ }
+ 
+-let pilInstancesCache;
++const pilInstancesCache = new Map();
+ 
+ function failPil(id, message, error) {
+   const detail = error instanceof Error ? error.message : String(error || "");
+@@ -130,7 +130,7 @@
+ }
+ 
+ function readPilInstances(id) {
+-  if (pilInstancesCache !== undefined) return pilInstancesCache;
++  if (pilInstancesCache.has(id.sessionKey)) return pilInstancesCache.get(id.sessionKey);
+   const pil = pilCommand(id);
+   try {
+     const raw = execFileSync(pil.file, [...pil.args, "instances", "--json"], {
+@@ -146,26 +146,41 @@
+         PI_LANE_CURRENT_LANE: id.lane,
+       },
+     });
+-    pilInstancesCache = JSON.parse(raw).instances || [];
++    pilInstancesCache.set(id.sessionKey, JSON.parse(raw).instances || []);
+   } catch (error) {
+     failPil(id, "tracked pi-lane pil command failed", error);
+   }
+-  return pilInstancesCache;
++  return pilInstancesCache.get(id.sessionKey);
+ }
+ 
+ function ownerInfo(id, job) {
+   const state = readPilInstances(id).find((item) => item.instanceId === job.instanceId);
++  // PBB also runs without a pi-lane extension; its own identity records the owner PID.
++  const ownerPid = readJson(join(instanceDir(id, job.instanceId), "identity.json"))?.pid;
++  let ownerLive = Boolean(state?.live);
++  if (!state && Number.isInteger(ownerPid) && ownerPid > 0) {
++    try { process.kill(ownerPid, 0); ownerLive = true; }
++    catch (error) {
++      if (error.code === "EPERM") ownerLive = true;
++      else if (error.code !== "ESRCH") throw error;
++    }
++  }
+   return {
+-    ownerStatus: state?.status || "unknown",
++    ownerStatus: state?.status || (ownerLive ? "running" : "unknown"),
+     ownerLastSeenAt: state?.lastSeenAt || "",
+     ownerLastSeenAgeMs: state?.lastSeenAgeMs,
+-    ownerLive: Boolean(state?.live),
+-    ownerStale: !state?.live,
++    ownerLive,
++    ownerStale: !ownerLive,
+   };
+ }
+ 
+ function enrichJob(id, job, path) {
+-  return { ...job, ...ownerInfo(id, job), _path: path };
++  const owner = ownerInfo(id, job);
++  const missingCompletion = owner.ownerStale && ["running", "kill_requested"].includes(job.status);
++  return { ...job, ...owner, ...(missingCompletion ? {
++    recordedStatus: job.status, status: "unknown", outcome: "unknown", exitCode: null,
++    reason: "owner_unavailable_without_completion",
++  } : {}), _path: path };
+ }
+ 
+ function listInstanceIds(id, scope, explicitInstance) {
+@@ -191,8 +206,27 @@
+   return jobs.sort((a, b) => String(a.startedAt ?? "").localeCompare(String(b.startedAt ?? "")) || String(a.jobId).localeCompare(String(b.jobId)));
+ }
+ 
+-function findJob(id, jobId, opts) {
+-  const jobs = readJobs(id, opts).filter((job) => job.jobId === jobId || job.globalJobId === jobId);
++function findJob(id, jobId, opts, acrossSessions = false) {
++  let jobs;
++  if (acrossSessions && opts.scope === "global") {
++    // Global IDs are read across retained sessions; short IDs keep their existing scope.
++    const [instance, localJob, extra] = jobId.split(":");
++    jobs = [];
++    const sessions = join(id.root, "sessions");
++    if (!extra && /^bg[0-9]+$/.test(localJob || "") && existsSync(sessions)) {
++      for (const entry of readdirSync(sessions, { withFileTypes: true })) {
++        if (!entry.isDirectory()) continue;
++        const source = { ...id, sessionKey: entry.name };
++        // Match a directory entry before using the caller's instance in a path.
++        if (!listInstanceIds(source, "session").includes(instance)) continue;
++        const path = join(jobsDir(source, instance), `${localJob}.json`);
++        const job = readJson(path);
++        if (job?.globalJobId === jobId) jobs.push(enrichJob({ ...source, ...job, root: id.root }, job, path));
++      }
++    }
++  } else {
++    jobs = readJobs(id, opts).filter((job) => job.jobId === jobId || job.globalJobId === jobId);
++  }
+   if (jobs.length === 0) return { error: "missing", jobs };
+   if (jobs.length > 1) return { error: "ambiguous", jobs };
+   return { job: jobs[0], jobs };
+@@ -275,8 +309,8 @@
+ 
+ function printStatus(id, jobId, opts) {
+   if (!jobId) return printList(id, opts);
+-  const scope = opts.scope || (opts.instance ? "session" : "current-instance");
+-  const result = findJob(id, jobId, { scope, instance: opts.instance });
++  const scope = jobId?.includes(":") ? "global" : opts.scope || (opts.instance ? "session" : "current-instance");
++  const result = findJob(id, jobId, { scope, instance: opts.instance }, true);
+   if (result.error === "missing") {
+     console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: "unknown_job" }, `unknown job ${jobId}`));
+     process.exit(2);
+@@ -300,8 +334,8 @@
+ }
+ 
+ function printTail(id, jobId, opts) {
+-  const scope = opts.scope || (opts.instance ? "session" : "current-instance");
+-  const result = findJob(id, jobId, { scope, instance: opts.instance });
++  const scope = jobId?.includes(":") ? "global" : opts.scope || (opts.instance ? "session" : "current-instance");
++  const result = findJob(id, jobId, { scope, instance: opts.instance }, true);
+   if (!result.job) {
+     console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: result.error === "ambiguous" ? "ambiguous_job" : "unknown_job" }, `${result.error === "ambiguous" ? "ambiguous" : "unknown"} job ${jobId}`));
+     process.exit(result.error === "ambiguous" ? 3 : 2);
+@@ -334,14 +368,14 @@
+ }
+ 
+ function printKill(id, jobId, opts) {
+-  const scope = opts.scope || (opts.instance ? "session" : "current-instance");
+-  const result = findJob(id, jobId, { scope, instance: opts.instance });
++  const scope = jobId?.includes(":") ? "global" : opts.scope || (opts.instance ? "session" : "current-instance");
++  const result = findJob(id, jobId, { scope, instance: opts.instance }, true);
+   if (!result.job) {
+     console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: result.error === "ambiguous" ? "ambiguous_job" : "unknown_job" }, `${result.error === "ambiguous" ? "ambiguous" : "unknown"} job ${jobId}`));
+     process.exit(result.error === "ambiguous" ? 3 : 2);
+   }
+   const job = result.job;
+-  if (!["running", "kill_requested"].includes(job.status)) {
++  if (!["running", "kill_requested"].includes(job.recordedStatus ?? job.status)) {
+     console.log(context("pbb.kill", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, lane: id.lane, scope, job_id: job.jobId, owner_instance_id: job.instanceId, status: job.status, requested: false }, `${job.jobId} is not running; no kill requested`));
+     return;
+   }
+@@ -378,7 +412,7 @@
+ const id = identity();
+ 
+ if (["help", "--help", "-h"].includes(command)) {
+-  console.log(`pbb - Pi background bash inspector\n\nCommands:\n  pbb self [--json]\n  pbb list [--scope current-instance|session] [--instance ID] [--json]\n  pbb instances [--json]\n  pbb status [JOB] [--json]\n  pbb tail JOB [-n LINES] [--full] [--json]\n  pbb kill JOB [--stale] [--signal TERM]\n\nDefaults to the current pi-lane instance using PI_LANE_* env vars.`);
++  console.log(`pbb - Pi background bash inspector\n\nCommands:\n  pbb self [--json]\n  pbb list [--scope current-instance|session] [--instance ID] [--json]\n  pbb instances [--json]\n  pbb status [JOB] [--json]\n  pbb tail JOB [-n LINES] [--full] [--json]\n  pbb kill JOB [--stale] [--signal TERM]\n\nDefaults to the current pi-lane instance using PI_LANE_* env vars. An empty list covers only that scope.\nUse pbb status/tail/kill INSTANCE:bgNNN to read or stop a retained result across sessions. Missing completion from an unavailable owner is unknown, not a confirmed cancellation.`);
+   process.exit(0);
+ }
+ 
+--- a/extensions/background-bash.ts
++++ b/extensions/background-bash.ts
+@@ -1,6 +1,6 @@
+ import { spawn, type ChildProcess } from "node:child_process";
+ import { createHash, randomUUID } from "node:crypto";
+-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
++import { appendFileSync, existsSync, mkdirSync, readFileSync, openSync, readSync, closeSync, fstatSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+ import { homedir } from "node:os";
+ import { dirname, join } from "node:path";
+ import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
+@@ -20,6 +20,7 @@
+ type Outcome = "running" | "exit" | "timeout" | "abort" | "error";
+ 
+ type BackgroundBashDetails = BashToolDetails & {
++	handle?: string;
+ 	jobId: string;
+ 	command: string;
+ 	outcome: Outcome;
+@@ -41,6 +42,7 @@
+ 	command: string;
+ 	timeout?: number;
+ 	background?: boolean;
++	service?: boolean;
+ };
+ 
+ type CompletedBashRun =
+@@ -59,6 +61,7 @@
+ 			details: BashToolDetails | undefined;
+ 			outcome: Outcome;
+ 			exitCode: number | null;
++			signal?: NodeJS.Signals;
+ 	  };
+ 
+ type PbbIdentity = {
+@@ -85,6 +88,11 @@
+ 	id: string;
+ 	command: string;
+ 	toolCallId: string;
++	ownerSessionId?: string;
++	service?: boolean;
++	capacityHandoff?: boolean;
++	completion?: Promise<CompletedBashRun>;
++	startError?: string;
+ 	abortController: AbortController;
+ 	startedAt: number;
+ 	cwd?: string;
+@@ -107,6 +115,7 @@
+ 	command: Type.String({ description: "Bash command to execute" }),
+ 	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+ 	background: Type.Optional(Type.Boolean({ description: "Run immediately in the background and return a job id" })),
++	service: Type.Optional(Type.Boolean({ description: "Run as a long-lived background service that does not delay session completion; default false" })),
+ });
+ 
+ const JOB_ID_PREFIX = "bg";
+@@ -214,6 +223,12 @@
+ 		laneRoot: process.env.PI_LANE_ROOT,
+ 		root: process.env.PBB_ROOT || join(homedir(), ".pi", "pbb"),
+ 	};
++}
++
++function currentPiSessionId(ctx: { sessionManager: { getSessionFile(): string | null | undefined; getSessionId(): string | null | undefined } }): string {
++	const sessionId = ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId();
++	if (!sessionId) throw new Error("Cannot track background bash job without a Pi session identity.");
++	return sessionId;
+ }
+ 
+ function asRecord(value: unknown): Record<string, unknown> | undefined {
+@@ -427,6 +442,7 @@
+ 		lane: job.pbb.lane,
+ 		jobId: job.id,
+ 		globalJobId: `${job.pbb.instanceId}:${job.id}`,
++					handle: `pbb:${job.pbb.instanceId}:${job.id}`,
+ 		...data,
+ 	})}\n`);
+ 	return eventId;
+@@ -440,6 +456,7 @@
+ 		schemaVersion: 1,
+ 		jobId: job.id,
+ 		globalJobId: `${job.pbb.instanceId}:${job.id}`,
++					handle: `pbb:${job.pbb.instanceId}:${job.id}`,
+ 		command: job.command,
+ 		toolCallId: job.toolCallId,
+ 		cwd: patch.cwd ?? job.cwd,
+@@ -503,6 +520,7 @@
+ 		status: completed.outcome === "exit" ? "exited" : completed.outcome,
+ 		outcome: completed.outcome,
+ 		exitCode: completed.exitCode,
++		signal: completed.status === "error" ? completed.signal : undefined,
+ 		completedAt: new Date().toISOString(),
+ 		durationMs,
+ 		lastEventId: job.lastEventId,
+@@ -571,15 +589,29 @@
+ 			resolve(completed);
+ 		};
+ 
+-		const child = spawn("bash", ["-lc", params.command], {
++		const managedRuntime = (globalThis as any)[Symbol.for("braid.native-runtime.v1")];
++		let child: ChildProcess;
++		let managedStartup: Promise<unknown> | undefined;
++		try {
++		child = (managedRuntime?.spawnManaged ?? spawn)("bash", ["-c", params.command], {
+ 			cwd,
+ 			env: process.env,
+ 			detached: true,
+ 			stdio: ["ignore", "pipe", "pipe"],
+-		});
++		}, { kind: "tool", service: job.service, manifest: job.pbb ? join(pbbJobsDir(job.pbb), `${job.id}.json`) : undefined });
++		managedStartup = managedRuntime?.waitManagedStartup(child);
++		} catch (error) {
++			job.startError = error instanceof Error ? error.message : String(error);
++			finish({ status: "error", error, body: job.startError, details: undefined, outcome: "error", exitCode: null });
++			return;
++		}
+ 		job.child = child;
+ 		job.pid = child.pid;
+ 		job.pgid = child.pid;
++		managedStartup?.catch((error) => {
++			job.startError = error instanceof Error ? error.message : String(error);
++			finish({ status: "error", error, body: job.startError, details: undefined, outcome: "error", exitCode: 75 });
++		});
+ 		writePbbJob(job, { pid: child.pid, pgid: child.pid, runner: "pbb" });
+ 
+ 		const append = (chunk: Buffer) => {
+@@ -616,15 +648,16 @@
+ 			finish({ status: "error", error, body: error.message, details: undefined, outcome: "error", exitCode: null });
+ 		});
+ 
+-		child.on("close", (code, signalName) => {
++		child.on("close", async (code, signalName) => {
++			await managedRuntime?.finishManagedProcess(child, { exit_code: code, signal: signalName, observed_at: Date.now() });
+ 			if (timedOut) {
+ 				const body = completionBody(output, `Command timed out after ${params.timeout} seconds`);
+-				finish({ status: "error", error: new Error(body), body, details: undefined, outcome: "timeout", exitCode: null });
++				finish({ status: "error", error: new Error(body), body, details: undefined, outcome: "timeout", exitCode: code, signal: signalName ?? undefined });
+ 				return;
+ 			}
+ 			if (aborted || signalName) {
+ 				const body = completionBody(output, "Command aborted");
+-				finish({ status: "error", error: new Error(body), body, details: undefined, outcome: "abort", exitCode: null });
++				finish({ status: "error", error: new Error(body), body, details: undefined, outcome: "abort", exitCode: code, signal: signalName ?? undefined });
+ 				return;
+ 			}
+ 			if (code === 0) {
+@@ -682,7 +715,7 @@
+ }
+ 
+ function writeForegroundFullOutput(body: string): string {
+-	const dir = join(homedir(), ".pi", "pbb", "truncated");
++	const dir = join(process.env.PBB_ROOT || join(homedir(), ".pi", "pbb"), "truncated");
+ 	mkdirSync(dir, { recursive: true });
+ 	const path = join(dir, `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}.log`);
+ 	writeFileSync(path, body);
+@@ -743,7 +776,7 @@
+ 
+ const pendingBackgroundResultFollowUps: PendingBackgroundResultFollowUp[] = [];
+ 
+-function deliverBackgroundResultFollowUp(pi: ExtensionAPI, item: PendingBackgroundResultFollowUp): void {
++function deliverBackgroundResultFollowUp(pi: ExtensionAPI, item: PendingBackgroundResultFollowUp, triggerTurn = true): void {
+ 	if (shuttingDown) return;
+ 	repairDetachedBackgroundToolResults(item.job.repairContext, item.job.toolCallId, { rewriteFile: item.job.repairContext?.isIdle?.() === true });
+ 	pi.sendMessage(
+@@ -753,14 +786,25 @@
+ 			display: true,
+ 			details: item.details,
+ 		},
+-		{ deliverAs: "followUp", triggerTurn: true },
++		{ deliverAs: "followUp", triggerTurn: triggerTurn && !item.job.service },
+ 	);
+ }
+ 
+-function flushPendingBackgroundResultFollowUps(pi: ExtensionAPI): void {
++function flushPendingBackgroundResultFollowUps(pi: ExtensionAPI, triggerTurn = true): void {
+ 	if (shuttingDown || pendingBackgroundResultFollowUps.length === 0) return;
+ 	const items = pendingBackgroundResultFollowUps.splice(0);
+-	for (const item of items) deliverBackgroundResultFollowUp(pi, item);
++	if (items.length === 1) {
++		deliverBackgroundResultFollowUp(pi, items[0], triggerTurn);
++		return;
++	}
++	// Completions queued during one inference are one observation batch, not
++	// separate user requests. Keep every result, but wake Pi only once.
++	for (const item of items) {
++		repairDetachedBackgroundToolResults(item.job.repairContext, item.job.toolCallId, { rewriteFile: item.job.repairContext?.isIdle?.() === true });
++	}
++	pi.sendMessage({ customType: CUSTOM_TYPE, content: items.map((item) => item.content).join("\n\n"), display: true,
++		details: { jobs: items.map((item) => item.details) } },
++		{ deliverAs: "followUp", triggerTurn: triggerTurn && items.some((item) => !item.job.service) });
+ }
+ 
+ function sendBackgroundResultFollowUp(pi: ExtensionAPI, job: ActiveJob, content: string, details: BackgroundBashDetails): void {
+@@ -783,12 +827,11 @@
+ }
+ 
+ function deliverBackgroundResult(pi: ExtensionAPI, job: ActiveJob, completed: CompletedBashRun, cwd: string) {
++	const durationMs = Date.now() - job.startedAt;
++	recordPbbJobCompleted(job, completed, cwd, durationMs);
+ 	activeJobs.delete(job.id);
+ 	pendingJobs.finish(job.id);
+-	if (shuttingDown) return;
+-
+-	const durationMs = Date.now() - job.startedAt;
+-	recordPbbJobCompleted(job, completed, cwd, durationMs);
++	if (shuttingDown || job.capacityHandoff) return;
+ 	const body = truncateBackgroundBody(job, completed.body);
+ 	const content = buildXmlResult(job, completed.outcome, completed.exitCode, durationMs, body);
+ 	const details: BackgroundBashDetails = {
+@@ -809,6 +852,7 @@
+ 					instanceId: job.pbb.instanceId,
+ 					lane: job.pbb.lane,
+ 					globalJobId: `${job.pbb.instanceId}:${job.id}`,
++					handle: `pbb:${job.pbb.instanceId}:${job.id}`,
+ 					pbbCursor: job.lastEventId,
+ 				}
+ 			: {}),
+@@ -884,6 +928,7 @@
+ 					instanceId: job.pbb.instanceId,
+ 					lane: job.pbb.lane,
+ 					globalJobId: `${job.pbb.instanceId}:${job.id}`,
++					handle: `pbb:${job.pbb.instanceId}:${job.id}`,
+ 					pbbCursor: job.lastEventId,
+ 				}
+ 			: {}),
+@@ -898,8 +943,6 @@
+ 		job.abortController.abort();
+ 		if (job.runner === "pbb") killProcessGroup(job.pgid ?? job.pid, "SIGTERM");
+ 	}
+-	activeJobs.clear();
+-	pendingJobs.clear();
+ }
+ 
+ function installProcessHooks() {
+@@ -908,7 +951,17 @@
+ 	// Best-effort last resort. Normal cleanup happens on Pi's session_shutdown event;
+ 	// do not install SIGINT/SIGTERM handlers here because that would interfere with
+ 	// Pi's own process-level signal handling.
+-	process.once("exit", abortAllJobs);
++	process.once("exit", () => {
++		// The event loop cannot observe child exits here. Never claim cancellation.
++		for (const job of activeJobs.values()) {
++			try {
++				writePbbJob(job, { status: "unknown", outcome: "unknown", reason: "owner_exited_before_completion" });
++			} catch (error) {
++				console.error(`Could not record unknown outcome for ${job.id}:`, error);
++			}
++		}
++		abortAllJobs();
++	});
+ }
+ 
+ function restoreJobCounterFromSession(ctx: { sessionManager?: { getEntries?: () => unknown[] } }) {
+@@ -917,7 +970,8 @@
+ 	for (const entry of entries as Array<Record<string, unknown>>) {
+ 		const details = entry.details as Record<string, unknown> | undefined;
+ 		const content = typeof entry.content === "string" ? entry.content : undefined;
+-		const candidates = [details?.jobId, content?.match(/<pi_context\b[^>]*\bid="(bg\d{3,})"/)?.[1]];
++		const batch = Array.isArray(details?.jobs) ? details.jobs as Record<string, unknown>[] : [];
++		const candidates = [details?.jobId, ...batch.map((job) => job.jobId), content?.match(/<pi_context\b[^>]*\bid="(bg\d{3,})"/)?.[1]];
+ 		for (const candidate of candidates) {
+ 			const n = parseJobNumber(candidate);
+ 			if (n !== undefined) max = Math.max(max, n);
+@@ -926,8 +980,40 @@
+ 	nextJobNumber = Math.max(nextJobNumber, max + 1);
+ }
+ 
+-export default function backgroundBashExtension(pi: ExtensionAPI) {
++function pendingCompletionJobs(): ActiveJob[] {
++	return [...activeJobs.values()].filter((job) => job.ownerSessionId && !job.service);
++}
++
++export default async function backgroundBashExtension(pi: ExtensionAPI) {
+ 	installProcessHooks();
++	const managedRuntime = (globalThis as any)[Symbol.for("braid.native-runtime.v1")];
++	const unregisterManaged = managedRuntime?.registerManagedProvider("pi-background-bash", () => {
++		const finite = [...activeJobs.values()].some((job) => !job.service);
++		const pending = pendingBackgroundResultFollowUps.length > 0;
++		return {
++			status: activeJobs.size || pending ? "busy" : "quiescent",
++			services_only: activeJobs.size > 0 && !finite && !pending,
++			reason: finite ? "finite_job_active" : pending ? "result_not_consumed" : "services_only",
++		};
++	}, async () => {
++		const jobs = [...activeJobs.values()];
++		if (pendingBackgroundResultFollowUps.length || jobs.some((job) => !job.service || !job.child?.managedProcessRecord || !job.completion)) {
++			throw new Error("Service handoff requires only registered service jobs with no pending result.");
++		}
++		for (const job of jobs) job.capacityHandoff = true;
++		for (const job of jobs) {
++			const stop = await managedRuntime.finishManagedProcess(job.child, { observation: "capacity_service_handoff", observed_at: Date.now() });
++			if (stop?.status !== "stopped") throw new Error(`Service ${job.id} stop proof failed: ${stop?.reason ?? "unknown"}`);
++			await job.completion;
++		}
++	});
++	// PBB drains its own finite jobs; the cross-plugin API is only needed when subagents is selected.
++	const unregisterBackgroundWork = process.env.BRAID_NATIVE_SUBAGENTS_ENABLED === "1"
++		? (await import("pi-subagents/background-work")).registerBackgroundWorkProvider({
++			name: "pi-background-bash",
++			listActiveWork: () => pendingCompletionJobs().map((job) => ({ id: job.id, sessionId: job.ownerSessionId! })),
++		})
++		: undefined;
+ 
+ 	pi.registerMessageRenderer<BackgroundBashDetails>(CUSTOM_TYPE, (message, options, theme) => {
+ 		const details = message.details;
+@@ -949,16 +1035,41 @@
+ 	});
+ 
+ 	pi.on("session_shutdown", async () => {
++		const jobs = [...activeJobs.values()];
+ 		abortAllJobs();
++		const outcomes = await Promise.allSettled(jobs.map((job) => job.completion ??
++			Promise.reject(new Error(`Background bash job ${job.id} has no completion promise.`))));
++		unregisterBackgroundWork?.();
++		unregisterManaged?.();
++		// Completion callbacks have persisted their results before notifications are discarded.
+ 		pendingBackgroundResultFollowUps.length = 0;
+ 		pendingJobs.detach();
+-	});
+-
+-	pi.on("agent_end", async () => {
+-		// Treat agent_end as the event-driven idle boundary, but defer one macrotask
+-		// so Pi can finish unwinding the just-ended turn before the follow-up starts.
+-		const handle = setImmediate(() => flushPendingBackgroundResultFollowUps(pi));
+-		handle.unref?.();
++		for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
++	});
++
++	const retainTerminalBackground = (outcome: "error" | "aborted") => {
++		// Preserve results without scheduling inference or changing active job ownership.
++		flushPendingBackgroundResultFollowUps(pi, false);
++		pi.sendMessage({ customType: "background-bash-terminal-work", content: "Inference did not complete; active bash jobs remain available for recovery.", display: false,
++			details: { outcome, jobs: [...activeJobs.values()].map((job) => ({ id: job.id, sessionId: job.ownerSessionId, service: job.service === true })) } }, { triggerTurn: false });
++	};
++	pi.on("agent_before_settle", async (event, ctx) => {
++		if (event.outcome !== "completed") {
++			retainTerminalBackground(event.outcome);
++			return;
++		}
++		// Child Pi sessions may load PBB without pi-subagents. Await their own
++		// finite jobs before non-interactive shutdown can abort them; RPC has a UI proxy.
++		if (ctx.mode !== "tui") await Promise.all(pendingCompletionJobs().map((job) => {
++			if (!job.completion) throw new Error(`Background bash job ${job.id} has no completion promise.`);
++			return job.completion;
++		}));
++		// Queue completions in Pi's native follow-up loop before agent_settled.
++		flushPendingBackgroundResultFollowUps(pi);
++	});
++
++	pi.on("agent_settled", (event) => {
++		if (event.aborted) retainTerminalBackground("aborted");
+ 	});
+ 
+ 	pi.on("context", (event) => {
+@@ -966,19 +1077,84 @@
+ 		if (messages) return { messages };
+ 	});
+ 
++
++	pi.registerTool({
++		name: "background_job",
++		label: "Background job",
++		description: "Read or wait for a specific Bash job by copying the actual Handle printed in the Bash startup response (never construct an instance placeholder). Terminal results remain available while the Agent is busy; do not use subagent_wait or pgrep for Bash jobs. result is immediate; wait has a bounded timeout; stop requests owned process-group shutdown and confirms it. Persistent servers must be launched with bash service:true. This reports the shell exit code, so preserve a suite's original exit code before formatting logs.",
++		parameters: Type.Object({
++			operation: Type.Union([Type.Literal("result"), Type.Literal("wait"), Type.Literal("stop")]),
++			handle: Type.String({ description: "Copy the actual Handle printed in the Bash result; a legacy bgNNN is resolved only in this current owner" }),
++			timeoutSeconds: Type.Optional(Type.Number({ minimum: 0, maximum: 300 })),
++		}),
++		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
++			const reply = (details: Record<string, unknown>, isError = false) => { if (isError) throw new Error(JSON.stringify(details)); return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details }; };
++			try {
++				const identity = pbbIdentity(ctx);
++				if (!identity) throw new Error("OWNER_UNAVAILABLE: persistent PBB identity is required");
++				const candidates = () => {
++					const jobs = pbbJobsDir(identity);
++					return existsSync(jobs) ? readdirSync(jobs).filter(name => /^bg[0-9]+\.json$/.test(name)).map(name => `pbb:${identity.instanceId}:${name.slice(0, -5)}`) : [];
++				};
++				// Local IDs are meaningful only in this process owner, never a search
++				// across old instances where the same bg number may name other work.
++				const requested = /^bg[0-9]+$/.test(params.handle) ? `pbb:${identity.instanceId}:${params.handle}` : params.handle;
++				const match = /^pbb:([A-Za-z0-9_.-]+):(bg[0-9]+)$/.exec(requested);
++				if (!match) throw new Error(`WRONG_HANDLE: copy the actual Handle printed by bash; current-owner handles: ${candidates().join(", ") || "none"}`);
++				const [, instance, local] = match;
++				const path = join(pbbSessionDir(identity), "instances", instance, "jobs", `${local}.json`);
++				const read = () => {
++					if (!existsSync(path)) throw new Error(`UNKNOWN_JOB: no retained result for this session and handle; current-owner handles: ${candidates().join(", ") || "none"}`);
++					const record = JSON.parse(readFileSync(path, "utf8"));
++					if (record.sessionKey !== identity.sessionKey || record.instanceId !== instance || record.jobId !== local) throw new Error("OWNER_MISMATCH: invalid retained job identity");
++					return record;
++				};
++				let record = read();
++				const started = Date.now();
++				const deadline = started + (params.timeoutSeconds ?? 30) * 1000;
++				const groupAlive = () => {
++					if (!Number.isInteger(record.pgid) || record.pgid <= 0) throw new Error("PROCESS_IDENTITY_MISSING: cannot confirm service shutdown");
++					try { process.kill(-record.pgid, 0); return true; }
++					catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
++				};
++				if (params.operation === "stop") {
++					const job = activeJobs.get(local!);
++					if (instance !== identity.instanceId || !job || job.pbb?.instanceId !== instance || job.ownerSessionId !== currentPiSessionId(ctx)) throw new Error("OWNER_UNAVAILABLE: stop requires this live owner; use explicit pbb stale control for old owners");
++					job.abortController.abort();
++				}
++				while (params.operation !== "result") {
++					if (signal?.aborted) throw new Error("ABORTED: query cancelled; job state is retained");
++					record = read();
++					const terminal = !["running", "kill_requested"].includes(record.status);
++					if (params.operation === "stop" && Date.now() - started >= 500 && groupAlive()) killProcessGroup(record.pgid, "SIGKILL");
++					if (terminal && (params.operation !== "stop" || !groupAlive())) break;
++					if (Date.now() >= deadline) return reply({ handle: requested, status: "wait_timeout", job: record, stopped: false }, true);
++					await new Promise<void>((resolve, reject) => {
++						const done = () => { signal?.removeEventListener("abort", abort); resolve(); };
++						const timer = setTimeout(done, 100);
++						const abort = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); reject(new Error("ABORTED: query cancelled; job state is retained")); };
++						signal?.addEventListener("abort", abort, { once: true });
++					});
++				}
++				const logPath = join(pbbSessionDir(identity), "instances", instance, "logs", `${local}.log`);
++				let body = "", bytes = 0;
++				if (existsSync(logPath)) {
++					const fd = openSync(logPath, "r");
++					try { bytes = fstatSync(fd).size; const buffer = Buffer.alloc(Math.min(bytes, MAX_RESULT_BYTES)); readSync(fd, buffer, 0, buffer.length, Math.max(0, bytes - buffer.length)); body = buffer.toString("utf8"); }
++					finally { closeSync(fd); }
++				}
++				return reply({ handle: requested, job: record, body: body.slice(-MAX_RESULT_BYTES), logPath, truncated: bytes > MAX_RESULT_BYTES, ...(params.operation === "stop" ? { stopped: true } : {}) }, record.outcome === "error" || record.status === "unknown");
++			} catch (error) { return reply({ handle: params.handle, error: error instanceof Error ? error.message : String(error) }, true); }
++		},
++	});
++
+ 	pi.registerTool({
+ 		name: "bash",
+ 		label: "bash",
+-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Verbose background results are truncated with the full output available through pbb tail. Set background: true to run immediately in the background and get a job id. Otherwise, if the command is still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default), it is automatically moved to the background; a <pi_context source="pi-background-bash" kind="background_bash_result"> message is injected when it finishes. Optionally provide a timeout in seconds.`,
+-		promptSnippet: `Execute bash commands (ls, grep, find, etc.); timeout is in seconds. Set background: true for long-running non-interactive commands. Commands still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default) automatically move to background and wake you with a pi-background-bash result when finished.`,
+-		promptGuidelines: [
+-			"Use bash with background: true for long-running non-interactive commands such as builds, full test suites, dev servers, watchers, deploys, downloads, or commands you do not need before the next step.",
+-			`Use bash normally for shell commands; Pi automatically moves bash commands that run longer than the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default) to the background.`,
+-			"When bash reports that a command started or moved to background, do not retry it just to wait; continue independent work or tell the user the job is running.",
+-			"Use the pbb CLI (`pbb list`, `pbb status <job>`, `pbb tail <job>`) only when you need progress before the completion follow-up arrives, need full truncated logs, or need to manage a job; pbb defaults to the current pi-lane runtime instance when available.",
+-			"When a <pi_context source=\"pi-background-bash\" kind=\"background_bash_result\"> message appears, treat it like the final result of the original bash command.",
+-			"Do not use bash for interactive commands that require stdin unless the user explicitly asks for that behavior.",
+-		],
++		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Optionally provide a timeout in seconds. Set background:true to run a long non-interactive command immediately in the background and get a job id and pbb handle for background_job; otherwise commands still running after the configured threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default) automatically move to background. Set service:true for a persistent server or watcher; it starts in the background and does not delay session completion.
++A <pi_context source="pi-background-bash" kind="background_bash_result"> message carries the final result of the original command. Obtain that result and exit code before reporting completion. Do not retry a background command merely to wait. Verbose results are truncated; use pbb tail for full logs. Use pbb list/status/tail only for early progress, full logs, or job management; pbb defaults to the current pi-lane runtime instance, so an empty current list does not describe old jobs. After session replacement, read retained results with pbb status/tail and the returned globalJobId.
++Do not use bash for interactive commands requiring stdin unless the user explicitly asks.`,
++		promptSnippet: "Execute shell commands and manage background jobs.",
+ 		parameters: schema,
+ 		async execute(toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<BashToolDetails | BackgroundBashDetails>> {
+ 			const autoAfterSeconds = getAutoBackgroundAfterSeconds(ctx.cwd);
+@@ -987,7 +1163,7 @@
+ 				throw new Error("Command aborted");
+ 			}
+ 
+-			if (params.background) {
++			if (params.background || params.service) {
+ 				if (activeJobs.size >= MAX_ACTIVE_JOBS) {
+ 					throw new Error(`Too many bash jobs running (${activeJobs.size}/${MAX_ACTIVE_JOBS}). Wait for one to finish before starting another.`);
+ 				}
+@@ -996,6 +1172,8 @@
+ 					id: formatJobId(nextJobNumber++),
+ 					command: params.command,
+ 					toolCallId,
++					ownerSessionId: currentPiSessionId(ctx),
++					service: params.service === true,
+ 					abortController: new AbortController(),
+ 					startedAt: Date.now(),
+ 					cwd: ctx.cwd,
+@@ -1009,20 +1187,32 @@
+ 					id: job.id,
+ 					text: job.command,
+ 					startedAt: job.startedAt,
+-					details: { toolCallId: job.toolCallId },
++					details: { toolCallId: job.toolCallId, ownerSessionId: job.ownerSessionId, service: job.service },
+ 				});
+ 
+ 				const completedPromise = runPbbBash(job, ctx.cwd, params);
++				const managedRuntime = (globalThis as any)[Symbol.for("braid.native-runtime.v1")];
++				if (job.child && managedRuntime) await managedRuntime.waitManagedStartup(job.child);
++				if (job.startError) {
++					const completed = await completedPromise;
++					recordPbbJobCompleted(job, completed, ctx.cwd, Date.now() - job.startedAt);
++					activeJobs.delete(job.id);
++					pendingJobs.finish(job.id);
++					throw new Error(job.startError);
++				}
+ 				// Capture cwd eagerly: the completion callback may fire after session
+ 				// teardown (headless one-shot exit), when ctx.cwd access throws.
+ 				const jobCwd = ctx.cwd;
+-				void completedPromise.then((completed) => {
++				job.completion = completedPromise.then((completed) => {
+ 					deliverBackgroundResult(pi, job, completed, jobCwd);
++					return completed;
+ 				});
+ 				scheduleDetachedBackgroundToolResultRepair(ctx, toolCallId);
+ 
+ 				return {
+-					content: [{ type: "text", text: `Bash job ${job.id} started in background. A follow-up result will arrive when it finishes; continue independent work. Use pbb only if you need progress before completion.` }],
++					content: [{ type: "text", text: params.service
++						? `Bash service ${job.id} started in background. Handle: ${job.pbb ? `pbb:${job.pbb.instanceId}:${job.id}` : "unavailable (no persistent owner identity)"}. Use background_job with this actual handle. It stays active until stopped or session shutdown; continue independent work.`
++						: `Bash job ${job.id} started in background. Handle: ${job.pbb ? `pbb:${job.pbb.instanceId}:${job.id}` : "unavailable (no persistent owner identity)"}. Use background_job with this actual handle. A follow-up result will arrive when it finishes; continue independent work. Use pbb only if you need progress before completion.` }],
+ 					details: runningJobDetails(job, ctx.cwd),
+ 				};
+ 			}
+@@ -1041,7 +1231,8 @@
+ 				if (signal?.aborted) forwardAbort();
+ 				else signal?.addEventListener("abort", forwardAbort, { once: true });
+ 				try {
+-					const completed = await runPbbBash(job, ctx.cwd, params, onUpdate);
++					job.completion = runPbbBash(job, ctx.cwd, params, onUpdate);
++					const completed = await job.completion;
+ 					if (completed.status === "success") return truncateForegroundResult(job, completed);
+ 					rethrowBashError(completed, job);
+ 				} finally {
+@@ -1078,6 +1269,7 @@
+ 				latestBody = getText(update);
+ 				if (!backgrounded) onUpdate?.(update);
+ 			});
++			job.completion = completedPromise;
+ 
+ 			const winner = await Promise.race([completedPromise, waitForBackgroundThreshold(autoAfterSeconds)]);
+ 			if (winner !== "background") {
+@@ -1093,6 +1285,8 @@
+ 			job.id = formatJobId(nextJobNumber++);
+ 			job.cwd = ctx.cwd;
+ 			job.pbb = pbbIdentity(ctx);
++			job.ownerSessionId = currentPiSessionId(ctx);
++			job.service = params.service === true;
+ 			activeJobs.set(job.id, job);
+ 			recordPbbJobStarted(job, ctx.cwd);
+ 			appendPbbLogDelta(job, latestBody);
+@@ -1100,19 +1294,20 @@
+ 				id: job.id,
+ 				text: job.command,
+ 				startedAt: job.startedAt,
+-				details: { toolCallId: job.toolCallId },
++				details: { toolCallId: job.toolCallId, ownerSessionId: job.ownerSessionId, service: job.service },
+ 			});
+ 
+ 			// Capture cwd eagerly: the completion callback may fire after session
+ 			// teardown (headless one-shot exit), when ctx.cwd access throws.
+ 			const jobCwd = ctx.cwd;
+-			void completedPromise.then((completed) => {
++			job.completion = completedPromise.then((completed) => {
+ 				deliverBackgroundResult(pi, job, completed, jobCwd);
++				return completed;
+ 			});
+ 			scheduleDetachedBackgroundToolResultRepair(ctx, toolCallId);
+ 
+ 			return {
+-				content: [{ type: "text", text: `Bash job ${job.id} moved to background after ${formatThreshold(autoAfterSeconds)}. A follow-up result will arrive when it finishes; continue independent work. Use pbb only if you need progress before completion.` }],
++				content: [{ type: "text", text: `Bash job ${job.id} moved to background after ${formatThreshold(autoAfterSeconds)}. Handle: ${job.pbb ? `pbb:${job.pbb.instanceId}:${job.id}` : "unavailable (no persistent owner identity)"}. Use background_job with this actual handle. A follow-up result will arrive when it finishes; continue independent work. Use pbb only if you need progress before completion.` }],
+ 				details: runningJobDetails(job, ctx.cwd),
+ 			};
+ 		},
+--- a/skills/pbb/SKILL.md
++++ b/skills/pbb/SKILL.md
+@@ -55,3 +55,9 @@
+ - If a job is ambiguous or belongs to another instance, ask before operating on it.
+ - `pbb kill` is intentionally conservative; same-instance live-runtime control is safest.
+ - Treat `owner=stale` as a warning that the owning Pi runtime may not honor mailbox requests.
++
++## Native job results and control
++
++Copy the actual Handle printed by Bash. Never construct an owner or instance placeholder; a legacy bg id is resolved only by the current owner. Use `background_job` with `operation: result`, `wait`, or `stop` and this exact handle. result reads retained terminal status and bounded output immediately; wait blocks only on this job for a bounded duration; stop requests this live owner to stop its process group and confirms disappearance. Errors are native tool failures with the concrete reason; timeout is not completion, and unknown/stale owner is not a safe automatic kill target. Repeated result reads retain the same job identity and log path. Do not pass Bash handles to subagent_wait or wait on all jobs merely for one suite. Declare persistent servers with `service:true`.
++
++Preserve the original check exit status before summarizing output. PBB records the shell exit code and does not infer application assertions from grep/tail. Automatic completion notifications retain their existing lifecycle; direct result retrieval does not trigger a new Agent turn.

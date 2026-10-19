@@ -1,0 +1,7 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Braid Console</title><link rel="icon" type="image/png" sizes="32x32" href="/favicon.png"><link rel="icon" type="image/svg+xml" sizes="any" href="/favicon.svg"><link rel="stylesheet" href="/console.css"><script src="/console.js" defer></script></head>
+<body>
+<aside><a class="brand" href="#overview"><img class="mark" src="/braid-logo.svg" alt="" width="32" height="32"> Braid <small>Console</small></a><nav aria-label="主导航"><a href="#overview">概览</a><a href="#traces">Trace 时间轴</a><a href="#logs">日志与会话</a><a href="#metrics">指标</a><a href="#objects">协作空间</a></nav><p class="aside-note">OTLP Collector<br>运行事实由 Braid 提供<br>采集记录不代表业务完成</p></aside>
+<main><header><div><p class="eyebrow">LOCAL OBSERVABILITY & CONTROL</p><h1 id="page-title">概览</h1></div><button id="refresh" type="button">刷新</button></header><div id="notice" role="status" aria-live="polite"></div><div id="content" aria-busy="true"></div><footer>数据仅包含已收到的 OTLP 记录；未收到的内容与采样缺口无法据此还原。</footer></main>
+</body></html>

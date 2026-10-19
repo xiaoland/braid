@@ -1,0 +1,10 @@
+--- a/dist/utils/retry.js
++++ b/dist/utils/retry.js
+@@ -50,6 +50,7 @@
+     "connection.?error",
+     "connection.?refused",
+     "connection.?lost",
++    "connection reset by peer",
+     "other side closed",
+     "fetch failed",
+     "getaddrinfo",

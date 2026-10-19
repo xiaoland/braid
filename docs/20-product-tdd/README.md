@@ -1,4 +1,4 @@
-# Product TDD: GitHub Working Memory Runtime
+# Product TDD: Working Memory Runtime
 
 This document owns Braid's cross-unit authority, topology, state ownership, and
 Rust realization. It deliberately excludes unit algorithms that are evident
@@ -20,43 +20,71 @@ from typed code and external wire details owned by the linked contracts.
 ## Authority and Topology
 
 ```text
-GitHub webhook ──verify/durable ingest──┐
-                                       ├─> canonical object ledger
-GitHub GraphQL/REST reconciliation ────┘          │
-                                                  v
-                                        Context materializer
-                                                  │
-                                  canonical diff + Event References
-                                                  │
-                              event classifier / debounce scheduler
-                                                  │
-                              Agent Group + logical session manager
-                                                  │
-                                     provider adapter (Codex v1)
+GitHub (object authority) ── webhook / canonical API ──┐
+                                                      ├─> Harness collaboration adapter
+Built-in platform (object authority) ── HTTP / events ┘             │
+                                                                   v
+                                                     Harness ledger / event cursor
+                                                                   │
+                                                Context / scheduler / Agent Group
+                                                                   │
+                                                          provider / worktree
 
-Agent ── braid gh ──> Braid write outbox ──> GitHub ──> origin-correlated echo
-Agent ── ordinary gh/git ─────────────────> GitHub ──> ordinary external event
+Agent ── Harness gateway / writer grant ──> selected platform API
+Harness outbox ── idempotent write ───────> selected platform API
 
-Quick Tunnel ──> loopback webhook ingress
-OTel SDK ──sampled OTLP──> operator-selected endpoint
+Braid Web Console ── object API ─────────> built-in platform
+                  ├─ runtime controller ─> Harness (either upstream)
+                  └─ OTLP Collector ──────> independent observation store / visualization
+
+Platform, Harness and observations each own their database and lifecycle.
+Quick Tunnel is optional GitHub webhook connectivity, not a Harness mode.
 ```
 
 - **GitHub** owns current Issue/PR bodies, metadata, relationships, comments,
   reviews, lifecycle, identity, and App permissions.
-- **GitHub Context** is a deterministic, complete projection of that state plus
+- **Built-in platform** independently owns its Issue/PR state, actors, event sequence,
+  candidate commits and command receipts; its SQLite is collaboration authority.
+- **Collaboration Context** is a deterministic, complete projection of upstream state plus
   durable deletion tombstones. It is the collaboration memory authority.
 - **Provider** owns physical session data, model execution, provider-native
-  compaction, turn lifecycle, and resume availability.
+  compaction, turn lifecycle, and resume availability. Pi 的锁定原生材料同时拥有
+  plugin 后台结果、物理执行登记及 owned 停止回执；Core turn idle 不推导这些义务
+  已收口。材料的版本与启动合同见 [provider 技术说明](app-server.md)。
 - **Coding Agent** owns interpretation, design/implementation choices, code,
   verification, and its Git/GitHub operations.
-- **Braid** owns canonical reads, projection, logical Agent Group/session
+- **Braid Harness** owns canonical reads, projection, logical Agent Group/session
   generations, scheduling, Context fencing/replacement, provider addressing,
-  PR worktree provisioning, Braid-authored GitHub writes, and mechanical
+  PR worktree provisioning, Braid-authored upstream writes, and mechanical
   idempotency/reconciliation.
 
-SQLite stores enough canonical object metadata and lifecycle tombstones to
+Harness SQLite stores enough canonical object metadata and lifecycle tombstones to
 compare versions, but it does not become an alternate Issue/PR or provider
-transcript authority. A full Context is rebuilt from GitHub before every turn.
+transcript authority. A full Context is rebuilt from the selected upstream before every turn.
+
+## 协作平台与 Harness
+
+一个 Harness 恰好接入 `[github]` 或 `[builtin]`。GitHub 和内建平台拥有上游
+对象权威，不双写或自动同步。内建平台有自己的配置、schema、SQLite 与 API，
+持有仓库、Issue/PR、评论、指派、关联、revision、候选、合并意图及对象回执。
+平台不读取 Profile、assignment、session、turn 或 worktree 执行表。
+
+Harness 的 `collaboration` adapter 从所选上游取得当前对象与默认分支，Group、
+Context、queue、provider 和停止证明共用。内建 adapter 使用 HTTP 平台接口，
+在自己的 ledger 保存平台身份、事件 cursor 和 delivery 去重。平台对象变化
+与稳定事件原子提交，事件不因某一消费者读过而消失；Harness 成功 ingest 后才
+推进自己的 cursor，状态 outbox 通过幂等接口写回平台。
+
+平台 actor 与 Harness Profile 分别拥有含义。Harness gateway 核验当前工作区及
+执行身份，使用平台 writer grant。平台提交事务检查 grant epoch、对象 revision
+和 request ID；执行替换先撤销旧 grant，撤销确认后才能完成 fencing。平台
+保存授权版本，不保存原生会话状态；撤销前已经提交的命令仍属于合法历史。
+
+PR 交接固定 commit OID。Harness 验证工作树责任，平台只在绑定 Git 对象库中
+验证提交并保留可达引用。首版要求两者能访问同一 Git 对象库，不提供远程
+Git 托管。合并用持久意图与 ref CAS 处理 SQLite/Git 边界；模型 Completed 不
+意味着候选被采用或 Issue 完成。旧 local:*对象与事件身份在显式导入时保留，
+历史迁移不可变；平台与 Harness 的 schema 此后各自演进。
 
 ## Single Source of Truth for Schema
 
@@ -70,16 +98,15 @@ against it.
 truth for the config schema. `braid setup` builds a `Config` value and
 serializes it, rather than formatting a template. If the type changes, the
 compiler forces the generator to change with it.
-- **Round-trip tests for generated artifacts**: Any code that emits a
-structured file a Human might edit must be covered by a test that parses the
-output back through the canonical type and validates it.
+- **Generated artifacts**: 配置由 canonical Rust type 序列化；编译与实际公开
+  命令操作核实消费者能解析和使用产物，不维护测试入口。
 - **No parallel string templates**: Do not maintain a separate text template
 for a file whose shape is already defined by a Rust type. Avoid
 `format!`-based generators for config, manifest, or protocol files.
 - **ROI boundary**: Not every documentation snippet is a schema instance.
 Only canonical or generated artifacts participate in SSoT validation. For
 example, `config.example.toml` is the canonical starter template, so it is
-loaded through `Config::load` in tests; a partial snippet in a runbook is not.
+loaded through `Config::load` by the public configuration command; a partial snippet in a runbook is not.
 - **Migrations are the exception**: SQLite schema is forward-only, immutable,
 and checksum-verified; it is not derived from Rust structs because the database
 must outlive any single binary version.
@@ -273,3 +300,28 @@ are outside it and converge only when GitHub reports them.
 - Packaging, OTel, tunnel, migration, and operation:
   [`../40-deployment/README.md`](../40-deployment/README.md)
 - External acceptance oracle: [`../10-prd/acceptance.md`](../10-prd/acceptance.md)
+
+## Console 与控制边界
+
+Console 的 OTLP Collector 保存原始传输批次与完整解码记录，使用独立数据库，
+不能写回对象或执行权威。资源身份、runtime generation、session、turn 与原生
+协议身份显式关联；采样和未关联记录是证据缺口，不是空闲状态。Web 查询分页
+读取该读模型，当前对象来自协作平台 API，执行状态来自 Harness ledger 与 runtime manager。
+
+平台通过有类型的应用命令修改对象。命令 request ID、内容摘要、预期 revision
+与回执持久保存在平台库；普通对象变更与事件、回执一起提交，
+并发正文修改不会覆盖新 revision。发布和合并保留 Git/SQLite 意图边界，不能用
+外层数据库事务假装跨系统原子化。浏览器只能选择固定 source 或由 Harness 验证的候选，不能提供任意路径。
+
+`console::runtime` 持有实际 runtime task、停止通道与启动 generation。Collector
+、平台和控制端点持续存活，Harness 可单独停止。GitHub 与内建上游通过统一 runtime 接口托管。请求接受不等于任务已就绪或已停止；
+监督器等待所有 Group/provider 停止结果，失败进入 blocked 并禁止新执行覆盖。
+Console 不调用 CLI，也不复制 Factory 的实验、赛事或容器生命周期。
+
+## Root 运行入口
+
+有限 `run` 与常驻 `serve` 是 Harness 的运行方式，平台仍是独立上游。`run`
+复用调度、原生 provider 和停止屏障，以独立 ledger 隔离一项 root 工作。父子 Issue、
+关联 PR、交付 ref 和 grant 边界由平台保存；输入绑定、执行状态和终态由 Harness 保存。
+Console 调用同一应用入口并读取当前 run ledger，OTLP 不承担终态权威。
+具体准入、关闭及接续合同见[生命周期说明](lifecycle.md#有限-root-运行)，输入与操作见[run 指南](../user-manual/run.md)。

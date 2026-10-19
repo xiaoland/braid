@@ -1,7 +1,8 @@
 # Braid Project Instructions
 
-This repository implements Braid: GitHub Issue and pull-request state become the
-durable working memory of local Coding Agents. Apply these instructions only in
+This repository implements Braid: collaboration Issue and pull-request state become
+the durable working memory of Coding Agents. GitHub and the built-in platform are
+peer upstreams; the Web Console belongs to Braid as a whole. Apply these instructions only in
 this repository; do not modify user-scope Agent instructions.
 
 <!-- svc:begin navigation sha256=48c8d7b497ed094589c4a192f3ef97450fd7f614712dc1b4b22e9a20578360cd -->
@@ -26,6 +27,9 @@ Use the installed `svc` CLI when SVC guidance or project integration is relevant
 - Project vocabulary: `docs/10-prd/glossary.md`
 - Volatile task control: `tasks/`; retain at most one active packet and delete
   it when the task closes after promoting binding truth.
+- Optional collaboration method: `skills/README.md` lists independent skills
+  with name, description and file path. Discover and read them on demand; do not
+  inline skill bodies into prompts or make them a runtime prerequisite.
 
 ## GitHub Working Memory Protocol
 

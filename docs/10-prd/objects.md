@@ -27,12 +27,18 @@ The exact projection is the [Context contract](../20-product-tdd/context.md).
 
 An Agent Profile is a versioned Braid configuration containing a provider,
 model, reasoning setting, Profile User Instructions, cwd/workspace policy,
-sandbox/approval settings, and optional tools, skills, MCP, or other
-provider-specific resources. Tags declare whether it can serve `issue`, `pr`,
+and supported provider resources. Tags declare whether it can serve `issue`, `pr`,
 or both. The Profile `workspace` names a clean source checkout, never the
 Agent's cwd: every Agent Group session runs in a dedicated generation-scoped
 Braid worktree (the Issue's sole Development branch when unambiguous,
 otherwise the default branch; the PR head for a PR Agent).
+
+Pi Profile 可以明确选择独立技能和原生角色材料。根会话模型与推理仍由 Profile
+决定，Pi 内部 subagent 角色不是可指派的 Braid Profile。材料安装、Profile 选择
+与会话实际装载分别需要依据；材料变化不得在保持旧 Profile 身份的情况下恢复
+原生历史。工具和 MCP 由已支持的原生安装能力提供，目前没有跨 provider 的
+tools/MCP 或 sandbox/approval Profile 配置接口。Factory preset 与 variant 属于
+消费方的装配，不属于 Braid 的 Profile 对象。
 
 Braid adds its own versioned System Prompt when materializing a Provider
 Session. It explains GitHub Working Memory, Braid and `braid gh`, concise public
@@ -48,3 +54,11 @@ sub-agent roles. MVP acceptance deliberately uses:
 
 Multi-Agent fan-out is not rejected, but cross-peer ordering, semantic merge,
 arbitration, and convergence are outside the MVP correctness claim.
+
+### 内建空间的对象
+
+Local Issue 和 PR 共享递增编号，使用稳定空间名称标识；编号不是 GitHub ID。
+正文、评论、负责人及关联由 Braid 持久保存。当前沿用一个 Issue Profile 与默认
+PR Profile，拒绝指派到没有对应执行者的配置。Issue 指派物化会话，后续评论唤醒
+设计工作；PR 指派启动实施。关闭与重开沿用当前逻辑会话生命周期，空间本身持续
+存在。评论和描述是工作数据，不获得系统指令权限。

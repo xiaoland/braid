@@ -1,24 +1,40 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
+use std::path::PathBuf;
+use std::process::ExitStatus;
+
+#[path = "pi_runtime.rs"]
+mod runtime;
+
+struct PiRequest {
+    response: oneshot::Sender<Result<Value, ProviderError>>,
+    turn_id: Option<String>,
+}
+
+type PiPendingRequests = BTreeMap<i64, PiRequest>;
 
 struct PiProcess {
-    writer: ChildStdin,
-    _child: Child,
+    writer: Option<ChildStdin>,
+    child: Child,
     #[allow(dead_code)]
     stdout_handle: tokio::task::JoinHandle<()>,
     #[allow(dead_code)]
     stderr_handle: tokio::task::JoinHandle<()>,
+    execution: Option<runtime::Execution>,
 }
 
 struct PiState {
     config: PiConfig,
-    pending: Arc<Mutex<PendingRequests>>,
+    pending: Arc<Mutex<PiPendingRequests>>,
     next_request_id: Arc<AtomicI64>,
     process: Option<PiProcess>,
     session: Option<String>,
     developer_instructions: String,
     context: String,
-    current_turn_id: Option<String>,
+    native_session_id: Option<String>,
+    native_home_key: Option<String>,
+    expected_profile_skills: Vec<String>,
+    close_result: Option<Result<(), String>>,
 }
 
 #[derive(Clone)]
@@ -31,6 +47,10 @@ pub struct PiProvider {
 }
 
 impl PiProvider {
+    pub(crate) fn validate_material(config: &PiConfig) -> Result<(), ProviderError> {
+        runtime::load(config).map(|_| ())
+    }
+
     pub fn connect(config: &PiConfig) -> Self {
         let (notifications, _) = broadcast::channel(512);
         let (closed, _) = watch::channel(false);
@@ -42,7 +62,10 @@ impl PiProvider {
             session: None,
             developer_instructions: String::new(),
             context: String::new(),
-            current_turn_id: None,
+            native_session_id: None,
+            native_home_key: None,
+            expected_profile_skills: Vec::new(),
+            close_result: None,
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -56,11 +79,34 @@ impl PiProvider {
     fn spawn(
         &self,
         state: &mut PiState,
+        profile: &Profile,
         workspace: &Path,
         session: Option<&str>,
     ) -> Result<(), ProviderError> {
-        let mut cmd = Command::new(&state.config.executable);
-        cmd.args(["--mode", "rpc"]);
+        state.close_result = None;
+        let material = runtime::load(&state.config)?;
+        let execution =
+            material.as_ref().map(|material| material.execution(workspace)).transpose()?;
+        let mut cmd = if let Some(execution) = &execution {
+            execution.command(&state.config.executable)
+        } else {
+            Command::new(&state.config.executable)
+        };
+        cmd.args(["--mode", "rpc", "--no-skills"]);
+        if execution.is_none() {
+            // External Pi is a base adapter; unmanaged ambient plugins cannot
+            // satisfy Braid's background result and owned-stop contract.
+            cmd.arg("--no-extensions");
+            for key in [
+                "BRAID_NATIVE_RUNTIME_MODULE",
+                "BRAID_NATIVE_EXECUTION_DIR",
+                "BRAID_NATIVE_EXECUTION_ID",
+                "BRAID_NATIVE_START_ID",
+                "BRAID_NATIVE_LAUNCH_START_ID",
+            ] {
+                cmd.env_remove(key);
+            }
+        }
         let session_dir = workspace.join(".braid").join("pi-sessions");
         std::fs::create_dir_all(&session_dir).map_err(|error| {
             ProviderError::Protocol(format!(
@@ -78,37 +124,22 @@ impl PiProvider {
         if let Some(thinking) = &state.config.thinking {
             cmd.args(["--thinking", thinking]);
         }
-        if let Some(home) = &state.config.home {
-            cmd.env("PI_CODING_AGENT_DIR", home);
+        let (home, skills) = Self::materialize_profile(state, profile, workspace, session)?;
+        cmd.env("PI_CODING_AGENT_DIR", &home);
+        for skill in &skills {
+            cmd.arg("--skill").arg(home.join("braid-skills").join(&skill.name));
         }
         if let Ok(api_key) = state.config.api_key()
             && let Some(api_key_env) = &state.config.api_key_environment
         {
             cmd.env(api_key_env, api_key);
         }
-        // Ensure the spawned Pi process can find the same `braid` binary and config
-        // so it can execute `braid gh` and `gh` shell commands.
-        if let Ok(current_exe) = std::env::current_exe()
-            && let Some(exe_dir) = current_exe.parent()
-        {
-            let mut path_parts: Vec<String> =
-                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect();
-            let exe_dir_str = exe_dir.to_string_lossy().into_owned();
-            if !path_parts.iter().any(|p| p == &exe_dir_str) {
-                path_parts.insert(0, exe_dir_str);
-            }
-            cmd.env("PATH", std::env::join_paths(path_parts).unwrap_or_default());
-        }
-        if let Ok(braid_config) = std::env::var("BRAID_CONFIG") {
-            cmd.env("BRAID_CONFIG", braid_config);
-        }
+        configure_braid_environment(&mut cmd, &state.config)?;
         if let Some(session_path) = session {
             cmd.args(["--session", session_path]);
         }
         if !state.developer_instructions.is_empty() {
-            cmd.args(["--system-prompt", &state.developer_instructions]);
+            cmd.args(["--append-system-prompt", &state.developer_instructions]);
         }
         cmd.current_dir(workspace);
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
@@ -134,20 +165,144 @@ impl PiProvider {
             Arc::clone(&self.thread_id),
             Arc::clone(&self.turn_id),
         );
-        let stderr_handle = spawn_pi_stderr(stderr);
-        state.process = Some(PiProcess { writer, _child: child, stdout_handle, stderr_handle });
+        let stderr_handle =
+            spawn_pi_stderr(stderr, Arc::clone(&self.thread_id), Arc::clone(&self.turn_id));
+        state.process = Some(PiProcess {
+            writer: Some(writer),
+            child,
+            stdout_handle,
+            stderr_handle,
+            execution,
+        });
         Ok(())
     }
 
+    fn materialize_profile(
+        state: &mut PiState,
+        profile: &Profile,
+        workspace: &Path,
+        session: Option<&str>,
+    ) -> Result<(PathBuf, Vec<crate::profile_materials::SkillIdentity>), ProviderError> {
+        let config_path = state.config.braid_config_path.as_ref().ok_or_else(|| {
+            ProviderError::Protocol("Pi Profile has no resolved Braid config path".into())
+        })?;
+        let config = crate::config::Config::load(config_path).map_err(|error| {
+            ProviderError::Protocol(format!("cannot reload Pi Profile materials: {error}"))
+        })?;
+        let configured_profile = config
+            .profile(&profile.id)
+            .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+        let materials = config
+            .profile_materials(configured_profile)
+            .map_err(|error| ProviderError::Protocol(error.to_string()))?;
+        if !state.config.profile_material_digest.is_empty()
+            && state.config.profile_material_digest != materials.digest
+        {
+            return Err(ProviderError::Protocol(format!(
+                "Pi Profile materials changed after selection: expected {}, found {}",
+                state.config.profile_material_digest, materials.digest
+            )));
+        }
+        let home_key = if let Some(session) = session {
+            crate::profile_materials::session_home_key(workspace, session).map_err(|error| {
+                ProviderError::Protocol(format!("cannot identify Pi session home: {error:#}"))
+            })?
+        } else {
+            uuid::Uuid::now_v7().to_string()
+        };
+        let home = crate::profile_materials::snapshot(
+            &config,
+            configured_profile,
+            workspace,
+            &home_key,
+            &materials.digest,
+        )
+        .map_err(|error| {
+            ProviderError::Protocol(format!("cannot materialize Pi Profile: {error:#}"))
+        })?;
+        state.native_home_key = Some(home_key);
+        state.expected_profile_skills =
+            materials.skills.iter().map(|skill| skill.name.clone()).collect();
+        Ok((home, materials.skills))
+    }
+
+    async fn prepare_native_close(
+        state: &mut PiState,
+        confirmed_idle: bool,
+    ) -> Result<bool, ProviderError> {
+        let managed = state.process.as_ref().is_some_and(|process| process.execution.is_some());
+        if managed {
+            // The live RPC fences spawning and drains registered plugin work;
+            // offline verification after EOF is the authoritative final scope.
+            let stopped = Self::request(state, json!({"type":"stop_owned_execution"})).await;
+            match stopped {
+                Ok(receipt) => {
+                    let execution = state
+                        .process
+                        .as_ref()
+                        .and_then(|process| process.execution.as_ref())
+                        .expect("managed execution");
+                    tracing::info!(name = "braid.provider.execution", provider.execution.id = %execution.id, receipt = %receipt,
+                            "Pi live owned execution stop receipt; offline verification follows");
+                    if receipt["data"]["execution_id"] != execution.id {
+                        tracing::warn!(provider.execution.id = %execution.id, receipt = %receipt,
+                                "Pi live stop receipt has mismatched identity; not accepted as stop proof");
+                    }
+                }
+                Err(error) => tracing::warn!(error.reason = %error,
+                        "Pi live owned execution stop unavailable; EOF and offline verification required"),
+            }
+            if !confirmed_idle {
+                for operation in ["clear_queue", "abort"] {
+                    if let Err(error) = Self::request(state, json!({"type": operation})).await {
+                        tracing::warn!(error.reason = %error, provider.process.operation = operation,
+                                "Pi native cancellation unavailable before owned cleanup");
+                    }
+                }
+            }
+        } else if !confirmed_idle {
+            let cleared = Self::request(state, json!({"type":"clear_queue"})).await?;
+            Self::success_or_protocol(&cleared, "clear_queue")?;
+            let aborted = Self::request(state, json!({"type":"abort"})).await?;
+            Self::success_or_protocol(&aborted, "abort")?;
+            let native = Self::request(state, json!({"type":"get_state"})).await?;
+            if native_is_busy(&native)? {
+                return Err(ProviderError::Protocol(
+                    "Pi remains busy after abort; replacement is blocked".into(),
+                ));
+            }
+        }
+        Ok(managed)
+    }
+
     async fn request(state: &mut PiState, frame: Value) -> Result<Value, ProviderError> {
+        Self::request_with_turn(state, frame, None).await
+    }
+
+    async fn request_with_turn(
+        state: &mut PiState,
+        frame: Value,
+        turn_id: Option<String>,
+    ) -> Result<Value, ProviderError> {
         let id = state.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let method = frame.get("type").and_then(Value::as_str).unwrap_or("unknown").to_owned();
         let mut frame = frame;
         if let Some(obj) = frame.as_object_mut() {
             obj.insert("id".to_string(), json!(id));
         }
 
         let (sender, receiver) = oneshot::channel();
-        state.pending.lock().await.insert(id, sender);
+        if let (Some(thread), Some(turn)) = (state.session.as_deref(), turn_id.as_deref()) {
+            telemetry::bind_provider_turn(thread, turn);
+        }
+        telemetry::emit_provider_payload(
+            "pi",
+            state.session.as_deref().unwrap_or(""),
+            turn_id.as_deref(),
+            "request",
+            &frame.to_string(),
+        );
+        state.pending.lock().await.insert(id, PiRequest { response: sender, turn_id });
 
         let process = state.process.as_mut().ok_or(ProviderError::Disconnected)?;
         let bytes = {
@@ -156,13 +311,18 @@ impl PiProvider {
             bytes.push(b'\n');
             bytes
         };
-        if let Err(error) = process.writer.write_all(&bytes).await {
+        let writer = process.writer.as_mut().ok_or(ProviderError::Disconnected)?;
+        if let Err(error) = writer.write_all(&bytes).await {
             state.pending.lock().await.remove(&id);
-            return Err(ProviderError::Start(error));
+            return Err(ProviderError::Unknown(format!(
+                "Pi {method} request {id} write failed: {error}"
+            )));
         }
-        if let Err(error) = process.writer.flush().await {
+        if let Err(error) = writer.flush().await {
             state.pending.lock().await.remove(&id);
-            return Err(ProviderError::Start(error));
+            return Err(ProviderError::Unknown(format!(
+                "Pi {method} request {id} flush failed: {error}"
+            )));
         }
 
         match timeout(REQUEST_TIMEOUT, receiver).await {
@@ -170,7 +330,7 @@ impl PiProvider {
             Ok(Err(_)) => Err(ProviderError::Disconnected),
             Err(_) => {
                 state.pending.lock().await.remove(&id);
-                Err(ProviderError::Timeout { method: "pi_rpc".into() })
+                Err(ProviderError::Timeout { method: format!("Pi {method} request {id}") })
             }
         }
     }
@@ -189,6 +349,42 @@ impl PiProvider {
             format!("{context} failed")
         };
         Err(ProviderError::Protocol(message))
+    }
+
+    async fn reject_startup(&self, thread_id: &str, error: ProviderError) -> ProviderError {
+        match self.close_session(thread_id, true).await {
+            Ok(()) => {
+                ProviderError::Protocol(format!("Pi Profile resource handshake failed: {error}"))
+            }
+            Err(cleanup) => ProviderError::Unknown(format!(
+                "Pi Profile resource handshake failed: {error}; owned session shutdown failed: {cleanup}"
+            )),
+        }
+    }
+
+    async fn verify_profile_resources(
+        state: &mut PiState,
+        profile: &Profile,
+        thread_id: &str,
+    ) -> Result<(), ProviderError> {
+        let commands = Self::request(state, json!({"type":"get_commands"})).await?;
+        Self::success_or_protocol(&commands, "get_commands")?;
+        let home_key = state.native_home_key.as_deref().ok_or_else(|| {
+            ProviderError::Protocol("Pi startup did not retain its native home identity".into())
+        })?;
+        let home = profile.workspace().join(".braid/pi-homes").join(home_key);
+        let selected_skills =
+            validate_profile_skills(&commands, &state.expected_profile_skills, &home)?;
+        tracing::info!(
+            name = "braid.provider.profile_resources",
+            provider.kind = "pi",
+            braid.provider_session.id = thread_id,
+            braid.profile.id = %profile.id,
+            braid.profile.effective_digest = %state.config.profile_material_digest,
+            provider.profile.skills = ?selected_skills,
+            "Pi startup verified Profile skills through get_commands"
+        );
+        Ok(())
     }
 }
 
@@ -212,10 +408,12 @@ impl AgentProvider for PiProvider {
         developer_instructions.clone_into(&mut state.developer_instructions);
         state.context.clear();
         state.session = None;
-        state.current_turn_id = None;
+        state.native_session_id = None;
+        state.native_home_key = None;
+        state.close_result = None;
         state.process = None;
 
-        self.spawn(&mut state, profile.workspace(), None)?;
+        self.spawn(&mut state, profile, profile.workspace(), None)?;
 
         let result =
             Self::request(&mut state, json!({"type": "new_session", "name": "braid-session"}))
@@ -223,18 +421,47 @@ impl AgentProvider for PiProvider {
         Self::success_or_protocol(&result, "new_session")?;
 
         let state_resp = Self::request(&mut state, json!({"type": "get_state"})).await?;
+        validate_started_runtime(&mut state, &state_resp).await?;
         let session_file = state_resp
             .get("data")
             .and_then(|data| data.get("sessionFile"))
             .and_then(Value::as_str)
             .ok_or_else(|| ProviderError::Protocol("get_state missing sessionFile".into()))?;
+        let home_key = state.native_home_key.clone().ok_or_else(|| {
+            ProviderError::Protocol("Pi startup did not retain its native home identity".into())
+        })?;
+        crate::profile_materials::bind_session_home(profile.workspace(), session_file, &home_key)
+            .map_err(|error| {
+            ProviderError::Protocol(format!("cannot bind Pi session native home: {error:#}"))
+        })?;
         state.session = Some(session_file.to_owned());
+        state.native_session_id =
+            Some(required_string(&state_resp["data"], "sessionId", "Pi get_state")?);
+        *self.thread_id.lock().await = session_file.to_owned();
+
+        if let Err(error) = Self::verify_profile_resources(&mut state, profile, session_file).await
+        {
+            drop(state);
+            return Err(self.reject_startup(session_file, error).await);
+        }
 
         Ok(ProviderSession { thread_id: session_file.to_owned() })
     }
 
-    async fn inject_context(&self, _thread_id: &str, context: &str) -> Result<(), ProviderError> {
+    async fn inject_context(&self, thread_id: &str, context: &str) -> Result<(), ProviderError> {
         let mut state = self.state.lock().await;
+        if state.session.as_deref() != Some(thread_id) {
+            return Err(ProviderError::Protocol("Context session identity mismatch".into()));
+        }
+        super::pi_context::save(
+            thread_id,
+            &super::pi_context::PendingContext {
+                native_session_id: state.native_session_id.clone().ok_or_else(|| {
+                    ProviderError::Protocol("Pi omitted native session identity".into())
+                })?,
+                context: context.to_owned(),
+            },
+        )?;
         context.clone_into(&mut state.context);
         Ok(())
     }
@@ -245,15 +472,55 @@ impl AgentProvider for PiProvider {
         profile: &Profile,
         developer_instructions: &str,
     ) -> Result<ProviderSession, ProviderError> {
+        let mut pending = super::pi_context::load(thread_id)?;
+        let has_history = Path::new(thread_id).is_file();
+        if has_history {
+            super::pi_context::validate_history(thread_id)?;
+        }
+        if !has_history && pending.is_none() {
+            return Err(ProviderError::Protocol(
+                "Pi native history and startup Context are both missing".into(),
+            ));
+        }
         let mut state = self.state.lock().await;
         developer_instructions.clone_into(&mut state.developer_instructions);
         state.context.clear();
         state.session = Some(thread_id.to_owned());
-        state.current_turn_id = None;
+        *self.thread_id.lock().await = thread_id.to_owned();
+        state.close_result = None;
         state.process = None;
-
-        self.spawn(&mut state, profile.workspace(), Some(thread_id))?;
-
+        self.spawn(&mut state, profile, profile.workspace(), Some(thread_id))?;
+        let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
+        validate_started_runtime(&mut state, &native).await?;
+        let resumed_path = required_string(&native["data"], "sessionFile", "Pi get_state")?;
+        if Path::new(&resumed_path) != Path::new(thread_id) {
+            return Err(ProviderError::Protocol("Pi resumed a different session path".into()));
+        }
+        let native_id = required_string(&native["data"], "sessionId", "Pi get_state")?;
+        state.native_session_id = Some(native_id.clone());
+        if let Err(error) = Self::verify_profile_resources(&mut state, profile, thread_id).await {
+            drop(state);
+            return Err(self.reject_startup(thread_id, error).await);
+        }
+        if let Some(initial) = pending.as_mut() {
+            if has_history && initial.native_session_id != native_id {
+                return Err(ProviderError::Protocol(
+                    "Pi startup Context belongs to a different native session".into(),
+                ));
+            }
+            let history = Self::request(&mut state, json!({"type":"get_entries"})).await?;
+            if !super::pi_context::consumed(initial, &history)? {
+                initial.context.clone_into(&mut state.context);
+            }
+            if !has_history {
+                // No prior user history exists: Pi recreated only the empty
+                // native header behind the same Braid execution identity.
+                native_id.clone_into(&mut initial.native_session_id);
+                super::pi_context::save(thread_id, initial)?;
+            }
+        }
+        state.native_session_id = Some(native_id);
+        *self.thread_id.lock().await = thread_id.to_owned();
         Ok(ProviderSession { thread_id: thread_id.to_owned() })
     }
 
@@ -264,60 +531,219 @@ impl AgentProvider for PiProvider {
         event_references: &str,
     ) -> Result<ProviderTurn, ProviderError> {
         let mut state = self.state.lock().await;
-        if state.process.is_none() {
+        let did_spawn = state.process.is_none();
+        if did_spawn {
             let session = state.session.clone();
-            self.spawn(&mut state, profile.workspace(), session.as_deref())?;
+            self.spawn(&mut state, profile, profile.workspace(), session.as_deref())?;
         }
 
-        let mut message = String::new();
-        if !state.developer_instructions.is_empty() {
-            message.push_str(&state.developer_instructions);
-            message.push_str("\n\n");
+        let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
+        validate_managed_state(&state, &native)?;
+        if did_spawn {
+            let native_thread_id = state.session.clone().ok_or_else(|| {
+                ProviderError::Protocol("Pi physical startup has no native session identity".into())
+            })?;
+            if let Err(error) =
+                Self::verify_profile_resources(&mut state, profile, &native_thread_id).await
+            {
+                drop(state);
+                return Err(self.reject_startup(&native_thread_id, error).await);
+            }
         }
+        if native_is_busy(&native)? {
+            return Err(ProviderError::Deferred(
+                "Pi is streaming, compacting or has queued input".into(),
+            ));
+        }
+        let mut message = String::new();
         if !state.context.is_empty() {
             message.push_str(&state.context);
             message.push_str("\n\n");
         }
         message.push_str(event_references);
-
         let turn_id = uuid::Uuid::now_v7().to_string();
-        state.current_turn_id = Some(turn_id.clone());
-        *self.turn_id.lock().await = turn_id.clone();
-        *self.thread_id.lock().await = state.session.clone().unwrap_or_default();
-
-        let result =
-            Self::request(&mut state, json!({"type": "prompt", "message": message})).await?;
-        Self::success_or_protocol(&result, "prompt")?;
-
+        let result = Self::request_with_turn(
+            &mut state,
+            json!({"type":"prompt","message":message}),
+            Some(turn_id.clone()),
+        )
+        .await;
+        match result {
+            Ok(result) => Self::success_or_protocol(&result, "prompt")?,
+            Err(ProviderError::Protocol(reason)) => {
+                let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
+                if native_is_busy(&native)? {
+                    return Err(ProviderError::Deferred(reason));
+                }
+                return Err(ProviderError::Protocol(reason));
+            }
+            Err(error) => return Err(error),
+        }
+        // ACK clears only this process's staging buffer. The immutable startup
+        // artifact survives until native history can establish consumption.
+        state.context.clear();
         Ok(ProviderTurn { turn_id })
     }
 
     async fn steer(
         &self,
         _thread_id: &str,
-        _expected_turn_id: &str,
+        expected_turn_id: &str,
         event_references: &str,
     ) -> Result<(), ProviderError> {
         let mut state = self.state.lock().await;
+        if self.turn_id.lock().await.as_str() != expected_turn_id {
+            return Err(ProviderError::Deferred("Pi active turn changed before steering".into()));
+        }
+        let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
+        if !required_native_bool(&native, "isStreaming")? {
+            return Err(ProviderError::Deferred("Pi is no longer streaming".into()));
+        }
         let result =
-            Self::request(&mut state, json!({"type": "steer", "message": event_references}))
-                .await?;
+            Self::request(&mut state, json!({"type":"steer","message":event_references})).await?;
         Self::success_or_protocol(&result, "steer")?;
+        if self.turn_id.lock().await.as_str() != expected_turn_id {
+            return Err(ProviderError::Unknown(
+                "Pi accepted steering at a changing turn boundary".into(),
+            ));
+        }
         Ok(())
     }
 
-    async fn interrupt(&self, _thread_id: &str, _turn_id: &str) -> Result<(), ProviderError> {
+    async fn interrupt(&self, _thread_id: &str, turn_id: &str) -> Result<(), ProviderError> {
         let mut state = self.state.lock().await;
-        let result = Self::request(&mut state, json!({"type": "abort"})).await?;
-        Self::success_or_protocol(&result, "abort")?;
-        Ok(())
+        if self.turn_id.lock().await.as_str() != turn_id {
+            return Ok(());
+        }
+        let result = Self::request(&mut state, json!({"type":"abort"})).await?;
+        Self::success_or_protocol(&result, "abort")
     }
+
+    async fn close_session(
+        &self,
+        thread_id: &str,
+        confirmed_idle: bool,
+    ) -> Result<(), ProviderError> {
+        let mut state = self.state.lock().await;
+        if let Some(result) = &state.close_result {
+            return result.clone().map_err(ProviderError::Protocol);
+        }
+        let native_session_id = state.native_session_id.clone();
+        let mut result = async {
+            let managed = Self::prepare_native_close(&mut state, confirmed_idle).await?;
+            if let Some(process) = state.process.as_mut() {
+                // Unix pipe shutdown is a no-op; dropping stdin delivers Pi's EOF shutdown.
+                drop(process.writer.take());
+                let status = wait_for_pi_child(process, thread_id, native_session_id.as_deref(), "graceful_eof").await?;
+                if !managed && !status.success() {
+                    return Err(ProviderError::Unknown(format!("External Pi parent exited with {status}; no owned execution cleanup contract is available")));
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if result.is_err()
+            && let Some(process) = state.process.as_mut()
+        {
+            // Reclaim the parent, but never promote a forced kill into a
+            // claim that detached tools have stopped.
+            let pid = process.child.id();
+            let kill_result = process.child.start_kill();
+            tracing::info!(
+                name = "braid.provider.process",
+                provider.kind = "pi",
+                braid.provider_session.id = thread_id,
+                provider.thread.id = thread_id,
+                provider.native_session.id = native_session_id.as_deref().unwrap_or(""),
+                process.pid = pid,
+                provider.process.operation = "kill_request",
+                braid.outcome = if kill_result.is_ok() { "sent" } else { "failed" },
+                error.reason =
+                    kill_result.as_ref().err().map(ToString::to_string).as_deref().unwrap_or(""),
+                "Pi parent cleanup request; does not confirm detached tools stopped"
+            );
+            let wait_result = wait_for_pi_child(
+                process,
+                thread_id,
+                native_session_id.as_deref(),
+                "forced_cleanup",
+            )
+            .await;
+            let cleanup_errors = kill_result
+                .err()
+                .map(|error| format!("kill request: {error}"))
+                .into_iter()
+                .chain(wait_result.err().map(|error| error.to_string()))
+                .collect::<Vec<_>>();
+            if !cleanup_errors.is_empty() {
+                let original = result.as_ref().expect_err("failed stop triggered cleanup");
+                result = Err(ProviderError::Unknown(format!(
+                    "{original}; parent cleanup: {}",
+                    cleanup_errors.join("; ")
+                )));
+            }
+        }
+        if let Some(execution) =
+            state.process.as_ref().and_then(|process| process.execution.as_ref())
+            && let Err(error) = execution.cleanup().await
+        {
+            result = Err(ProviderError::Unknown(match result {
+                Ok(()) => error.to_string(),
+                Err(previous) => format!("{previous}; owned cleanup: {error}"),
+            }));
+        }
+        state.close_result = Some(result.as_ref().copied().map_err(ToString::to_string));
+        if result.is_ok() {
+            state.process = None;
+        }
+        result
+    }
+}
+
+async fn wait_for_pi_child(
+    process: &mut PiProcess,
+    thread_id: &str,
+    native_session_id: Option<&str>,
+    stage: &'static str,
+) -> Result<ExitStatus, ProviderError> {
+    let pid = process.child.id();
+    let waited = timeout(REQUEST_TIMEOUT, process.child.wait()).await;
+    let result = match waited {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(ProviderError::Protocol(format!(
+            "Pi child wait ({stage}, pid {pid:?}) failed: {error}"
+        ))),
+        Err(_) => {
+            Err(ProviderError::Timeout { method: format!("Pi child wait ({stage}, pid {pid:?})") })
+        }
+    };
+    let exit_status = result.as_ref().ok().map(ToString::to_string);
+    let exit_code = result.as_ref().ok().and_then(ExitStatus::code);
+    tracing::info!(
+        name = "braid.provider.process",
+        provider.kind = "pi",
+        braid.runtime.generation =
+            telemetry::evidence_health().runtime_generation.as_deref().unwrap_or(""),
+        braid.provider_session.id = thread_id,
+        provider.thread.id = thread_id,
+        provider.native_session.id = native_session_id.unwrap_or(""),
+        process.pid = pid,
+        provider.process.operation = "wait",
+        provider.process.stage = stage,
+        provider.process.kind = if process.execution.is_some() { "managed_launcher" } else { "pi" },
+        braid.outcome = if result.is_ok() { "exited" } else { "unconfirmed" },
+        process.exit.status = exit_status.as_deref().unwrap_or(""),
+        process.exit.code = exit_code,
+        error.reason = result.as_ref().err().map(ToString::to_string).as_deref().unwrap_or(""),
+        "Pi child wait observation; parent exit does not prove detached tools stopped"
+    );
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_pi_stdout(
     stdout: tokio::process::ChildStdout,
-    pending: Arc<Mutex<PendingRequests>>,
+    pending: Arc<Mutex<PiPendingRequests>>,
     notifications: broadcast::Sender<ProviderNotification>,
     closed: watch::Sender<bool>,
     thread_id: Arc<Mutex<String>>,
@@ -325,21 +751,32 @@ fn spawn_pi_stdout(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
+        let mut last_stop = None;
+        let mut last_error = None;
+        let mut extension_errors = Vec::new();
         while let Ok(Some(line)) = lines.next_line().await {
-            telemetry::emit_payload_event(&PayloadEvidence {
-                github_body: "",
-                github_summary: "",
-                credential: "",
-                provider_transcript: &line,
-                webhook_payload: "",
-                local_path: "",
-            });
-            let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+            let current_thread = thread_id.lock().await.clone();
+            let current_turn = turn_id.lock().await.clone();
+            let parsed = serde_json::from_str::<Value>(&line);
+            let response_turn = if let Ok(frame) = &parsed {
+                if let Some(id) = frame.get("id").and_then(Value::as_i64) {
+                    pending.lock().await.get(&id).and_then(|request| request.turn_id.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let evidence_turn = response_turn
+                .as_deref()
+                .or_else(|| (!current_turn.is_empty()).then_some(current_turn.as_str()));
+            telemetry::emit_provider_payload("pi", &current_thread, evidence_turn, "stdout", &line);
+            let Ok(frame) = parsed else {
                 tracing::warn!("pi emitted non-JSON stdout");
                 continue;
             };
             if let Some(id) = frame.get("id").and_then(Value::as_i64) {
-                if let Some(sender) = pending.lock().await.remove(&id) {
+                if let Some(request) = pending.lock().await.remove(&id) {
                     let response = if frame.get("success").and_then(Value::as_bool) == Some(false) {
                         let message = frame
                             .get("error")
@@ -350,95 +787,291 @@ fn spawn_pi_stdout(
                     } else {
                         Ok(frame)
                     };
-                    let _ = sender.send(response);
+                    let response = match (response, request.turn_id) {
+                        (Ok(frame), Some(candidate)) => {
+                            if frame["data"]["disposition"]
+                                .as_str()
+                                .is_some_and(|value| value != "started")
+                            {
+                                Err(ProviderError::Unknown(format!(
+                                    "Pi prompt accepted without immediate execution: {}",
+                                    frame["data"]
+                                )))
+                            } else {
+                                last_stop = None;
+                                last_error = None;
+                                extension_errors.clear();
+                                *turn_id.lock().await = candidate;
+                                Ok(frame)
+                            }
+                        }
+                        (response, _) => response,
+                    };
+                    let _ = request.response.send(response);
                 }
                 continue;
             }
-            let current_thread = thread_id.lock().await.clone();
-            let current_turn = turn_id.lock().await.clone();
-            if let Some(notification) = parse_pi_event(&frame, &current_thread, &current_turn) {
+            if let Some(notification) = parse_pi_event(
+                &frame,
+                &current_thread,
+                &current_turn,
+                &mut last_stop,
+                &mut last_error,
+                &mut extension_errors,
+            ) {
+                let settled = matches!(notification, ProviderNotification::TurnCompleted { .. });
                 let _ = notifications.send(notification);
+                if settled {
+                    turn_id.lock().await.clear();
+                }
             }
         }
         let drained = std::mem::take(&mut *pending.lock().await);
-        for sender in drained.into_values() {
-            let _ = sender.send(Err(ProviderError::Disconnected));
+        for request in drained.into_values() {
+            let _ = request.response.send(Err(ProviderError::Disconnected));
         }
         let _ = notifications.send(ProviderNotification::Disconnected);
         closed.send_replace(true);
     })
 }
 
-fn spawn_pi_stderr(stderr: tokio::process::ChildStderr) -> tokio::task::JoinHandle<()> {
+fn spawn_pi_stderr(
+    stderr: tokio::process::ChildStderr,
+    thread_id: Arc<Mutex<String>>,
+    turn_id: Arc<Mutex<String>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            telemetry::emit_payload_event(&PayloadEvidence {
-                github_body: "",
-                github_summary: "",
-                credential: "",
-                provider_transcript: &line,
-                webhook_payload: "",
-                local_path: "",
-            });
+            let thread = thread_id.lock().await.clone();
+            let turn = turn_id.lock().await.clone();
+            telemetry::emit_provider_payload(
+                "pi",
+                &thread,
+                (!turn.is_empty()).then_some(turn.as_str()),
+                "stderr",
+                &line,
+            );
             tracing::debug!(provider = "pi", output = %line, "provider diagnostic");
         }
     })
 }
 
-fn parse_pi_event(frame: &Value, thread_id: &str, turn_id: &str) -> Option<ProviderNotification> {
+fn parse_pi_event(
+    frame: &Value,
+    thread_id: &str,
+    turn_id: &str,
+    last_stop: &mut Option<String>,
+    last_error: &mut Option<String>,
+    extension_errors: &mut Vec<String>,
+) -> Option<ProviderNotification> {
     let event_type = frame.get("type")?.as_str()?;
+    if event_type == "agent_start" {
+        *last_stop = None;
+        *last_error = None;
+    }
+    if event_type == "extension_error"
+        && matches!(
+            frame["event"].as_str(),
+            Some("agent_end" | "agent_before_settle" | "agent_settled")
+        )
+    {
+        let path = frame["extensionPath"].as_str().unwrap_or("unknown extension");
+        let detail = frame["error"].as_str().unwrap_or("extension reported no error detail");
+        extension_errors.push(format!("Pi {path} {} failed: {detail}", frame["event"]));
+    }
+    if event_type == "message_end" {
+        let message = &frame["message"];
+        if message["role"] == "assistant" {
+            *last_stop = message["stopReason"].as_str().map(str::to_owned);
+            *last_error = message["errorMessage"].as_str().map(str::to_owned);
+        }
+    }
     match event_type {
         "turn_start" => Some(ProviderNotification::TurnStarted {
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
         }),
-        "agent_settled" => Some(ProviderNotification::TurnCompleted {
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            status: "completed".into(),
-            error: None,
-        }),
-        "message_end" => {
-            // Fallback for Pi sessions that emit the final assistant message without a
-            // following turn_end (for example, when the model stops cleanly but the
-            // session remains open for follow-ups). Only treat a stopReason of "stop"
-            // as terminal; toolUse means more tool calls are expected.
-            let message = frame.get("message")?;
-            if message.get("role").and_then(Value::as_str) != Some("assistant") {
-                return Some(ProviderNotification::Activity {
-                    method: event_type.into(),
-                    thread_id: None,
-                    turn_id: None,
-                });
-            }
-            let stop_reason = message.get("stopReason").and_then(Value::as_str)?;
-            if stop_reason == "stop" {
-                Some(ProviderNotification::TurnCompleted {
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    status: "completed".into(),
-                    error: None,
-                })
-            } else if stop_reason == "error" || stop_reason == "aborted" {
-                Some(ProviderNotification::TurnCompleted {
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    status: "failed".into(),
-                    error: Some(format!("pi assistant message ended with {stop_reason}")),
-                })
+        // Pi may persist, compact, or retry after message_end. Only settled
+        // closes this physical run; a transient error must not abort recovery.
+        "agent_settled" => {
+            // The SDK settled flag is authoritative; retained older materials
+            // and external Pi may carry the final assistant's aborted reason.
+            let interrupted = frame["aborted"].as_bool() == Some(true)
+                || frame["cancelled"].as_bool() == Some(true)
+                || last_stop.as_deref() == Some("aborted");
+            let completed = last_stop.as_deref() == Some("stop") && !interrupted;
+            let failed = !extension_errors.is_empty() || (!interrupted && !completed);
+            let error = if failed {
+                let mut reasons = extension_errors.clone();
+                if let Some(error) = last_error {
+                    reasons.insert(0, error.clone());
+                }
+                if reasons.is_empty() {
+                    reasons.push(format!("Pi settled with {last_stop:?}"));
+                }
+                Some(reasons.join("; "))
             } else {
-                Some(ProviderNotification::Activity {
-                    method: event_type.into(),
-                    thread_id: None,
-                    turn_id: None,
-                })
+                None
+            };
+            Some(ProviderNotification::TurnCompleted {
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                status: if failed {
+                    "failed"
+                } else if interrupted {
+                    "interrupted"
+                } else {
+                    "completed"
+                }
+                .into(),
+                error,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn required_native_bool(response: &Value, field: &str) -> Result<bool, ProviderError> {
+    response["data"][field]
+        .as_bool()
+        .ok_or_else(|| ProviderError::Protocol(format!("Pi get_state missing boolean {field}")))
+}
+
+fn validate_profile_skills(
+    response: &Value,
+    expected_skills: &[String],
+    native_home: &std::path::Path,
+) -> Result<Vec<(String, String)>, ProviderError> {
+    let commands = response["data"]["commands"]
+        .as_array()
+        .ok_or_else(|| ProviderError::Protocol("Pi get_commands omitted commands".into()))?;
+    let mut selected = Vec::with_capacity(expected_skills.len());
+    for name in expected_skills {
+        let command_name = format!("skill:{name}");
+        let matches = commands
+            .iter()
+            .filter(|command| {
+                command["name"].as_str() == Some(command_name.as_str())
+                    && command["source"].as_str() == Some("skill")
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(ProviderError::Protocol(format!(
+                "Pi get_commands returned {} entries for Profile skill {name:?}",
+                matches.len()
+            )));
+        }
+        let path = matches[0]["sourceInfo"]["path"].as_str().ok_or_else(|| {
+            ProviderError::Protocol(format!(
+                "Pi get_commands omitted sourceInfo.path for Profile skill {name:?}"
+            ))
+        })?;
+        let actual_path = std::path::Path::new(path).canonicalize().map_err(|error| {
+            ProviderError::Protocol(format!(
+                "Pi Profile skill {name:?} source path {path:?}: {error}"
+            ))
+        })?;
+        let expected_path =
+            native_home.join("braid-skills").join(name).join("SKILL.md").canonicalize().map_err(
+                |error| {
+                    ProviderError::Protocol(format!(
+                        "Pi materialized Profile skill {name:?} entrypoint: {error}"
+                    ))
+                },
+            )?;
+        if actual_path != expected_path {
+            return Err(ProviderError::Protocol(format!(
+                "Pi selected Profile skill {name:?} from {} instead of the frozen Profile snapshot {}",
+                actual_path.display(),
+                expected_path.display()
+            )));
+        }
+        selected.push((name.clone(), actual_path.display().to_string()));
+    }
+    Ok(selected)
+}
+
+fn native_is_busy(response: &Value) -> Result<bool, ProviderError> {
+    let streaming = required_native_bool(response, "isStreaming")?;
+    let compacting = required_native_bool(response, "isCompacting")?;
+    let pending = response["data"]["pendingMessageCount"].as_u64().ok_or_else(|| {
+        ProviderError::Protocol("Pi get_state missing pendingMessageCount".into())
+    })?;
+    Ok(streaming || compacting || pending != 0)
+}
+
+fn validate_managed_state(state: &PiState, response: &Value) -> Result<(), ProviderError> {
+    if let Some(execution) = state.process.as_ref().and_then(|process| process.execution.as_ref()) {
+        let managed = execution.state(response)?;
+        tracing::info!(name = "braid.provider.execution", provider.kind = "pi",
+            provider.execution.id = %execution.id, provider.managed.state = ?managed.status,
+            error.reason = managed.reason.as_deref().unwrap_or(""),
+            "Pi native managed state observation");
+    }
+    Ok(())
+}
+
+async fn validate_started_runtime(
+    state: &mut PiState,
+    response: &Value,
+) -> Result<(), ProviderError> {
+    let validation = validate_managed_state(state, response).and_then(|()| {
+        if let Some(execution) =
+            state.process.as_ref().and_then(|process| process.execution.as_ref())
+        {
+            let managed = execution.state(response)?;
+            if matches!(managed.status, runtime::ManagedStatus::Unknown) {
+                return Err(ProviderError::Protocol(format!(
+                    "Pi managed execution is unavailable at startup: {}",
+                    managed.reason.as_deref().unwrap_or("native returned unknown without a reason")
+                )));
             }
         }
-        _ => Some(ProviderNotification::Activity {
-            method: event_type.into(),
-            thread_id: None,
-            turn_id: None,
-        }),
+        Ok(())
+    });
+    let Err(error) = validation else { return Ok(()) };
+    let mut reasons = vec![error.to_string()];
+    if let Some(process) = state.process.as_mut() {
+        drop(process.writer.take());
+        if let Err(error) = wait_for_pi_child(process, "", None, "rejected_runtime").await {
+            reasons.push(error.to_string());
+        }
+        if let Some(execution) = &process.execution
+            && let Err(error) = execution.cleanup().await
+        {
+            reasons.push(error.to_string());
+        }
     }
+    Err(ProviderError::Unknown(reasons.join("; ")))
+}
+
+fn configure_braid_environment(cmd: &mut Command, config: &PiConfig) -> Result<(), ProviderError> {
+    // Native shell commands must reach the same Braid binary as this runtime.
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(exe_dir) = current_exe.parent()
+    {
+        let mut path_parts: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        if !path_parts.iter().any(|p| p == exe_dir) {
+            path_parts.insert(0, exe_dir.to_path_buf());
+        }
+        cmd.env(
+            "PATH",
+            std::env::join_paths(path_parts).map_err(|error| {
+                ProviderError::Protocol(format!("cannot build native Pi PATH: {error}"))
+            })?,
+        );
+    }
+    if let Some(braid_config) = &config.braid_config_path {
+        let braid_config = if braid_config.is_absolute() {
+            braid_config.clone()
+        } else {
+            std::env::current_dir()?.join(braid_config)
+        };
+        cmd.env("BRAID_CONFIG", braid_config).env("BRAID_AGENT", "1");
+    } else if let Ok(braid_config) = std::env::var("BRAID_CONFIG") {
+        cmd.env("BRAID_CONFIG", braid_config);
+    }
+    Ok(())
 }
