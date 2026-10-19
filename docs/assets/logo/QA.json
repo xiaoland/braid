@@ -1,0 +1,130 @@
+{
+  "color_v2_byte_identical_files": 48,
+  "color_v2_unchanged": true,
+  "png_count": 80,
+  "svg_count": 40,
+  "monochrome_checks": [
+    {
+      "size": 16,
+      "alpha_difference_max": 0,
+      "solid_complement_error_max": 0,
+      "alpha_vs_solid_error_max": 0,
+      "negative_regions_4_connected": 3,
+      "negative_region_areas": [
+        181,
+        3,
+        7
+      ]
+    },
+    {
+      "size": 20,
+      "alpha_difference_max": 0,
+      "solid_complement_error_max": 0,
+      "alpha_vs_solid_error_max": 0,
+      "negative_regions_4_connected": 3,
+      "negative_region_areas": [
+        278,
+        5,
+        13
+      ]
+    },
+    {
+      "size": 24,
+      "alpha_difference_max": 0,
+      "solid_complement_error_max": 0,
+      "alpha_vs_solid_error_max": 0,
+      "negative_regions_4_connected": 3,
+      "negative_region_areas": [
+        390,
+        10,
+        17
+      ]
+    },
+    {
+      "size": 32,
+      "alpha_difference_max": 0,
+      "solid_complement_error_max": 0,
+      "alpha_vs_solid_error_max": 0,
+      "negative_regions_4_connected": 3,
+      "negative_region_areas": [
+        679,
+        17,
+        29
+      ]
+    },
+    {
+      "size": 48,
+      "alpha_difference_max": 0,
+      "solid_complement_error_max": 0,
+      "alpha_vs_solid_error_max": 0,
+      "negative_regions_4_connected": 3,
+      "negative_region_areas": [
+        1622,
+        30,
+        60
+      ]
+    },
+    {
+      "size": 64,
+      "alpha_difference_max": 0,
+      "solid_complement_error_max": 0,
+      "alpha_vs_solid_error_max": 0,
+      "negative_regions_4_connected": 3,
+      "negative_region_areas": [
+        2869,
+        51,
+        106
+      ]
+    },
+    {
+      "size": 128,
+      "alpha_difference_max": 0,
+      "solid_complement_error_max": 0,
+      "alpha_vs_solid_error_max": 0,
+      "negative_regions_4_connected": 3,
+      "negative_region_areas": [
+        11351,
+        211,
+        427
+      ]
+    },
+    {
+      "size": 256,
+      "alpha_difference_max": 0,
+      "solid_complement_error_max": 0,
+      "alpha_vs_solid_error_max": 0,
+      "negative_regions_4_connected": 3,
+      "negative_region_areas": [
+        45353,
+        852,
+        1701
+      ]
+    },
+    {
+      "size": 512,
+      "alpha_difference_max": 0,
+      "solid_complement_error_max": 0,
+      "alpha_vs_solid_error_max": 0,
+      "negative_regions_4_connected": 3,
+      "negative_region_areas": [
+        181241,
+        3403,
+        6813
+      ]
+    },
+    {
+      "size": 1024,
+      "alpha_difference_max": 0,
+      "solid_complement_error_max": 0,
+      "alpha_vs_solid_error_max": 0,
+      "negative_regions_4_connected": 3,
+      "negative_region_areas": [
+        724952,
+        13610,
+        27300
+      ]
+    }
+  ],
+  "svg_no_images_text_external_references": true,
+  "note": "Negative-region check uses threshold alpha 128 and 4-neighbour connectivity; standard has two enclosed counters plus exterior-connected lower openings."
+}

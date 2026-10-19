@@ -234,6 +234,40 @@ fn web_routes() -> Router {
     Router::new()
         .route("/", get(|| async { Html(include_str!("web/index.html")) }))
         .route(
+            "/braid-logo.svg",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "image/svg+xml")],
+                    include_str!(
+                        "../../docs/assets/logo/svg/small-optical-color/braid-color-on-transparent.svg"
+                    ),
+                )
+            }),
+        )
+        .route(
+            "/favicon.svg",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "image/svg+xml")],
+                    include_str!(
+                        "../../docs/assets/logo/svg/small-optical-color/braid-color-on-badge.svg"
+                    ),
+                )
+            }),
+        )
+        .route(
+            "/favicon.png",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "image/png")],
+                    include_bytes!(
+                        "../../docs/assets/logo/png/braid-color-on-badge/braid-color-on-badge-32.png"
+                    )
+                    .as_slice(),
+                )
+            }),
+        )
+        .route(
             "/console.css",
             get(|| async {
                 (

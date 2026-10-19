@@ -23,9 +23,10 @@ pub fn generate(owner: &str, output: &Path) -> Result<()> {
     let owner_avatar =
         image::load_from_memory(&avatar_bytes).context("cannot decode owner avatar")?.to_rgba8();
 
-    let braid_logo =
-        image::load_from_memory(include_bytes!("../../docs/assets/braid-logo-transparent.png"))
-            .context("cannot decode embedded Braid logo")?;
+    let braid_logo = image::load_from_memory(include_bytes!(
+        "../../docs/assets/logo/png/braid-color-on-transparent/braid-color-on-transparent-512.png"
+    ))
+    .context("cannot decode embedded Braid logo")?;
 
     let mut canvas = RgbaImage::from_pixel(CANVAS_SIZE, CANVAS_SIZE, Rgba([0, 0, 0, 0]));
 

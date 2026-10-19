@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/braid-logo-128.png" alt="Braid logo" width="96" height="96">
+  <img src="docs/assets/logo/png/braid-color-on-badge/braid-color-on-badge-128.png" alt="Braid logo" width="96" height="96">
 </p>
 
 <h1 align="center">Braid</h1>
