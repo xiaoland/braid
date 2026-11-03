@@ -2,11 +2,12 @@
 use super::*;
 
 pub fn require_configured_repository(config: &Config, target: &WorkItemLocator) -> Result<()> {
-    if target.repository.to_string() != config.repository() {
+    let target_repository = target.repository.to_string();
+    if !config.github_repositories().contains(&target_repository.as_str()) {
         bail!(
-            "target repository {} does not match configured repository {}",
+            "target repository {} is not configured for this instance (configured: {})",
             target.repository,
-            config.repository()
+            config.github_repositories().join(", ")
         );
     }
     Ok(())

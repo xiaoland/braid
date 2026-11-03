@@ -18,6 +18,19 @@ Versioning once release artifacts are published.
   secret 文件；`setup`/`init` 不再支持 `--api-key-environment` 或
   `api_key_environment` 配置。Pi 原生材料统一引用 Braid 管理的进程内
   `BRAID_PROVIDER_API_KEY`，旧配置须显式迁移，不会自动导入旧环境变量。
+- 一个 GitHub instance 可以服务多个显式配置的 repository。GitHub App、
+  webhook、进程与 runtime catalogs 共享；Profile、workspace、调度、worktree、
+  mention、outbox、reconcile 和 `pr ensure` 均按 repository 路由。多仓库配置
+  中每个 Profile 必须声明 repository 和显式 workspace，`braid gh pr ensure`
+  必须显式 `--repository`。
+- `setup --no-browser` 改为可完成的 headless 两段流程：保留 pending setup
+  draft，随后用完整 `--callback-url` 完成 App conversion 和 instance 写入；
+  state 不匹配会拒绝。setup 默认 webhook 事件补齐 `issue_dependencies` 和
+  `pull_request_review_thread`，Linux 下不再硬编码 Homebrew `gh` 路径。
+- 新增 `braid assignment reactivate`：对已 blocked 的 open Work Item 显式
+  排队新的 activation generation；不会静默恢复不兼容 Profile session。
+- Release workflow 同时构建 macOS arm64 和 Linux x86_64 预编译产物；doctor
+  的不可达 OTLP endpoint 降级为可选警告，不再阻断本机 runtime readiness。
 
 本版本不新增数据库 migration；配置 schema 保持 3。使用旧环境变量字段或
 在 schema 3 的非 Pi Profile 上声明 provider 的配置会被明确拒绝；schema 2

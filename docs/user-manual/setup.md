@@ -185,6 +185,42 @@ CODEX_HOME=~/.braid/instances/<KEY>/provider/codex codex login
 provider-home bootstrap: it authenticates with the API key read from the
 explicit secret file declared by its Profile.
 
+## Multiple repositories in one instance
+
+A setup-generated instance starts with one repository. One GitHub App and one
+Braid instance may serve additional explicitly configured repositories when the
+operational profile is intentionally shared, but Profiles, workspaces, Events,
+worktrees, and writes remain repository-scoped. Braid does not build a shared
+cross-repository Context or work graph.
+
+Add repository names under `additional_repositories`, then bind every GitHub
+Profile to a repository and give it an explicit source checkout:
+
+```toml
+[github]
+repository = "owner/first"
+additional_repositories = [{ name = "owner/second" }]
+# ... App credentials and webhook settings
+
+[[profiles]]
+id = "issue-first"
+repository = "owner/first"
+workspace = "/absolute/path/to/first-source"
+# ...
+
+[[profiles]]
+id = "issue-second"
+repository = "owner/second"
+workspace = "/absolute/path/to/second-source"
+# ...
+```
+
+Profile ids remain unique within the instance. Install the same GitHub App on
+every configured repository. Webhooks from other installed but unconfigured
+repositories are rejected before scheduling. `braid gh pr ensure` requires
+`--repository` in a multi-repository instance; generation-scoped worktrees are
+kept under a repository-prefixed path.
+
 ## Headless / manual App creation
 
 If you cannot or do not want to open a browser from the terminal, run:
@@ -193,15 +229,28 @@ If you cannot or do not want to open a browser from the terminal, run:
 braid setup owner/repository --adapter pi --no-browser
 ```
 
-This prints:
+Braid writes a pending setup draft under `~/.braid/setup-drafts/`, prints the
+manifest form, and shows how to finish later. Open the HTML form from any
+browser. GitHub redirects to the local callback URL; on a headless host that
+page is expected to fail. Copy the complete URL, then run the same setup
+options again with `--callback-url` instead of `--no-browser`:
+
+```shell
+braid setup owner/repository --adapter pi --model <MODEL> --llm-provider <ID> \
+  --callback-url '<complete-redirect-url>'
+```
+
+The callback state must match the pending draft, so a stale or cross-instance
+redirect is rejected before the App manifest is converted. The completion path
+requires no browser on the setup host. It prints:
 
 - A generated auto-submitting HTML form file; open it in any browser to POST
   the manifest to GitHub.
 - A `curl` command that performs the same POST.
 - The full manifest JSON for copy-paste creation.
 - The install URL for the repository.
-- Instructions on how to persist the PEM, secrets file, and config so Braid
-  can run.
+- Instructions for completing the instance with `--callback-url`, or for manual
+  recovery by writing the PEM, secrets file, and config yourself.
 
 GitHub expects the manifest as a `POST` form field named `manifest`; a plain
 query parameter will not pre-fill the form. The generated HTML file handles this

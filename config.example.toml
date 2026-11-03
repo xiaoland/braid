@@ -12,6 +12,10 @@ auto_migrate = false
 [github]
 app_id = 123456
 repository = "owner/repository"
+# One instance can serve additional repositories. In that mode every Profile
+# must declare its repository and explicit workspace; do not add repositories
+# that should not share this App/webhook/process lifecycle.
+# additional_repositories = [{ name = "owner/second" }]
 handle = "braid"
 api_version = "2022-11-28"
 private_key_file = "/absolute/path/to/instance/github-app.pem"
@@ -73,6 +77,9 @@ tags = ["issue"]
 adapter_type = "codex"
 adapter_version = "codex-cli 0.147.0-alpha.6.5"
 model = "example-model"
+# Profiles in a multi-repository config also declare:
+# repository = "owner/repository" (or another configured repository)
+# workspace = "/absolute/path/to/that-repository-source-checkout"
 user_instructions = "Keep design discussion concise and maintain the Issue description as working memory."
 # Optional. The source Git checkout of the configured repository, shared by
 # all profiles as the worktree provisioning source (one repository = one

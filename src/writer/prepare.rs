@@ -29,7 +29,7 @@ pub async fn prepare_pull_request(
         match issue_context.linked_branches.as_slice() {
             [] => format!("braid/implementation-request-{}", request.comment_id),
             [linked] => linked
-                .strip_prefix(&format!("{}:", config.repository()))
+                .strip_prefix(&format!("{repository}:"))
                 .map(str::to_owned)
                 .with_context(|| {
                     format!(
@@ -46,27 +46,22 @@ pub async fn prepare_pull_request(
     if head_ref == base_ref {
         bail!("Implementation Request head must differ from the default branch {base_ref:?}");
     }
-    let profile = config.profile(&config.profile_selection.default_pr_profile)?;
+    let profile = config.pr_profile_for_repository(&repository.to_string())?;
     if !profile.has_tag("pr") {
-        bail!("default PR Profile {:?} is not tagged pr", profile.id);
+        bail!("PR Profile {:?} for {} is not tagged pr", profile.id, repository);
     }
     let profile_digest = helpers::digest(&serde_json::to_string(profile)?);
-    let request_key = format!("pr_ensure\0{}\0{}", config.repository(), request.comment_id);
+    let request_key = format!("pr_ensure\0{}\0{}", repository, request.comment_id);
     let request_digest = helpers::digest(&format!(
         "pr_ensure\0{}\0{}\0{}\0{}\0{}\0{}",
-        config.repository(),
-        request.comment_id,
-        base_ref,
-        head_ref,
-        profile.id,
-        profile_digest
+        repository, request.comment_id, base_ref, head_ref, profile.id, profile_digest
     ));
     store
         .prepare_implementation_request(NewImplementationRequest {
             write: NewGhWriteIntent {
                 request_key,
                 operation: "pr_ensure",
-                repository: config.repository().to_owned(),
+                repository: repository.to_string(),
                 target: comment.html_url.clone(),
                 profile_id: profile.id.clone(),
                 role: "PR Implementation Agent".into(),

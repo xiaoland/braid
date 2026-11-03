@@ -83,6 +83,7 @@ pub(crate) async fn run(a: InitArguments) -> Result<()> {
         adapter_type: a.adapter.clone(),
         adapter_version: runtime.version.clone(),
         provider: profile_provider,
+        repository: None,
         model: Some(a.model.clone()),
         reasoning: a.reasoning.clone(),
         user_instructions:

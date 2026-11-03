@@ -23,7 +23,7 @@ pub(crate) enum GroupKind {
 }
 
 impl GroupKind {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Issue => "issue",
             Self::Pr => "pr",
@@ -35,6 +35,7 @@ pub(crate) struct GroupSpec {
     pub(super) kind: GroupKind,
     pub(super) profile: Profile,
     pub(super) profile_record: ProfileRecord,
+    pub(crate) repository: String,
 }
 
 impl GroupSpec {
@@ -42,19 +43,20 @@ impl GroupSpec {
         &self.profile.id
     }
 
-    pub(crate) fn new(kind: GroupKind, config: &Config, store: &StoreActor) -> Result<Self> {
+    pub(crate) fn new(
+        kind: GroupKind,
+        config: &Config,
+        store: &StoreActor,
+        repository: &str,
+    ) -> Result<Self> {
         let profile = match kind {
-            GroupKind::Issue => config
-                .profiles
-                .iter()
-                .find(|profile| profile.has_tag("issue"))
-                .context("configuration has no Issue Profile")?,
-            GroupKind::Pr => config.profile(&config.profile_selection.default_pr_profile)?,
+            GroupKind::Issue => config.issue_profile_for_repository(repository)?,
+            GroupKind::Pr => config.pr_profile_for_repository(repository)?,
         }
         .clone();
         let profile_record = materialized_profile(config, &profile)?;
         store.register_profile(profile_record.clone())?;
-        Ok(Self { kind, profile, profile_record })
+        Ok(Self { kind, profile, profile_record, repository: repository.to_owned() })
     }
 }
 

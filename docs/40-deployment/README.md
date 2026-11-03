@@ -6,9 +6,10 @@ GitHub mutation authority by itself.
 
 ## Supported Shape
 
-The first supported artifact is a signed/checksummed macOS arm64 `braid` binary.
-It runs without Python, PDM, Cargo, or a source checkout. Linux x86_64 is the
-next target. Runtime prerequisites remain explicit:
+The supported packaged artifacts are signed/checksummed macOS arm64 and
+Linux x86_64 `braid` binaries produced by the release workflow from the same
+locked source. They run without Python, PDM, Cargo, or a source checkout.
+Runtime prerequisites remain explicit:
 
 - Git and `gh` for Agent workflows;
 - pinned Codex executable and authenticated provider home;
@@ -32,7 +33,8 @@ database schema. It contains no secret values. Provider API keys always use
 `api_key_file` references; the GitHub webhook secret separately supports a file
 reference or environment-variable name. The main sections are:
 
-- GitHub App/repository/handle, API version, webhook and reconciliation;
+- GitHub App/repository or explicitly configured multi-repository set,
+  handle, API version, webhook and reconciliation;
 - the instance key under `[instance]`;
 - Profile definitions/tags/default PR Profile/context byte budgets/status
   surfaces/provider/workspace/resources;
@@ -46,7 +48,12 @@ reference or environment-variable name. The main sections are:
 - log format and bounded health/status settings.
 
 `braid config check` prints the effective non-secret declaration and validates
-its static invariants. `braid doctor` runs filesystem, SQLite, GitHub, Codex
+its static invariants. Single-repository GitHub configs may omit
+`profile.repository`; a config with `github.additional_repositories` requires
+every Profile to declare its repository and explicit workspace. The App and
+webhook secret stay instance-level, while Profiles, scheduling, worktrees, and
+writes remain repository-scoped. `braid doctor` runs filesystem, SQLite,
+GitHub, Codex
 schema, Git/gh, OTLP, and Wrangler precondition probes. Profiles expose
 their effective mapped provider settings through `braid profile inspect`.
 
@@ -70,7 +77,7 @@ Everything below is scoped by trust boundary:
     state/
       braid.sqlite3
       backups/
-      worktrees/<repository>/<pr-number>-<assignment-generation>/
+      worktrees/<repository>/<issue-or-pr-number>-<assignment-generation>/
     provider/                   # adapter home (e.g. Codex provider state)
     logs/                       # optional sampled-log export
 ```

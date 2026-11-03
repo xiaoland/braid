@@ -48,7 +48,8 @@ pub(crate) async fn prepare_pr_context(
     let CanonicalContext::PullRequest(pull_request) = canonical else {
         unreachable!("PR materializer returned Issue Context");
     };
-    if pull_request.head_repository.as_deref() != Some(config.repository()) {
+    let expected_repository = config.profile_repository(profile);
+    if pull_request.head_repository.as_deref() != Some(expected_repository) {
         bail!("PR #{} head repository is not the configured repository", candidate.number);
     }
     Ok(PreparedPrContext {
@@ -86,9 +87,11 @@ pub(super) fn provision_pr_worktree_from_ref(
     repository_node_id: &str,
     head_ref: &str,
 ) -> Result<Profile> {
+    let repository_slug = config.profile_repository(profile).replace('/', "--");
     let target = config
         .runtime
         .worktrees()
+        .join(repository_slug)
         .join(format!("pr-{number}"))
         .join(format!("{}-g{}", profile.id, materialization.generation));
     let local_branch =
@@ -96,7 +99,7 @@ pub(super) fn provision_pr_worktree_from_ref(
     let provisioned = worktree::provision(&WorktreeRequest {
         source: profile.workspace(),
         target: &target,
-        repository: config.repository(),
+        repository: config.profile_repository(profile),
         remote: "origin",
         local_only: config.is_builtin(),
         git: &config.tools.git,
@@ -205,7 +208,7 @@ impl GroupDriver<'_> {
             }
             let instructions = pr_system_prompt(config, profile, candidate.number, head_ref);
             let instruction_revision = hex::encode(Sha256::digest(instructions.as_bytes()));
-            let incompatible_reason = if candidate.repository != config.repository() {
+            let incompatible_reason = if candidate.repository != self.spec.repository {
                 Some("repository mismatch")
             } else if candidate.work_item_kind != "pr" {
                 Some("Work Item kind mismatch")
@@ -282,13 +285,14 @@ impl GroupDriver<'_> {
 
     pub(super) async fn materialize_next_pr_assignment(&self) {
         let store = self.store;
-        let candidate = match store.assignment_candidates("pr".into(), 1) {
-            Ok(candidates) => candidates.into_iter().next(),
-            Err(error) => {
-                tracing::error!(%error, "cannot inspect PR activation events");
-                return;
-            }
-        };
+        let candidate =
+            match store.assignment_candidates(self.spec.repository.clone(), "pr".into(), 1) {
+                Ok(candidates) => candidates.into_iter().next(),
+                Err(error) => {
+                    tracing::error!(%error, "cannot inspect PR activation events");
+                    return;
+                }
+            };
         let Some(candidate) = candidate else { return };
         if candidate.action == "unassign" && self.collaboration.is_builtin() {
             if let Err(error) = self.settle_builtin_pr_unassignment(candidate).await {

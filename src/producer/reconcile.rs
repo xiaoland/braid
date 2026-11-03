@@ -1,10 +1,10 @@
 #![allow(clippy::large_futures)]
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex as StdMutex},
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use sha2::{Digest, Sha256};
 use tokio::{
     sync::{RwLock, watch},
@@ -66,7 +66,7 @@ pub(crate) async fn lease_worker(
 
 pub(crate) async fn reconciliation_worker(
     store: Arc<StoreActor>,
-    github: Arc<GitHubClient>,
+    github: Arc<HashMap<String, Arc<GitHubClient>>>,
     config: Config,
     health: Arc<RwLock<HealthSnapshot>>,
     mut shutdown: watch::Receiver<bool>,
@@ -100,47 +100,56 @@ pub(crate) async fn reconciliation_worker(
 
 pub(crate) async fn reconcile_once(
     store: &StoreActor,
-    github: &GitHubClient,
+    github: &HashMap<String, Arc<GitHubClient>>,
     config: &Config,
 ) -> Result<usize> {
-    if store.tracked_work_items()?.is_empty() {
-        return Ok(0);
-    }
-    let run = store.begin_reconciliation(github.identity().repository_node_id.clone())?;
-    let result = Box::pin(reconcile_work_items(store, github, config)).await;
-    match &result {
-        Ok((work_items, changes)) => {
-            store.finish_reconciliation(run, "completed", *work_items, *changes, None)?;
+    let mut changes = 0;
+    let mut failures = Vec::new();
+    for (repository, client) in github {
+        let run = store.begin_reconciliation(client.identity().repository_node_id.clone())?;
+        match Box::pin(reconcile_work_items(store, client, config, repository)).await {
+            Ok((work_items, repository_changes)) => {
+                store.finish_reconciliation(
+                    run,
+                    "completed",
+                    work_items,
+                    repository_changes,
+                    None,
+                )?;
+                changes += repository_changes;
+            }
+            Err(error) => {
+                store.finish_reconciliation(run, "failed", 0, 0, Some(error.to_string()))?;
+                failures.push(format!("{repository}: {error:#}"));
+            }
         }
-        Err(error) => {
-            store.finish_reconciliation(run, "failed", 0, 0, Some(error.to_string()))?;
-        }
     }
-    result.map(|(_, changes)| changes)
+    if failures.is_empty() { Ok(changes) } else { anyhow::bail!(failures.join("; ")) }
 }
 
 pub(crate) async fn reconcile_work_items(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
+    repository: &str,
 ) -> Result<(usize, usize)> {
-    let tracked = store.tracked_work_items()?;
+    let tracked = store
+        .tracked_work_items()?
+        .into_iter()
+        .filter(|work_item| work_item.repository == repository)
+        .collect::<Vec<_>>();
+    if tracked.is_empty() {
+        return Ok((0, 0));
+    }
     let mut changes = 0;
     for work_item in &tracked {
         let repository = work_item.repository.parse::<RepositoryName>()?;
-        let scoped;
-        let client = if repository == config.repository().parse::<RepositoryName>()? {
-            github
-        } else {
-            scoped = github.for_repository(&repository).await?;
-            &scoped
-        };
         let locator = WorkItemLocator { repository, number: work_item.number };
         let mut canonical = if work_item.kind == "issue" {
-            CanonicalContext::Issue(context::materialize_issue(client, &locator, 100).await?)
+            CanonicalContext::Issue(context::materialize_issue(github, &locator, 100).await?)
         } else if work_item.kind == "pr" {
             CanonicalContext::PullRequest(
-                context::materialize_pull_request(client, &locator, 100).await?,
+                context::materialize_pull_request(github, &locator, 100).await?,
             )
         } else {
             continue;
@@ -186,13 +195,9 @@ pub(crate) async fn reconcile_work_items(
         changes += reconcile_observations(store, github, config, &scope, &prior, &observations)?;
         context::reconcile_local_state(&mut canonical, store)?;
         let profile = if work_item.kind == "pr" {
-            config.profile(&config.profile_selection.default_pr_profile)?
+            config.pr_profile_for_repository(&work_item.repository)?
         } else {
-            config
-                .profiles
-                .iter()
-                .find(|profile| profile.has_tag("issue"))
-                .context("configuration has no Issue Profile")?
+            config.issue_profile_for_repository(&work_item.repository)?
         };
         let rendered = context::render_complete(
             &canonical,

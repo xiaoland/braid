@@ -102,7 +102,7 @@ pub(crate) fn issue_system_prompt(config: &Config, profile: &Profile, issue_numb
          Never publish Agent comments through another identity: uncorrelated writes are read back as external Human input and will wake you again.\n\
          Never publish raw chain of thought. Treat folded or deleted bodies as absent.\n\n\
          --- Profile User Instructions ---\n{}",
-        config.repository(),
+        config.profile_repository(profile),
         issue_number,
         profile.user_instructions,
     )
@@ -135,7 +135,7 @@ pub(crate) fn pr_system_prompt(
          Never publish Agent comments through another identity: uncorrelated writes are read back as external Human input and will wake you again.\n\
          Never publish raw chain of thought. Treat folded or deleted bodies as absent.\n\n\
          --- Profile User Instructions ---\n{}",
-        config.repository(),
+        config.profile_repository(profile),
         pull_request_number,
         head_ref,
         profile.user_instructions,

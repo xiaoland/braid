@@ -45,6 +45,10 @@ external activity.
 - Persist `X-GitHub-Delivery`, `X-GitHub-Event`, action, repository/object IDs,
   actor, receipt time, and raw payload before acknowledging. Redelivery retains
   the delivery GUID.
+- The repository in the payload must be one of the explicitly configured
+  repositories for this instance. A signed delivery from another installed
+  repository is rejected before scheduling rather than routed through a default
+  repository.
 - Return 2xx within GitHub's ten-second deadline only after durable ingest.
   GitHub does not automatically retry failed deliveries; reconciliation and
   explicit redelivery remain required.
@@ -233,13 +237,10 @@ exact attributed body content provides the fallback retry identity, while an
 explicit value lets the Agent name retry intent. Command results expose only
 bounded operation/target/Profile/lifecycle and semantic GitHub comment/PR
 references. Internal write IDs, node IDs, digests, and retry counters remain in
-SQLite and never enter Agent tool output. `pr ensure` accepts an optional
-explicit `--head`, then the
-sole same-repository Development branch, then its deterministic
-request-comment-derived branch.
-
-`pr ensure` first selects an explicit requested head, the sole unambiguous
-Development linked branch, or a deterministic request-comment-derived ref. It
+SQLite and never enter Agent tool output. `pr ensure` accepts an optional explicit `--head` and, in a multi-repository
+instance, requires `--repository`. It first selects an explicit requested head,
+the sole unambiguous Development linked branch, or a deterministic
+request-comment-derived ref. It
 compares that head to the intended base. When GitHub has no differing commit,
 Braid uses the Git Data API to create a commit with the current head tree and
 parent, message `chore(braid): initialize implementation request <comment>`, and

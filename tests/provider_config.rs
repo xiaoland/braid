@@ -242,14 +242,19 @@ fn init_generates_an_explicit_keyless_pi_route() {
     assert!(!generated.contains("api_key_file"), "{generated}");
     assert!(!generated.contains("protocol"), "{generated}");
     assert!(!generated.contains("allowances"), "{generated}");
+    fs::write(&config, generated.replace("http://127.0.0.1:4318", "http://127.0.0.1:9"))
+        .expect("make OTLP endpoint unavailable");
+    fs::create_dir_all(harness.join("state/backups")).expect("create runtime directories");
+    let isolated_home = temporary.join("user-home");
 
     let output = braid()
-        .args(["config", "check", "--config"])
+        .args(["doctor", "--config"])
         .arg(&config)
+        .env("BRAID_USER_HOME", &isolated_home)
         .output()
-        .expect("check generated keyless config");
+        .expect("run doctor with unavailable optional OTLP");
     let _ = fs::remove_dir_all(&temporary);
-    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(output.status.success(), "stdout:\n{}\nstderr:\n{}", stdout(&output), stderr(&output));
 }
 
 #[test]

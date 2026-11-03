@@ -225,6 +225,11 @@ pub struct LocalConfig {
 pub struct GitHubConfig {
     pub app_id: u64,
     pub repository: String,
+    /// Additional repositories served by this same GitHub App and instance.
+    /// The existing `repository` remains the single-repository default; when
+    /// this list is non-empty every Profile must declare its repository.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_repositories: Vec<GitHubRepositoryConfig>,
     pub handle: String,
     pub api_version: String,
     pub private_key_file: PathBuf,
@@ -233,6 +238,12 @@ pub struct GitHubConfig {
     #[serde(default)]
     pub webhook_secret_file: Option<PathBuf>,
     pub projects_v2_enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubRepositoryConfig {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -337,6 +348,11 @@ pub struct Profile {
     /// Adapters with their own authentication, such as Codex, omit this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// GitHub repository this Profile serves. Single-repository GitHub configs
+    /// may omit it and use `github.repository`; multi-repository configs must
+    /// set it explicitly. Built-in platform Profiles omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     pub model: Option<String>,
     pub reasoning: Option<String>,
     pub user_instructions: String,
@@ -391,6 +407,7 @@ pub struct ConfigSummary<'a> {
     pub upstream: &'static str,
     pub instance_key: &'a str,
     pub repository: &'a str,
+    pub repositories: Vec<&'a str>,
     pub runtime_root: &'a Path,
     pub database: &'a Path,
     pub profile_ids: Vec<&'a str>,
@@ -467,7 +484,15 @@ impl Config {
                 *manifest = resolve_path(&base, manifest);
             }
         }
+        let multi_repository =
+            config.github.as_ref().is_some_and(|github| !github.additional_repositories.is_empty());
         for profile in &mut config.profiles {
+            if multi_repository && profile.workspace.is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "profile {:?} requires an explicit workspace in a multi-repository config",
+                    profile.id
+                )));
+            }
             profile.resolve_workspace(&base);
         }
         config.validate()?;
@@ -489,6 +514,60 @@ impl Config {
 
     pub fn is_builtin(&self) -> bool {
         self.builtin.is_some()
+    }
+
+    pub fn github_repositories(&self) -> Vec<&str> {
+        let Some(github) = &self.github else { return Vec::new() };
+        std::iter::once(github.repository.as_str())
+            .chain(github.additional_repositories.iter().map(|repository| repository.name.as_str()))
+            .collect()
+    }
+
+    pub fn repositories(&self) -> Vec<&str> {
+        if self.is_builtin() { vec![self.repository()] } else { self.github_repositories() }
+    }
+
+    pub fn is_multi_repository(&self) -> bool {
+        self.github.as_ref().is_some_and(|github| !github.additional_repositories.is_empty())
+    }
+
+    pub fn profile_repository<'a>(&'a self, profile: &'a Profile) -> &'a str {
+        match (&self.github, &self.builtin) {
+            (Some(github), None) => profile.repository.as_deref().unwrap_or(&github.repository),
+            (None, Some(builtin)) => &builtin.repository,
+            _ => unreachable!("configuration validates exactly one collaboration backend"),
+        }
+    }
+
+    pub fn profiles_for_repository<'a>(&'a self, repository: &str, tag: &str) -> Vec<&'a Profile> {
+        self.profiles
+            .iter()
+            .filter(|profile| {
+                self.profile_repository(profile) == repository && profile.has_tag(tag)
+            })
+            .collect()
+    }
+
+    pub fn issue_profile_for_repository(&self, repository: &str) -> Result<&Profile, ConfigError> {
+        self.profiles_for_repository(repository, "issue").into_iter().next().ok_or_else(|| {
+            ConfigError::Invalid(format!("repository {repository:?} has no Issue Profile"))
+        })
+    }
+
+    pub fn pr_profile_for_repository(&self, repository: &str) -> Result<&Profile, ConfigError> {
+        let candidates = self.profiles_for_repository(repository, "pr");
+        if let [profile] = candidates.as_slice() {
+            return Ok(profile);
+        }
+        candidates
+            .iter()
+            .find(|profile| profile.id == self.profile_selection.default_pr_profile)
+            .copied()
+            .ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "repository {repository:?} does not have an unambiguous PR Profile"
+                ))
+            })
     }
 
     pub fn github(&self) -> Result<&GitHubConfig, ConfigError> {
@@ -513,6 +592,7 @@ impl Config {
             upstream: if self.is_builtin() { "builtin" } else { "github" },
             instance_key: &self.instance.key,
             repository: self.repository(),
+            repositories: self.repositories(),
             runtime_root: self.runtime.root(),
             database: self.runtime.database(),
             profile_ids: self.profiles.iter().map(|profile| profile.id.as_str()).collect(),
@@ -719,6 +799,17 @@ impl Config {
                 return Err(ConfigError::Invalid("github.app_id must be positive".into()));
             }
             validate_repository(&github.repository)?;
+            let mut repository_names = HashSet::new();
+            repository_names.insert(github.repository.as_str());
+            for repository in &github.additional_repositories {
+                validate_repository(&repository.name)?;
+                if !repository_names.insert(repository.name.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "duplicate GitHub repository {:?}",
+                        repository.name
+                    )));
+                }
+            }
             validate_token("github.handle", &github.handle)?;
             if github.webhook_secret_environment.is_none() && github.webhook_secret_file.is_none() {
                 return Err(ConfigError::Invalid("one of github.webhook_secret_environment or github.webhook_secret_file must be set".into()));
@@ -855,6 +946,17 @@ impl Config {
                 )));
             }
         }
+        if self.github.is_some() {
+            for repository in self.github_repositories() {
+                if self.profiles_for_repository(repository, "issue").is_empty()
+                    && self.profiles_for_repository(repository, "pr").is_empty()
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "GitHub repository {repository:?} has no Issue or PR Profile"
+                    )));
+                }
+            }
+        }
         let default_pr = self.profile(&self.profile_selection.default_pr_profile)?;
         if !default_pr.has_tag("pr") {
             return Err(ConfigError::Invalid(
@@ -898,6 +1000,39 @@ impl TelemetryConfig {
 }
 
 impl Profile {
+    fn validate_repository_scope(&self, config: &Config) -> Result<(), ConfigError> {
+        let Some(github) = &config.github else {
+            if self.repository.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "profile {:?} repository is supported only by the GitHub backend",
+                    self.id
+                )));
+            }
+            return Ok(());
+        };
+        let configured = config.github_repositories();
+        match &self.repository {
+            Some(repository) => {
+                validate_repository(repository)?;
+                if !configured.contains(&repository.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "profile {:?} references unconfigured GitHub repository {:?}",
+                        self.id, repository
+                    )));
+                }
+            }
+            None => {
+                if !github.additional_repositories.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "profile {:?} requires an explicit repository in a multi-repository config",
+                        self.id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn has_tag(&self, tag: &str) -> bool {
         self.tags.iter().any(|candidate| candidate == tag)
     }
@@ -937,6 +1072,7 @@ impl Profile {
                 self.id
             )));
         }
+        self.validate_repository_scope(config)?;
         if let Some(workspace) = &self.workspace {
             require_absolute(&format!("profile {:?}.workspace", self.id), workspace)?;
         }

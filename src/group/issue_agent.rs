@@ -32,9 +32,11 @@ pub(crate) fn provision_issue_agent_worktree(
     head_ref: &str,
     repository_node_id: String,
 ) -> Result<Profile> {
+    let repository_slug = config.profile_repository(profile).replace('/', "--");
     let target = config
         .runtime
         .worktrees()
+        .join(repository_slug)
         .join(format!("issue-{issue_number}"))
         .join(format!("{}-g{}", profile.id, materialization.generation));
     let local_branch =
@@ -42,7 +44,7 @@ pub(crate) fn provision_issue_agent_worktree(
     let provisioned = worktree::provision(&WorktreeRequest {
         source: profile.workspace(),
         target: &target,
-        repository: config.repository(),
+        repository: config.profile_repository(profile),
         remote: "origin",
         local_only: config.is_builtin(),
         git: &config.tools.git,
@@ -148,7 +150,7 @@ impl GroupDriver<'_> {
                 enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
                 continue;
             };
-            let incompatible_reason = if candidate.repository != config.repository() {
+            let incompatible_reason = if candidate.repository != self.spec.repository {
                 Some("repository mismatch")
             } else if candidate.profile_id != profile.id {
                 Some("Profile id mismatch")
@@ -306,13 +308,14 @@ impl GroupDriver<'_> {
 
     pub(super) async fn materialize_next_issue_assignment(&self) {
         let store = self.store;
-        let candidate = match store.assignment_candidates("issue".into(), 1) {
-            Ok(candidates) => candidates.into_iter().next(),
-            Err(error) => {
-                tracing::error!(%error, "cannot inspect assignment events");
-                return;
-            }
-        };
+        let candidate =
+            match store.assignment_candidates(self.spec.repository.clone(), "issue".into(), 1) {
+                Ok(candidates) => candidates.into_iter().next(),
+                Err(error) => {
+                    tracing::error!(%error, "cannot inspect assignment events");
+                    return;
+                }
+            };
         let Some(candidate) = candidate else { return };
         if candidate.action == "unassign" {
             if let Err(error) = self.settle_issue_unassignment(candidate).await {
@@ -392,7 +395,7 @@ impl GroupDriver<'_> {
             anyhow::bail!(message);
         }
         let head_ref =
-            match resolve_issue_worktree_ref(&canonical, config.repository(), github).await {
+            match resolve_issue_worktree_ref(&canonical, &self.spec.repository, github).await {
                 Ok(head_ref) => head_ref,
                 Err(error) => {
                     let message = format!("cannot resolve the Issue worktree ref: {error:#}");

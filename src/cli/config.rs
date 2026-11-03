@@ -8,7 +8,7 @@ pub fn config_check(arguments: &ConfigPath) -> Result<()> {
     } else {
         println!("configuration: valid");
         println!("schema: {}", config.schema_version);
-        println!("repository: {}", config.repository());
+        println!("repositories: {}", config.repositories().join(", "));
         println!("database: {}", config.runtime.database().display());
         println!(
             "profiles: {}",

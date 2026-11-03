@@ -48,7 +48,7 @@ pub fn parse_verified(
     headers: WebhookHeaders<'_>,
     body: &[u8],
     secret: &[u8],
-    configured_repository: &str,
+    configured_repositories: &[String],
     configured_handle: &str,
     actors: ActorPolicy<'_>,
 ) -> Result<IngressEvent, WebhookError> {
@@ -57,10 +57,10 @@ pub fn parse_verified(
     let event_name = headers.event.ok_or(WebhookError::MissingEvent)?;
     let payload: Payload = serde_json::from_slice(body)?;
     let repository = payload.repository.as_ref().ok_or(WebhookError::MissingRepository)?;
-    if repository.full_name != configured_repository {
+    if !configured_repositories.iter().any(|configured| configured == &repository.full_name) {
         return Err(WebhookError::WrongRepository {
             actual: repository.full_name.clone(),
-            expected: configured_repository.into(),
+            expected: configured_repositories.join(", "),
         });
     }
 

@@ -130,7 +130,7 @@ async fn managed(
     if provider_enabled {
         let factories = crate::provider::session_factories(&config)?;
         for kind in [GroupKind::Issue, GroupKind::Pr] {
-            let spec = GroupSpec::new(kind, &config, &store)?;
+            let spec = GroupSpec::new(kind, &config, &store, config.repository())?;
             let factory = factories
                 .get(spec.profile_id())
                 .context("Profile session factory missing")?

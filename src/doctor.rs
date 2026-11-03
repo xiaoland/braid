@@ -120,10 +120,15 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
                 }
                 checks.push(match command_version("Pi CLI", &pi.executable).await {
                     check if check.state == CheckState::Pass => match pi.api_key() {
-                        Ok(_) => Check {
+                        Ok(Some(_)) => Check {
                             name: "Pi provider".into(),
                             state: CheckState::Pass,
                             detail: format!("{} (API key present)", check.detail),
+                        },
+                        Ok(None) => Check {
+                            name: "Pi provider".into(),
+                            state: CheckState::Pass,
+                            detail: format!("{} (keyless route)", check.detail),
                         },
                         Err(error) => Check {
                             name: "Pi provider".into(),
@@ -160,87 +165,107 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
     }
     checks.push(otlp_check(config));
     checks.push(cross_instance_port_check(config, user_home));
-    let ready = checks.iter().all(|check| check.state == CheckState::Pass);
+    let ready = report_ready(&checks);
     DoctorReport { ready, checks }
+}
+
+fn report_ready(checks: &[Check]) -> bool {
+    checks.iter().all(|check| {
+        check.state == CheckState::Pass
+            || (check.name == "OTLP endpoint" && check.state == CheckState::Unavailable)
+    })
 }
 
 /// The instance source checkout must be a Git clone of the configured
 /// repository; it is the provisioning source for every Agent worktree.
 fn source_checkout_check(config: &Config) -> Check {
     let name = "Source checkout";
-    let Some(profile) = config.profiles.first() else {
+    if config.profiles.is_empty() {
         return Check { name: name.into(), state: CheckState::Fail, detail: "no profiles".into() };
-    };
-    let source = profile.workspace();
-    if !source.join(".git").exists() {
-        return Check {
-            name: name.into(),
-            state: CheckState::Fail,
-            detail: if config.is_builtin() {
-                format!(
-                    "{} is not a Git checkout; configure profile.workspace with the execution source for this platform repository",
-                    source.display()
-                )
-            } else {
-                format!(
-                    "{} is not a Git checkout; clone with `git clone https://github.com/{} {}`",
-                    source.display(),
-                    config.repository(),
-                    source.display()
-                )
-            },
-        };
     }
-    if config.is_builtin() {
-        return match git2::Repository::open(source) {
-            Ok(repo) if !repo.is_bare() => Check {
-                name: name.into(),
-                state: CheckState::Pass,
-                detail: source.display().to_string(),
-            },
-            Ok(_) => Check {
+    let mut seen = std::collections::HashSet::new();
+    let mut details = Vec::new();
+    for profile in &config.profiles {
+        let repository = config.profile_repository(profile);
+        let source = profile.workspace();
+        if !seen.insert((repository.to_owned(), source.to_path_buf())) {
+            continue;
+        }
+        if !source.join(".git").exists() {
+            return Check {
                 name: name.into(),
                 state: CheckState::Fail,
-                detail: "profile.workspace must be a working Git checkout".into(),
-            },
-            Err(error) => {
-                Check { name: name.into(), state: CheckState::Fail, detail: error.to_string() }
-            }
-        };
-    }
-    let remote = std::process::Command::new("git")
-        .arg("-C")
-        .arg(source)
-        .args(["remote", "get-url", "origin"])
-        .output();
-    match remote {
-        Ok(output) if output.status.success() => {
-            let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if url.to_ascii_lowercase().contains(&config.repository().to_ascii_lowercase()) {
-                Check {
-                    name: name.into(),
-                    state: CheckState::Pass,
-                    detail: format!("{} ({})", source.display(), url),
+                detail: if config.is_builtin() {
+                    format!(
+                        "{repository}: {} is not a Git checkout; configure profile.workspace with the execution source for this platform repository",
+                        source.display()
+                    )
+                } else {
+                    format!(
+                        "{repository}: {} is not a Git checkout; clone with `git clone https://github.com/{repository} {}`",
+                        source.display(),
+                        source.display()
+                    )
+                },
+            };
+        }
+        if config.is_builtin() {
+            match git2::Repository::open(source) {
+                Ok(repo) if !repo.is_bare() => {
+                    details.push(format!("{repository}: {}", source.display()));
                 }
-            } else {
-                Check {
+                Ok(_) => {
+                    return Check {
+                        name: name.into(),
+                        state: CheckState::Fail,
+                        detail: format!(
+                            "{repository}: profile.workspace must be a working Git checkout"
+                        ),
+                    };
+                }
+                Err(error) => {
+                    return Check {
+                        name: name.into(),
+                        state: CheckState::Fail,
+                        detail: format!("{repository}: {error}"),
+                    };
+                }
+            }
+            continue;
+        }
+        let remote = std::process::Command::new("git")
+            .arg("-C")
+            .arg(source)
+            .args(["remote", "get-url", "origin"])
+            .output();
+        match remote {
+            Ok(output) if output.status.success() => {
+                let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                if !url.to_ascii_lowercase().contains(&repository.to_ascii_lowercase()) {
+                    return Check {
+                        name: name.into(),
+                        state: CheckState::Fail,
+                        detail: format!(
+                            "{repository}: {} remote origin is {url}, not {repository}",
+                            source.display()
+                        ),
+                    };
+                }
+                details.push(format!("{repository}: {} ({url})", source.display()));
+            }
+            _ => {
+                return Check {
                     name: name.into(),
                     state: CheckState::Fail,
                     detail: format!(
-                        "{} remote origin is {}, not {}",
-                        source.display(),
-                        url,
-                        config.repository()
+                        "{repository}: cannot inspect git remote in {}",
+                        source.display()
                     ),
-                }
+                };
             }
         }
-        _ => Check {
-            name: name.into(),
-            state: CheckState::Fail,
-            detail: format!("cannot inspect git remote in {}", source.display()),
-        },
     }
+    Check { name: name.into(), state: CheckState::Pass, detail: details.join("; ") }
 }
 
 fn codex_credentials_check(codex: &crate::config::CodexConfig) -> Check {
@@ -265,16 +290,6 @@ fn codex_credentials_check(codex: &crate::config::CodexConfig) -> Check {
 }
 
 async fn github_app_check(config: &Config) -> Check {
-    let repository = match config.repository().parse::<RepositoryName>() {
-        Ok(repository) => repository,
-        Err(error) => {
-            return Check {
-                name: "GitHub App".into(),
-                state: CheckState::Fail,
-                detail: error.to_string(),
-            };
-        }
-    };
     let github = match config.github() {
         Ok(github) => github,
         Err(error) => {
@@ -285,27 +300,40 @@ async fn github_app_check(config: &Config) -> Check {
             };
         }
     };
-    match GitHubClient::connect(github, &repository).await {
-        Ok(client) => {
-            let identity = client.identity();
-            Check {
-                name: "GitHub App".into(),
-                state: CheckState::Pass,
-                detail: format!(
-                    "{} (App {}, installation {}) can address {}",
-                    identity.app_slug,
-                    identity.app_id,
-                    identity.installation_id,
-                    identity.repository
-                ),
+    let mut details = Vec::new();
+    for repository in config.github_repositories() {
+        let repository = match repository.parse::<RepositoryName>() {
+            Ok(repository) => repository,
+            Err(error) => {
+                return Check {
+                    name: "GitHub App".into(),
+                    state: CheckState::Fail,
+                    detail: error.to_string(),
+                };
+            }
+        };
+        match GitHubClient::connect(github, &repository).await {
+            Ok(client) => {
+                let identity = client.identity();
+                details.push(format!(
+                    "{} (App {}, installation {})",
+                    identity.repository, identity.app_id, identity.installation_id
+                ));
+            }
+            Err(error) => {
+                return Check {
+                    name: "GitHub App".into(),
+                    state: if error.is_unavailable() {
+                        CheckState::Unavailable
+                    } else {
+                        CheckState::Fail
+                    },
+                    detail: format!("{repository}: {error}"),
+                };
             }
         }
-        Err(error) => Check {
-            name: "GitHub App".into(),
-            state: if error.is_unavailable() { CheckState::Unavailable } else { CheckState::Fail },
-            detail: error.to_string(),
-        },
     }
+    Check { name: "GitHub App".into(), state: CheckState::Pass, detail: details.join("; ") }
 }
 
 fn cross_instance_port_check(config: &Config, user_home: &UserHome) -> Check {
@@ -484,5 +512,30 @@ fn otlp_check(config: &Config) -> Check {
         } else {
             format!("{} did not accept a TCP connection", config.telemetry.endpoint)
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Check, CheckState, report_ready};
+
+    fn check(name: &str, state: CheckState) -> Check {
+        Check { name: name.into(), state, detail: String::new() }
+    }
+
+    #[test]
+    fn unavailable_optional_otlp_does_not_block_readiness() {
+        let checks = vec![
+            check("SQLite", CheckState::Pass),
+            check("OTLP endpoint", CheckState::Unavailable),
+        ];
+        assert!(report_ready(&checks));
+    }
+
+    #[test]
+    fn other_unavailable_checks_block_readiness() {
+        let checks =
+            vec![check("SQLite", CheckState::Pass), check("GitHub App", CheckState::Unavailable)];
+        assert!(!report_ready(&checks));
     }
 }

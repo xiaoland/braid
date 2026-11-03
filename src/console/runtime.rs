@@ -188,7 +188,7 @@ async fn status(State(manager): State<Manager>) -> Result<Json<Value>, ApiError>
         None
     };
     Ok(Json(
-        json!({"instance":config.instance_key(),"repository":config.repository(),"upstream":if config.is_builtin(){"builtin"}else{"github"},"generation":state.generation,"state":state.state,"error":state.error,"provider_enabled":state.provider_enabled,"health":health,"authority":"in-process runtime supervisor","mode":if state.run_request.is_some() {"run"} else {"serve"},"stop_confirmed":state.stop_confirmed,"run_request":state.run_request,"run":run,"evidence":crate::telemetry::evidence_health(),"telemetry":{"endpoint":config.telemetry.endpoint,"sample_ratio":config.telemetry.sample_ratio,"incident_mode":config.telemetry.incident_mode}}),
+        json!({"instance":config.instance_key(),"repository":config.repositories().join(", "),"upstream":if config.is_builtin(){"builtin"}else{"github"},"generation":state.generation,"state":state.state,"error":state.error,"provider_enabled":state.provider_enabled,"health":health,"authority":"in-process runtime supervisor","mode":if state.run_request.is_some() {"run"} else {"serve"},"stop_confirmed":state.stop_confirmed,"run_request":state.run_request,"run":run,"evidence":crate::telemetry::evidence_health(),"telemetry":{"endpoint":config.telemetry.endpoint,"sample_ratio":config.telemetry.sample_ratio,"incident_mode":config.telemetry.incident_mode}}),
     ))
 }
 

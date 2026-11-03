@@ -42,7 +42,11 @@ Quick Tunnel is optional GitHub webhook connectivity, not a Harness mode.
 ```
 
 - **GitHub** owns current Issue/PR bodies, metadata, relationships, comments,
-  reviews, lifecycle, identity, and App permissions.
+  reviews, lifecycle, identity, and App permissions for every explicitly
+  configured repository. A multi-repository GitHub instance shares only the App,
+  webhook ingress, process, runtime catalogs, and observability; repository
+  remains part of every scheduling, Profile, workspace, write, resume, and
+  reconciliation decision. It never creates a cross-repository work graph.
 - **Built-in platform** independently owns its Issue/PR state, actors, event sequence,
   candidate commits and command receipts; its SQLite is collaboration authority.
 - **Collaboration Context** is a deterministic, complete projection of upstream state plus
@@ -165,7 +169,7 @@ best-effort one-way projection from it. Nonessential state is not persisted.
 | State | Authority | Projections |
 | --- | --- | --- |
 | Work Items, assignments, turns, context ledger/resets, queue/batches, outbox, owner lease | Durable store (SQLite) | In-memory `RunningAgentTurn` (claim cache for the in-flight turn), health snapshot |
-| GitHub canonical state | GitHub | `canonical_objects` / `sync_cursors` snapshots for diffing |
+| GitHub canonical state | GitHub (per configured repository) | `canonical_objects` / `sync_cursors` snapshots for diffing |
 | Physical session identity (`provider_session_id`) | Durable store (`provider_sessions`) | `SessionManager` 的 opaque key 与 adapter 寻址；句柄可替换，assignment 与 worktree 连续性不依赖连接 |
 | Current provider turn | Provider process | `SessionEvent` stream (exactly one `TurnStarted`/`TurnTerminal` per turn; receiver handed off with the turn, never re-subscribed) → durable store; 恢复时 fencing 遗留的 starting/running turn |
 | Provider connectivity | Provider connection | adapter 内部观察连接退出 → 受影响句柄的 latched availability；runtime 汇总各 driver 的恢复结果，成功不能覆盖另一方的失败 |

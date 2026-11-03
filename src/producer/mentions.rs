@@ -3,7 +3,7 @@ use crate::{
     github::GitHubClient,
     store::{SchedulerPolicy, StoreActor},
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::{
     sync::watch,
     time::{Duration, MissedTickBehavior},
@@ -11,7 +11,7 @@ use tokio::{
 
 pub(crate) async fn mention_worker(
     store: Arc<StoreActor>,
-    github: Arc<GitHubClient>,
+    github: Arc<HashMap<String, Arc<GitHubClient>>>,
     policy: SchedulerPolicy,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -31,7 +31,11 @@ pub(crate) async fn mention_worker(
                         Ok(candidates) => {
                             let mut failed = false;
                             for candidate in candidates {
-                                match github.repository_permission(&candidate.actor_login).await {
+                                let Some(client) = github.get(&candidate.repository) else {
+                                    tracing::error!(repository = %candidate.repository, "mention event references an unconfigured repository");
+                                    continue;
+                                };
+                                match client.repository_permission(&candidate.actor_login).await {
                                     Ok(role) => {
                                         let trusted = matches!(role.to_ascii_lowercase().as_str(), "maintain" | "admin");
                                         if let Err(error) = store.resolve_mention(candidate.event_id, trusted, policy) {

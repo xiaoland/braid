@@ -254,6 +254,7 @@ pub struct IngestResult {
 #[derive(Debug, Clone)]
 pub struct MentionCandidate {
     pub event_id: String,
+    pub repository: String,
     pub actor_login: String,
 }
 
@@ -927,26 +928,50 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
+    pub fn enqueue_blocked_reactivation(
+        &self,
+        repository: String,
+        work_item_kind: String,
+        number: u64,
+        reason: String,
+        policy: SchedulerPolicy,
+    ) -> Result<String, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::EnqueueBlockedReactivation(
+                repository,
+                work_item_kind,
+                number,
+                reason,
+                policy,
+                reply,
+            ))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
     pub fn assignment_candidates(
         &self,
+        repository: String,
         work_item_kind: String,
         limit: usize,
     ) -> Result<Vec<AssignmentCandidate>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::AssignmentCandidates(work_item_kind, limit, reply))
+            .send(Command::AssignmentCandidates(repository, work_item_kind, limit, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
     pub fn work_item_lifecycle_candidates(
         &self,
+        repository: String,
         work_item_kind: String,
         limit: usize,
     ) -> Result<Vec<WorkItemLifecycleCandidate>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::WorkItemLifecycleCandidates(work_item_kind, limit, reply))
+            .send(Command::WorkItemLifecycleCandidates(repository, work_item_kind, limit, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1396,8 +1421,22 @@ enum Command {
     ),
     RecordProviderResume(String, Sender<Result<(), StoreError>>),
     BlockProviderSession(String, String, Sender<Result<(), StoreError>>),
-    AssignmentCandidates(String, usize, Sender<Result<Vec<AssignmentCandidate>, StoreError>>),
+    AssignmentCandidates(
+        String,
+        String,
+        usize,
+        Sender<Result<Vec<AssignmentCandidate>, StoreError>>,
+    ),
+    EnqueueBlockedReactivation(
+        String,
+        String,
+        u64,
+        String,
+        SchedulerPolicy,
+        Sender<Result<String, StoreError>>,
+    ),
     WorkItemLifecycleCandidates(
+        String,
         String,
         usize,
         Sender<Result<Vec<WorkItemLifecycleCandidate>, StoreError>>,
@@ -1638,12 +1677,38 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::BlockProviderSession(provider_session_id, error, reply) => {
                 let _ = reply.send(block_provider_session(database, &provider_session_id, &error));
             }
-            Command::AssignmentCandidates(work_item_kind, limit, reply) => {
-                let _ = reply.send(assignment_candidates(database, &work_item_kind, limit));
+            Command::AssignmentCandidates(repository, work_item_kind, limit, reply) => {
+                let _ = reply.send(assignment_candidates(
+                    database,
+                    &repository,
+                    &work_item_kind,
+                    limit,
+                ));
             }
-            Command::WorkItemLifecycleCandidates(work_item_kind, limit, reply) => {
-                let _ =
-                    reply.send(work_item_lifecycle_candidates(database, &work_item_kind, limit));
+            Command::EnqueueBlockedReactivation(
+                repository,
+                work_item_kind,
+                number,
+                reason,
+                policy,
+                reply,
+            ) => {
+                let _ = reply.send(enqueue_blocked_reactivation(
+                    database,
+                    &repository,
+                    &work_item_kind,
+                    number,
+                    &reason,
+                    policy,
+                ));
+            }
+            Command::WorkItemLifecycleCandidates(repository, work_item_kind, limit, reply) => {
+                let _ = reply.send(work_item_lifecycle_candidates(
+                    database,
+                    &repository,
+                    &work_item_kind,
+                    limit,
+                ));
             }
             Command::PrepareWorkItemFinalization(event_id, reply) => {
                 let _ = reply.send(prepare_work_item_finalization(database, &event_id));
@@ -2663,14 +2728,18 @@ fn mention_candidates(database: &Path, limit: usize) -> Result<Vec<MentionCandid
     let limit =
         i64::try_from(limit).map_err(|_| StoreError::InvalidData("limit exceeds i64".into()))?;
     let mut statement = connection.prepare(
-        "SELECT e.event_id,d.actor_login
+        "SELECT e.event_id,d.repository_name,d.actor_login
          FROM events e JOIN deliveries d ON d.delivery_guid=e.delivery_guid
          WHERE e.mention_candidate=1 AND e.trusted_mention IS NULL AND e.lifecycle='pending'
            AND d.repository_name IS NOT NULL AND d.actor_login IS NOT NULL
          ORDER BY e.observed_at,e.event_id LIMIT ?1",
     )?;
     let rows = statement.query_map([limit], |row| {
-        Ok(MentionCandidate { event_id: row.get(0)?, actor_login: row.get(1)? })
+        Ok(MentionCandidate {
+            event_id: row.get(0)?,
+            repository: row.get(1)?,
+            actor_login: row.get(2)?,
+        })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
 }
@@ -3362,8 +3431,100 @@ fn block_provider_session(
     Ok(())
 }
 
+fn enqueue_blocked_reactivation(
+    database: &Path,
+    repository: &str,
+    work_item_kind: &str,
+    number: u64,
+    reason: &str,
+    policy: SchedulerPolicy,
+) -> Result<String, StoreError> {
+    require_current_schema(database)?;
+    validate_work_item_kind(work_item_kind)?;
+    let reason = if reason.trim().is_empty() {
+        "operator requested a new activation generation after a blocked Profile or provider recovery".to_owned()
+    } else {
+        reason.trim().chars().take(500).collect()
+    };
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let (work_item_node_id, state) = transaction
+        .query_row(
+            "SELECT w.node_id,w.state FROM work_items w\n             JOIN repositories r ON r.node_id=w.repository_node_id\n             WHERE r.name_with_owner=?1 AND w.kind=?2 AND w.number=?3",
+            params![repository, work_item_kind, sqlite_u64(number, "Work Item number")?],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::InvalidData(format!(
+                "no tracked {work_item_kind} {repository}#{number} in the Braid ledger"
+            ))
+        })?;
+    if !state.eq_ignore_ascii_case("open") {
+        return Err(StoreError::InvalidData(format!(
+            "cannot reactivate {repository}#{number} while it is {state}; reopen it first"
+        )));
+    }
+    let busy = transaction
+        .query_row(
+            "SELECT 1 FROM assignments\n             WHERE work_item_node_id=?1 AND lifecycle IN ('materializing','active','finalizing') LIMIT 1",
+            [&work_item_node_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if busy {
+        return Err(StoreError::InvalidData(format!(
+            "{repository}#{number} already has a materializing, active, or finalizing assignment"
+        )));
+    }
+    let blocked = transaction
+        .query_row(
+            "SELECT 1 FROM assignments\n             WHERE work_item_node_id=?1 AND lifecycle='blocked' LIMIT 1",
+            [&work_item_node_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !blocked {
+        return Err(StoreError::InvalidData(format!(
+            "{repository}#{number} has no blocked assignment to reactivate"
+        )));
+    }
+    let pending = transaction
+        .query_row(
+            "SELECT event_id FROM events\n             WHERE work_item_node_id=?1 AND kind='mention' AND detail='operator_reactivation'\n               AND lifecycle='pending' ORDER BY observed_at DESC LIMIT 1",
+            [&work_item_node_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(event_id) = pending {
+        transaction.commit()?;
+        return Ok(event_id);
+    }
+
+    let event_id = Uuid::now_v7().to_string();
+    transaction.execute(
+        "INSERT INTO events(\n           event_id,delivery_guid,work_item_node_id,object_node_id,object_version,\n           kind,detail,origin,reference,lifecycle,observed_at,dedupe_key,\n           mention_candidate,trusted_mention,body_digest\n         ) VALUES (?1,NULL,?2,?3,NULL,'mention','operator_reactivation','operator',?4,'pending',?5,?6,1,0,NULL)",
+        params![
+            event_id,
+            work_item_node_id,
+            work_item_node_id,
+            reason,
+            now,
+            format!("operator-reactivation:{repository}:{work_item_kind}:{number}:{event_id}"),
+        ],
+    )?;
+    schedule_event(&transaction, &work_item_node_id, &event_id, policy, false, &now)?;
+    transaction.commit()?;
+    Ok(event_id)
+}
+
 fn assignment_candidates(
     database: &Path,
+    repository: &str,
     work_item_kind: &str,
     limit: usize,
 ) -> Result<Vec<AssignmentCandidate>, StoreError> {
@@ -3377,11 +3538,11 @@ fn assignment_candidates(
          FROM events e
          JOIN work_items w ON w.node_id=e.work_item_node_id
          JOIN repositories r ON r.node_id=w.repository_node_id
-         WHERE e.lifecycle='pending' AND w.kind=?1
+         WHERE r.name_with_owner=?1 AND e.lifecycle='pending' AND w.kind=?2
            AND e.kind IN ('assign','unassign','mention')
-         ORDER BY e.observed_at,e.event_id LIMIT ?2",
+         ORDER BY e.observed_at,e.event_id LIMIT ?3",
     )?;
-    let rows = statement.query_map(params![work_item_kind, limit], |row| {
+    let rows = statement.query_map(params![repository, work_item_kind, limit], |row| {
         Ok(AssignmentCandidate {
             event_id: row.get(0)?,
             action: row.get(1)?,
@@ -3395,6 +3556,7 @@ fn assignment_candidates(
 
 fn work_item_lifecycle_candidates(
     database: &Path,
+    repository: &str,
     work_item_kind: &str,
     limit: usize,
 ) -> Result<Vec<WorkItemLifecycleCandidate>, StoreError> {
@@ -3408,11 +3570,11 @@ fn work_item_lifecycle_candidates(
          FROM events e
          JOIN work_items w ON w.node_id=e.work_item_node_id
          JOIN repositories r ON r.node_id=w.repository_node_id
-         WHERE e.lifecycle='pending' AND e.kind='lifecycle'
-           AND w.kind=?1 AND e.detail IN ('closed','merged','reopened')
-         ORDER BY e.observed_at,e.event_id LIMIT ?2",
+         WHERE r.name_with_owner=?1 AND e.lifecycle='pending' AND e.kind='lifecycle'
+           AND w.kind=?2 AND e.detail IN ('closed','merged','reopened')
+         ORDER BY e.observed_at,e.event_id LIMIT ?3",
     )?;
-    let rows = statement.query_map(params![work_item_kind, limit], |row| {
+    let rows = statement.query_map(params![repository, work_item_kind, limit], |row| {
         Ok(WorkItemLifecycleCandidate {
             event_id: row.get(0)?,
             action: row.get(1)?,

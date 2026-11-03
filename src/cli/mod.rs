@@ -20,6 +20,7 @@ use crate::{
     writer::{self, CommentCreateRequest, PullRequestEnsureRequest},
 };
 
+mod assignment;
 mod config;
 mod context_cmd;
 mod doctor_cmd;
@@ -46,6 +47,10 @@ enum Command {
     Platform(crate::platform::cli::PlatformArguments),
     /// Initialize a Braid-owned collaboration space around a local Git checkout.
     Init(crate::local::init::InitArguments),
+    Assignment {
+        #[command(subcommand)]
+        command: AssignmentCommand,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -99,6 +104,25 @@ struct ObjectArguments {
     expected_revision: Option<u64>,
     #[command(subcommand)]
     command: crate::local::cli::LocalCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AssignmentCommand {
+    Reactivate(AssignmentReactivate),
+}
+
+#[derive(Debug, Args)]
+struct AssignmentReactivate {
+    #[arg(value_name = "NUMBER")]
+    number: u64,
+    #[command(flatten)]
+    source: ConfigSource,
+    #[arg(long, value_name = "OWNER/REPOSITORY")]
+    repository: Option<String>,
+    #[arg(long, value_name = "issue|pr", default_value = "issue", value_parser = ["issue", "pr"])]
+    kind: String,
+    #[arg(long, value_name = "TEXT")]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -290,6 +314,8 @@ struct GhPrEnsure {
     comment: u64,
     #[command(flatten)]
     source: ConfigSource,
+    #[arg(long, value_name = "OWNER/REPOSITORY")]
+    repository: Option<String>,
     #[arg(long, value_name = "BRANCH")]
     head: Option<String>,
     #[arg(long)]
@@ -320,6 +346,9 @@ pub(crate) struct SetupArguments {
     pub(crate) user_home: PathBuf,
     #[arg(long, value_name = "PATH")]
     pub(crate) runtime_executable: Option<PathBuf>,
+    /// Complete a prior `--no-browser` setup from the GitHub redirect URL.
+    #[arg(long, value_name = "URL", conflicts_with = "no_browser")]
+    pub(crate) callback_url: Option<String>,
     #[arg(
         long,
         help = "Skip opening a browser; print manifest values and manual instructions instead"
@@ -395,7 +424,7 @@ struct LocalStatus<'a> {
     binary_version: &'static str,
     config_schema: u32,
     instance_key: &'a str,
-    repository: &'a str,
+    repository: String,
     default_pr_profile: &'a str,
     database: StoreStatus,
     telemetry_endpoint: String,
@@ -406,6 +435,9 @@ struct LocalStatus<'a> {
 
 pub async fn run() -> Result<()> {
     match Cli::parse().command {
+        Command::Assignment { command: AssignmentCommand::Reactivate(arguments) } => {
+            assignment::reactivate(arguments)?;
+        }
         Command::Config { command: ConfigCommand::Check(arguments) } => {
             config::config_check(&arguments)?;
         }

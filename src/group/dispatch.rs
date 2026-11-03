@@ -56,7 +56,11 @@ impl GroupDriver<'_> {
     pub(super) async fn handle_next_work_item_lifecycle(&self) -> (bool, Option<RunningAgentTurn>) {
         let store = self.store;
         let work_item_kind = self.spec.kind.as_str();
-        let candidate = match store.work_item_lifecycle_candidates(work_item_kind.into(), 1) {
+        let candidate = match store.work_item_lifecycle_candidates(
+            self.spec.repository.clone(),
+            work_item_kind.into(),
+            1,
+        ) {
             Ok(candidates) => candidates.into_iter().next(),
             Err(error) => {
                 tracing::error!(%error, work_item_kind, "cannot inspect Work Item lifecycle events");
@@ -135,7 +139,7 @@ impl GroupDriver<'_> {
                 == "pr"
             {
                 let pull_request = github.materialize_pull_request(&locator).await?;
-                if pull_request.head_repository.as_deref() != Some(config.repository()) {
+                if pull_request.head_repository.as_deref() != Some(self.spec.repository.as_str()) {
                     bail!(
                         "reopened PR #{} head repository is not the configured repository",
                         candidate.number
@@ -183,28 +187,28 @@ impl GroupDriver<'_> {
                 let issue = github.materialize_issue(&locator).await?;
                 let repository_node_id = issue.repository_node_id.clone();
                 let canonical = CanonicalContext::Issue(issue);
-                let effective_profile = if let Some(preserved) =
-                    materialization.worktree_path.clone()
-                {
-                    let mut effective_profile = profile.clone();
-                    effective_profile.workspace = Some(preserved);
-                    effective_profile
-                } else {
-                    // Pre-worktree generations (v0.3.0 data) preserved no
-                    // worktree; provision a fresh one on the current head ref
-                    // instead of parking the group blocked.
-                    let head_ref =
-                        resolve_issue_worktree_ref(&canonical, config.repository(), github).await?;
-                    provision_issue_agent_worktree(
-                        store,
-                        config,
-                        profile,
-                        candidate.number,
-                        &materialization,
-                        &head_ref,
-                        repository_node_id,
-                    )?
-                };
+                let effective_profile =
+                    if let Some(preserved) = materialization.worktree_path.clone() {
+                        let mut effective_profile = profile.clone();
+                        effective_profile.workspace = Some(preserved);
+                        effective_profile
+                    } else {
+                        // Pre-worktree generations (v0.3.0 data) preserved no
+                        // worktree; provision a fresh one on the current head ref
+                        // instead of parking the group blocked.
+                        let head_ref =
+                            resolve_issue_worktree_ref(&canonical, &self.spec.repository, github)
+                                .await?;
+                        provision_issue_agent_worktree(
+                            store,
+                            config,
+                            profile,
+                            candidate.number,
+                            &materialization,
+                            &head_ref,
+                            repository_node_id,
+                        )?
+                    };
                 (
                     canonical,
                     issue_system_prompt(config, profile, candidate.number),

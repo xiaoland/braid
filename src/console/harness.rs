@@ -23,7 +23,7 @@ pub(super) fn router(config: &Config, manager: super::runtime::Manager) -> Route
         database: config.runtime.database().into(),
         run_id: None,
         manager,
-        repository: config.repository().into(),
+        repository: config.repositories().join(", "),
         profiles: serde_json::json!({
             "issue":config.profiles.iter().find(|p|p.tags.iter().any(|t|t=="issue")).map(|p|&p.id),
             "pr":config.profile_selection.default_pr_profile,

@@ -216,6 +216,18 @@ assertions but cannot substitute for public product behavior.
 The golden Issue-to-PR journey must pass without corrective operator action. A
 fresh installation and fixture must pass the entire campaign three consecutive
 times before the implementation PR becomes ready.
+
+## 多 repository instance 的验收边界
+
+多仓库验收使用同一个 GitHub App、一个 webhook/tunnel 入口和两个已配置
+repository。两个 repository 使用不同的 Profile/user_instructions 与独立
+source checkout，最好包含相同 Issue 编号以证明裸 number 不成为身份。分别
+触发 trusted mention，核对：事件只进入所属 repository 的队列；Context 标题、
+正文和评论不混入另一仓库；worktree 路径按 repository 隔离；comment/reaction、
+status 和 `pr ensure` 都使用目标 repository 的 scoped client。第三个已安装但
+未配置 repository 的 signed delivery 必须在调度前拒绝。跨 repository 关联
+只能作为明确 reference 出现，不展开共享 Context 或工作图。
+
 ## 内建空间的验收边界
 
 内建平台的操作验收从公开 `platform/init/object/serve` 入口进行：没有 GitHub App 配置时，

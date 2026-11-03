@@ -16,7 +16,7 @@ use axum::{
     routing::get,
 };
 use rand::Rng as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
 
@@ -50,6 +50,56 @@ struct CallbackState {
     state: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetupDraft {
+    repository: String,
+    instance_key: String,
+    state: String,
+}
+
+fn save_setup_draft(user_home: &UserHome, draft: &SetupDraft) -> Result<PathBuf> {
+    let directory = user_home.setup_drafts_dir();
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("cannot create setup draft directory {}", directory.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = fs::metadata(&directory)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&directory, permissions)?;
+    }
+    let path = user_home.setup_draft_path(&draft.instance_key);
+    write_secret(&path, toml::to_string(draft)?.as_bytes())?;
+    Ok(path)
+}
+
+fn load_setup_draft(user_home: &UserHome, instance_key: &str) -> Result<SetupDraft> {
+    let path = user_home.setup_draft_path(instance_key);
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("cannot read pending setup draft {}", path.display()))?;
+    toml::from_str(&text)
+        .with_context(|| format!("cannot parse pending setup draft {}", path.display()))
+}
+
+fn callback_code_from_url(raw_url: &str, draft: &SetupDraft) -> Result<String> {
+    let url = url::Url::parse(raw_url).context("callback URL is not a valid absolute URL")?;
+    let mut code = None;
+    let mut state = None;
+    for (name, value) in url.query_pairs() {
+        match name.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    let state = state.context("callback URL is missing state")?;
+    if state != draft.state {
+        bail!("callback URL state does not match the pending setup draft");
+    }
+    code.filter(|code| !code.is_empty()).context("callback URL is missing code")
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn run(arguments: SetupArguments) -> Result<()> {
     let user_home = UserHome::resolve(Some(&arguments.user_home))?;
@@ -74,11 +124,31 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         );
     }
 
-    let state = random_hex(16);
+    let pending_draft = if arguments.callback_url.is_some() {
+        let draft = load_setup_draft(&user_home, &instance_key)?;
+        if draft.repository != arguments.repository || draft.instance_key != instance_key {
+            bail!("pending setup draft does not match this repository and instance");
+        }
+        Some(draft)
+    } else {
+        None
+    };
+    let state = pending_draft.as_ref().map_or_else(|| random_hex(16), |draft| draft.state.clone());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    let redirect_url = format!("http://127.0.0.1:{port}/callback");
+    let listener = if arguments.callback_url.is_none() {
+        Some(tokio::net::TcpListener::bind("127.0.0.1:0").await?)
+    } else {
+        None
+    };
+    let redirect_url = listener.as_ref().map_or_else(
+        || "http://127.0.0.1/callback".to_owned(),
+        |listener| {
+            format!(
+                "http://127.0.0.1:{}/callback",
+                listener.local_addr().expect("bound listener").port()
+            )
+        },
+    );
 
     let manifest = json!({
         "name": format!("braid-of-{owner}"),
@@ -90,9 +160,11 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         "default_events": [
             "issues",
             "issue_comment",
+            "issue_dependencies",
             "pull_request",
             "pull_request_review",
-            "pull_request_review_comment"
+            "pull_request_review_comment",
+            "pull_request_review_thread"
         ],
         "default_permissions": {
             "metadata": "read",
@@ -113,6 +185,12 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     };
 
     if arguments.no_browser {
+        let draft = SetupDraft {
+            repository: arguments.repository.clone(),
+            instance_key: instance_key.clone(),
+            state: state.clone(),
+        };
+        let draft_path = save_setup_draft(&user_home, &draft)?;
         let html_path = write_manifest_html(&form_action, &manifest_json)?;
         print_manual_guide(
             &arguments.repository,
@@ -123,6 +201,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
             html_path.as_os_str().to_str().unwrap_or(""),
             &manifest_json,
         );
+        println!("Saved pending setup state to: {}", draft_path.display());
         return Ok(());
     }
 
@@ -132,26 +211,34 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         .context("setup requires --model when writing an instance configuration")?;
     let llm_provider = select_llm_provider(&arguments)?;
 
-    let html_path = write_manifest_html(&form_action, &manifest_json)?;
+    let code = if let Some(callback_url) = &arguments.callback_url {
+        callback_code_from_url(callback_url, pending_draft.as_ref().expect("callback draft"))?
+    } else {
+        let html_path = write_manifest_html(&form_action, &manifest_json)?;
+        let listener = listener.expect("browser setup listener");
+        let shared = Arc::new(Mutex::new(CallbackState::default()));
+        let app = Router::new()
+            .route("/callback", get(callback))
+            .route("/", get(|| async { Html("<h1>Waiting for GitHub redirect...</h1>") }))
+            .with_state(Arc::clone(&shared));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(tokio::time::sleep(Duration::from_secs(300)))
+                .await;
+        });
 
-    let shared = Arc::new(Mutex::new(CallbackState::default()));
-    let app = Router::new()
-        .route("/callback", get(callback))
-        .route("/", get(|| async { Html("<h1>Waiting for GitHub redirect...</h1>") }))
-        .with_state(Arc::clone(&shared));
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(tokio::time::sleep(Duration::from_secs(300)))
-            .await;
-    });
+        println!("\nOpening browser to create the GitHub App...");
+        open_browser(html_path.as_os_str().to_str().unwrap_or(""))?;
+        println!(
+            "If the browser did not open, open this file manually:\n{}\n",
+            html_path.display()
+        );
 
-    println!("\nOpening browser to create the GitHub App...");
-    open_browser(html_path.as_os_str().to_str().unwrap_or(""))?;
-    println!("If the browser did not open, open this file manually:\n{}\n", html_path.display());
-
-    println!("Waiting for GitHub to redirect back with the manifest code...");
-    let code = wait_for_code(shared).await?;
-    server.abort();
+        println!("Waiting for GitHub to redirect back with the manifest code...");
+        let code = wait_for_code(shared, &state).await?;
+        server.abort();
+        code
+    };
 
     println!("Exchanging manifest code for App credentials...");
     let app: AppConversion = gh_api_json(&format!("app-manifests/{code}/conversions"), Some(""))
@@ -254,6 +341,13 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         }
     }
 
+    if arguments.callback_url.is_some() {
+        let draft_path = user_home.setup_draft_path(&instance_key);
+        fs::remove_file(&draft_path).with_context(|| {
+            format!("cannot remove completed setup draft {}", draft_path.display())
+        })?;
+    }
+
     Ok(())
 }
 
@@ -283,8 +377,13 @@ fn print_manual_guide(
     println!("Manifest JSON:\n{manifest_json}\n");
     println!(
         "Because `--no-browser` runs no local callback server, the browser redirect\n\
-         to the manifest's redirect_url will fail to load. That is expected: copy the\n\
-         `code` query parameter from the failing address bar, then exchange it:\n\n\
+         to the manifest's redirect_url will fail to load. That is expected. Copy the\n\
+         complete failing URL, then finish setup on this machine with the same options\n\
+         and `--callback-url` instead of `--no-browser`:\n\n\
+            braid setup {repository} --callback-url '<complete-redirect-url>'\n\n\
+         The pending setup draft proves the state value; Braid rejects a mismatched\n\
+         callback instead of converting the wrong App. Manual App credential import\n\
+         remains available below for recovery:\n\n\
             gh api -X POST app-manifests/<code>/conversions\n\n\
          The JSON response contains the App's `id`, `slug`, and `pem` (private key).\n"
     );
@@ -359,11 +458,14 @@ async fn callback(
     )
 }
 
-async fn wait_for_code(state: Arc<Mutex<CallbackState>>) -> Result<String> {
+async fn wait_for_code(state: Arc<Mutex<CallbackState>>, expected_state: &str) -> Result<String> {
     for _ in 0..3000 {
         {
             let guard = state.lock().await;
             if let Some(code) = guard.code.clone() {
+                if guard.state.as_deref() != Some(expected_state) {
+                    bail!("GitHub App manifest callback state does not match this setup");
+                }
                 return Ok(code);
             }
         }
@@ -567,6 +669,7 @@ fn build_config(
         github: Some(GitHubConfig {
             app_id,
             repository: arguments.repository.clone(),
+            additional_repositories: vec![],
             handle: "braid".to_owned(),
             api_version: "2022-11-28".to_owned(),
             private_key_file: private_key_file.to_path_buf(),
@@ -583,7 +686,7 @@ fn build_config(
         llm_providers: llm_provider.clone().into_iter().collect(),
         tools: ToolConfig {
             git: PathBuf::from(tool_path("git", "/usr/bin/git")),
-            gh: PathBuf::from(tool_path("gh", "/opt/homebrew/bin/gh")),
+            gh: PathBuf::from(tool_path("gh", "gh")),
             wrangler: PathBuf::from(tool_path("wrangler", "wrangler")),
         },
         server: ServerConfig {
@@ -609,6 +712,7 @@ fn build_config(
             // upgrades.
             adapter_version: runtime_version,
             provider: llm_provider.map(|provider| provider.id),
+            repository: None,
             model: Some(model.to_owned()),
             reasoning: reasoning.map(str::to_owned),
             user_instructions: "You are Braid, a helpful coding assistant. Work from the supplied GitHub Context, publish concise public comments, and keep descriptions and implementation state current.".to_owned(),

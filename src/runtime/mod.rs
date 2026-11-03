@@ -1,6 +1,9 @@
 #![allow(clippy::large_futures)]
 mod builtin;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex as StdMutex},
+};
 
 use anyhow::{Context as _, Result, bail};
 use axum::{
@@ -57,7 +60,7 @@ pub(crate) fn initial_health(config: &Config, provider_enabled: bool) -> HealthS
     HealthSnapshot {
         ready: false,
         ingress: config.server.ingress.to_string(),
-        repository: config.repository().into(),
+        repository: config.github_repositories().join(", "),
         tunnel: "disabled",
         webhook_url: None,
         reconciliation: "starting",
@@ -157,16 +160,29 @@ async fn serve_github_managed(
     let _lease_guard = RuntimeLeaseGuard { store: Arc::clone(&store), lease: Arc::clone(&lease) };
     store.recover_writes()?;
 
-    let repository = config.repository().parse::<RepositoryName>()?;
-    let github = Arc::new(GitHubClient::connect(config.github()?, &repository).await?);
-    if !github
-        .identity()
-        .permissions
-        .get("issues")
-        .is_some_and(|permission| permission == "write" || permission == "admin")
-    {
-        bail!("Slice 2 requires GitHub App Issues: write for Braid-owned reactions");
+    let repositories = config
+        .github_repositories()
+        .into_iter()
+        .map(str::parse::<RepositoryName>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut github_client_map = HashMap::new();
+    for repository in &repositories {
+        let client = GitHubClient::connect(config.github()?, repository).await?;
+        if !client
+            .identity()
+            .permissions
+            .get("issues")
+            .is_some_and(|permission| permission == "write" || permission == "admin")
+        {
+            bail!(
+                "GitHub repository {repository} requires Issues: write for Braid-owned reactions"
+            );
+        }
+        github_client_map.insert(repository.name_with_owner(), Arc::new(client));
     }
+    let github =
+        github_client_map.get(config.repository()).expect("primary repository client").clone();
+    let github_clients = Arc::new(github_client_map);
     let secret = config
         .webhook_secret()
         .with_context(|| "cannot load GitHub webhook secret from configured source")?;
@@ -180,7 +196,7 @@ async fn serve_github_managed(
     let state = Arc::new(IngressState {
         store: Arc::clone(&store),
         policy,
-        repository: config.repository().to_owned(),
+        repositories: config.github_repositories().into_iter().map(str::to_owned).collect(),
         handle: config.github()?.handle.clone(),
         app_actor_node_id: github.identity().actor_node_id.clone(),
         app_actor_login: github.identity().actor_login.clone(),
@@ -201,18 +217,18 @@ async fn serve_github_managed(
     workers.spawn(worker_result(queue_worker(Arc::clone(&store), shutdown_receiver.clone())));
     workers.spawn(worker_result(mention_worker(
         Arc::clone(&store),
-        Arc::clone(&github),
+        Arc::clone(&github_clients),
         policy,
         shutdown_receiver.clone(),
     )));
     workers.spawn(worker_result(outbox_worker(
         Arc::clone(&store),
-        Arc::clone(&github),
+        Arc::clone(&github_clients),
         shutdown_receiver.clone(),
     )));
     workers.spawn(worker_result(reconciliation_worker(
         Arc::clone(&store),
-        Arc::clone(&github),
+        Arc::clone(&github_clients),
         config.clone(),
         Arc::clone(&health),
         shutdown_receiver.clone(),
@@ -225,9 +241,17 @@ async fn serve_github_managed(
 
     if provider_enabled {
         let factories = crate::provider::session_factories(&config)?;
-        let specs = [GroupKind::Issue, GroupKind::Pr]
+        let mut spec_scopes = Vec::new();
+        for repository in config.github_repositories() {
+            for kind in [GroupKind::Issue, GroupKind::Pr] {
+                if !config.profiles_for_repository(repository, kind.as_str()).is_empty() {
+                    spec_scopes.push((repository, kind));
+                }
+            }
+        }
+        let specs = spec_scopes
             .into_iter()
-            .map(|kind| GroupSpec::new(kind, &config, &store))
+            .map(|(repository, kind)| GroupSpec::new(kind, &config, &store, repository))
             .collect::<Result<Vec<_>>>()?;
         let (reports, receiver) = tokio::sync::mpsc::channel(8);
         workers.spawn(worker_result(crate::health::provider_health_worker(
@@ -242,7 +266,10 @@ async fn serve_github_managed(
                 .clone();
             workers.spawn(agent_group_worker(
                 Arc::clone(&store),
-                Arc::clone(&github),
+                github_clients
+                    .get(&spec.repository)
+                    .context("repository GitHub client missing")?
+                    .clone(),
                 config.clone(),
                 spec,
                 factory,
@@ -289,7 +316,7 @@ async fn serve_github_managed(
         tunnel = Some(started);
     }
     health.write().await.ready = true;
-    tracing::info!(repository = %config.repository(), "Braid transport runtime is ready");
+    tracing::info!(repositories = %config.github_repositories().join(", "), "Braid transport runtime is ready");
 
     let mut tunnel_poll = tokio::time::interval(Duration::from_secs(2));
     tunnel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -394,7 +421,7 @@ async fn serve_github_managed(
         if status.pending_writes == 0 && status.uncertain_writes == 0 {
             break;
         }
-        drain_one_write(&store, &github).await;
+        drain_one_write(&store, &github_clients).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let _ = tokio::time::timeout(Duration::from_secs(5), ingress).await;

@@ -114,6 +114,14 @@ impl UserHome {
         self.root.join("secrets")
     }
 
+    pub fn setup_drafts_dir(&self) -> PathBuf {
+        self.root.join("setup-drafts")
+    }
+
+    pub fn setup_draft_path(&self, key: &str) -> PathBuf {
+        self.setup_drafts_dir().join(format!("{key}.toml"))
+    }
+
     pub fn instance_dir(&self, key: &str) -> PathBuf {
         self.instances_dir().join(key)
     }
