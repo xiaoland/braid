@@ -17,15 +17,66 @@ braid --version
 - [`gh`](https://cli.github.com/) installed and authenticated with an account
   that can create GitHub Apps for the target owner (user or organization).
 - A repository where you will install the App.
-- For the Pi provider: a DeepSeek API key exported as `DEEPSEEK_API_KEY` (or
-  the environment variable configured with `--api-key-environment`) *only at
-  setup time*.
+- For the Pi adapter: an explicitly selected LLM provider and model; if that
+  route uses an API key, the existing secret file described below. Codex uses
+  its own provider home instead.
+
+## Pi 原生插件
+
+需要 subagents 或 background 时，先按 [原生材料说明](../../native/pi/README.md)
+安装锁定材料，再给 setup 指定 `--runtime-executable <install>/pi`。
+Setup 识别相邻 `runtime-manifest.json`；既有配置可将 `[[runtimes]]` 的
+`executable` 与 `native_runtime` 指向同一安装。外部 Pi 仍可基础接入，但不会自动
+加载宿主扩展。材料验证失败须修复明确的文件或配置漂移，不能静默改走全局 Pi。
+
+## Provider API key
+
+Pi setups reference an existing secret file only when the selected LLM route
+authenticates with an API key. Braid does not derive a default provider, model,
+authentication method, or file name from the adapter. A conventional location is
+`~/.braid/secrets/<provider>.toml`; create the file before setup when needed and
+do not put the key in `config.toml` or a shell environment variable:
+
+```shell
+install -d -m 700 ~/.braid/secrets
+${EDITOR:-vi} ~/.braid/secrets/<provider>.toml
+chmod 600 ~/.braid/secrets/<provider>.toml
+```
+
+The file contains only the secret field:
+
+```toml
+provider_api_key = "..."
+```
+
+Setup validates and references the explicit `--api-key-file` path when it is
+present. It does not create a provider secret, derive one from `pi`, or copy a
+provider key from the environment. A keyless Pi model route may omit both
+`--api-key-file` and `models.json.apiKey`; if the material references
+`$BRAID_PROVIDER_API_KEY`, the file is required. To migrate an existing
+configuration, remove
+`api_key_environment`, keep or add the absolute `api_key_file` reference, and
+store the key in that file explicitly; Codex schema-3 profiles also remove the
+old inert `provider` label. Braid does not import legacy environment variables
+automatically.
 
 ## Bootstrap
 
+Pi requires an explicit model route. When that route needs an API key, it
+also requires a secret file:
+
 ```shell
-export DEEPSEEK_API_KEY=...
-braid setup owner/repository --instance <KEY>
+braid setup owner/repository --instance <KEY> --adapter pi --model <MODEL> \
+  --llm-provider <PROVIDER_ID> --api-key-file ~/.braid/secrets/<provider>.toml
+```
+
+A keyless Pi route uses only `--adapter pi --model <MODEL> --llm-provider
+<PROVIDER_ID>`.
+
+Codex uses its own authenticated home and no LLM provider arguments:
+
+```shell
+braid setup owner/repository --instance <KEY> --adapter codex --model <MODEL>
 ```
 
 `--instance` defaults to the repository owner. It is the local name for the
@@ -34,11 +85,14 @@ and the `service.instance.id` telemetry attribute.
 
 Options:
 
-- `--provider pi|codex` — defaults to `pi`.
-- `--model <MODEL>` — defaults to `deepseek-chat`.
-- `--api-key-environment <ENV>` — env var to read the provider API key from
-  during setup; defaults to `DEEPSEEK_API_KEY`. The key is then persisted into
-  the user-level secrets file, so the env var is only needed at setup time.
+- `--adapter pi|codex` — selects the Agent runtime adapter; it does not imply
+  an LLM provider.
+- `--model <MODEL>` — model requested from the selected runtime.
+- `--reasoning <LEVEL>` — optional runtime reasoning/thinking level; Braid
+  does not choose one by default.
+- Pi only: `--llm-provider <ID>` declares the LLM route. Add
+  `--api-key-file <PATH>` when that route uses an API key. Wire protocol
+  descriptors belong to Pi materials, not Braid's provider catalog.
 - `--user-home <DIR>` — defaults to `~/.braid` (or `BRAID_USER_HOME`).
 - `--instance <KEY>` — defaults to the repository owner.
 
@@ -48,8 +102,8 @@ Options:
 2. Resolves the Braid user home (`~/.braid` by default) and instance key
    (owner by default).
 3. Generates a random webhook secret.
-4. Reads the provider API key from the environment variable named by
-   `--api-key-environment`.
+4. For Pi, validates the explicit provider secret file when the selected route
+   declares one.
 5. Builds a GitHub App Manifest with the permissions Braid needs
    (`contents:write`, `issues:write`, `pull_requests:write`, `metadata:read`).
 6. Starts a temporary local HTTP callback server.
@@ -60,17 +114,17 @@ Options:
 9. Writes files under `~/.braid`:
    - `registry.toml` — the instance registry (SSoT for `BRAID_INSTANCE`
      resolution).
-   - `instances/<key>/config.toml` (schema version 2)
+   - `instances/<key>/config.toml` (schema version 3)
    - `instances/<key>/github-app.pem` (mode `0600`)
    - `instances/<key>/secrets.toml` (mode `0600`) — webhook secret only
-   - `secrets/<provider>.toml` (mode `0600`) — provider API key, shared
-     across instances for the same provider
    - `instances/<key>/state/` directory for the SQLite database, backups,
      and worktrees.
 
-Using per-instance secrets and a shared user-level provider key means multiple
-Braid instances can run on the same machine without colliding on a single
-environment variable. `BRAID_WEBHOOK_SECRET` is no longer required.
+Using per-instance webhook secrets and explicit provider key files means
+multiple Braid instances can run on the same machine without putting provider
+credentials in their shell environments. Instances may share one provider key
+file only when you intentionally reference the same file.
+`BRAID_WEBHOOK_SECRET` is no longer required.
 
 After setup:
 
@@ -127,15 +181,16 @@ authenticate it before serving:
 CODEX_HOME=~/.braid/instances/<KEY>/provider/codex codex login
 ```
 
-`braid doctor` reports this as the "Codex credentials" check. The Pi provider
-needs no home bootstrap: it authenticates with the API key persisted at setup.
+`braid doctor` reports this as the "Codex credentials" check. Pi needs no
+provider-home bootstrap: it authenticates with the API key read from the
+explicit secret file declared by its Profile.
 
 ## Headless / manual App creation
 
 If you cannot or do not want to open a browser from the terminal, run:
 
 ```shell
-braid setup owner/repository --no-browser
+braid setup owner/repository --adapter pi --no-browser
 ```
 
 This prints:
@@ -159,4 +214,5 @@ automatically.
 - The generated App logo is saved as
   `~/.braid/instances/<key>/braid-of-<owner>-logo.png`.
 - Secrets are split: the webhook secret lives in the instance
-  `secrets.toml`; the provider API key lives in `~/.braid/secrets/<provider>.toml`. Both are mode `0600`.
+  `secrets.toml`; any Pi provider API key lives in the explicit file referenced
+  by `llm_providers.api_key_file`. Both files should be mode `0600`.

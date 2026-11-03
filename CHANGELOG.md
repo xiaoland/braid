@@ -3,6 +3,48 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
+## [Unreleased]
+
+## [0.3.3] - 2026-10-13
+
+### Changed
+
+- Runtime adapter 与 LLM provider 解耦：`setup`/`init` 使用 `--adapter`
+  选择 Pi/Codex；Pi 需要显式 `--llm-provider` 和 `--model`，仅使用 API key
+  的 route 才需要 `--api-key-file`。Codex 继续使用隔离 provider home，不再
+  生成或引用伪造的 LLM API key 文件。Braid 不再生成硬编码 reasoning、协议
+  或费用配方。
+- Provider API key 只通过可选的 `[[llm_providers]].api_key_file` 引用权限受限的
+  secret 文件；`setup`/`init` 不再支持 `--api-key-environment` 或
+  `api_key_environment` 配置。Pi 原生材料统一引用 Braid 管理的进程内
+  `BRAID_PROVIDER_API_KEY`，旧配置须显式迁移，不会自动导入旧环境变量。
+
+本版本不新增数据库 migration；配置 schema 保持 3。使用旧环境变量字段或
+在 schema 3 的非 Pi Profile 上声明 provider 的配置会被明确拒绝；schema 2
+Codex 配置中的旧 provider 标签及 LLM 协议/费用元数据仅作为惰性迁移字段读取。
+
+## [Unreleased pre-0.3.3]
+
+- 有限 run 的 Issue 指派保留真实执行输入，首次轮次前处理已有 Context reset；普通 serve 指派仍保持空闲会话合同。
+- 受控 Pi background Bash 使用非登录 shell，原生入口移除 BASH_ENV/ENV，工具路径与缓存由实例明确提供。
+- 内建协作的 Harness ledger 写命令先取得 IMMEDIATE 事务准入，纯读仍为 DEFERRED；绑定错误保留账本路径与 SQLite extended code。
+
+- 新增与常驻 `serve` 并列的 `braid run`：从顶层 root Issue 或 description 驱动自主拆分、指派、PR 实现与交付，首版接入独立 built-in 平台。
+- 平台原子保存父子 Issue，冻结 run/client/交付分支边界；范围关闭和 pending 授权撤销保留停止门控。Console 通过共享接口控制 run，支持原输入接续与独立终态展示。
+- Harness schema 7 保存有限运行身份和结果，平台 schema 3 增加任务树与范围授权。配置 schema 保持 3，旧迁移不改写。
+
+- 内建协作平台与 GitHub 作为 Harness 的同层上游。平台独立配置、schema、对象库
+  与 HTTP API，不再依赖 Harness 会话表或 `local` 运行模式。
+- Web Console 属于整个 Braid，集成 OTLP 三信号原始证据与可视化，直接控制任一
+  上游的 Harness，并可便捷托管独立平台；停止 Harness 不关闭平台或 Collector。
+- Harness 自存上游事件游标及写入授权。平台 grant、对象 revision、命令回执与
+  Git 候选意图保留并发和停止边界，过期执行不能继续发布。
+- 配置 schema 3 使用互斥 `[github]` / `[builtin]`；原 GitHub schema 2 配置可继续
+  读取。旧 `[local]` 必须停止后显式导入平台，保留原对象身份、历史与回执。
+- Harness 数据库 schema 6 曾增加接入状态，平台 schema 独立演进。旧迁移保持不可变，
+  新版本使用前须迁移，旧二进制不能读取更新后的 Harness 数据库。
+- 修复输入接纳、首次 Context 持久化、完整错误保存与停止证明不足时的恢复门控。
+
 ## [0.3.2] - 2026-09-19
 
 ### Changed
@@ -333,6 +375,10 @@ Versioning once release artifacts are published.
   `40_context_lifecycle.sh` for the collapsed schema version 1.
 
 ## [Unreleased]
+
+- 新增与常驻 `serve` 并列的 `braid run`：从顶层 root Issue 或 description 驱动自主拆分、指派、PR 实现与交付，首版接入独立 built-in 平台。
+- 平台原子保存父子 Issue，冻结 run/client/交付分支边界；范围关闭和 pending 授权撤销保留停止门控。Console 通过共享接口控制 run，支持原输入接续与独立终态展示。
+- Harness schema 7 保存有限运行身份和结果，平台 schema 3 增加任务树与范围授权。配置 schema 保持 3，旧迁移不改写。
 
 ### Changed
 

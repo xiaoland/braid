@@ -1,0 +1,36 @@
+--- a/lib/api.ts
++++ b/lib/api.ts
+@@ -13,26 +13,13 @@
+ }
+ 
+ async function parseErrorResponse(response: Response): Promise<string> {
+-  try {
+-    const json = (await response.json()) as { message?: string };
+-    if (json.message) return json.message;
+-  } catch {
+-    // JSON parsing failed, fall through to status-based message
+-  }
+-
+-  const hasKey = Boolean(process.env.CONTEXT7_API_KEY);
+-  if (response.status === 429) {
+-    return hasKey
+-      ? "Rate limited or quota exceeded. Upgrade your plan at https://context7.com/plans for higher limits."
+-      : "Rate limited or quota exceeded. Create a free API key at https://context7.com/dashboard for higher limits.";
+-  }
+-  if (response.status === 404) {
+-    return "The library you are trying to access does not exist. Please try with a different library ID.";
+-  }
+-  if (response.status === 401) {
+-    return "Invalid API key. Please check your API key. API keys should start with 'ctx7sk' prefix.";
+-  }
+-  return `Request failed with status ${response.status}. Please try again later.`;
++  let body = await response.text();
++  const apiKey = process.env.CONTEXT7_API_KEY;
++  if (apiKey) body = body.split(apiKey).join("[REDACTED]");
++  const limit = 8000;
++  const truncated = body.length > limit ? `\n[Response truncated: ${body.length} characters, showing ${limit}]` : "";
++  const requestId = response.headers.get("x-request-id");
++  return `HTTP ${response.status} ${response.statusText}${requestId ? `; request ID: ${requestId}` : ""}\n${body.slice(0, limit) || "(empty response)"}${truncated}`;
+ }
+ 
+ export async function searchLibraries(query: string, libraryName: string): Promise<SearchResponse> {

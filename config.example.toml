@@ -1,4 +1,4 @@
-schema_version = 2
+schema_version = 3
 
 [instance]
 key = "owner"
@@ -33,34 +33,21 @@ home = "/absolute/path/to/instance/provider/codex"
 stable_schema_sha256 = "7d79fe309dd7520843459070f3884ecf0e39cee2620c1c49aad6efb4eca76ecb"
 experimental_schema_sha256 = "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b5364439063a5c8"
 
-# Alternative: Pi runtime with DeepSeek
+# Alternative: Pi runtime with an explicitly declared LLM provider. Pi owns
+# model routing, so the provider id and credential reference are user choices;
+# Braid does not infer them from the adapter. Omit api_key_file for a keyless
+# route; declare it when models.json references the managed API key.
 # [[runtimes]]
 # adapter_type = "pi"
-# version = "0.84.3"
+# version = "1.0.2"
 # executable = "/usr/local/bin/pi"
 # home = "/absolute/path/to/instance/provider/pi"
-
-[[llm_providers]]
-id = "openai"
-protocol = "openai"
-api_key_file = "/absolute/path/to/user/secrets/openai.toml"
-
-[[llm_providers.models]]
-model_id = "gpt-5.6-sol"
-input_cost = 0.0
-output_cost = 0.0
-cache_input_cost = 0.0
-
-[[llm_providers]]
-id = "deepseek"
-protocol = "openai-compatible"
-api_key_file = "/absolute/path/to/user/secrets/deepseek.toml"
-
-[[llm_providers.models]]
-model_id = "deepseek-chat"
-input_cost = 0.0
-output_cost = 0.0
-cache_input_cost = 0.0
+# For the locked native material, select <install>/pi above and declare:
+# native_runtime = "/absolute/path/to/install/runtime-manifest.json"
+#
+# [[llm_providers]]
+# id = "example-llm"
+# api_key_file = "/absolute/path/to/user/secrets/example-llm.toml"
 
 [tools]
 git = "/usr/bin/git"
@@ -85,9 +72,7 @@ display_name = "Codex design partner"
 tags = ["issue"]
 adapter_type = "codex"
 adapter_version = "codex-cli 0.147.0-alpha.6.5"
-provider = "openai"
-model = "gpt-5.6-sol"
-reasoning = "high"
+model = "example-model"
 user_instructions = "Keep design discussion concise and maintain the Issue description as working memory."
 # Optional. The source Git checkout of the configured repository, shared by
 # all profiles as the worktree provisioning source (one repository = one
@@ -105,9 +90,7 @@ display_name = "Codex implementation agent"
 tags = ["pr", "implementation"]
 adapter_type = "codex"
 adapter_version = "codex-cli 0.147.0-alpha.6.5"
-provider = "openai"
-model = "gpt-5.6-sol"
-reasoning = "high"
+model = "example-model"
 user_instructions = "Implement from linked Issue working memory and keep GitHub comments brief."
 # workspace: see the issue profile above; omit it to share the default
 # instance source checkout.

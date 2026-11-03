@@ -66,14 +66,21 @@ pub struct RepositoryName {
 }
 
 impl RepositoryName {
+    pub(crate) fn local(name: &str) -> Self {
+        Self { owner: String::new(), name: name.to_owned() }
+    }
     pub fn name_with_owner(&self) -> String {
-        format!("{}/{}", self.owner, self.name)
+        if self.owner.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}/{}", self.owner, self.name)
+        }
     }
 }
 
 impl fmt::Display for RepositoryName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}/{}", self.owner, self.name)
+        formatter.write_str(&self.name_with_owner())
     }
 }
 

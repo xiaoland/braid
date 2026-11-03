@@ -21,7 +21,7 @@ pub async fn context(command: ContextCommand) -> Result<()> {
     if !profile.has_tag(kind) {
         bail!("Profile {:?} is not tagged {kind}", profile.id);
     }
-    let client = GitHubClient::connect(&config.github, &locator.repository)
+    let client = GitHubClient::connect(config.github()?, &locator.repository)
         .await
         .context("GitHub Context is unavailable")?;
     let mut canonical = if kind == "issue" {

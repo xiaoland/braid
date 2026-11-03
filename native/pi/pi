@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "$(dirname "$0")/bin/node" "$(dirname "$0")/pi.mjs" "$@"

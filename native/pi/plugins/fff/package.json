@@ -1,0 +1,8 @@
+{
+  "name": "@braid/pi-runtime-fff",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@ff-labs/pi-fff": "0.11.0"
+  }
+}

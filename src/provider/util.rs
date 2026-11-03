@@ -31,6 +31,14 @@ impl AgentProvider for Arc<dyn AgentProvider> {
         self.as_ref().closed().await;
     }
 
+    async fn close_session(
+        &self,
+        thread_id: &str,
+        confirmed_idle: bool,
+    ) -> Result<(), ProviderError> {
+        self.as_ref().close_session(thread_id, confirmed_idle).await
+    }
+
     async fn start_session(
         &self,
         profile: &Profile,
@@ -83,6 +91,14 @@ impl AgentProvider for Box<dyn AgentProvider> {
 
     async fn closed(&self) {
         self.as_ref().closed().await;
+    }
+
+    async fn close_session(
+        &self,
+        thread_id: &str,
+        confirmed_idle: bool,
+    ) -> Result<(), ProviderError> {
+        self.as_ref().close_session(thread_id, confirmed_idle).await
     }
 
     async fn start_session(

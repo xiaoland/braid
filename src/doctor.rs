@@ -14,6 +14,7 @@ use crate::{
     github::{GitHubClient, RepositoryName},
     home::{self, UserHome},
     protocol::{inspect_codex, verify_identity},
+    provider::PiProvider,
     store::StoreActor,
 };
 
@@ -38,6 +39,7 @@ pub struct DoctorReport {
     pub checks: Vec<Check>,
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
     let mut checks = vec![
         path_check("runtime root", config.runtime.root(), true),
@@ -47,9 +49,11 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
             true,
         ),
         path_check("backup directory", config.runtime.backups(), true),
-        path_check("GitHub App private key", &config.github.private_key_file, false),
-        secret_check("GitHub webhook secret", || config.webhook_secret()),
     ];
+    if let Some(github) = &config.github {
+        checks.push(path_check("GitHub App private key", &github.private_key_file, false));
+        checks.push(secret_check("GitHub webhook secret", || config.webhook_secret()));
+    }
     checks.push(source_checkout_check(config));
 
     let store = StoreActor::start(
@@ -100,6 +104,20 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
                 });
             }
             if let Some(pi) = provider_config.pi {
+                if pi.native_runtime.is_some() {
+                    checks.push(match PiProvider::validate_material(&pi) {
+                        Ok(()) => Check {
+                            name: "Pi native material".into(),
+                            state: CheckState::Pass,
+                            detail: "locked file identities verified; live capabilities checked at session startup".into(),
+                        },
+                        Err(error) => Check {
+                            name: "Pi native material".into(),
+                            state: CheckState::Fail,
+                            detail: error.to_string(),
+                        },
+                    });
+                }
                 checks.push(match command_version("Pi CLI", &pi.executable).await {
                     check if check.state == CheckState::Pass => match pi.api_key() {
                         Ok(_) => Check {
@@ -133,9 +151,13 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
         ("GitHub CLI", &config.tools.gh),
         ("Wrangler", &config.tools.wrangler),
     ] {
-        checks.push(command_version(name, executable).await);
+        if !config.is_builtin() || name == "Git" {
+            checks.push(command_version(name, executable).await);
+        }
     }
-    checks.push(github_app_check(config).await);
+    if !config.is_builtin() {
+        checks.push(github_app_check(config).await);
+    }
     checks.push(otlp_check(config));
     checks.push(cross_instance_port_check(config, user_home));
     let ready = checks.iter().all(|check| check.state == CheckState::Pass);
@@ -154,12 +176,36 @@ fn source_checkout_check(config: &Config) -> Check {
         return Check {
             name: name.into(),
             state: CheckState::Fail,
-            detail: format!(
-                "{} is not a Git checkout; clone with `git clone https://github.com/{} {}`",
-                source.display(),
-                config.github.repository,
-                source.display()
-            ),
+            detail: if config.is_builtin() {
+                format!(
+                    "{} is not a Git checkout; configure profile.workspace with the execution source for this platform repository",
+                    source.display()
+                )
+            } else {
+                format!(
+                    "{} is not a Git checkout; clone with `git clone https://github.com/{} {}`",
+                    source.display(),
+                    config.repository(),
+                    source.display()
+                )
+            },
+        };
+    }
+    if config.is_builtin() {
+        return match git2::Repository::open(source) {
+            Ok(repo) if !repo.is_bare() => Check {
+                name: name.into(),
+                state: CheckState::Pass,
+                detail: source.display().to_string(),
+            },
+            Ok(_) => Check {
+                name: name.into(),
+                state: CheckState::Fail,
+                detail: "profile.workspace must be a working Git checkout".into(),
+            },
+            Err(error) => {
+                Check { name: name.into(), state: CheckState::Fail, detail: error.to_string() }
+            }
         };
     }
     let remote = std::process::Command::new("git")
@@ -170,7 +216,7 @@ fn source_checkout_check(config: &Config) -> Check {
     match remote {
         Ok(output) if output.status.success() => {
             let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if url.to_ascii_lowercase().contains(&config.github.repository.to_ascii_lowercase()) {
+            if url.to_ascii_lowercase().contains(&config.repository().to_ascii_lowercase()) {
                 Check {
                     name: name.into(),
                     state: CheckState::Pass,
@@ -184,7 +230,7 @@ fn source_checkout_check(config: &Config) -> Check {
                         "{} remote origin is {}, not {}",
                         source.display(),
                         url,
-                        config.github.repository
+                        config.repository()
                     ),
                 }
             }
@@ -219,7 +265,7 @@ fn codex_credentials_check(codex: &crate::config::CodexConfig) -> Check {
 }
 
 async fn github_app_check(config: &Config) -> Check {
-    let repository = match config.github.repository.parse::<RepositoryName>() {
+    let repository = match config.repository().parse::<RepositoryName>() {
         Ok(repository) => repository,
         Err(error) => {
             return Check {
@@ -229,7 +275,17 @@ async fn github_app_check(config: &Config) -> Check {
             };
         }
     };
-    match GitHubClient::connect(&config.github, &repository).await {
+    let github = match config.github() {
+        Ok(github) => github,
+        Err(error) => {
+            return Check {
+                name: "GitHub App".into(),
+                state: CheckState::Fail,
+                detail: error.to_string(),
+            };
+        }
+    };
+    match GitHubClient::connect(github, &repository).await {
         Ok(client) => {
             let identity = client.identity();
             Check {

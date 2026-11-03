@@ -29,7 +29,7 @@ pub async fn prepare_pull_request(
         match issue_context.linked_branches.as_slice() {
             [] => format!("braid/implementation-request-{}", request.comment_id),
             [linked] => linked
-                .strip_prefix(&format!("{}:", config.github.repository))
+                .strip_prefix(&format!("{}:", config.repository()))
                 .map(str::to_owned)
                 .with_context(|| {
                     format!(
@@ -51,10 +51,10 @@ pub async fn prepare_pull_request(
         bail!("default PR Profile {:?} is not tagged pr", profile.id);
     }
     let profile_digest = helpers::digest(&serde_json::to_string(profile)?);
-    let request_key = format!("pr_ensure\0{}\0{}", config.github.repository, request.comment_id);
+    let request_key = format!("pr_ensure\0{}\0{}", config.repository(), request.comment_id);
     let request_digest = helpers::digest(&format!(
         "pr_ensure\0{}\0{}\0{}\0{}\0{}\0{}",
-        config.github.repository,
+        config.repository(),
         request.comment_id,
         base_ref,
         head_ref,
@@ -66,7 +66,7 @@ pub async fn prepare_pull_request(
             write: NewGhWriteIntent {
                 request_key,
                 operation: "pr_ensure",
-                repository: config.github.repository.clone(),
+                repository: config.repository().to_owned(),
                 target: comment.html_url.clone(),
                 profile_id: profile.id.clone(),
                 role: "PR Implementation Agent".into(),
