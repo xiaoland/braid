@@ -159,6 +159,7 @@ async fn managed(
         let (reports, report_receiver) = tokio::sync::mpsc::channel(8);
         workers.spawn(worker_result(crate::health::provider_health_worker(
             Arc::clone(&health),
+            provider_groups.len(),
             report_receiver,
             receiver.clone(),
         )));

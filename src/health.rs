@@ -22,6 +22,7 @@ pub(crate) struct ProviderHealthUpdate {
 
 pub(crate) async fn provider_health_worker(
     health: std::sync::Arc<tokio::sync::RwLock<HealthSnapshot>>,
+    expected_groups: usize,
     mut reports: tokio::sync::mpsc::Receiver<ProviderHealthUpdate>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -38,7 +39,7 @@ pub(crate) async fn provider_health_worker(
         let mut current = health.write().await;
         current.provider = if error.is_some() {
             "unavailable"
-        } else if observations.len() == 2 {
+        } else if observations.len() == expected_groups {
             "connected"
         } else {
             "starting"

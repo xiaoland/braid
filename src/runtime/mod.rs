@@ -256,6 +256,7 @@ async fn serve_github_managed(
         let (reports, receiver) = tokio::sync::mpsc::channel(8);
         workers.spawn(worker_result(crate::health::provider_health_worker(
             Arc::clone(&health),
+            specs.len(),
             receiver,
             shutdown_receiver.clone(),
         )));
