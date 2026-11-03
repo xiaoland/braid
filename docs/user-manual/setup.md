@@ -17,8 +17,9 @@ braid --version
 - [`gh`](https://cli.github.com/) installed and authenticated with an account
   that can create GitHub Apps for the target owner (user or organization).
 - A repository where you will install the App.
-- For the Pi adapter: an existing secret file for your explicitly selected
-  LLM provider, described below. Codex uses its own provider home instead.
+- For the Pi adapter: an explicitly selected LLM provider and model; if that
+  route uses an API key, the existing secret file described below. Codex uses
+  its own provider home instead.
 
 ## Pi 原生插件
 
@@ -30,11 +31,11 @@ Setup 识别相邻 `runtime-manifest.json`；既有配置可将 `[[runtimes]]` �
 
 ## Provider API key
 
-Pi setups reference an existing secret file for the LLM provider you choose.
-Braid does not derive a default provider, protocol, model, or file name from
-the adapter. A conventional location is `~/.braid/secrets/<provider>.toml`;
-create the file before setup and do not put the key in `config.toml` or a
-shell environment variable:
+Pi setups reference an existing secret file only when the selected LLM route
+authenticates with an API key. Braid does not derive a default provider, model,
+authentication method, or file name from the adapter. A conventional location is
+`~/.braid/secrets/<provider>.toml`; create the file before setup when needed and
+do not put the key in `config.toml` or a shell environment variable:
 
 ```shell
 install -d -m 700 ~/.braid/secrets
@@ -48,9 +49,12 @@ The file contains only the secret field:
 provider_api_key = "..."
 ```
 
-Setup validates and references the explicit `--api-key-file` path. It does
-not create a provider secret, derive one from `pi`, or copy a provider key
-from the environment. To migrate an existing configuration, remove
+Setup validates and references the explicit `--api-key-file` path when it is
+present. It does not create a provider secret, derive one from `pi`, or copy a
+provider key from the environment. A keyless Pi model route may omit both
+`--api-key-file` and `models.json.apiKey`; if the material references
+`$BRAID_PROVIDER_API_KEY`, the file is required. To migrate an existing
+configuration, remove
 `api_key_environment`, keep or add the absolute `api_key_file` reference, and
 store the key in that file explicitly; Codex schema-3 profiles also remove the
 old inert `provider` label. Braid does not import legacy environment variables
@@ -58,13 +62,16 @@ automatically.
 
 ## Bootstrap
 
-Pi requires an explicit model route and secret file:
+Pi requires an explicit model route. When that route needs an API key, it
+also requires a secret file:
 
 ```shell
 braid setup owner/repository --instance <KEY> --adapter pi --model <MODEL> \
-  --llm-provider <PROVIDER_ID> --llm-protocol <PROTOCOL> \
-  --api-key-file ~/.braid/secrets/<provider>.toml
+  --llm-provider <PROVIDER_ID> --api-key-file ~/.braid/secrets/<provider>.toml
 ```
+
+A keyless Pi route uses only `--adapter pi --model <MODEL> --llm-provider
+<PROVIDER_ID>`.
 
 Codex uses its own authenticated home and no LLM provider arguments:
 
@@ -81,8 +88,11 @@ Options:
 - `--adapter pi|codex` — selects the Agent runtime adapter; it does not imply
   an LLM provider.
 - `--model <MODEL>` — model requested from the selected runtime.
-- Pi only: `--llm-provider <ID>`, `--llm-protocol <PROTOCOL>`, and
-  `--api-key-file <PATH>` declare the LLM route and credential reference.
+- `--reasoning <LEVEL>` — optional runtime reasoning/thinking level; Braid
+  does not choose one by default.
+- Pi only: `--llm-provider <ID>` declares the LLM route. Add
+  `--api-key-file <PATH>` when that route uses an API key. Wire protocol
+  descriptors belong to Pi materials, not Braid's provider catalog.
 - `--user-home <DIR>` — defaults to `~/.braid` (or `BRAID_USER_HOME`).
 - `--instance <KEY>` — defaults to the repository owner.
 
@@ -92,7 +102,8 @@ Options:
 2. Resolves the Braid user home (`~/.braid` by default) and instance key
    (owner by default).
 3. Generates a random webhook secret.
-4. For Pi, validates the explicit provider secret file.
+4. For Pi, validates the explicit provider secret file when the selected route
+   declares one.
 5. Builds a GitHub App Manifest with the permissions Braid needs
    (`contents:write`, `issues:write`, `pull_requests:write`, `metadata:read`).
 6. Starts a temporary local HTTP callback server.

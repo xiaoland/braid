@@ -168,11 +168,18 @@ pub struct RuntimeEntry {
 #[serde(deny_unknown_fields)]
 pub struct LlmProvider {
     pub id: String,
-    pub protocol: String,
-    pub api_key_file: PathBuf,
-    #[serde(default)]
+    /// Legacy schema-2 metadata. Pi's native models.json owns wire routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Secret reference for model routes that use an API key. Keyless Pi
+    /// providers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_file: Option<PathBuf>,
+    /// Legacy schema-2 cost catalogue; Braid does not consume it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<LlmModel>,
-    #[serde(default)]
+    /// Legacy schema-2 allowance metadata; Braid does not consume it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowances: Vec<LlmAllowance>,
 }
 
@@ -267,7 +274,8 @@ pub struct PiConfig {
     pub executable: PathBuf,
     pub provider: Option<String>,
     pub model: Option<String>,
-    pub api_key_file: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_file: Option<PathBuf>,
     pub thinking: Option<String>,
     pub home: Option<PathBuf>,
     #[serde(default)]
@@ -275,8 +283,8 @@ pub struct PiConfig {
 }
 
 impl PiConfig {
-    pub fn api_key(&self) -> Result<String, ConfigError> {
-        load_provider_secret_file(&self.api_key_file)
+    pub fn api_key(&self) -> Result<Option<String>, ConfigError> {
+        self.api_key_file.as_deref().map(load_provider_secret_file).transpose()
     }
 }
 
@@ -794,11 +802,25 @@ impl Config {
         let mut provider_ids = HashSet::new();
         for provider in &self.llm_providers {
             validate_token("llm_providers.id", &provider.id)?;
-            validate_token("llm_providers.protocol", &provider.protocol)?;
-            require_absolute(
-                &format!("llm_providers.{}.api_key_file", provider.id),
-                &provider.api_key_file,
-            )?;
+            if let Some(api_key_file) = &provider.api_key_file {
+                require_absolute(
+                    &format!("llm_providers.{}.api_key_file", provider.id),
+                    api_key_file,
+                )?;
+            }
+            if self.schema_version == 2 {
+                if let Some(protocol) = &provider.protocol {
+                    validate_token("llm_providers.protocol", protocol)?;
+                }
+            } else if provider.protocol.is_some()
+                || !provider.models.is_empty()
+                || !provider.allowances.is_empty()
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "llm_providers {:?} contains schema-2 protocol/cost metadata; schema 3 keeps only id and api_key_file",
+                    provider.id
+                )));
+            }
             if !provider_ids.insert(provider.id.as_str()) {
                 return Err(ConfigError::Invalid(format!(
                     "duplicate llm_providers id {:?}",
@@ -813,7 +835,7 @@ impl Config {
                 )?;
                 if !model_ids.insert(model.model_id.as_str()) {
                     return Err(ConfigError::Invalid(format!(
-                        "duplicate model {:?} in llm_providers {:?}",
+                        "duplicate legacy model {:?} in llm_providers {:?}",
                         model.model_id, provider.id
                     )));
                 }
@@ -903,6 +925,12 @@ impl Profile {
                 ))
             })?;
             validate_token("profile.provider", provider)?;
+            if self.model.is_none() && config.schema_version != 2 {
+                return Err(ConfigError::Invalid(format!(
+                    "profile {:?} requires an explicit model for the Pi adapter",
+                    self.id
+                )));
+            }
         } else if self.provider.is_some() && config.schema_version != 2 {
             return Err(ConfigError::Invalid(format!(
                 "profile {:?} provider is supported only by the Pi adapter",

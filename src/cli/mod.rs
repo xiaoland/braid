@@ -305,12 +305,12 @@ pub(crate) struct SetupArguments {
     pub(crate) adapter: String,
     #[arg(long, value_name = "MODEL")]
     pub(crate) model: Option<String>,
+    /// Optional reasoning/thinking level for runtimes that support one.
+    #[arg(long, value_name = "LEVEL")]
+    pub(crate) reasoning: Option<String>,
     /// Pi-only LLM provider catalog id; Braid does not infer one from the adapter.
     #[arg(long, value_name = "ID")]
     pub(crate) llm_provider: Option<String>,
-    /// Pi-only LLM protocol label recorded in the provider catalog.
-    #[arg(long, value_name = "PROTOCOL")]
-    pub(crate) llm_protocol: Option<String>,
     /// Pi-only existing provider secret TOML containing `provider_api_key`.
     #[arg(long, value_name = "PATH")]
     pub(crate) api_key_file: Option<PathBuf>,

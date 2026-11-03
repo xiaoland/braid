@@ -25,12 +25,12 @@ use crate::cli::SetupArguments;
 pub(crate) mod discovery;
 mod logo;
 
+use crate::config::LlmProvider;
 use crate::config::{
     CONFIG_SCHEMA_VERSION, Config, GitHubConfig, LogFormat, Profile, ProfileSelection,
     RuntimeConfig, RuntimeEntry, SchedulerConfig, ServerConfig, TelemetryConfig, ToolConfig,
     load_provider_secret_file,
 };
-use crate::config::{LlmAllowance, LlmModel, LlmProvider};
 use crate::home::{InstanceEntry, UserHome, allocate_server_ports, validate_instance_key};
 
 #[allow(dead_code)]
@@ -63,6 +63,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     println!("Target repository: {owner}/{repo}");
     let instance_key = arguments.instance.clone().unwrap_or_else(|| owner.to_lowercase());
     validate_instance_key(&instance_key)?;
+    reject_non_pi_llm_options(&arguments)?;
 
     let mut registry = user_home.load_registry()?;
     let instance_dir = user_home.instance_dir(&instance_key);
@@ -129,7 +130,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         .model
         .clone()
         .context("setup requires --model when writing an instance configuration")?;
-    let llm_provider = select_llm_provider(&arguments, &model)?;
+    let llm_provider = select_llm_provider(&arguments)?;
 
     let html_path = write_manifest_html(&form_action, &manifest_json)?;
 
@@ -186,6 +187,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         &instance_key,
         &arguments,
         &model,
+        arguments.reasoning.as_deref(),
         &pem_path,
         &secrets_path,
         runtime,
@@ -217,8 +219,10 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
 
     println!("\nWrote configuration to: {}", config_path.display());
     println!("Wrote instance secrets to: {}", secrets_path.display());
-    if let Some(provider) = &llm_provider {
-        println!("Using provider secret: {}", provider.api_key_file.display());
+    if let Some(provider) = &llm_provider
+        && let Some(api_key_file) = &provider.api_key_file
+    {
+        println!("Using provider secret: {}", api_key_file.display());
     }
     println!("\nNext, install the App on {}:\n{}\n", arguments.repository, install_url(&app.slug));
     println!(
@@ -492,16 +496,18 @@ async fn select_runtime(arguments: &SetupArguments) -> Result<RuntimeEntry> {
         .with_context(|| format!("cannot verify {} runtime", arguments.adapter))
 }
 
-fn select_llm_provider(arguments: &SetupArguments, model: &str) -> Result<Option<LlmProvider>> {
+fn reject_non_pi_llm_options(arguments: &SetupArguments) -> Result<()> {
+    if arguments.adapter != "pi"
+        && (arguments.llm_provider.is_some() || arguments.api_key_file.is_some())
+    {
+        bail!("--llm-provider and --api-key-file are only supported for the Pi adapter");
+    }
+    Ok(())
+}
+
+fn select_llm_provider(arguments: &SetupArguments) -> Result<Option<LlmProvider>> {
     if arguments.adapter != "pi" {
-        if arguments.llm_provider.is_some()
-            || arguments.llm_protocol.is_some()
-            || arguments.api_key_file.is_some()
-        {
-            bail!(
-                "--llm-provider, --llm-protocol and --api-key-file are only supported for the Pi adapter"
-            );
-        }
+        reject_non_pi_llm_options(arguments)?;
         return Ok(None);
     }
 
@@ -509,40 +515,23 @@ fn select_llm_provider(arguments: &SetupArguments, model: &str) -> Result<Option
         .llm_provider
         .clone()
         .context("Pi setup requires --llm-provider; Braid does not infer one from the adapter")?;
-    let protocol = arguments
-        .llm_protocol
-        .clone()
-        .context("Pi setup requires --llm-protocol; Braid does not infer one from the adapter")?;
     let api_key_file = arguments
         .api_key_file
         .as_ref()
-        .context("Pi setup requires --api-key-file")?
-        .canonicalize()
-        .context("cannot resolve Pi provider API key file")?;
-    let api_key = load_provider_secret_file(&api_key_file)?;
-    if api_key.trim().is_empty() {
-        bail!(
-            "provider API key secret file {} must contain a non-empty provider_api_key",
-            api_key_file.display()
-        );
-    }
+        .map(|path| {
+            let path = path.canonicalize().context("cannot resolve Pi provider API key file")?;
+            let api_key = load_provider_secret_file(&path)?;
+            if api_key.trim().is_empty() {
+                bail!(
+                    "provider API key secret file {} must contain a non-empty provider_api_key",
+                    path.display()
+                );
+            }
+            Ok(path)
+        })
+        .transpose()?;
 
-    Ok(Some(LlmProvider {
-        id,
-        protocol,
-        api_key_file,
-        models: vec![LlmModel {
-            model_id: model.to_owned(),
-            input_cost: 0.0,
-            output_cost: 0.0,
-            cache_input_cost: 0.0,
-        }],
-        allowances: vec![LlmAllowance {
-            since: "2026-01-01".to_owned(),
-            until: "2027-01-01".to_owned(),
-            amount: 0.0,
-        }],
-    }))
+    Ok(Some(LlmProvider { id, protocol: None, api_key_file, models: vec![], allowances: vec![] }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -552,6 +541,7 @@ fn build_config(
     instance_key: &str,
     arguments: &SetupArguments,
     model: &str,
+    reasoning: Option<&str>,
     private_key_file: &Path,
     secrets_file: &Path,
     runtime: RuntimeEntry,
@@ -620,7 +610,7 @@ fn build_config(
             adapter_version: runtime_version,
             provider: llm_provider.map(|provider| provider.id),
             model: Some(model.to_owned()),
-            reasoning: Some("high".to_owned()),
+            reasoning: reasoning.map(str::to_owned),
             user_instructions: "You are Braid, a helpful coding assistant. Work from the supplied GitHub Context, publish concise public comments, and keep descriptions and implementation state current.".to_owned(),
             skills: Vec::new(),
             native_template: None,
@@ -642,8 +632,9 @@ fn build_config(
 /// Prepare the instance-scoped provider home so the runtime can actually
 /// authenticate. Codex isolates `CODEX_HOME` per instance, so its global
 /// credentials do not apply: import `~/.codex/auth.json` when present,
-/// otherwise print explicit login instructions. Pi authenticates through the
-/// persisted provider API key and needs no home bootstrap.
+/// otherwise print explicit login instructions. Pi uses its explicit model
+/// route and, when declared, its provider API key file; it needs no home
+/// bootstrap.
 /// The instance source checkout: one Git clone of the configured repository,
 /// shared by all Profiles as the worktree provisioning source. Clone when
 /// missing or empty; never overwrite a non-Git directory.

@@ -10,17 +10,18 @@ Versioning once release artifacts are published.
 ### Changed
 
 - Runtime adapter 与 LLM provider 解耦：`setup`/`init` 使用 `--adapter`
-  选择 Pi/Codex；只有 Pi 需要显式 `--llm-provider`、`--llm-protocol`、
-  `--model` 和 `--api-key-file`。Codex 继续使用隔离 provider home，不再
-  生成或引用伪造的 LLM API key 文件。
-- Provider API key 只通过 `[[llm_providers]].api_key_file` 引用权限受限的
+  选择 Pi/Codex；Pi 需要显式 `--llm-provider` 和 `--model`，仅使用 API key
+  的 route 才需要 `--api-key-file`。Codex 继续使用隔离 provider home，不再
+  生成或引用伪造的 LLM API key 文件。Braid 不再生成硬编码 reasoning、协议
+  或费用配方。
+- Provider API key 只通过可选的 `[[llm_providers]].api_key_file` 引用权限受限的
   secret 文件；`setup`/`init` 不再支持 `--api-key-environment` 或
   `api_key_environment` 配置。Pi 原生材料统一引用 Braid 管理的进程内
   `BRAID_PROVIDER_API_KEY`，旧配置须显式迁移，不会自动导入旧环境变量。
 
 本版本不新增数据库 migration；配置 schema 保持 3。使用旧环境变量字段或
 在 schema 3 的非 Pi Profile 上声明 provider 的配置会被明确拒绝；schema 2
-Codex 配置中的旧 provider 标签仅作为惰性迁移字段读取。
+Codex 配置中的旧 provider 标签及 LLM 协议/费用元数据仅作为惰性迁移字段读取。
 
 ## [Unreleased pre-0.3.3]
 

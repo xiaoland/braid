@@ -1,6 +1,6 @@
 # Agent Profile 与原生材料
 
-Profile 定义根 Agent 的 adapter、model、reasoning、指令及支持的材料选择；
+Profile 定义根 Agent 的 adapter、model、可选 reasoning、指令及支持的材料选择；
 只有 Pi Profile 额外引用 `llm_providers` 中的 provider。Codex 通过自己的
 provider home 认证，Profile 不声明 LLM provider 或 API key 文件。Runtime 定义
 可执行入口、adapter 版本及锁定插件安装。Factory 的 preset、variant
@@ -40,16 +40,18 @@ auth、原生会话、缓存或临时文件。未指定模板时，已有 `Runti
 PR 改写共享 home；恢复不会用当前模板覆盖旧材料。
 
 根模型及推理仍由 Profile 决定。`models.json` 提供原生模型 descriptor 和路由，
-不是第二套根模型选择；Braid 从 `llm_providers.api_key_file` 读取凭据并注入对应
-Pi 子进程，不得在模板写入 key 值。`settings.json` 只支持有实际消费者的设置，不能另行选择根模型、
+不是第二套根模型选择；声明 `llm_providers.api_key_file` 时，Braid 从该文件
+读取凭据并注入对应 Pi 子进程，不得在模板写入 key 值。`settings.json` 只支持有实际消费者的设置，不能另行选择根模型、
 凭据、扩展、技能或动态安装 package。扩展由 `RuntimeEntry.native_runtime` 的锁定
 manifest 提供。原生子角色的职责、模型、工具与继承范围由受支持的角色材料及
 Pi 插件决定；Braid 不把这些角色提升为 Issue/PR 负责人，也不承诺仓库代码的
 安全沙箱。
 
 `models.json.apiKey` 固定使用 `$BRAID_PROVIDER_API_KEY` 或
-`${BRAID_PROVIDER_API_KEY}`。这个名称是 Braid 的进程内注入合同，不是用户配置项；
-其它环境变量引用和字面 key 都会被拒绝。服务 URL 不携带 userinfo 凭据。Header
+`${BRAID_PROVIDER_API_KEY}`，且对应 `llm_providers` 条目必须声明
+`api_key_file`。这个名称是 Braid 的进程内注入合同，不是用户配置项；
+其它环境变量引用和字面 key 都会被拒绝。无需 API key 的 route 可以同时省略
+`apiKey` 和 `api_key_file`。服务 URL 不携带 userinfo 凭据。Header
 保留 Pi 的原生解析能力，识别为认证用途的 header 必须引用同一固定名称，普通协议
 header 可以声明非秘密值；配置者不得借其它
 字段写入凭据。本材料合同支持 `$ENV_NAME`、`${ENV_NAME}` 及常见 `Bearer` 引用；
@@ -78,8 +80,8 @@ braid profile inspect --config /absolute/path/to/config.toml PROFILE_ID --json
 新材料下续用旧历史。应先完成旧执行停止，再按现有公开重新指派或新运行流程
 消费新配置，不能修改 ledger 或旧 home 标记制造兼容。
 
-Pi 自己保存的根模型偏好不成为第二权威：Profile 显式指定的 model/reasoning
-及根 provider 覆盖对应偏好。快照设置按 JSON 语义核对，避免仅格式变化阻断恢复；
+Pi 自己保存的根模型偏好不成为第二权威：Profile 显式指定的 model 及根
+provider 覆盖对应偏好；reasoning 只在声明时覆盖。快照设置按 JSON 语义核对，避免仅格式变化阻断恢复；
 其它行为键、角色与技能内容变化仍拒绝复用。原生运行状态不作为声明材料复制。
 
 这次身份合同补全后，旧版仅按 Profile JSON 生成的版本也可能不兼容；保留旧

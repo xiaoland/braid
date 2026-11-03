@@ -18,7 +18,7 @@ fn public_error_summary(config: &Config, profile: &Profile, reason: &str) -> Str
     let mut reason = reason.to_owned();
     if let Ok(settings) = config.provider_config_for_profile(profile)
         && let Some(pi) = settings.pi
-        && let Ok(key) = pi.api_key()
+        && let Ok(Some(key)) = pi.api_key()
         && !key.is_empty()
     {
         reason = reason.replace(&key, "[redacted provider key]");

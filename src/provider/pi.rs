@@ -129,10 +129,11 @@ impl PiProvider {
         for skill in &skills {
             cmd.arg("--skill").arg(home.join("braid-skills").join(&skill.name));
         }
-        let api_key = state.config.api_key().map_err(|error| {
+        if let Some(api_key) = state.config.api_key().map_err(|error| {
             ProviderError::Protocol(format!("cannot load provider API key: {error}"))
-        })?;
-        cmd.env(crate::config::PROVIDER_API_KEY_ENVIRONMENT, api_key);
+        })? {
+            cmd.env(crate::config::PROVIDER_API_KEY_ENVIRONMENT, api_key);
+        }
         configure_braid_environment(&mut cmd, &state.config)?;
         if let Some(session_path) = session {
             cmd.args(["--session", session_path]);

@@ -1,8 +1,7 @@
 //! Declare a Harness connected to an existing built-in collaboration platform.
 use crate::config::{
-    BuiltinConfig, CONFIG_SCHEMA_VERSION, Config, InstanceConfig, LlmModel, LlmProvider, LogFormat,
-    Profile, ProfileSelection, RuntimeConfig, SchedulerConfig, ServerConfig, TelemetryConfig,
-    ToolConfig,
+    BuiltinConfig, CONFIG_SCHEMA_VERSION, Config, InstanceConfig, LlmProvider, LogFormat, Profile,
+    ProfileSelection, RuntimeConfig, SchedulerConfig, ServerConfig, TelemetryConfig, ToolConfig,
 };
 use anyhow::{Context as _, Result, ensure};
 use clap::Args;
@@ -26,13 +25,13 @@ pub(crate) struct InitArguments {
     /// Pi-only LLM provider catalog id; Braid does not infer one from the adapter.
     #[arg(long, value_name = "ID", required_if_eq("adapter", "pi"))]
     pub llm_provider: Option<String>,
-    /// Pi-only LLM protocol label recorded in the provider catalog.
-    #[arg(long, value_name = "PROTOCOL", required_if_eq("adapter", "pi"))]
-    pub llm_protocol: Option<String>,
     #[arg(long)]
     pub model: String,
-    /// Pi-only existing provider secret TOML containing `provider_api_key`.
-    #[arg(long, value_name = "PATH", required_if_eq("adapter", "pi"))]
+    /// Optional reasoning/thinking level for runtimes that support one.
+    #[arg(long, value_name = "LEVEL")]
+    pub reasoning: Option<String>,
+    /// Pi provider secret TOML used only by model routes that need an API key.
+    #[arg(long, value_name = "PATH")]
     pub api_key_file: Option<PathBuf>,
 }
 
@@ -51,37 +50,26 @@ pub(crate) async fn run(a: InitArguments) -> Result<()> {
         let id = a.llm_provider.clone().context(
             "Pi init requires --llm-provider; Braid does not infer one from the adapter",
         )?;
-        let protocol = a.llm_protocol.clone().context(
-            "Pi init requires --llm-protocol; Braid does not infer one from the adapter",
-        )?;
         let api_key_file = a
             .api_key_file
             .as_ref()
-            .context("Pi init requires --api-key-file")?
-            .canonicalize()
-            .context("cannot resolve Pi provider API key file")?;
-        let api_key = crate::config::load_provider_secret_file(&api_key_file)?;
-        ensure!(
-            !api_key.trim().is_empty(),
-            "provider API key secret file {} must contain a non-empty provider_api_key",
-            api_key_file.display()
-        );
-        Some(LlmProvider {
-            id,
-            protocol,
-            api_key_file,
-            models: vec![LlmModel {
-                model_id: a.model.clone(),
-                input_cost: 0.0,
-                output_cost: 0.0,
-                cache_input_cost: 0.0,
-            }],
-            allowances: vec![],
-        })
+            .map(|path| {
+                let path =
+                    path.canonicalize().context("cannot resolve Pi provider API key file")?;
+                let api_key = crate::config::load_provider_secret_file(&path)?;
+                ensure!(
+                    !api_key.trim().is_empty(),
+                    "provider API key secret file {} must contain a non-empty provider_api_key",
+                    path.display()
+                );
+                Ok(path)
+            })
+            .transpose()?;
+        Some(LlmProvider { id, protocol: None, api_key_file, models: vec![], allowances: vec![] })
     } else {
         ensure!(
-            a.llm_provider.is_none() && a.llm_protocol.is_none() && a.api_key_file.is_none(),
-            "--llm-provider, --llm-protocol and --api-key-file are only supported for the Pi adapter"
+            a.llm_provider.is_none() && a.api_key_file.is_none(),
+            "--llm-provider and --api-key-file are only supported for the Pi adapter"
         );
         None
     };
@@ -96,7 +84,7 @@ pub(crate) async fn run(a: InitArguments) -> Result<()> {
         adapter_version: runtime.version.clone(),
         provider: profile_provider,
         model: Some(a.model.clone()),
-        reasoning: Some("high".into()),
+        reasoning: a.reasoning.clone(),
         user_instructions:
             "维护当前需求与决定，交付可采用的实现候选；只在有行动价值时发布简洁评论。".into(),
         skills: Vec::new(),
