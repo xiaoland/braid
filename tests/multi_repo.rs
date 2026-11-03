@@ -96,8 +96,8 @@ fn multi_repository_config_requires_repo_scoped_profiles() {
     assert!(output.status.success(), "{}", stderr(&output));
 
     let missing_binding = fs::read_to_string(&path).expect("read multi config").replacen(
-        "repository = \"owner/other\"\nmodel",
-        "model",
+        "repository = \"owner/repository\"\nworkspace",
+        "workspace",
         1,
     );
     fs::write(&path, missing_binding).expect("remove one repository binding");

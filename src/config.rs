@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -937,7 +937,20 @@ impl Config {
             return Err(ConfigError::Invalid("at least one profile is required".into()));
         }
         let mut ids = HashSet::new();
+        let mut repository_workspaces = HashMap::new();
         for profile in &self.profiles {
+            let repository = self.profile_repository(profile);
+            if let Some(workspace) = &profile.workspace
+                && let Some(existing) =
+                    repository_workspaces.insert(repository, workspace.as_path())
+                && existing != workspace
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "profiles for repository {repository:?} must share one source checkout; {} and {} differ",
+                    existing.display(),
+                    workspace.display()
+                )));
+            }
             profile.validate(self)?;
             if !ids.insert(profile.id.as_str()) {
                 return Err(ConfigError::Invalid(format!(
