@@ -219,7 +219,9 @@ Profile ids remain unique within the instance. Install the same GitHub App on
 every configured repository. Webhooks from other installed but unconfigured
 repositories are rejected before scheduling. `braid gh pr ensure` requires
 `--repository` in a multi-repository instance; generation-scoped worktrees are
-kept under a repository-prefixed path.
+kept under a repository-prefixed path. This release keeps the existing MVP
+constraint that all Profiles use the same runtime adapter type; it does not yet
+mix Codex and Pi repositories in one instance.
 
 ## Headless / manual App creation
 

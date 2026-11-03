@@ -226,7 +226,8 @@ source checkout，最好包含相同 Issue 编号以证明裸 number 不成为�
 正文和评论不混入另一仓库；worktree 路径按 repository 隔离；comment/reaction、
 status 和 `pr ensure` 都使用目标 repository 的 scoped client。第三个已安装但
 未配置 repository 的 signed delivery 必须在调度前拒绝。跨 repository 关联
-只能作为明确 reference 出现，不展开共享 Context 或工作图。
+只能作为明确 reference 出现，不展开共享 Context 或工作图。当前 MVP 桥接仍要求
+同一 instance 的 Profiles 使用相同 adapter_type，不宣称混合 Codex/Pi 多仓库。
 
 ## 内建空间的验收边界
 
