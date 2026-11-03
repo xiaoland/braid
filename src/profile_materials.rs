@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, Profile};
+use crate::config::{Config, PROVIDER_API_KEY_ENVIRONMENT, Profile};
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EffectiveMaterials {
@@ -264,7 +264,6 @@ fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
                     &relative,
                     &bytes,
                     profile,
-                    llm.api_key_environment.as_deref(),
                     profile.native_template.is_some(),
                 )?;
                 let identity_bytes = if relative == Path::new("settings.json") {
@@ -336,7 +335,6 @@ fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
         "provider_route": {
             "provider": llm.id,
             "protocol": llm.protocol,
-            "api_key_environment": llm.api_key_environment,
             "model": profile.model,
             "reasoning": profile.reasoning
         },
@@ -548,7 +546,7 @@ fn sensitive_query_name(name: &str) -> bool {
     .any(|exact| name == *exact)
 }
 
-fn supported_header_value(header: &str, value: &str, api_key_environment: Option<&str>) -> bool {
+fn supported_header_value(header: &str, value: &str) -> bool {
     if value.starts_with('!') {
         return false;
     }
@@ -557,8 +555,7 @@ fn supported_header_value(header: &str, value: &str, api_key_environment: Option
         return !sensitive;
     }
     let matches_profile_key = |reference: &str| {
-        environment_reference_name(reference) == api_key_environment
-            && api_key_environment.is_some()
+        environment_reference_name(reference) == Some(PROVIDER_API_KEY_ENVIRONMENT)
     };
     matches_profile_key(value)
         || (header.eq_ignore_ascii_case("authorization")
@@ -582,12 +579,11 @@ fn validate_json_material(
     path: &Path,
     bytes: &[u8],
     profile: &Profile,
-    api_key_environment: Option<&str>,
     reject_root_model: bool,
 ) -> Result<()> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).with_context(|| format!("invalid Pi {}", path.display()))?;
-    reject_ambient_authority(&value, path, api_key_environment, reject_root_model)?;
+    reject_ambient_authority(&value, path, reject_root_model)?;
     if path == Path::new("models.json")
         && let Some(model) = &profile.model
     {
@@ -619,13 +615,11 @@ fn validate_json_material(
 fn reject_ambient_authority(
     value: &serde_json::Value,
     path: &Path,
-    api_key_environment: Option<&str>,
     reject_root_model: bool,
 ) -> Result<()> {
     fn visit(
         value: &serde_json::Value,
         path: &Path,
-        api_key_environment: Option<&str>,
         reject_root_model: bool,
         root: bool,
     ) -> Result<()> {
@@ -637,19 +631,14 @@ fn reject_ambient_authority(
                     {
                         key == "apiKey"
                             && value.as_str().is_none_or(|key| {
-                                !valid_environment_reference(key)
-                                    || api_key_environment
-                                        .is_none_or(|environment| key != format!("${environment}"))
+                                environment_reference_name(key)
+                                    != Some(PROVIDER_API_KEY_ENVIRONMENT)
                             })
                             || (key == "headers"
                                 && value.as_object().is_none_or(|headers| {
                                     headers.iter().any(|(header, value)| {
                                         value.as_str().is_none_or(|value| {
-                                            !supported_header_value(
-                                                header,
-                                                value,
-                                                api_key_environment,
-                                            )
+                                            !supported_header_value(header, value)
                                         })
                                     })
                                 }))
@@ -683,25 +672,25 @@ fn reject_ambient_authority(
                             key
                         );
                     }
-                    visit(value, path, api_key_environment, reject_root_model, false)?;
+                    visit(value, path, reject_root_model, false)?;
                 }
             }
             serde_json::Value::Array(array) => {
                 for value in array {
-                    visit(value, path, api_key_environment, reject_root_model, false)?;
+                    visit(value, path, reject_root_model, false)?;
                 }
             }
             _ => {}
         }
         Ok(())
     }
-    visit(value, path, api_key_environment, reject_root_model, true)
+    visit(value, path, reject_root_model, true)
 }
 
 fn settings_semantics(bytes: &[u8], profile: &Profile) -> Result<Vec<u8>> {
     let mut value: serde_json::Value =
         serde_json::from_slice(bytes).context("Pi settings snapshot must remain valid JSON")?;
-    reject_ambient_authority(&value, Path::new("settings.json"), None, false)?;
+    reject_ambient_authority(&value, Path::new("settings.json"), false)?;
     let settings = value.as_object_mut().context("Pi settings.json must contain an object")?;
     let mut overridden_preferences = vec!["defaultProvider"];
     if profile.model.is_some() {
@@ -724,10 +713,7 @@ fn settings_semantics(bytes: &[u8], profile: &Profile) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&value)?)
 }
 
-fn valid_environment_reference(reference: &str) -> bool {
-    let Some(name) = reference.strip_prefix('$') else {
-        return false;
-    };
+fn valid_environment_reference(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
         && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())

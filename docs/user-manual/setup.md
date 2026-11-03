@@ -17,9 +17,8 @@ braid --version
 - [`gh`](https://cli.github.com/) installed and authenticated with an account
   that can create GitHub Apps for the target owner (user or organization).
 - A repository where you will install the App.
-- For the Pi provider: a DeepSeek API key exported as `DEEPSEEK_API_KEY` (or
-  the environment variable configured with `--api-key-environment`) *only at
-  setup time*.
+- For the Pi provider: a DeepSeek API key in the user-level secret file
+  described below.
 
 ## Pi 原生插件
 
@@ -29,10 +28,34 @@ Setup 识别相邻 `runtime-manifest.json`；既有配置可将 `[[runtimes]]` �
 `executable` 与 `native_runtime` 指向同一安装。外部 Pi 仍可基础接入，但不会自动
 加载宿主扩展。材料验证失败须修复明确的文件或配置漂移，不能静默改走全局 Pi。
 
+## Provider API key
+
+Braid stores the Pi provider key in `~/.braid/secrets/deepseek.toml` by default,
+or `<user-home>/secrets/deepseek.toml` when `--user-home` is set. Create the
+file before setup; do not put the key in `config.toml` or a shell environment
+variable:
+
+```shell
+install -d -m 700 ~/.braid/secrets
+${EDITOR:-vi} ~/.braid/secrets/deepseek.toml
+chmod 600 ~/.braid/secrets/deepseek.toml
+```
+
+The file contains only the secret field:
+
+```toml
+provider_api_key = "..."
+```
+
+Setup validates and reuses this file. It does not copy a provider key from the
+environment. To migrate an existing configuration, remove
+`api_key_environment`, keep or add the absolute `api_key_file` reference, and
+store the key in that file explicitly; Braid does not import legacy environment
+variables automatically.
+
 ## Bootstrap
 
 ```shell
-export DEEPSEEK_API_KEY=...
 braid setup owner/repository --instance <KEY>
 ```
 
@@ -44,9 +67,6 @@ Options:
 
 - `--provider pi|codex` — defaults to `pi`.
 - `--model <MODEL>` — defaults to `deepseek-chat`.
-- `--api-key-environment <ENV>` — env var to read the provider API key from
-  during setup; defaults to `DEEPSEEK_API_KEY`. The key is then persisted into
-  the user-level secrets file, so the env var is only needed at setup time.
 - `--user-home <DIR>` — defaults to `~/.braid` (or `BRAID_USER_HOME`).
 - `--instance <KEY>` — defaults to the repository owner.
 
@@ -56,8 +76,7 @@ Options:
 2. Resolves the Braid user home (`~/.braid` by default) and instance key
    (owner by default).
 3. Generates a random webhook secret.
-4. Reads the provider API key from the environment variable named by
-   `--api-key-environment`.
+4. Validates the existing user-level provider secret file.
 5. Builds a GitHub App Manifest with the permissions Braid needs
    (`contents:write`, `issues:write`, `pull_requests:write`, `metadata:read`).
 6. Starts a temporary local HTTP callback server.
@@ -77,8 +96,8 @@ Options:
      and worktrees.
 
 Using per-instance secrets and a shared user-level provider key means multiple
-Braid instances can run on the same machine without colliding on a single
-environment variable. `BRAID_WEBHOOK_SECRET` is no longer required.
+Braid instances can run on the same machine without putting provider credentials
+in their shell environments. `BRAID_WEBHOOK_SECRET` is no longer required.
 
 After setup:
 
@@ -136,7 +155,8 @@ CODEX_HOME=~/.braid/instances/<KEY>/provider/codex codex login
 ```
 
 `braid doctor` reports this as the "Codex credentials" check. The Pi provider
-needs no home bootstrap: it authenticates with the API key persisted at setup.
+needs no home bootstrap: it authenticates with the API key read from the
+user-level secret file.
 
 ## Headless / manual App creation
 

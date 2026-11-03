@@ -5,6 +5,20 @@ Versioning once release artifacts are published.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-13
+
+### Changed
+
+- Provider API key 只通过 `[[llm_providers]].api_key_file` 引用权限受限的
+  secret 文件；`setup`/`init` 不再支持 `--api-key-environment` 或
+  `api_key_environment` 配置。Pi 原生材料统一引用 Braid 管理的进程内
+  `BRAID_PROVIDER_API_KEY`，旧配置须显式迁移，不会自动导入旧环境变量。
+
+本版本不新增数据库 migration；配置 schema 保持 3，使用旧环境变量字段的
+配置会被明确拒绝。
+
+## [Unreleased pre-0.3.3]
+
 - 有限 run 的 Issue 指派保留真实执行输入，首次轮次前处理已有 Context reset；普通 serve 指派仍保持空闲会话合同。
 - 受控 Pi background Bash 使用非登录 shell，原生入口移除 BASH_ENV/ENV，工具路径与缓存由实例明确提供。
 - 内建协作的 Harness ledger 写命令先取得 IMMEDIATE 事务准入，纯读仍为 DEFERRED；绑定错误保留账本路径与 SQLite extended code。

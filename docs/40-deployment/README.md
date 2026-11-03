@@ -28,9 +28,9 @@ subagents/background 的共同结果与停止合同时，先安装材料并明�
 ## Configuration
 
 The instance `config.toml` is versioned independently from binary and
-database schema. It
-contains no secret values; secrets use file references or environment-variable
-names. The main sections are:
+database schema. It contains no secret values. Provider API keys always use
+`api_key_file` references; the GitHub webhook secret separately supports a file
+reference or environment-variable name. The main sections are:
 
 - GitHub App/repository/handle, API version, webhook and reconciliation;
 - the instance key under `[instance]`;
@@ -77,6 +77,9 @@ Everything below is scoped by trust boundary:
 The default `runtime.root` is `<config_dir>/state`. `braid setup` writes
 `instances/<key>` explicitly with the layout above. Multiple instances share
 the same user root but have isolated databases, webhooks, and worktrees.
+A provider secret file contains `provider_api_key = "..."` and must be mode
+`0600`. Pi setup reads `secrets/deepseek.toml`; runtime configuration references
+the file by absolute path and never declares provider-key environment variables.
 
 ## Database Lifecycle
 

@@ -27,8 +27,9 @@ pub(crate) struct InitArguments {
     pub provider: String,
     #[arg(long)]
     pub model: String,
-    #[arg(long)]
-    pub api_key_environment: String,
+    /// Existing provider secret TOML containing `provider_api_key`.
+    #[arg(long, value_name = "PATH")]
+    pub api_key_file: PathBuf,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -87,8 +88,7 @@ pub(crate) async fn run(a: InitArguments) -> Result<()> {
         llm_providers: vec![LlmProvider {
             id: a.provider,
             protocol: if a.adapter == "codex" { "openai" } else { "openai-compatible" }.into(),
-            api_key_environment: Some(a.api_key_environment),
-            api_key_file: None,
+            api_key_file: a.api_key_file,
             models: vec![LlmModel {
                 model_id: a.model,
                 input_cost: 0.0,

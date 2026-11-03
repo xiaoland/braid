@@ -27,8 +27,8 @@ mod logo;
 
 use crate::config::{
     CONFIG_SCHEMA_VERSION, Config, GitHubConfig, LogFormat, Profile, ProfileSelection,
-    ProviderSecretFile, RuntimeConfig, RuntimeEntry, SchedulerConfig, ServerConfig,
-    TelemetryConfig, ToolConfig,
+    RuntimeConfig, RuntimeEntry, SchedulerConfig, ServerConfig, TelemetryConfig, ToolConfig,
+    load_provider_secret_file,
 };
 use crate::config::{LlmAllowance, LlmModel, LlmProvider};
 use crate::home::{InstanceEntry, UserHome, allocate_server_ports, validate_instance_key};
@@ -125,6 +125,8 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         return Ok(());
     }
 
+    let provider_secret_path = ensure_provider_secret(&user_home, &arguments.provider)?;
+
     let html_path = write_manifest_html(&form_action, &manifest_json)?;
 
     let shared = Arc::new(Mutex::new(CallbackState::default()));
@@ -173,15 +175,8 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     let webhook_toml = format!("webhook_secret = {webhook_secret:?}\n");
     write_secret(&secrets_path, webhook_toml.as_bytes())?;
 
-    let provider_secret_path =
-        write_provider_secret(&user_home, &runtime.adapter_type, &arguments.api_key_environment)?;
-
-    let llm_provider = build_llm_provider(
-        &runtime.adapter_type,
-        &arguments.model,
-        &arguments.api_key_environment,
-        &provider_secret_path,
-    );
+    let llm_provider =
+        build_llm_provider(&runtime.adapter_type, &arguments.model, &provider_secret_path);
 
     let config_path = base_dir.join("config.toml");
     let mut config = build_config(
@@ -501,43 +496,33 @@ fn provider_secret_path(user_home: &UserHome, adapter_type: &str) -> PathBuf {
     user_home.secrets_dir().join(format!("{provider_id}.toml"))
 }
 
-#[allow(clippy::collapsible_if)]
-fn write_provider_secret(
-    user_home: &UserHome,
-    adapter_type: &str,
-    api_key_environment: &str,
-) -> Result<PathBuf> {
+fn ensure_provider_secret(user_home: &UserHome, adapter_type: &str) -> Result<PathBuf> {
     let path = provider_secret_path(user_home, adapter_type);
-    if let Ok(text) = fs::read_to_string(&path) {
-        if let Ok(file) = toml::from_str::<ProviderSecretFile>(&text) {
-            if !file.provider_api_key.is_empty() {
-                return Ok(path);
-            }
+    if path.exists() {
+        let api_key = load_provider_secret_file(&path)?;
+        if adapter_type == "pi" && api_key.trim().is_empty() {
+            bail!(
+                "provider API key secret file {} must contain a non-empty provider_api_key",
+                path.display()
+            );
         }
+        return Ok(path);
+    }
+    if adapter_type == "pi" {
+        bail!(
+            "provider API key secret file {} must exist before setup; create it with mode 0600 \
+             and a non-empty provider_api_key",
+            path.display()
+        );
     }
 
-    let api_key = if adapter_type == "pi" {
-        std::env::var(api_key_environment).with_context(|| {
-            format!(
-                "provider API key environment variable {api_key_environment} must be set during setup, \
-                 or the user secret file {} must already contain provider_api_key",
-                path.display()
-            )
-        })?
-    } else {
-        std::env::var(api_key_environment).unwrap_or_default()
-    };
-    let toml = format!("provider_api_key = {api_key:?}\n");
-    write_secret(&path, toml.as_bytes())?;
+    // Codex authenticates through its isolated home; retain the provider
+    // catalog's file reference without inventing an API key.
+    write_secret(&path, b"provider_api_key = \"\"\n")?;
     Ok(path)
 }
 
-fn build_llm_provider(
-    adapter_type: &str,
-    model: &str,
-    api_key_environment: &str,
-    provider_secret_file: &Path,
-) -> LlmProvider {
+fn build_llm_provider(adapter_type: &str, model: &str, provider_secret_file: &Path) -> LlmProvider {
     let (id, protocol) = if adapter_type == "codex" {
         ("openai".to_owned(), "openai".to_owned())
     } else {
@@ -546,8 +531,7 @@ fn build_llm_provider(
     LlmProvider {
         id,
         protocol,
-        api_key_environment: Some(api_key_environment.to_owned()),
-        api_key_file: Some(provider_secret_file.to_path_buf()),
+        api_key_file: provider_secret_file.to_path_buf(),
         models: vec![LlmModel {
             model_id: model.to_owned(),
             input_cost: 0.0,

@@ -38,17 +38,18 @@ auth、原生会话、缓存或临时文件。未指定模板时，已有 `Runti
 PR 改写共享 home；恢复不会用当前模板覆盖旧材料。
 
 根模型及推理仍由 Profile 决定。`models.json` 提供原生模型 descriptor 和路由，
-不是第二套根模型选择；凭据沿 `llm_providers` 的环境变量或文件引用注入，不得在
-模板写入 key 值。`settings.json` 只支持有实际消费者的设置，不能另行选择根模型、
+不是第二套根模型选择；Braid 从 `llm_providers.api_key_file` 读取凭据并注入对应
+Pi 子进程，不得在模板写入 key 值。`settings.json` 只支持有实际消费者的设置，不能另行选择根模型、
 凭据、扩展、技能或动态安装 package。扩展由 `RuntimeEntry.native_runtime` 的锁定
 manifest 提供。原生子角色的职责、模型、工具与继承范围由受支持的角色材料及
 Pi 插件决定；Braid 不把这些角色提升为 Issue/PR 负责人，也不承诺仓库代码的
 安全沙箱。
 
-`models.json.apiKey` 使用与该 Profile 的 `llm_providers.api_key_environment` 一致
-的 `$ENV_NAME` 引用；通过 key 文件加载时，也需声明这个注入环境变量。服务 URL
-不携带 userinfo 凭据。Header 保留 Pi 的原生解析能力，识别为认证用途的 header
-必须引用同一凭据环境变量，普通协议 header 可以声明非秘密值；配置者不得借其它
+`models.json.apiKey` 固定使用 `$BRAID_PROVIDER_API_KEY` 或
+`${BRAID_PROVIDER_API_KEY}`。这个名称是 Braid 的进程内注入合同，不是用户配置项；
+其它环境变量引用和字面 key 都会被拒绝。服务 URL 不携带 userinfo 凭据。Header
+保留 Pi 的原生解析能力，识别为认证用途的 header 必须引用同一固定名称，普通协议
+header 可以声明非秘密值；配置者不得借其它
 字段写入凭据。本材料合同支持 `$ENV_NAME`、`${ENV_NAME}` 及常见 `Bearer` 引用；
 未知环境引用、其它混合模板和 `!command` 明确拒绝，后者会额外执行未受控 shell。
 正常版本或部署 query 保留，明确的凭据 query 不允许。模板中的非空原生角色

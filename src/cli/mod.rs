@@ -300,12 +300,10 @@ struct GhPrEnsure {
 pub(crate) struct SetupArguments {
     #[arg(value_name = "OWNER/REPOSITORY")]
     pub(crate) repository: String,
-    #[arg(long, value_name = "pi|codex", default_value = "pi")]
+    #[arg(long, value_name = "pi|codex", default_value = "pi", value_parser = ["pi", "codex"])]
     pub(crate) provider: String,
     #[arg(long, value_name = "MODEL", default_value = "deepseek-chat")]
     pub(crate) model: String,
-    #[arg(long, value_name = "ENV", default_value = "DEEPSEEK_API_KEY")]
-    pub(crate) api_key_environment: String,
     #[arg(long, value_name = "KEY", env = "BRAID_INSTANCE")]
     pub(crate) instance: Option<String>,
     #[arg(long, value_name = "DIR", env = "BRAID_USER_HOME", default_value = "~/.braid")]

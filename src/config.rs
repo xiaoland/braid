@@ -12,6 +12,9 @@ use url::Url;
 use crate::home::validate_instance_key;
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 3;
+/// Process-local credential injection for one Pi provider. Users configure only
+/// the secret file; native materials reference this fixed name.
+pub const PROVIDER_API_KEY_ENVIRONMENT: &str = "BRAID_PROVIDER_API_KEY";
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -165,10 +168,7 @@ pub struct RuntimeEntry {
 pub struct LlmProvider {
     pub id: String,
     pub protocol: String,
-    #[serde(default)]
-    pub api_key_environment: Option<String>,
-    #[serde(default)]
-    pub api_key_file: Option<PathBuf>,
+    pub api_key_file: PathBuf,
     #[serde(default)]
     pub models: Vec<LlmModel>,
     #[serde(default)]
@@ -266,10 +266,7 @@ pub struct PiConfig {
     pub executable: PathBuf,
     pub provider: Option<String>,
     pub model: Option<String>,
-    #[serde(default)]
-    pub api_key_environment: Option<String>,
-    #[serde(default)]
-    pub api_key_file: Option<PathBuf>,
+    pub api_key_file: PathBuf,
     pub thinking: Option<String>,
     pub home: Option<PathBuf>,
     #[serde(default)]
@@ -277,22 +274,8 @@ pub struct PiConfig {
 }
 
 impl PiConfig {
-    /// Load the provider API key from `api_key_file` if set, otherwise from
-    /// `api_key_environment`.
     pub fn api_key(&self) -> Result<String, ConfigError> {
-        if let Some(path) = &self.api_key_file {
-            return load_provider_secret_file(path);
-        }
-        if let Some(env) = &self.api_key_environment {
-            return std::env::var(env).map_err(|_| {
-                ConfigError::Invalid(format!(
-                    "environment variable {env:?} for provider.pi.api_key_environment is not set"
-                ))
-            });
-        }
-        Err(ConfigError::Invalid(
-            "one of provider.pi.api_key_environment or provider.pi.api_key_file must be set".into(),
-        ))
+        load_provider_secret_file(&self.api_key_file)
     }
 }
 
@@ -431,7 +414,7 @@ fn load_webhook_secret_file(path: &Path) -> Result<String, ConfigError> {
     Ok(file.webhook_secret)
 }
 
-fn load_provider_secret_file(path: &Path) -> Result<String, ConfigError> {
+pub(crate) fn load_provider_secret_file(path: &Path) -> Result<String, ConfigError> {
     let text = fs::read_to_string(path)
         .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
     let deserializer = toml::de::Deserializer::parse(&text).map_err(|error| {
@@ -640,7 +623,6 @@ impl Config {
                     executable: runtime.executable.clone(),
                     provider: Some(llm.id.clone()),
                     model: profile.model.clone(),
-                    api_key_environment: llm.api_key_environment.clone(),
                     api_key_file: llm.api_key_file.clone(),
                     thinking: profile.reasoning.clone(),
                     home: runtime.home.clone(),
@@ -809,15 +791,10 @@ impl Config {
         for provider in &self.llm_providers {
             validate_token("llm_providers.id", &provider.id)?;
             validate_token("llm_providers.protocol", &provider.protocol)?;
-            if provider.api_key_environment.is_none() && provider.api_key_file.is_none() {
-                return Err(ConfigError::Invalid(format!(
-                    "llm_providers {:?} requires api_key_environment or api_key_file",
-                    provider.id
-                )));
-            }
-            if let Some(file) = &provider.api_key_file {
-                require_absolute(&format!("llm_providers.{}.api_key_file", provider.id), file)?;
-            }
+            require_absolute(
+                &format!("llm_providers.{}.api_key_file", provider.id),
+                &provider.api_key_file,
+            )?;
             if !provider_ids.insert(provider.id.as_str()) {
                 return Err(ConfigError::Invalid(format!(
                     "duplicate llm_providers id {:?}",
