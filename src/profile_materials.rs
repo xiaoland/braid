@@ -235,7 +235,14 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
     let runtime = config.runtime_for(profile)?;
-    let llm = config.llm_provider_for(profile)?;
+    let llm = if profile.adapter_type == "pi" {
+        let provider_id = profile.provider.as_deref().with_context(|| {
+            format!("profile {:?} requires provider for the Pi adapter", profile.id)
+        })?;
+        Some(config.llm_provider_for(provider_id)?)
+    } else {
+        None
+    };
     let skills = collect_profile_skills(profile)?;
     let skill_files = skills.files;
     let skill_identities = skills.identities;
@@ -319,6 +326,11 @@ fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
     let mut semantic = serde_json::to_value(profile)?;
     semantic["skills"] = serde_json::Value::Null;
     semantic["native_template"] = serde_json::Value::Null;
+    if profile.adapter_type != "pi" {
+        // Schema-2 Codex configs could carry an inert legacy provider label.
+        // It is readable for migration, but it is not a runtime/material route.
+        semantic["provider"] = serde_json::Value::Null;
+    }
     let runtime_manifest = runtime.native_runtime.as_ref().map(fs::read).transpose()?;
     let manifest_hash = runtime_manifest.as_deref().map(sha);
     let runtime_api_url = runtime.api_url.as_deref().map(sanitized_runtime_api_url).transpose()?;
@@ -332,12 +344,12 @@ fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
             "stable_schema_sha256": runtime.stable_schema_sha256,
             "experimental_schema_sha256": runtime.experimental_schema_sha256,
         },
-        "provider_route": {
+        "provider_route": llm.map(|llm| serde_json::json!({
             "provider": llm.id,
             "protocol": llm.protocol,
             "model": profile.model,
             "reasoning": profile.reasoning
-        },
+        })),
         "native_files": material_identities,
         "skills": skill_identities,
     });
@@ -591,8 +603,11 @@ fn validate_json_material(
             .get("providers")
             .and_then(serde_json::Value::as_object)
             .context("Pi models.json must contain providers when selected as profile material")?;
-        let descriptor = providers.get(&profile.provider).with_context(|| {
-            format!("Pi models.json does not define selected provider {:?}", profile.provider)
+        let provider_id = profile.provider.as_deref().with_context(|| {
+            format!("profile {:?} requires provider for Pi models.json", profile.id)
+        })?;
+        let descriptor = providers.get(provider_id).with_context(|| {
+            format!("Pi models.json does not define selected provider {provider_id:?}")
         })?;
         let models = descriptor
             .get("models")
@@ -603,9 +618,7 @@ fn validate_json_material(
             .any(|entry| entry.get("id").and_then(serde_json::Value::as_str) == Some(model))
         {
             bail!(
-                "Pi models.json does not define selected root model {:?} for provider {:?}",
-                model,
-                profile.provider
+                "Pi models.json does not define selected root model {model:?} for provider {provider_id:?}"
             );
         }
     }

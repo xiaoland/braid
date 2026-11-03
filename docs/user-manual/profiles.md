@@ -1,7 +1,9 @@
 # Agent Profile 与原生材料
 
-Profile 定义根 Agent 的 provider、model、reasoning、指令及支持的材料选择。
-Runtime 定义可执行入口、adapter 版本及锁定插件安装。Factory 的 preset、variant
+Profile 定义根 Agent 的 adapter、model、reasoning、指令及支持的材料选择；
+只有 Pi Profile 额外引用 `llm_providers` 中的 provider。Codex 通过自己的
+provider home 认证，Profile 不声明 LLM provider 或 API key 文件。Runtime 定义
+可执行入口、adapter 版本及锁定插件安装。Factory 的 preset、variant
 和实验配方由消费方装配，不导入 Braid 的配置目录。Pi 原生 subagent 角色是根
 Agent 的局部执行能力，不是可独立指派的 Braid Profile。
 

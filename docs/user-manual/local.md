@@ -19,12 +19,13 @@ braid platform serve --config /absolute/path/to/platform.toml
 默认分支不会随 source 当前检出的分支改变。平台对象只能访问已绑定的 Git
 对象库，HTTP 调用不能提交任意文件路径。
 
-Harness 单独声明上游与执行环境。准备实际安装的 Pi 或 Codex，并明确模型与
-provider secret 文件。文件权限应为 `0600`，内容只需 `provider_api_key = "..."`；
-初始化不读取或复制 key 值，也不在配置中声明环境变量：
+Harness 单独声明上游与执行环境。准备实际安装的 Pi 或 Codex，并明确模型。
+Pi 还要显式声明 LLM provider id、协议和已有 secret 文件；文件权限应为
+`0600`，内容只需 `provider_api_key = "..."`。Codex 使用自己的 provider home，
+不接受这些 LLM 参数。初始化不复制 key 值，也不在配置中声明环境变量：
 
 ```shell
-braid init --source /absolute/path/to/repository --config /absolute/path/to/harness/config.toml --name demo --endpoint http://127.0.0.1:18082 --adapter pi --executable /absolute/path/to/pi --provider deepseek --model deepseek-chat --api-key-file /absolute/path/to/user/secrets/deepseek.toml
+braid init --source /absolute/path/to/repository --config /absolute/path/to/harness/config.toml --name demo --endpoint http://127.0.0.1:18082 --adapter pi --executable /absolute/path/to/pi --model <MODEL> --llm-provider <PROVIDER_ID> --llm-protocol <PROTOCOL> --api-key-file /absolute/path/to/user/secrets/<provider>.toml
 braid config check --config /absolute/path/to/harness/config.toml
 braid migrate apply --config /absolute/path/to/harness/config.toml
 braid serve --config /absolute/path/to/harness/config.toml

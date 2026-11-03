@@ -125,7 +125,11 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         return Ok(());
     }
 
-    let provider_secret_path = ensure_provider_secret(&user_home, &arguments.provider)?;
+    let model = arguments
+        .model
+        .clone()
+        .context("setup requires --model when writing an instance configuration")?;
+    let llm_provider = select_llm_provider(&arguments, &model)?;
 
     let html_path = write_manifest_html(&form_action, &manifest_json)?;
 
@@ -175,19 +179,17 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     let webhook_toml = format!("webhook_secret = {webhook_secret:?}\n");
     write_secret(&secrets_path, webhook_toml.as_bytes())?;
 
-    let llm_provider =
-        build_llm_provider(&runtime.adapter_type, &arguments.model, &provider_secret_path);
-
     let config_path = base_dir.join("config.toml");
     let mut config = build_config(
         &base_dir,
         app.id,
         &instance_key,
         &arguments,
+        &model,
         &pem_path,
         &secrets_path,
         runtime,
-        llm_provider,
+        llm_provider.clone(),
     )?;
     config.server.ingress = ingress;
     config.server.health = health;
@@ -205,8 +207,8 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
             source.display()
         );
     }
-    let runtime_home = base_dir.join("provider").join(&arguments.provider);
-    bootstrap_provider_home(&runtime_home, &arguments.provider)?;
+    let runtime_home = base_dir.join("provider").join(&arguments.adapter);
+    bootstrap_provider_home(&runtime_home, &arguments.adapter)?;
 
     let config_text = toml::to_string(&config).context("cannot serialize generated config")?;
     write_secret(&config_path, config_text.as_bytes())?;
@@ -215,7 +217,9 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
 
     println!("\nWrote configuration to: {}", config_path.display());
     println!("Wrote instance secrets to: {}", secrets_path.display());
-    println!("Wrote provider secret to: {}", provider_secret_path.display());
+    if let Some(provider) = &llm_provider {
+        println!("Using provider secret: {}", provider.api_key_file.display());
+    }
     println!("\nNext, install the App on {}:\n{}\n", arguments.repository, install_url(&app.slug));
     println!(
         "Then run:\n  braid doctor --instance {instance_key}\n  braid serve --instance {instance_key} --tunnel\n"
@@ -436,33 +440,30 @@ fn write_secret(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 async fn select_runtime(arguments: &SetupArguments) -> Result<RuntimeEntry> {
-    if let Some(api_url) = &arguments.runtime_api_url {
-        return discovery::from_api_url(&arguments.provider, api_url.clone());
-    }
     if let Some(executable) = &arguments.runtime_executable {
-        return discovery::from_executable(&arguments.provider, executable).await;
+        return discovery::from_executable(&arguments.adapter, executable).await;
     }
 
-    let candidates = discovery::discover(&arguments.provider).await?;
+    let candidates = discovery::discover(&arguments.adapter).await?;
     if candidates.is_empty() {
         eprintln!(
             "No {} runtime found on this machine.\n\n{}",
-            arguments.provider,
-            discovery::install_hint(&arguments.provider)
+            arguments.adapter,
+            discovery::install_hint(&arguments.adapter)
         );
-        bail!("setup requires a {} runtime; install it and re-run", arguments.provider);
+        bail!("setup requires a {} runtime; install it and re-run", arguments.adapter);
     }
 
     let chosen = if candidates.len() == 1 {
         println!(
             "Found one {} runtime: {} ({})",
-            arguments.provider,
+            arguments.adapter,
             candidates[0].executable.display(),
             candidates[0].source
         );
         candidates.into_iter().next().expect("one candidate")
     } else {
-        println!("Found {} {} runtimes:", candidates.len(), arguments.provider);
+        println!("Found {} {} runtimes:", candidates.len(), arguments.adapter);
         for (index, candidate) in candidates.iter().enumerate() {
             println!(
                 "  [{}] {} ({}) version {}",
@@ -488,50 +489,48 @@ async fn select_runtime(arguments: &SetupArguments) -> Result<RuntimeEntry> {
 
     discovery::verify(chosen)
         .await
-        .with_context(|| format!("cannot verify {} runtime", arguments.provider))
+        .with_context(|| format!("cannot verify {} runtime", arguments.adapter))
 }
 
-fn provider_secret_path(user_home: &UserHome, adapter_type: &str) -> PathBuf {
-    let provider_id = if adapter_type == "codex" { "openai" } else { "deepseek" };
-    user_home.secrets_dir().join(format!("{provider_id}.toml"))
-}
-
-fn ensure_provider_secret(user_home: &UserHome, adapter_type: &str) -> Result<PathBuf> {
-    let path = provider_secret_path(user_home, adapter_type);
-    if path.exists() {
-        let api_key = load_provider_secret_file(&path)?;
-        if adapter_type == "pi" && api_key.trim().is_empty() {
+fn select_llm_provider(arguments: &SetupArguments, model: &str) -> Result<Option<LlmProvider>> {
+    if arguments.adapter != "pi" {
+        if arguments.llm_provider.is_some()
+            || arguments.llm_protocol.is_some()
+            || arguments.api_key_file.is_some()
+        {
             bail!(
-                "provider API key secret file {} must contain a non-empty provider_api_key",
-                path.display()
+                "--llm-provider, --llm-protocol and --api-key-file are only supported for the Pi adapter"
             );
         }
-        return Ok(path);
+        return Ok(None);
     }
-    if adapter_type == "pi" {
+
+    let id = arguments
+        .llm_provider
+        .clone()
+        .context("Pi setup requires --llm-provider; Braid does not infer one from the adapter")?;
+    let protocol = arguments
+        .llm_protocol
+        .clone()
+        .context("Pi setup requires --llm-protocol; Braid does not infer one from the adapter")?;
+    let api_key_file = arguments
+        .api_key_file
+        .as_ref()
+        .context("Pi setup requires --api-key-file")?
+        .canonicalize()
+        .context("cannot resolve Pi provider API key file")?;
+    let api_key = load_provider_secret_file(&api_key_file)?;
+    if api_key.trim().is_empty() {
         bail!(
-            "provider API key secret file {} must exist before setup; create it with mode 0600 \
-             and a non-empty provider_api_key",
-            path.display()
+            "provider API key secret file {} must contain a non-empty provider_api_key",
+            api_key_file.display()
         );
     }
 
-    // Codex authenticates through its isolated home; retain the provider
-    // catalog's file reference without inventing an API key.
-    write_secret(&path, b"provider_api_key = \"\"\n")?;
-    Ok(path)
-}
-
-fn build_llm_provider(adapter_type: &str, model: &str, provider_secret_file: &Path) -> LlmProvider {
-    let (id, protocol) = if adapter_type == "codex" {
-        ("openai".to_owned(), "openai".to_owned())
-    } else {
-        ("deepseek".to_owned(), "openai-compatible".to_owned())
-    };
-    LlmProvider {
+    Ok(Some(LlmProvider {
         id,
         protocol,
-        api_key_file: provider_secret_file.to_path_buf(),
+        api_key_file,
         models: vec![LlmModel {
             model_id: model.to_owned(),
             input_cost: 0.0,
@@ -543,7 +542,7 @@ fn build_llm_provider(adapter_type: &str, model: &str, provider_secret_file: &Pa
             until: "2027-01-01".to_owned(),
             amount: 0.0,
         }],
-    }
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -552,10 +551,11 @@ fn build_config(
     app_id: u64,
     instance_key: &str,
     arguments: &SetupArguments,
+    model: &str,
     private_key_file: &Path,
     secrets_file: &Path,
     runtime: RuntimeEntry,
-    llm_provider: LlmProvider,
+    llm_provider: Option<LlmProvider>,
 ) -> anyhow::Result<Config> {
     let runtime_version = runtime.version.clone();
     let mut config = Config {
@@ -590,7 +590,7 @@ fn build_config(
             reconciliation_seconds: 60,
         },
         runtimes: vec![runtime],
-        llm_providers: vec![llm_provider],
+        llm_providers: llm_provider.clone().into_iter().collect(),
         tools: ToolConfig {
             git: PathBuf::from(tool_path("git", "/usr/bin/git")),
             gh: PathBuf::from(tool_path("gh", "/opt/homebrew/bin/gh")),
@@ -612,18 +612,14 @@ fn build_config(
             id: "default".to_owned(),
             display_name: "Braid Agent".to_owned(),
             tags: vec!["issue".to_owned(), "pr".to_owned()],
-            adapter_type: arguments.provider.clone(),
+            adapter_type: arguments.adapter.clone(),
             // Pin the profile to the runtime that setup actually discovered:
             // config validation requires adapter_version == runtime.version,
             // so a hardcoded string breaks the moment the local runtime
             // upgrades.
             adapter_version: runtime_version,
-            provider: if arguments.provider == "codex" {
-                "openai".to_owned()
-            } else {
-                "deepseek".to_owned()
-            },
-            model: Some(arguments.model.clone()),
+            provider: llm_provider.map(|provider| provider.id),
+            model: Some(model.to_owned()),
             reasoning: Some("high".to_owned()),
             user_instructions: "You are Braid, a helpful coding assistant. Work from the supplied GitHub Context, publish concise public comments, and keep descriptions and implementation state current.".to_owned(),
             skills: Vec::new(),

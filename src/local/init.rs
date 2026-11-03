@@ -19,17 +19,21 @@ pub(crate) struct InitArguments {
     /// Built-in collaboration platform HTTP origin.
     #[arg(long, default_value = "http://127.0.0.1:18082")]
     pub endpoint: url::Url,
-    #[arg(long, default_value="pi", value_parser=["pi","codex"])]
+    #[arg(long, value_parser=["pi","codex"])]
     pub adapter: String,
     #[arg(long)]
     pub executable: PathBuf,
-    #[arg(long)]
-    pub provider: String,
+    /// Pi-only LLM provider catalog id; Braid does not infer one from the adapter.
+    #[arg(long, value_name = "ID", required_if_eq("adapter", "pi"))]
+    pub llm_provider: Option<String>,
+    /// Pi-only LLM protocol label recorded in the provider catalog.
+    #[arg(long, value_name = "PROTOCOL", required_if_eq("adapter", "pi"))]
+    pub llm_protocol: Option<String>,
     #[arg(long)]
     pub model: String,
-    /// Existing provider secret TOML containing `provider_api_key`.
-    #[arg(long, value_name = "PATH")]
-    pub api_key_file: PathBuf,
+    /// Pi-only existing provider secret TOML containing `provider_api_key`.
+    #[arg(long, value_name = "PATH", required_if_eq("adapter", "pi"))]
+    pub api_key_file: Option<PathBuf>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -43,6 +47,45 @@ pub(crate) async fn run(a: InitArguments) -> Result<()> {
         if a.config.is_absolute() { a.config } else { std::env::current_dir()?.join(a.config) };
     let directory = config_path.parent().context("config path has no parent")?;
     let executable = a.executable.canonicalize().context("cannot resolve Agent executable")?;
+    let llm_provider = if a.adapter == "pi" {
+        let id = a.llm_provider.clone().context(
+            "Pi init requires --llm-provider; Braid does not infer one from the adapter",
+        )?;
+        let protocol = a.llm_protocol.clone().context(
+            "Pi init requires --llm-protocol; Braid does not infer one from the adapter",
+        )?;
+        let api_key_file = a
+            .api_key_file
+            .as_ref()
+            .context("Pi init requires --api-key-file")?
+            .canonicalize()
+            .context("cannot resolve Pi provider API key file")?;
+        let api_key = crate::config::load_provider_secret_file(&api_key_file)?;
+        ensure!(
+            !api_key.trim().is_empty(),
+            "provider API key secret file {} must contain a non-empty provider_api_key",
+            api_key_file.display()
+        );
+        Some(LlmProvider {
+            id,
+            protocol,
+            api_key_file,
+            models: vec![LlmModel {
+                model_id: a.model.clone(),
+                input_cost: 0.0,
+                output_cost: 0.0,
+                cache_input_cost: 0.0,
+            }],
+            allowances: vec![],
+        })
+    } else {
+        ensure!(
+            a.llm_provider.is_none() && a.llm_protocol.is_none() && a.api_key_file.is_none(),
+            "--llm-provider, --llm-protocol and --api-key-file are only supported for the Pi adapter"
+        );
+        None
+    };
+    let profile_provider = llm_provider.as_ref().map(|provider| provider.id.clone());
     let mut runtime = crate::setup::discovery::from_executable(&a.adapter, &executable).await?;
     runtime.home = Some(directory.join("provider").join(&a.adapter));
     let profile = Profile {
@@ -51,7 +94,7 @@ pub(crate) async fn run(a: InitArguments) -> Result<()> {
         tags: vec!["issue".into(), "pr".into()],
         adapter_type: a.adapter.clone(),
         adapter_version: runtime.version.clone(),
-        provider: a.provider.clone(),
+        provider: profile_provider,
         model: Some(a.model.clone()),
         reasoning: Some("high".into()),
         user_instructions:
@@ -85,18 +128,7 @@ pub(crate) async fn run(a: InitArguments) -> Result<()> {
             reconciliation_seconds: 60,
         },
         runtimes: vec![runtime],
-        llm_providers: vec![LlmProvider {
-            id: a.provider,
-            protocol: if a.adapter == "codex" { "openai" } else { "openai-compatible" }.into(),
-            api_key_file: a.api_key_file,
-            models: vec![LlmModel {
-                model_id: a.model,
-                input_cost: 0.0,
-                output_cost: 0.0,
-                cache_input_cost: 0.0,
-            }],
-            allowances: vec![],
-        }],
+        llm_providers: llm_provider.into_iter().collect(),
         tools: ToolConfig {
             git: which::which("git").context("Git executable unavailable")?,
             gh: "gh".into(),

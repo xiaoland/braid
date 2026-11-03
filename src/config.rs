@@ -52,8 +52,9 @@ pub struct Config {
     /// Adapter connectivity, keyed by `adapter_type`. One entry per `adapter_type`
     /// per worker; the profile's `adapter_type` locates the runtime entry.
     pub runtimes: Vec<RuntimeEntry>,
-    /// LLM provider catalogue. Profiles reference an entry by id; enforcement is
-    /// outside the scope of this pass.
+    /// LLM provider catalogue. Only Pi profiles reference these entries; Codex
+    /// configurations may omit the catalogue entirely.
+    #[serde(default)]
     pub llm_providers: Vec<LlmProvider>,
     pub tools: ToolConfig,
     pub server: ServerConfig,
@@ -325,7 +326,9 @@ pub struct Profile {
     /// Contract pin checked against the runtime entry's version.
     pub adapter_version: String,
     /// References an entry in `llm_providers` for adapters that need an LLM.
-    pub provider: String,
+    /// Adapters with their own authentication, such as Codex, omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning: Option<String>,
     pub user_instructions: String,
@@ -552,15 +555,10 @@ impl Config {
             })
     }
 
-    pub fn llm_provider_for(&self, profile: &Profile) -> Result<&LlmProvider, ConfigError> {
-        self.llm_providers.iter().find(|provider| provider.id == profile.provider).ok_or_else(
-            || {
-                ConfigError::Invalid(format!(
-                    "profile {:?} references unknown provider {:?}",
-                    profile.id, profile.provider
-                ))
-            },
-        )
+    pub fn llm_provider_for(&self, provider_id: &str) -> Result<&LlmProvider, ConfigError> {
+        self.llm_providers.iter().find(|provider| provider.id == provider_id).ok_or_else(|| {
+            ConfigError::Invalid(format!("unknown llm_providers entry {provider_id:?}"))
+        })
     }
 
     /// Provider settings for the default PR Profile, used by operator probes.
@@ -613,8 +611,14 @@ impl Config {
         }
 
         if runtime.adapter_type == "pi" {
-            // Pi needs an LLM provider entry for its API key and model info.
-            let llm = self.llm_provider_for(profile)?;
+            // Pi needs an explicit LLM provider entry for its API key and model route.
+            let provider_id = profile.provider.as_deref().ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "profile {:?} requires provider for the Pi adapter",
+                    profile.id
+                ))
+            })?;
+            let llm = self.llm_provider_for(provider_id)?;
             return Ok(ProviderConfig {
                 codex: None,
                 pi: Some(PiConfig {
@@ -891,7 +895,20 @@ impl Profile {
                 self.id
             )));
         }
-        validate_token("profile.provider", &self.provider)?;
+        if self.adapter_type == "pi" {
+            let provider = self.provider.as_deref().ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "profile {:?} requires provider for the Pi adapter",
+                    self.id
+                ))
+            })?;
+            validate_token("profile.provider", provider)?;
+        } else if self.provider.is_some() && config.schema_version != 2 {
+            return Err(ConfigError::Invalid(format!(
+                "profile {:?} provider is supported only by the Pi adapter",
+                self.id
+            )));
+        }
         if let Some(workspace) = &self.workspace {
             require_absolute(&format!("profile {:?}.workspace", self.id), workspace)?;
         }
@@ -950,7 +967,10 @@ impl Profile {
                 self.id, self.adapter_version, runtime.adapter_type, runtime.version
             )));
         }
-        let _llm = config.llm_provider_for(self)?;
+        if self.adapter_type == "pi" {
+            let provider = self.provider.as_deref().expect("Pi provider checked above");
+            let _llm = config.llm_provider_for(provider)?;
+        }
         // The profile's model is a request to the provider, and the provider
         // is the authority on which models it accepts. The llm_providers
         // catalog only carries cost metadata, so an uncatalogued model is

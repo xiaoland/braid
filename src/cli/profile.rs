@@ -13,7 +13,12 @@ pub fn profile_inspect(arguments: &ProfileInspect) -> Result<()> {
     } else {
         println!("profile: {} ({})", profile.id, profile.display_name);
         println!("tags: {}", profile.tags.join(", "));
-        println!("provider: {}", profile.provider);
+        let provider = if profile.adapter_type == "pi" {
+            profile.provider.as_deref().unwrap_or("missing")
+        } else {
+            "adapter-managed"
+        };
+        println!("provider: {provider}");
         println!("model: {}", profile.model.as_deref().unwrap_or("provider default"));
         println!("reasoning: {}", profile.reasoning.as_deref().unwrap_or("provider default"));
         println!("workspace: {}", profile.workspace().display());

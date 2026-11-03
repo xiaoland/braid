@@ -37,8 +37,9 @@ reference or environment-variable name. The main sections are:
 - Profile definitions/tags/default PR Profile/context byte budgets/status
   surfaces/provider/workspace/resources;
 - scheduler quiet/count settings;
-- `[[runtimes]]` adapter executables/version pins and provider home;
-- `[[llm_providers]]` provider credentials (file references, not values);
+- `[[runtimes]]` adapter executables/version pins and adapter home;
+- optional `[[llm_providers]]` credentials for Pi profiles (file references,
+  not values); Codex profiles do not declare them;
 - SQLite/runtime/worktree directories;
 - loopback ingress/health ports and Wrangler path;
 - OTLP endpoint/protocol, trace sample ratio, and incident override;
@@ -78,8 +79,9 @@ The default `runtime.root` is `<config_dir>/state`. `braid setup` writes
 `instances/<key>` explicitly with the layout above. Multiple instances share
 the same user root but have isolated databases, webhooks, and worktrees.
 A provider secret file contains `provider_api_key = "..."` and must be mode
-`0600`. Pi setup reads `secrets/deepseek.toml`; runtime configuration references
-the file by absolute path and never declares provider-key environment variables.
+`0600`. Its path and provider id are explicit user choices. Pi configurations
+reference the file by absolute path and never declare provider-key environment
+variables; Braid does not derive a default file from the adapter or provider.
 
 ## Database Lifecycle
 

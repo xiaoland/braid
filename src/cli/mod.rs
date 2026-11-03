@@ -300,18 +300,26 @@ struct GhPrEnsure {
 pub(crate) struct SetupArguments {
     #[arg(value_name = "OWNER/REPOSITORY")]
     pub(crate) repository: String,
-    #[arg(long, value_name = "pi|codex", default_value = "pi", value_parser = ["pi", "codex"])]
-    pub(crate) provider: String,
-    #[arg(long, value_name = "MODEL", default_value = "deepseek-chat")]
-    pub(crate) model: String,
+    /// Agent runtime adapter to discover or verify. This does not select an LLM provider.
+    #[arg(long, value_name = "pi|codex", value_parser = ["pi", "codex"])]
+    pub(crate) adapter: String,
+    #[arg(long, value_name = "MODEL")]
+    pub(crate) model: Option<String>,
+    /// Pi-only LLM provider catalog id; Braid does not infer one from the adapter.
+    #[arg(long, value_name = "ID")]
+    pub(crate) llm_provider: Option<String>,
+    /// Pi-only LLM protocol label recorded in the provider catalog.
+    #[arg(long, value_name = "PROTOCOL")]
+    pub(crate) llm_protocol: Option<String>,
+    /// Pi-only existing provider secret TOML containing `provider_api_key`.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) api_key_file: Option<PathBuf>,
     #[arg(long, value_name = "KEY", env = "BRAID_INSTANCE")]
     pub(crate) instance: Option<String>,
     #[arg(long, value_name = "DIR", env = "BRAID_USER_HOME", default_value = "~/.braid")]
     pub(crate) user_home: PathBuf,
-    #[arg(long, value_name = "PATH", conflicts_with = "runtime_api_url")]
+    #[arg(long, value_name = "PATH")]
     pub(crate) runtime_executable: Option<PathBuf>,
-    #[arg(long, value_name = "URL", conflicts_with = "runtime_executable")]
-    pub(crate) runtime_api_url: Option<String>,
     #[arg(
         long,
         help = "Skip opening a browser; print manifest values and manual instructions instead"

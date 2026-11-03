@@ -65,14 +65,15 @@ brew install xiaoland/braid/braid
 
 **2. Set up your GitHub App and agent**
 
-For example, using Pi with a DeepSeek API key already stored in
-`~/.braid/secrets/deepseek.toml`:
+For example, using Pi with an explicitly selected LLM provider and an existing
+secret file:
 
 ```sh
-braid setup owner/repository --provider pi --model deepseek-chat
+braid setup owner/repository --adapter pi --model <MODEL> --llm-provider <PROVIDER_ID> --llm-protocol <PROTOCOL> --api-key-file /absolute/path/to/secrets/<provider>.toml
 ```
 
-The setup guide documents the secret file format and permissions.
+The setup guide documents the secret file format and permissions. Codex setups
+use the isolated Codex home instead and do not take LLM provider arguments.
 
 Follow the printed GitHub App installation link, then check the instance and start the local runtime:
 
@@ -101,7 +102,7 @@ Web Console 属于整个 Braid，平台配置与 Harness 配置可分别装配�
 
 ```shell
 braid platform init --source /absolute/path/to/repository --config /absolute/path/to/platform.toml --name demo
-braid init --source /absolute/path/to/repository --config /absolute/path/to/harness/config.toml --name demo --endpoint http://127.0.0.1:18082 --adapter pi --executable /absolute/path/to/pi --provider deepseek --model deepseek-chat --api-key-file /absolute/path/to/user/secrets/deepseek.toml
+braid init --source /absolute/path/to/repository --config /absolute/path/to/harness/config.toml --name demo --endpoint http://127.0.0.1:18082 --adapter pi --executable /absolute/path/to/pi --model <MODEL> --llm-provider <PROVIDER_ID> --llm-protocol <PROTOCOL> --api-key-file /absolute/path/to/user/secrets/<provider>.toml
 braid migrate apply --config /absolute/path/to/harness/config.toml
 braid console --platform-config /absolute/path/to/platform.toml --config /absolute/path/to/harness/config.toml --database /absolute/path/to/observations.sqlite3
 ```
