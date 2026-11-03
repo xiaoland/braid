@@ -50,6 +50,7 @@ exit 1
 "#,
     );
     write_executable(&directory.join("pi"), "#!/bin/sh\necho 'pi 1.2.3'\n");
+    write_executable(&directory.join("wrangler"), "#!/bin/sh\necho 'wrangler 0.0.0-test'\n");
     write_executable(
         &directory.join("git"),
         r#"#!/bin/sh

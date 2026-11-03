@@ -210,6 +210,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         .clone()
         .context("setup requires --model when writing an instance configuration")?;
     let llm_provider = select_llm_provider(&arguments)?;
+    ensure_setup_tools()?;
 
     let code = if let Some(callback_url) = &arguments.callback_url {
         callback_code_from_url(callback_url, pending_draft.as_ref().expect("callback draft"))?
@@ -685,9 +686,9 @@ fn build_config(
         runtimes: vec![runtime],
         llm_providers: llm_provider.clone().into_iter().collect(),
         tools: ToolConfig {
-            git: PathBuf::from(tool_path("git", "/usr/bin/git")),
-            gh: PathBuf::from(tool_path("gh", "gh")),
-            wrangler: PathBuf::from(tool_path("wrangler", "wrangler")),
+            git: required_tool_path("git")?,
+            gh: required_tool_path("gh")?,
+            wrangler: required_tool_path("wrangler")?,
         },
         server: ServerConfig {
             ingress: "127.0.0.1:18080".parse().expect("valid socket address"),
@@ -797,6 +798,15 @@ fn bootstrap_provider_home(home: &Path, adapter_type: &str) -> Result<()> {
     Ok(())
 }
 
-fn tool_path(name: &str, fallback: &str) -> String {
-    which::which(name).map_or_else(|_| fallback.to_owned(), |p| p.to_string_lossy().into_owned())
+fn required_tool_path(name: &str) -> Result<PathBuf> {
+    which::which(name).with_context(|| {
+        format!("{name} executable not found; install {name} before running braid setup")
+    })
+}
+
+fn ensure_setup_tools() -> Result<()> {
+    for name in ["git", "gh", "wrangler"] {
+        let _ = required_tool_path(name)?;
+    }
+    Ok(())
 }
