@@ -252,7 +252,17 @@ fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
     } else if let Some(template) = &profile.native_template {
         Some(template)
     } else {
-        runtime.home.as_ref().filter(|home| home.exists())
+        let runtime_home = runtime.home.as_ref().filter(|home| home.exists());
+        if let Some(home) = runtime_home
+            && !credential_available
+            && home.join("auth.json").is_file()
+        {
+            bail!(
+                "Pi runtime home {} contains auth.json, but Profile material snapshots do not carry it; keyless routes would lose the native credential",
+                home.display()
+            );
+        }
+        runtime_home
     };
     let mut native_files = BTreeMap::new();
     let mut material_identities = BTreeMap::new();

@@ -127,8 +127,11 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
                         },
                         Ok(None) => Check {
                             name: "Pi provider".into(),
-                            state: CheckState::Pass,
-                            detail: format!("{} (keyless route)", check.detail),
+                            state: CheckState::Unavailable,
+                            detail: format!(
+                                "{} (no declared API key; native OAuth credentials are not managed by Braid)",
+                                check.detail
+                            ),
                         },
                         Err(error) => Check {
                             name: "Pi provider".into(),
@@ -172,7 +175,8 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
 fn report_ready(checks: &[Check]) -> bool {
     checks.iter().all(|check| {
         check.state == CheckState::Pass
-            || (check.name == "OTLP endpoint" && check.state == CheckState::Unavailable)
+            || ((check.name == "OTLP endpoint" || check.name == "Pi provider")
+                && check.state == CheckState::Unavailable)
     })
 }
 
@@ -537,5 +541,12 @@ mod tests {
         let checks =
             vec![check("SQLite", CheckState::Pass), check("GitHub App", CheckState::Unavailable)];
         assert!(!report_ready(&checks));
+    }
+
+    #[test]
+    fn unmanaged_pi_oauth_warning_does_not_block_readiness() {
+        let checks =
+            vec![check("SQLite", CheckState::Pass), check("Pi provider", CheckState::Unavailable)];
+        assert!(report_ready(&checks));
     }
 }

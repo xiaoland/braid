@@ -253,6 +253,9 @@ fn init_generates_an_explicit_keyless_pi_route() {
         .env("BRAID_USER_HOME", &isolated_home)
         .output()
         .expect("run doctor with unavailable optional OTLP");
+    let checks = stdout(&output);
+    assert!(checks.contains("Unavailable\tPi provider"), "{checks}");
+    assert!(checks.contains("Unavailable\tOTLP endpoint"), "{checks}");
     let _ = fs::remove_dir_all(&temporary);
     assert!(output.status.success(), "stdout:\n{}\nstderr:\n{}", stdout(&output), stderr(&output));
 }
@@ -319,6 +322,19 @@ fn pi_materials_use_only_the_managed_credential_reference() {
     remove_model_api_key(&directory);
     let output = inspect_profile(&config);
     assert!(output.status.success(), "{}", stderr(&output));
+
+    let directory = temporary.join("lost-native-auth");
+    let config = write_pi_config(&example, &directory, "$BRAID_PROVIDER_API_KEY");
+    remove_secret_reference(&config);
+    remove_model_api_key(&directory);
+    fs::write(directory.join("auth.json"), "{}").expect("write runtime-home auth");
+    let output = inspect_profile(&config);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("auth.json, but Profile material snapshots do not carry it"),
+        "{}",
+        stderr(&output)
+    );
 
     let directory = temporary.join("missing-secret");
     let config = write_pi_config(&example, &directory, "$BRAID_PROVIDER_API_KEY");
