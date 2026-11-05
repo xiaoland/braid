@@ -30,9 +30,17 @@ pub(crate) struct InitArguments {
     /// Optional reasoning/thinking level for runtimes that support one.
     #[arg(long, value_name = "LEVEL")]
     pub reasoning: Option<String>,
-    /// Pi provider secret TOML used only by model routes that need an API key.
+    /// Pi-only credential kind for the selected LLM provider.
+    #[arg(
+        long,
+        value_name = "api_key|oauth|none",
+        value_parser = ["api_key", "oauth", "none"],
+        required_if_eq("adapter", "pi")
+    )]
+    pub llm_credential_kind: Option<String>,
+    /// Pi-only Braid-schema credential file; required unless kind is `none`.
     #[arg(long, value_name = "PATH")]
-    pub api_key_file: Option<PathBuf>,
+    pub llm_credential_file: Option<PathBuf>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -50,26 +58,27 @@ pub(crate) async fn run(a: InitArguments) -> Result<()> {
         let id = a.llm_provider.clone().context(
             "Pi init requires --llm-provider; Braid does not infer one from the adapter",
         )?;
-        let api_key_file = a
-            .api_key_file
-            .as_ref()
-            .map(|path| {
-                let path =
-                    path.canonicalize().context("cannot resolve Pi provider API key file")?;
-                let api_key = crate::config::load_provider_secret_file(&path)?;
-                ensure!(
-                    !api_key.trim().is_empty(),
-                    "provider API key secret file {} must contain a non-empty provider_api_key",
-                    path.display()
-                );
-                Ok(path)
-            })
-            .transpose()?;
-        Some(LlmProvider { id, protocol: None, api_key_file, models: vec![], allowances: vec![] })
+        let kind = a
+            .llm_credential_kind
+            .as_deref()
+            .context("Pi init requires --llm-credential-kind api_key|oauth|none")
+            .and_then(crate::setup::parse_credential_kind)?;
+        let credential =
+            crate::setup::resolve_credential_arguments(kind, a.llm_credential_file.as_deref())?;
+        Some(LlmProvider {
+            id,
+            credential: Some(credential),
+            protocol: None,
+            api_key_file: None,
+            models: vec![],
+            allowances: vec![],
+        })
     } else {
         ensure!(
-            a.llm_provider.is_none() && a.api_key_file.is_none(),
-            "--llm-provider and --api-key-file are only supported for the Pi adapter"
+            a.llm_provider.is_none()
+                && a.llm_credential_kind.is_none()
+                && a.llm_credential_file.is_none(),
+            "--llm-provider and --llm-credential-* are only supported for the Pi adapter"
         );
         None
     };

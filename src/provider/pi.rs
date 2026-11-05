@@ -129,10 +129,16 @@ impl PiProvider {
         for skill in &skills {
             cmd.arg("--skill").arg(home.join("braid-skills").join(&skill.name));
         }
-        if let Some(api_key) = state.config.api_key().map_err(|error| {
-            ProviderError::Protocol(format!("cannot load provider API key: {error}"))
+        match state.config.credential.load().map_err(|error| {
+            ProviderError::Protocol(format!("cannot load provider credential: {error}"))
         })? {
-            cmd.env(crate::config::PROVIDER_API_KEY_ENVIRONMENT, api_key);
+            crate::config::LoadedCredential::ApiKey(api_key) => {
+                cmd.env(crate::config::PROVIDER_API_KEY_ENVIRONMENT, api_key);
+            }
+            crate::config::LoadedCredential::OAuth(oauth) => {
+                write_pi_auth_json(&home, &state.config, &oauth)?;
+            }
+            crate::config::LoadedCredential::None => {}
         }
         configure_braid_environment(&mut cmd, &state.config)?;
         if let Some(session_path) = session {
@@ -1044,6 +1050,70 @@ async fn validate_started_runtime(
         }
     }
     Err(ProviderError::Unknown(reasons.join("; ")))
+}
+
+/// Render the Braid OAuth credential into Pi's `auth.json` in the session
+/// material home. The Pi adapter owns this runtime format; the config layer
+/// only knows the Braid credential schema.
+fn write_pi_auth_json(
+    home: &Path,
+    config: &PiConfig,
+    oauth: &crate::config::OAuthCredentialFile,
+) -> Result<(), ProviderError> {
+    use std::io::Write as _;
+
+    let provider_id = config.provider.as_deref().ok_or_else(|| {
+        ProviderError::Protocol("Pi OAuth credential requires an explicit provider id".into())
+    })?;
+    let mut credential = serde_json::json!({
+        "type": "oauth",
+        "access": oauth.access,
+        "refresh": oauth.refresh,
+        "expires": oauth.expires,
+    });
+    if let Some(account) = &oauth.account {
+        credential["account"] = serde_json::json!(account);
+    }
+    let auth = serde_json::json!({ provider_id: credential });
+    let path = home.join("auth.json");
+    let mut file =
+        std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path).map_err(
+            |error| {
+                ProviderError::Protocol(format!(
+                    "cannot write Pi auth.json {}: {error}",
+                    path.display()
+                ))
+            },
+        )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = file
+            .metadata()
+            .map_err(|error| {
+                ProviderError::Protocol(format!(
+                    "cannot stat Pi auth.json {}: {error}",
+                    path.display()
+                ))
+            })?
+            .permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&path, permissions).map_err(|error| {
+            ProviderError::Protocol(format!(
+                "cannot protect Pi auth.json {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    file.write_all(
+        &serde_json::to_vec(&auth).map_err(|error| {
+            ProviderError::Protocol(format!("cannot encode Pi auth.json: {error}"))
+        })?,
+    )
+    .and_then(|()| file.sync_all())
+    .map_err(|error| {
+        ProviderError::Protocol(format!("cannot write Pi auth.json {}: {error}", path.display()))
+    })
 }
 
 fn configure_braid_environment(cmd: &mut Command, config: &PiConfig) -> Result<(), ProviderError> {

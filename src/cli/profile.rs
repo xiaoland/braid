@@ -20,6 +20,13 @@ pub fn profile_inspect(arguments: &ProfileInspect) -> Result<()> {
             "adapter-managed"
         };
         println!("provider: {provider}");
+        if profile.adapter_type == "pi"
+            && let Some(provider_id) = profile.provider.as_deref()
+            && let Ok(llm) = config.llm_provider_for(provider_id)
+        {
+            let credential = llm.resolved_credential();
+            println!("credential: {:?}", credential.kind);
+        }
         println!("model: {}", profile.model.as_deref().unwrap_or("provider default"));
         println!("reasoning: {}", profile.reasoning.as_deref().unwrap_or("provider default"));
         println!("workspace: {}", profile.workspace().display());

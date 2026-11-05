@@ -101,7 +101,14 @@ fn no_browser_setup_can_be_completed_from_callback_url() {
         .to_owned();
 
     let wrong = setup_command(&fake_bin, &home)
-        .args(["--model", "example-chat", "--llm-provider", "example-llm"])
+        .args([
+            "--model",
+            "example-chat",
+            "--llm-provider",
+            "example-llm",
+            "--llm-credential-kind",
+            "none",
+        ])
         .args(["--callback-url", "http://127.0.0.1/callback?code=wrong&state=wrong"])
         .output()
         .expect("reject mismatched callback state");
@@ -110,7 +117,14 @@ fn no_browser_setup_can_be_completed_from_callback_url() {
 
     let callback = format!("http://127.0.0.1/callback?code=code123&state={state}");
     let output = setup_command(&fake_bin, &home)
-        .args(["--model", "example-chat", "--llm-provider", "example-llm"])
+        .args([
+            "--model",
+            "example-chat",
+            "--llm-provider",
+            "example-llm",
+            "--llm-credential-kind",
+            "none",
+        ])
         .args(["--runtime-executable"])
         .arg(fake_bin.join("pi"))
         .args(["--callback-url", &callback])

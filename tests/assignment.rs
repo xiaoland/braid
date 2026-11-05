@@ -61,7 +61,14 @@ fn initialize(temporary: &Path) -> PathBuf {
         .arg(&config)
         .args(["--name", "demo", "--adapter", "pi", "--executable"])
         .arg(&pi)
-        .args(["--model", "example-chat", "--llm-provider", "example-llm"])
+        .args([
+            "--model",
+            "example-chat",
+            "--llm-provider",
+            "example-llm",
+            "--llm-credential-kind",
+            "none",
+        ])
         .output()
         .expect("initialize config");
     assert!(output.status.success(), "{}", stderr(&output));

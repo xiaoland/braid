@@ -119,19 +119,21 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
                     });
                 }
                 checks.push(match command_version("Pi CLI", &pi.executable).await {
-                    check if check.state == CheckState::Pass => match pi.api_key() {
-                        Ok(Some(_)) => Check {
+                    check if check.state == CheckState::Pass => match pi.credential.load() {
+                        Ok(crate::config::LoadedCredential::ApiKey(_)) => Check {
                             name: "Pi provider".into(),
                             state: CheckState::Pass,
-                            detail: format!("{} (API key present)", check.detail),
+                            detail: format!("{} (API key credential)", check.detail),
                         },
-                        Ok(None) => Check {
+                        Ok(crate::config::LoadedCredential::OAuth(_)) => Check {
                             name: "Pi provider".into(),
-                            state: CheckState::Unavailable,
-                            detail: format!(
-                                "{} (no declared API key; native OAuth credentials are not managed by Braid)",
-                                check.detail
-                            ),
+                            state: CheckState::Pass,
+                            detail: format!("{} (OAuth credential)", check.detail),
+                        },
+                        Ok(crate::config::LoadedCredential::None) => Check {
+                            name: "Pi provider".into(),
+                            state: CheckState::Pass,
+                            detail: format!("{} (explicit keyless route)", check.detail),
                         },
                         Err(error) => Check {
                             name: "Pi provider".into(),
@@ -175,8 +177,7 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
 fn report_ready(checks: &[Check]) -> bool {
     checks.iter().all(|check| {
         check.state == CheckState::Pass
-            || ((check.name == "OTLP endpoint" || check.name == "Pi provider")
-                && check.state == CheckState::Unavailable)
+            || (check.name == "OTLP endpoint" && check.state == CheckState::Unavailable)
     })
 }
 
@@ -541,12 +542,5 @@ mod tests {
         let checks =
             vec![check("SQLite", CheckState::Pass), check("GitHub App", CheckState::Unavailable)];
         assert!(!report_ready(&checks));
-    }
-
-    #[test]
-    fn unmanaged_pi_oauth_warning_does_not_block_readiness() {
-        let checks =
-            vec![check("SQLite", CheckState::Pass), check("Pi provider", CheckState::Unavailable)];
-        assert!(report_ready(&checks));
     }
 }

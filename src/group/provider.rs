@@ -18,10 +18,18 @@ fn public_error_summary(config: &Config, profile: &Profile, reason: &str) -> Str
     let mut reason = reason.to_owned();
     if let Ok(settings) = config.provider_config_for_profile(profile)
         && let Some(pi) = settings.pi
-        && let Ok(Some(key)) = pi.api_key()
-        && !key.is_empty()
     {
-        reason = reason.replace(&key, "[redacted provider key]");
+        match pi.credential.load() {
+            Ok(crate::config::LoadedCredential::ApiKey(key)) if !key.is_empty() => {
+                reason = reason.replace(&key, "[redacted provider key]");
+            }
+            Ok(crate::config::LoadedCredential::OAuth(oauth)) => {
+                reason = reason
+                    .replace(&oauth.access, "[redacted oauth access token]")
+                    .replace(&oauth.refresh, "[redacted oauth refresh token]");
+            }
+            _ => {}
+        }
     }
     let mut summary: String = reason.chars().take(3000).collect();
     if reason.chars().count() > 3000 {

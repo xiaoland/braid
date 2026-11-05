@@ -39,8 +39,9 @@ experimental_schema_sha256 = "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b
 
 # Alternative: Pi runtime with an explicitly declared LLM provider. Pi owns
 # model routing, so the provider id and credential reference are user choices;
-# Braid does not infer them from the adapter. Omit api_key_file for a keyless
-# route; declare it when models.json references the managed API key.
+# Braid does not infer them from the adapter. credential.kind is one of
+# api_key (Braid-schema provider_api_key file), oauth (Braid-schema OAuth token
+# set rendered into the session home auth.json), or none (explicit keyless).
 # [[runtimes]]
 # adapter_type = "pi"
 # version = "1.0.2"
@@ -51,7 +52,7 @@ experimental_schema_sha256 = "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b
 #
 # [[llm_providers]]
 # id = "example-llm"
-# api_key_file = "/absolute/path/to/user/secrets/example-llm.toml"
+# credential = { kind = "api_key", file = "/absolute/path/to/user/secrets/example-llm.toml" }
 
 [tools]
 git = "/usr/bin/git"

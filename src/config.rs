@@ -164,15 +164,91 @@ pub struct RuntimeEntry {
     pub experimental_schema_sha256: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum CredentialKind {
+    #[serde(rename = "api_key")]
+    ApiKey,
+    #[serde(rename = "oauth")]
+    OAuth,
+    #[serde(rename = "none")]
+    None,
+}
+
+/// Credential reference for one LLM provider. The referenced file is Braid
+/// schema (never a runtime-native file); adapters convert it at
+/// materialization time.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCredential {
+    pub kind: CredentialKind,
+    /// Required for `api_key` and `oauth`; must be absent for `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
+}
+
+impl ProviderCredential {
+    pub fn none() -> Self {
+        Self { kind: CredentialKind::None, file: None }
+    }
+
+    pub fn load(&self) -> Result<LoadedCredential, ConfigError> {
+        match self.kind {
+            CredentialKind::None => {
+                if self.file.is_some() {
+                    return Err(ConfigError::Invalid(
+                        "credential kind \"none\" must not reference a file".into(),
+                    ));
+                }
+                Ok(LoadedCredential::None)
+            }
+            CredentialKind::ApiKey => {
+                let file = self.file.as_ref().ok_or_else(|| {
+                    ConfigError::Invalid("credential kind \"api_key\" requires a file".into())
+                })?;
+                Ok(LoadedCredential::ApiKey(load_provider_secret_file(file)?))
+            }
+            CredentialKind::OAuth => {
+                let file = self.file.as_ref().ok_or_else(|| {
+                    ConfigError::Invalid("credential kind \"oauth\" requires a file".into())
+                })?;
+                Ok(LoadedCredential::OAuth(load_oauth_file(file)?))
+            }
+        }
+    }
+}
+
+pub enum LoadedCredential {
+    ApiKey(String),
+    OAuth(OAuthCredentialFile),
+    None,
+}
+
+/// Braid-schema OAuth token set for one provider (no refresh lifecycle:
+/// the operator replaces the file explicitly).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthCredentialFile {
+    pub access: String,
+    pub refresh: String,
+    /// Expiry as epoch milliseconds, matching the provider's token record.
+    pub expires: u64,
+    /// Optional diagnostic account label; never required for rendering.
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmProvider {
     pub id: String,
+    /// Explicit credential for this provider. Schema 3 requires it; schema 2
+    /// may omit it and rely on the legacy `api_key_file` fallback instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<ProviderCredential>,
     /// Legacy schema-2 metadata. Pi's native models.json owns wire routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
-    /// Secret reference for model routes that use an API key. Keyless Pi
-    /// providers omit it.
+    /// Legacy schema-2 API key reference; schema 3 requires `credential`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_file: Option<PathBuf>,
     /// Legacy schema-2 cost catalogue; Braid does not consume it.
@@ -181,6 +257,21 @@ pub struct LlmProvider {
     /// Legacy schema-2 allowance metadata; Braid does not consume it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowances: Vec<LlmAllowance>,
+}
+
+impl LlmProvider {
+    /// The credential this provider uses at runtime: the explicit
+    /// `credential` entry, or the legacy schema-2 `api_key_file` fallback,
+    /// otherwise an explicit keyless route.
+    pub fn resolved_credential(&self) -> ProviderCredential {
+        if let Some(credential) = &self.credential {
+            return credential.clone();
+        }
+        if let Some(file) = &self.api_key_file {
+            return ProviderCredential { kind: CredentialKind::ApiKey, file: Some(file.clone()) };
+        }
+        ProviderCredential::none()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -285,18 +376,12 @@ pub struct PiConfig {
     pub executable: PathBuf,
     pub provider: Option<String>,
     pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key_file: Option<PathBuf>,
+    #[serde(default = "ProviderCredential::none")]
+    pub credential: ProviderCredential,
     pub thinking: Option<String>,
     pub home: Option<PathBuf>,
     #[serde(default)]
     pub profile_material_digest: String,
-}
-
-impl PiConfig {
-    pub fn api_key(&self) -> Result<Option<String>, ConfigError> {
-        self.api_key_file.as_deref().map(load_provider_secret_file).transpose()
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -453,6 +538,31 @@ pub(crate) fn load_provider_secret_file(path: &Path) -> Result<String, ConfigErr
             ConfigError::Invalid(format!("cannot parse secrets file {}: {error}", path.display()))
         })?;
     Ok(file.provider_api_key)
+}
+
+pub(crate) fn load_oauth_file(path: &Path) -> Result<OAuthCredentialFile, ConfigError> {
+    let text = fs::read_to_string(path)
+        .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
+    let deserializer = toml::de::Deserializer::parse(&text).map_err(|error| {
+        ConfigError::Invalid(format!(
+            "cannot parse OAuth credential file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let file: OAuthCredentialFile =
+        serde_path_to_error::deserialize(deserializer).map_err(|error| {
+            ConfigError::Invalid(format!(
+                "cannot parse OAuth credential file {}: {error}",
+                path.display()
+            ))
+        })?;
+    if file.access.trim().is_empty() || file.refresh.trim().is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "OAuth credential file {} requires non-empty access and refresh tokens",
+            path.display()
+        )));
+    }
+    Ok(file)
 }
 
 impl Config {
@@ -715,7 +825,7 @@ impl Config {
                     executable: runtime.executable.clone(),
                     provider: Some(llm.id.clone()),
                     model: profile.model.clone(),
-                    api_key_file: llm.api_key_file.clone(),
+                    credential: llm.resolved_credential(),
                     thinking: profile.reasoning.clone(),
                     home: runtime.home.clone(),
                     profile_material_digest: self.profile_materials(profile)?.digest,
@@ -893,6 +1003,12 @@ impl Config {
         let mut provider_ids = HashSet::new();
         for provider in &self.llm_providers {
             validate_token("llm_providers.id", &provider.id)?;
+            if let Some(credential) = &provider.credential {
+                validate_credential(
+                    &format!("llm_providers.{}.credential", provider.id),
+                    credential,
+                )?;
+            }
             if let Some(api_key_file) = &provider.api_key_file {
                 require_absolute(
                     &format!("llm_providers.{}.api_key_file", provider.id),
@@ -903,14 +1019,28 @@ impl Config {
                 if let Some(protocol) = &provider.protocol {
                     validate_token("llm_providers.protocol", protocol)?;
                 }
-            } else if provider.protocol.is_some()
-                || !provider.models.is_empty()
-                || !provider.allowances.is_empty()
-            {
-                return Err(ConfigError::Invalid(format!(
-                    "llm_providers {:?} contains schema-2 protocol/cost metadata; schema 3 keeps only id and api_key_file",
-                    provider.id
-                )));
+            } else {
+                if provider.api_key_file.is_some() {
+                    return Err(ConfigError::Invalid(format!(
+                        "llm_providers {:?} uses legacy api_key_file; schema 3 uses credential = {{ kind = \"api_key\", file = ... }}",
+                        provider.id
+                    )));
+                }
+                if provider.credential.is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "llm_providers {:?} requires an explicit credential; use kind = \"none\" for a keyless route",
+                        provider.id
+                    )));
+                }
+                if provider.protocol.is_some()
+                    || !provider.models.is_empty()
+                    || !provider.allowances.is_empty()
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "llm_providers {:?} contains schema-2 protocol/cost metadata; schema 3 keeps only id, credential, and base_url/api/models metadata",
+                        provider.id
+                    )));
+                }
             }
             if !provider_ids.insert(provider.id.as_str()) {
                 return Err(ConfigError::Invalid(format!(
@@ -1158,6 +1288,28 @@ impl Profile {
     }
 }
 
+fn validate_credential(name: &str, credential: &ProviderCredential) -> Result<(), ConfigError> {
+    match credential.kind {
+        CredentialKind::None => {
+            if credential.file.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "{name}: kind \"none\" must not reference a file"
+                )));
+            }
+        }
+        CredentialKind::ApiKey | CredentialKind::OAuth => match &credential.file {
+            Some(file) => require_absolute(name, file)?,
+            None => {
+                return Err(ConfigError::Invalid(format!(
+                    "{name}: kind {:?} requires a file",
+                    credential.kind
+                )));
+            }
+        },
+    }
+    Ok(())
+}
+
 fn resolve_path(base: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() { path.to_path_buf() } else { base.join(path) }
 }
@@ -1181,7 +1333,7 @@ fn validate_repository(repository: &str) -> Result<(), ConfigError> {
     validate_token("github.repository name", name)
 }
 
-fn validate_token(name: &str, value: &str) -> Result<(), ConfigError> {
+pub(crate) fn validate_token(name: &str, value: &str) -> Result<(), ConfigError> {
     if value.trim().is_empty() || value.chars().any(char::is_whitespace) {
         Err(ConfigError::Invalid(format!("{name} must be a non-empty token")))
     } else {

@@ -29,7 +29,6 @@ use crate::config::LlmProvider;
 use crate::config::{
     CONFIG_SCHEMA_VERSION, Config, GitHubConfig, LogFormat, Profile, ProfileSelection,
     RuntimeConfig, RuntimeEntry, SchedulerConfig, ServerConfig, TelemetryConfig, ToolConfig,
-    load_provider_secret_file,
 };
 use crate::home::{InstanceEntry, UserHome, allocate_server_ports, validate_instance_key};
 
@@ -308,9 +307,10 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     println!("\nWrote configuration to: {}", config_path.display());
     println!("Wrote instance secrets to: {}", secrets_path.display());
     if let Some(provider) = &llm_provider
-        && let Some(api_key_file) = &provider.api_key_file
+        && let Some(credential) = &provider.credential
+        && let Some(file) = &credential.file
     {
-        println!("Using provider secret: {}", api_key_file.display());
+        println!("Using provider credential ({:?}): {}", credential.kind, file.display());
     }
     println!("\nNext, install the App on {}:\n{}\n", arguments.repository, install_url(&app.slug));
     println!(
@@ -601,9 +601,11 @@ async fn select_runtime(arguments: &SetupArguments) -> Result<RuntimeEntry> {
 
 fn reject_non_pi_llm_options(arguments: &SetupArguments) -> Result<()> {
     if arguments.adapter != "pi"
-        && (arguments.llm_provider.is_some() || arguments.api_key_file.is_some())
+        && (arguments.llm_provider.is_some()
+            || arguments.llm_credential_kind.is_some()
+            || arguments.llm_credential_file.is_some())
     {
-        bail!("--llm-provider and --api-key-file are only supported for the Pi adapter");
+        bail!("--llm-provider and --llm-credential-* are only supported for the Pi adapter");
     }
     Ok(())
 }
@@ -618,23 +620,53 @@ fn select_llm_provider(arguments: &SetupArguments) -> Result<Option<LlmProvider>
         .llm_provider
         .clone()
         .context("Pi setup requires --llm-provider; Braid does not infer one from the adapter")?;
-    let api_key_file = arguments
-        .api_key_file
-        .as_ref()
-        .map(|path| {
-            let path = path.canonicalize().context("cannot resolve Pi provider API key file")?;
-            let api_key = load_provider_secret_file(&path)?;
-            if api_key.trim().is_empty() {
-                bail!(
-                    "provider API key secret file {} must contain a non-empty provider_api_key",
-                    path.display()
-                );
-            }
-            Ok(path)
-        })
-        .transpose()?;
+    let kind = arguments
+        .llm_credential_kind
+        .as_deref()
+        .context("Pi setup requires --llm-credential-kind api_key|oauth|none")
+        .and_then(parse_credential_kind)?;
+    let credential = resolve_credential_arguments(kind, arguments.llm_credential_file.as_deref())?;
 
-    Ok(Some(LlmProvider { id, protocol: None, api_key_file, models: vec![], allowances: vec![] }))
+    Ok(Some(LlmProvider {
+        id,
+        credential: Some(credential),
+        protocol: None,
+        api_key_file: None,
+        models: vec![],
+        allowances: vec![],
+    }))
+}
+
+pub(crate) fn parse_credential_kind(value: &str) -> Result<crate::config::CredentialKind> {
+    match value {
+        "api_key" => Ok(crate::config::CredentialKind::ApiKey),
+        "oauth" => Ok(crate::config::CredentialKind::OAuth),
+        "none" => Ok(crate::config::CredentialKind::None),
+        other => bail!("unsupported credential kind {other:?}; expected api_key|oauth|none"),
+    }
+}
+
+pub(crate) fn resolve_credential_arguments(
+    kind: crate::config::CredentialKind,
+    file: Option<&Path>,
+) -> Result<crate::config::ProviderCredential> {
+    match kind {
+        crate::config::CredentialKind::None => {
+            if file.is_some() {
+                bail!("--llm-credential-file is not allowed when --llm-credential-kind is none");
+            }
+            Ok(crate::config::ProviderCredential::none())
+        }
+        crate::config::CredentialKind::ApiKey | crate::config::CredentialKind::OAuth => {
+            let file = file
+                .context("--llm-credential-file is required unless --llm-credential-kind is none")?
+                .canonicalize()
+                .context("cannot resolve LLM credential file")?;
+            let credential = crate::config::ProviderCredential { kind, file: Some(file) };
+            credential.load().context("cannot load LLM credential file")?;
+            Ok(credential)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

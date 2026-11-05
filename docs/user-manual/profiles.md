@@ -44,18 +44,49 @@ auth、原生会话、缓存或临时文件。未指定模板时，已有 `Runti
 PR 改写共享 home；恢复不会用当前模板覆盖旧材料。
 
 根模型及推理仍由 Profile 决定。`models.json` 提供原生模型 descriptor 和路由，
-不是第二套根模型选择；声明 `llm_providers.api_key_file` 时，Braid 从该文件
-读取凭据并注入对应 Pi 子进程，不得在模板写入 key 值。`settings.json` 只支持有实际消费者的设置，不能另行选择根模型、
+不是第二套根模型选择；凭据由 `llm_providers` 条目的 `credential` 声明。`settings.json` 只支持有实际消费者的设置，不能另行选择根模型、
 凭据、扩展、技能或动态安装 package。扩展由 `RuntimeEntry.native_runtime` 的锁定
 manifest 提供。原生子角色的职责、模型、工具与继承范围由受支持的角色材料及
 Pi 插件决定；Braid 不把这些角色提升为 Issue/PR 负责人，也不承诺仓库代码的
 安全沙箱。
 
-`models.json.apiKey` 固定使用 `$BRAID_PROVIDER_API_KEY` 或
-`${BRAID_PROVIDER_API_KEY}`，且对应 `llm_providers` 条目必须声明
-`api_key_file`。这个名称是 Braid 的进程内注入合同，不是用户配置项；
-其它环境变量引用和字面 key 都会被拒绝。无需 API key 的 route 可以同时省略
-`apiKey` 和 `api_key_file`。服务 URL 不携带 userinfo 凭据。Header
+## Provider credential
+
+每个 `llm_providers` 条目必须显式声明凭据，三种 kind 覆盖全部情况：
+
+```toml
+[[llm_providers]]
+id = "example-llm"
+credential = { kind = "api_key", file = "/absolute/path/to/secrets/example-llm.toml" }
+# 或：credential = { kind = "oauth", file = "/absolute/path/to/secrets/kimi.toml" }
+# 或：credential = { kind = "none" }（显式 keyless，不引用任何文件）
+```
+
+凭据文件是 Braid 自己的 schema，不是 runtime 的文件格式。`api_key` 文件仍是
+`provider_api_key = "..."`；`oauth` 文件是 token set：
+
+```toml
+access = "..."
+refresh = "..."
+expires = 4102444800000   # epoch 毫秒
+account = "..."           # 可选，仅诊断展示
+```
+
+Pi adapter 是唯一位于 runtime 格式边界内的层：`api_key` 凭据被读取后以
+`BRAID_PROVIDER_API_KEY` 注入对应 Pi 子进程（`models.json.apiKey` 固定引用该
+名称，且仅在 kind 为 `api_key` 时允许）；`oauth` token set 被渲染为 session home
+的 `auth.json`，`none` 不注入任何东西。凭据是静态秘密，Braid 从不修改凭据文件；
+过期或轮换由显式替换触发，内容 hash 变化会改变 Profile 有效版本并让旧 session
+明确 blocked。kind 与内容摘要可见于 `braid profile inspect`，凭据值永不展示。
+
+既有 Pi `auth.json` 不要手工复制到任何 runtime home——材料快照从不携带它。
+用一次性显式 import 转换进 Braid secrets：
+
+```sh
+braid provider import-auth <PROVIDER_ID> --from /path/to/auth.json
+```
+
+服务 URL 不携带 userinfo 凭据。Header
 保留 Pi 的原生解析能力，识别为认证用途的 header 必须引用同一固定名称，普通协议
 header 可以声明非秘密值；配置者不得借其它
 字段写入凭据。本材料合同支持 `$ENV_NAME`、`${ENV_NAME}` 及常见 `Bearer` 引用；

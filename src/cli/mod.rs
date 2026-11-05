@@ -29,6 +29,7 @@ mod gh_cmd;
 mod helpers;
 mod migrate;
 mod profile;
+mod provider_cmd;
 mod status;
 mod telemetry_cmd;
 
@@ -58,6 +59,10 @@ enum Command {
     Profile {
         #[command(subcommand)]
         command: ProfileCommand,
+    },
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
     },
     Migrate {
         #[command(subcommand)]
@@ -133,6 +138,11 @@ enum ConfigCommand {
 #[derive(Debug, Subcommand)]
 enum ProfileCommand {
     Inspect(ProfileInspect),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderCommand {
+    ImportAuth(provider_cmd::ProviderImportAuth),
 }
 
 #[derive(Debug, Subcommand)]
@@ -337,9 +347,12 @@ pub(crate) struct SetupArguments {
     /// Pi-only LLM provider catalog id; Braid does not infer one from the adapter.
     #[arg(long, value_name = "ID")]
     pub(crate) llm_provider: Option<String>,
-    /// Pi-only existing provider secret TOML containing `provider_api_key`.
+    /// Pi-only credential kind for the selected LLM provider.
+    #[arg(long, value_name = "api_key|oauth|none", value_parser = ["api_key", "oauth", "none"])]
+    pub(crate) llm_credential_kind: Option<String>,
+    /// Pi-only Braid-schema credential file; required unless kind is `none`.
     #[arg(long, value_name = "PATH")]
-    pub(crate) api_key_file: Option<PathBuf>,
+    pub(crate) llm_credential_file: Option<PathBuf>,
     #[arg(long, value_name = "KEY", env = "BRAID_INSTANCE")]
     pub(crate) instance: Option<String>,
     #[arg(long, value_name = "DIR", env = "BRAID_USER_HOME", default_value = "~/.braid")]
@@ -443,6 +456,9 @@ pub async fn run() -> Result<()> {
         }
         Command::Profile { command: ProfileCommand::Inspect(arguments) } => {
             profile::profile_inspect(&arguments)?;
+        }
+        Command::Provider { command: ProviderCommand::ImportAuth(arguments) } => {
+            provider_cmd::import_auth(&arguments)?;
         }
         Command::Migrate { command } => migrate::migrate(command)?,
         Command::Status(arguments) => {

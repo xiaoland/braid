@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, PROVIDER_API_KEY_ENVIRONMENT, Profile};
+use crate::config::{Config, LlmProvider, PROVIDER_API_KEY_ENVIRONMENT, Profile};
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EffectiveMaterials {
@@ -244,7 +244,9 @@ fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
         None
     };
     let skills = collect_profile_skills(profile)?;
-    let credential_available = llm.is_some_and(|llm| llm.api_key_file.is_some());
+    let credential = llm.map(LlmProvider::resolved_credential);
+    let credential_available =
+        credential.as_ref().is_some_and(|c| c.kind == crate::config::CredentialKind::ApiKey);
     let skill_files = skills.files;
     let skill_identities = skills.identities;
     let native_source = if profile.adapter_type != "pi" {
@@ -254,11 +256,10 @@ fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
     } else {
         let runtime_home = runtime.home.as_ref().filter(|home| home.exists());
         if let Some(home) = runtime_home
-            && !credential_available
             && home.join("auth.json").is_file()
         {
             bail!(
-                "Pi runtime home {} contains auth.json, but Profile material snapshots do not carry it; keyless routes would lose the native credential",
+                "Pi runtime home {} contains auth.json, which Profile material snapshots never carry; convert it once with `braid provider import-auth` and reference it as an OAuth credential",
                 home.display()
             );
         }
@@ -346,6 +347,23 @@ fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
     let runtime_manifest = runtime.native_runtime.as_ref().map(fs::read).transpose()?;
     let manifest_hash = runtime_manifest.as_deref().map(sha);
     let runtime_api_url = runtime.api_url.as_deref().map(sanitized_runtime_api_url).transpose()?;
+    let credential_identity = credential
+        .as_ref()
+        .map(|credential| {
+            let content_hash = credential
+                .file
+                .as_deref()
+                .map(fs::read)
+                .transpose()
+                .map(|bytes: Option<Vec<u8>>| bytes.as_deref().map(sha))
+                .with_context(|| format!("cannot read credential file {:?}", credential.file))?;
+            Ok::<_, anyhow::Error>(serde_json::json!({
+                "kind": credential.kind,
+                "file": credential.file,
+                "content_hash": content_hash,
+            }))
+        })
+        .transpose()?;
     let digest_input = serde_json::json!({
         "profile": semantic,
         "adapter": {
@@ -359,7 +377,8 @@ fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
         "provider_route": llm.map(|llm| serde_json::json!({
             "provider": llm.id,
             "model": profile.model,
-            "reasoning": profile.reasoning
+            "reasoning": profile.reasoning,
+            "credential": credential_identity,
         })),
         "native_files": material_identities,
         "skills": skill_identities,

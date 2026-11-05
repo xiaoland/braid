@@ -29,8 +29,9 @@ subagents/background 的共同结果与停止合同时，先安装材料并明�
 ## Configuration
 
 The instance `config.toml` is versioned independently from binary and
-database schema. It contains no secret values. Provider API keys always use
-`api_key_file` references; the GitHub webhook secret separately supports a file
+database schema. It contains no secret values. Provider credentials always use
+explicit `credential = { kind, file }` references (Braid-schema `api_key` /
+`oauth` files, or `none`); the GitHub webhook secret separately supports a file
 reference or environment-variable name. The main sections are:
 
 - GitHub App/repository or explicitly configured multi-repository set,
@@ -85,10 +86,13 @@ Everything below is scoped by trust boundary:
 The default `runtime.root` is `<config_dir>/state`. `braid setup` writes
 `instances/<key>` explicitly with the layout above. Multiple instances share
 the same user root but have isolated databases, webhooks, and worktrees.
-A provider secret file contains `provider_api_key = "..."` and must be mode
-`0600`. Its path and provider id are explicit user choices. Pi configurations
-reference the file by absolute path and never declare provider-key environment
-variables; Braid does not derive a default file from the adapter or provider.
+A provider credential file is Braid schema (`provider_api_key = "..."` for
+`api_key`, or an `access`/`refresh`/`expires` token set for `oauth`) and must
+be mode `0600`. Its path and provider id are explicit user choices. The Pi
+adapter converts it at session materialization — injecting `api_key` as the
+managed environment reference or rendering `oauth` into the session home
+`auth.json`; `kind = "none"` injects nothing. Runtime homes never carry
+`auth.json`; convert existing ones once with `braid provider import-auth`.
 
 ## Database Lifecycle
 

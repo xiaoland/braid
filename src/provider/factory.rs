@@ -99,7 +99,11 @@ impl SessionFactory for PiSessions {
                 self.config.executable.display()
             ))
         })?;
-        self.config.api_key().map(|_| ()).map_err(|error| SessionError::Failed(error.to_string()))
+        self.config
+            .credential
+            .load()
+            .map(|_| ())
+            .map_err(|error| SessionError::Failed(error.to_string()))
     }
 
     async fn start(

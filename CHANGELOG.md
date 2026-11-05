@@ -14,10 +14,18 @@ Versioning once release artifacts are published.
   的 route 才需要 `--api-key-file`。Codex 继续使用隔离 provider home，不再
   生成或引用伪造的 LLM API key 文件。Braid 不再生成硬编码 reasoning、协议
   或费用配方。
-- Provider API key 只通过可选的 `[[llm_providers]].api_key_file` 引用权限受限的
-  secret 文件；`setup`/`init` 不再支持 `--api-key-environment` 或
-  `api_key_environment` 配置。Pi 原生材料统一引用 Braid 管理的进程内
-  `BRAID_PROVIDER_API_KEY`，旧配置须显式迁移，不会自动导入旧环境变量。
+- Provider 凭据改为显式 `credential = { kind = "api_key" | "oauth" | "none", file }`
+  声明，文件为 Braid schema（`provider_api_key` 或 OAuth token set），不是任何
+  runtime 的文件格式。Pi adapter 在材料化时转换：`api_key` 注入
+  `BRAID_PROVIDER_API_KEY`，`oauth` 渲染 session home 的 `auth.json`，`none`
+  显式 keyless。凭据为静态秘密，内容 hash 进入 Profile 有效版本。
+- 新增 `braid provider import-auth` 一次性把 Pi 原生 `auth.json` 转换进 Braid
+  secrets；runtime home 中的 `auth.json` 一律拒绝并指向该工具。
+- `setup`/`init` 不再支持 `--api-key-environment`/`api_key_environment` 与
+  `--api-key-file`/`api_key_file`（schema 3）；改用
+  `--llm-credential-kind` 与 `--llm-credential-file`。schema 2 的旧字段继续
+  惰性兼容。Pi 原生材料统一引用 Braid 管理的进程内 `BRAID_PROVIDER_API_KEY`，
+  旧配置须显式迁移，不会自动导入旧环境变量。
 - 一个 GitHub instance 可以服务多个显式配置的 repository。GitHub App、
   webhook、进程与 runtime catalogs 共享；Profile、workspace、调度、worktree、
   mention、outbox、reconcile 和 `pr ensure` 均按 repository 路由。多仓库配置
