@@ -208,7 +208,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         .model
         .clone()
         .context("setup requires --model when writing an instance configuration")?;
-    let llm_provider = select_llm_provider(&arguments)?;
+    let llm_provider = select_llm_provider(&arguments, &model)?;
     ensure_setup_tools()?;
 
     let code = if let Some(callback_url) = &arguments.callback_url {
@@ -610,9 +610,12 @@ fn reject_non_pi_llm_options(arguments: &SetupArguments) -> Result<()> {
     Ok(())
 }
 
-fn select_llm_provider(arguments: &SetupArguments) -> Result<Option<LlmProvider>> {
+fn select_llm_provider(arguments: &SetupArguments, model: &str) -> Result<Option<LlmProvider>> {
     if arguments.adapter != "pi" {
         reject_non_pi_llm_options(arguments)?;
+        if arguments.llm_base_url.is_some() {
+            bail!("--llm-base-url is only supported for the Pi adapter");
+        }
         return Ok(None);
     }
 
@@ -626,13 +629,19 @@ fn select_llm_provider(arguments: &SetupArguments) -> Result<Option<LlmProvider>
         .context("Pi setup requires --llm-credential-kind api_key|oauth|none")
         .and_then(parse_credential_kind)?;
     let credential = resolve_credential_arguments(kind, arguments.llm_credential_file.as_deref())?;
+    let base_url = arguments
+        .llm_base_url
+        .clone()
+        .context("Pi setup requires --llm-base-url for models.json derivation")?;
 
     Ok(Some(LlmProvider {
         id,
         credential: Some(credential),
+        base_url: Some(base_url),
+        api: None,
         protocol: None,
         api_key_file: None,
-        models: vec![],
+        models: vec![crate::config::LlmModel { id: model.to_owned(), ..Default::default() }],
         allowances: vec![],
     }))
 }

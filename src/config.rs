@@ -245,13 +245,20 @@ pub struct LlmProvider {
     /// may omit it and rely on the legacy `api_key_file` fallback instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<ProviderCredential>,
+    /// Provider endpoint rendered into Pi's models.json by the adapter.
+    /// Required for providers referenced by a schema-3 Pi Profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Wire API name rendered into Pi's models.json (e.g. openai-completions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
     /// Legacy schema-2 metadata. Pi's native models.json owns wire routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     /// Legacy schema-2 API key reference; schema 3 requires `credential`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_file: Option<PathBuf>,
-    /// Legacy schema-2 cost catalogue; Braid does not consume it.
+    /// Declared models rendered into Pi's models.json by the adapter.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<LlmModel>,
     /// Legacy schema-2 allowance metadata; Braid does not consume it.
@@ -274,16 +281,54 @@ impl LlmProvider {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmModel {
-    pub model_id: String,
-    #[serde(default)]
-    pub input_cost: f64,
-    #[serde(default)]
-    pub output_cost: f64,
-    #[serde(default)]
-    pub cache_input_cost: f64,
+    /// Model id; legacy schema-2 configs used `model_id`.
+    #[serde(alias = "model_id")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub thinking_level_map: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<LlmModelCompat>,
+    /// Legacy schema-2 cost metadata; schema 3 rejects it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_input_cost: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmModelCompat {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_store: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_developer_role: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_reasoning_effort: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_strict_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zai_tool_stream: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1033,13 +1078,23 @@ impl Config {
                     )));
                 }
                 if provider.protocol.is_some()
-                    || !provider.models.is_empty()
                     || !provider.allowances.is_empty()
+                    || provider.models.iter().any(|model| {
+                        model.input_cost.is_some()
+                            || model.output_cost.is_some()
+                            || model.cache_input_cost.is_some()
+                    })
                 {
                     return Err(ConfigError::Invalid(format!(
                         "llm_providers {:?} contains schema-2 protocol/cost metadata; schema 3 keeps only id, credential, and base_url/api/models metadata",
                         provider.id
                     )));
+                }
+                if let Some(base_url) = &provider.base_url {
+                    validate_provider_base_url(
+                        &format!("llm_providers.{}.base_url", provider.id),
+                        base_url,
+                    )?;
                 }
             }
             if !provider_ids.insert(provider.id.as_str()) {
@@ -1050,14 +1105,17 @@ impl Config {
             }
             let mut model_ids = HashSet::new();
             for model in &provider.models {
-                validate_token(
-                    &format!("llm_providers.{}.model_id", provider.id),
-                    &model.model_id,
-                )?;
-                if !model_ids.insert(model.model_id.as_str()) {
+                validate_token(&format!("llm_providers.{}.models.id", provider.id), &model.id)?;
+                if !model_ids.insert(model.id.as_str()) {
                     return Err(ConfigError::Invalid(format!(
-                        "duplicate legacy model {:?} in llm_providers {:?}",
-                        model.model_id, provider.id
+                        "duplicate model {:?} in llm_providers {:?}",
+                        model.id, provider.id
+                    )));
+                }
+                if model.context_window == Some(0) || model.max_tokens == Some(0) {
+                    return Err(ConfigError::Invalid(format!(
+                        "llm_providers.{} model {:?} requires positive context_window and max_tokens",
+                        provider.id, model.id
                     )));
                 }
             }
@@ -1143,6 +1201,32 @@ impl TelemetryConfig {
 }
 
 impl Profile {
+    fn validate_pi_provider_route(&self, config: &Config) -> Result<(), ConfigError> {
+        if self.adapter_type != "pi" {
+            return Ok(());
+        }
+        let provider_id = self.provider.as_deref().expect("Pi provider checked above");
+        let llm = config.llm_provider_for(provider_id)?;
+        if config.schema_version == 2 {
+            return Ok(());
+        }
+        if llm.base_url.is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "llm_providers {:?} requires base_url for Pi models.json derivation",
+                llm.id
+            )));
+        }
+        if let Some(model) = &self.model
+            && !llm.models.iter().any(|declared| declared.id == *model)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "profile {:?} model {:?} is not declared in llm_providers {:?} models",
+                self.id, model, llm.id
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_repository_scope(&self, config: &Config) -> Result<(), ConfigError> {
         let Some(github) = &config.github else {
             if self.repository.is_some() {
@@ -1274,10 +1358,7 @@ impl Profile {
                 self.id, self.adapter_version, runtime.adapter_type, runtime.version
             )));
         }
-        if self.adapter_type == "pi" {
-            let provider = self.provider.as_deref().expect("Pi provider checked above");
-            let _llm = config.llm_provider_for(provider)?;
-        }
+        self.validate_pi_provider_route(config)?;
         // The profile's model is a request to the provider, and the provider
         // is the authority on which models it accepts. The llm_providers
         // catalog only carries cost metadata, so an uncatalogued model is
@@ -1286,6 +1367,44 @@ impl Profile {
         config.profile_materials(self)?;
         Ok(())
     }
+}
+
+fn validate_provider_base_url(name: &str, value: &str) -> Result<(), ConfigError> {
+    let url = url::Url::parse(value)
+        .map_err(|error| ConfigError::Invalid(format!("{name} is not a valid URL: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(ConfigError::Invalid(format!("{name} must use http or https")));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ConfigError::Invalid(format!("{name} must not carry credentials")));
+    }
+    if url.query_pairs().any(|(key, _)| sensitive_query_name(&key)) {
+        return Err(ConfigError::Invalid(format!(
+            "{name} must not carry credential query parameters"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn sensitive_query_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "api-key",
+        "api_key",
+        "apikey",
+        "auth",
+        "authorization",
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "signature",
+        "key",
+        "access-token",
+        "access_token",
+    ]
+    .iter()
+    .any(|exact| name == *exact)
 }
 
 fn validate_credential(name: &str, credential: &ProviderCredential) -> Result<(), ConfigError> {

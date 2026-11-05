@@ -1,7 +1,8 @@
 //! Declare a Harness connected to an existing built-in collaboration platform.
 use crate::config::{
-    BuiltinConfig, CONFIG_SCHEMA_VERSION, Config, InstanceConfig, LlmProvider, LogFormat, Profile,
-    ProfileSelection, RuntimeConfig, SchedulerConfig, ServerConfig, TelemetryConfig, ToolConfig,
+    BuiltinConfig, CONFIG_SCHEMA_VERSION, Config, InstanceConfig, LlmModel, LlmProvider, LogFormat,
+    Profile, ProfileSelection, RuntimeConfig, SchedulerConfig, ServerConfig, TelemetryConfig,
+    ToolConfig,
 };
 use anyhow::{Context as _, Result, ensure};
 use clap::Args;
@@ -41,6 +42,9 @@ pub(crate) struct InitArguments {
     /// Pi-only Braid-schema credential file; required unless kind is `none`.
     #[arg(long, value_name = "PATH")]
     pub llm_credential_file: Option<PathBuf>,
+    /// Pi-only provider endpoint rendered into models.json.
+    #[arg(long, value_name = "URL", required_if_eq("adapter", "pi"))]
+    pub llm_base_url: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -65,20 +69,27 @@ pub(crate) async fn run(a: InitArguments) -> Result<()> {
             .and_then(crate::setup::parse_credential_kind)?;
         let credential =
             crate::setup::resolve_credential_arguments(kind, a.llm_credential_file.as_deref())?;
+        let base_url = a
+            .llm_base_url
+            .clone()
+            .context("Pi init requires --llm-base-url for models.json derivation")?;
         Some(LlmProvider {
             id,
             credential: Some(credential),
+            base_url: Some(base_url),
+            api: None,
             protocol: None,
             api_key_file: None,
-            models: vec![],
+            models: vec![LlmModel { id: a.model.clone(), ..Default::default() }],
             allowances: vec![],
         })
     } else {
         ensure!(
             a.llm_provider.is_none()
                 && a.llm_credential_kind.is_none()
-                && a.llm_credential_file.is_none(),
-            "--llm-provider and --llm-credential-* are only supported for the Pi adapter"
+                && a.llm_credential_file.is_none()
+                && a.llm_base_url.is_none(),
+            "--llm-provider, --llm-credential-* and --llm-base-url are only supported for the Pi adapter"
         );
         None
     };

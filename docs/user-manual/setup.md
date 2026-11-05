@@ -65,16 +65,19 @@ automatically.
 
 ## Bootstrap
 
-Pi requires an explicit model route and credential kind:
+Pi requires an explicit model route, provider endpoint, and credential kind:
 
 ```shell
 braid setup owner/repository --instance <KEY> --adapter pi --model <MODEL> \
-  --llm-provider <PROVIDER_ID> --llm-credential-kind api_key \
-  --llm-credential-file ~/.braid/secrets/<provider>.toml
+  --llm-provider <PROVIDER_ID> --llm-base-url https://api.example.invalid/v1 \
+  --llm-credential-kind api_key --llm-credential-file ~/.braid/secrets/<provider>.toml
 ```
 
 OAuth routes pass `--llm-credential-kind oauth` with the token-set file; a
-keyless route passes `--llm-credential-kind none` and no file.
+keyless route passes `--llm-credential-kind none` and no file. The setup writes
+`base_url` plus a single declared model; enrich `[[llm_providers.models]]` in
+the generated config when you need capability metadata — the Pi adapter derives
+`models.json` from it and rejects template copies.
 
 Codex uses its own authenticated home and no LLM provider arguments:
 
@@ -93,10 +96,10 @@ Options:
 - `--model <MODEL>` — model requested from the selected runtime.
 - `--reasoning <LEVEL>` — optional runtime reasoning/thinking level; Braid
   does not choose one by default.
-- Pi only: `--llm-provider <ID>` declares the LLM route, and
-  `--llm-credential-kind api_key|oauth|none` plus `--llm-credential-file <PATH>`
-  (unless `none`) declare its credential. Wire protocol descriptors belong to
-  Pi materials, not Braid's provider catalog.
+- Pi only: `--llm-provider <ID>` declares the LLM route,
+  `--llm-base-url <URL>` its endpoint (rendered into the derived `models.json`),
+  and `--llm-credential-kind api_key|oauth|none` plus
+  `--llm-credential-file <PATH>` (unless `none`) declare its credential.
 - `--user-home <DIR>` — defaults to `~/.braid` (or `BRAID_USER_HOME`).
 - `--instance <KEY>` — defaults to the repository owner.
 

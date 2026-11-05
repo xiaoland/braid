@@ -68,6 +68,8 @@ fn initialize(temporary: &Path) -> PathBuf {
             "example-llm",
             "--llm-credential-kind",
             "none",
+            "--llm-base-url",
+            "https://llm.example.invalid/v1",
         ])
         .output()
         .expect("initialize config");

@@ -138,30 +138,12 @@ fn schema3_rejects_legacy_provider_surfaces() {
     }
 }
 
-/// Write a Pi-flavored variant of the example config with an explicit
-/// credential entry. `api_key_reference` is used verbatim as the models.json
-/// apiKey value; `credential_fragment` is the TOML inline value for
-/// `credential = ...` in the `llm_providers` entry. When it references a file,
-/// the file is created under `directory` with the given placeholder contents.
-fn write_pi_config(
-    example: &str,
-    directory: &Path,
-    api_key_reference: &str,
-    credential_fragment: &str,
-) -> PathBuf {
+/// Write a Pi-flavored variant of the example config. models.json is derived
+/// from the `llm_providers` entry, so no template file is needed; `directory`
+/// stands in for the Pi runtime home and may carry extra files for negative
+/// cases.
+fn write_pi_config(example: &str, directory: &Path, credential_fragment: &str) -> PathBuf {
     fs::create_dir_all(directory).expect("create Pi material directory");
-    let models = serde_json::json!({
-        "providers": {
-            "example-llm": {
-                "baseUrl": "https://llm.example.invalid/v1",
-                "apiKey": api_key_reference,
-                "models": [{"id": "example-chat"}]
-            }
-        }
-    });
-    fs::write(directory.join("models.json"), serde_json::to_vec(&models).expect("encode models"))
-        .expect("write models");
-
     let config = example
         .replace("adapter_type = \"codex\"", "adapter_type = \"pi\"")
         .replace("version = \"codex-cli 0.147.0-alpha.6.5\"", "version = \"1.0.2\"")
@@ -179,7 +161,7 @@ fn write_pi_config(
         .replacen(
             "[tools]",
             &format!(
-                "[[llm_providers]]\nid = \"example-llm\"\ncredential = {credential_fragment}\n\n[tools]"
+                "[[llm_providers]]\nid = \"example-llm\"\nbase_url = \"https://llm.example.invalid/v1\"\ncredential = {credential_fragment}\n\n[[llm_providers.models]]\nid = \"example-chat\"\n\n[tools]"
             ),
             1,
         );
@@ -219,89 +201,139 @@ fn check_config(config: &Path) -> std::process::Output {
     braid().args(["config", "check", "--config"]).arg(config).output().expect("run config check")
 }
 
-fn remove_model_api_key(directory: &Path) {
-    let models_path = directory.join("models.json");
-    let mut models: serde_json::Value =
-        serde_json::from_slice(&fs::read(&models_path).expect("read models"))
-            .expect("parse models");
-    models["providers"]["example-llm"].as_object_mut().expect("provider object").remove("apiKey");
-    fs::write(&models_path, serde_json::to_vec(&models).expect("encode models"))
-        .expect("write keyless models");
+fn reject_config_case(example: &str, directory: &Path, mutate: impl Fn(&Path), expected: &str) {
+    let credential = api_key_credential(directory);
+    let config = write_pi_config(example, directory, &credential);
+    mutate(&config);
+    let output = check_config(&config);
+    assert!(
+        !output.status.success(),
+        "case {expected} unexpectedly succeeded:\nstdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains(expected), "{expected}: {}", stderr(&output));
 }
 
 #[test]
-fn pi_materials_use_only_the_managed_credential_reference() {
+fn pi_materials_are_derived_from_provider_declarations() {
     let example =
         fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml"))
             .expect("read example");
     let temporary =
         std::env::temp_dir().join(format!("braid-pi-provider-materials-{}", std::process::id()));
 
-    for (index, reference) in
-        ["$BRAID_PROVIDER_API_KEY", "${BRAID_PROVIDER_API_KEY}"].into_iter().enumerate()
-    {
-        let directory = temporary.join(format!("managed-{index}"));
-        let credential = api_key_credential(&directory);
-        let output =
-            inspect_profile(&write_pi_config(&example, &directory, reference, &credential));
-        assert!(output.status.success(), "{reference}: {}", stderr(&output));
+    for (name, credential_fragment) in [
+        ("api-key", api_key_credential(&temporary.join("api-key"))),
+        ("oauth", oauth_credential(&temporary.join("oauth"))),
+        ("none", "{ kind = \"none\" }".to_owned()),
+    ] {
+        let directory = temporary.join(name);
+        let output = inspect_profile(&write_pi_config(&example, &directory, &credential_fragment));
+        assert!(output.status.success(), "{name}: {}", stderr(&output));
+    }
+    let _ = fs::remove_dir_all(&temporary);
+}
+
+#[test]
+fn pi_derivation_rejects_bad_provider_surfaces() {
+    let example =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml"))
+            .expect("read example");
+    let temporary =
+        std::env::temp_dir().join(format!("braid-pi-derivation-rejects-{}", std::process::id()));
+
+    for (name, needle, replacement, expected) in [
+        (
+            "missing-provider",
+            "\nprovider = \"example-llm\"",
+            "",
+            "requires provider for the Pi adapter",
+        ),
+        (
+            "missing-model",
+            "\nmodel = \"example-chat\"",
+            "",
+            "requires an explicit model for the Pi adapter",
+        ),
+        (
+            "missing-base-url",
+            "\nbase_url = \"https://llm.example.invalid/v1\"",
+            "",
+            "requires base_url for Pi models.json derivation",
+        ),
+        (
+            "undeclared-model",
+            "\nid = \"example-chat\"",
+            "\nid = \"other-model\"",
+            "is not declared in llm_providers",
+        ),
+    ] {
+        reject_config_case(
+            &example,
+            &temporary.join(name),
+            |config| {
+                let mutated = fs::read_to_string(config).expect("read Pi config").replacen(
+                    needle,
+                    replacement,
+                    1,
+                );
+                fs::write(config, mutated).expect("mutate config");
+            },
+            expected,
+        );
     }
 
-    // OAuth credentials also validate and inspect; models.json omits apiKey.
-    let directory = temporary.join("oauth");
-    let credential = oauth_credential(&directory);
-    let config = write_pi_config(&example, &directory, "$BRAID_PROVIDER_API_KEY", &credential);
-    remove_model_api_key(&directory);
-    let output = inspect_profile(&config);
-    assert!(output.status.success(), "{}", stderr(&output));
+    reject_config_case(
+        &example,
+        &temporary.join("template-models"),
+        |config| {
+            fs::write(config.parent().expect("config parent").join("models.json"), "{}")
+                .expect("write template models.json");
+        },
+        "models.json is derived from llm_providers metadata",
+    );
 
-    let directory = temporary.join("missing-provider");
+    // Schema 2 keeps the legacy models.json template path readable.
+    let directory = temporary.join("legacy-schema2");
+    fs::create_dir_all(&directory).expect("create schema-2 directory");
+    fs::write(
+        directory.join("models.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "providers": {
+                "example-llm": {
+                    "baseUrl": "https://llm.example.invalid/v1",
+                    "apiKey": "$BRAID_PROVIDER_API_KEY",
+                    "models": [{"id": "example-chat"}]
+                }
+            }
+        }))
+        .expect("encode models"),
+    )
+    .expect("write schema-2 models.json");
     let credential = api_key_credential(&directory);
-    let config = write_pi_config(&example, &directory, "$BRAID_PROVIDER_API_KEY", &credential);
-    let missing_provider = fs::read_to_string(&config).expect("read Pi config").replacen(
-        "provider = \"example-llm\"\n",
-        "",
+    let config = write_pi_config(&example, &directory, &credential);
+    let schema2 = fs::read_to_string(&config).expect("read generated config").replacen(
+        "schema_version = 3",
+        "schema_version = 2",
         1,
     );
-    fs::write(&config, missing_provider).expect("remove Pi provider");
-    let output = check_config(&config);
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("requires provider for the Pi adapter"),
-        "{}",
-        stderr(&output)
-    );
-
-    let directory = temporary.join("missing-model");
-    let credential = api_key_credential(&directory);
-    let config = write_pi_config(&example, &directory, "$BRAID_PROVIDER_API_KEY", &credential);
-    let missing_model = fs::read_to_string(&config).expect("read Pi config").replacen(
-        "model = \"example-chat\"\n",
-        "",
-        1,
-    );
-    fs::write(&config, missing_model).expect("remove Pi model");
-    let output = check_config(&config);
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("requires an explicit model for the Pi adapter"),
-        "{}",
-        stderr(&output)
-    );
-
-    let directory = temporary.join("keyless");
-    let config =
-        write_pi_config(&example, &directory, "$BRAID_PROVIDER_API_KEY", "{ kind = \"none\" }");
-    remove_model_api_key(&directory);
+    fs::write(&config, schema2).expect("write schema-2 config");
     let output = inspect_profile(&config);
+    let _ = fs::remove_dir_all(&temporary);
     assert!(output.status.success(), "{}", stderr(&output));
+}
 
-    let directory = temporary.join("lost-native-auth");
-    let config =
-        write_pi_config(&example, &directory, "$BRAID_PROVIDER_API_KEY", "{ kind = \"none\" }");
-    remove_model_api_key(&directory);
-    fs::write(directory.join("auth.json"), "{}").expect("write runtime-home auth");
+#[test]
+fn runtime_home_auth_json_is_always_rejected_with_import_hint() {
+    let example =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml"))
+            .expect("read example");
+    let temporary = std::env::temp_dir().join(format!("braid-pi-home-auth-{}", std::process::id()));
+    let config = write_pi_config(&example, &temporary, "{ kind = \"none\" }");
+    fs::write(temporary.join("auth.json"), "{}").expect("write runtime-home auth");
     let output = inspect_profile(&config);
+    let _ = fs::remove_dir_all(&temporary);
     assert!(!output.status.success());
     assert!(
         stderr(&output).contains("auth.json, which Profile material snapshots never carry"),
@@ -309,29 +341,6 @@ fn pi_materials_use_only_the_managed_credential_reference() {
         stderr(&output)
     );
     assert!(stderr(&output).contains("braid provider import-auth"), "{}", stderr(&output));
-
-    let directory = temporary.join("missing-secret");
-    let config =
-        write_pi_config(&example, &directory, "$BRAID_PROVIDER_API_KEY", "{ kind = \"none\" }");
-    let output = inspect_profile(&config);
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("unsupported or conflicting key \"apiKey\""),
-        "{}",
-        stderr(&output)
-    );
-
-    let directory = temporary.join("legacy");
-    let credential = api_key_credential(&directory);
-    let output =
-        inspect_profile(&write_pi_config(&example, &directory, "$DEEPSEEK_API_KEY", &credential));
-    let _ = fs::remove_dir_all(&temporary);
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("unsupported or conflicting key \"apiKey\""),
-        "{}",
-        stderr(&output)
-    );
 }
 
 #[test]
@@ -385,6 +394,8 @@ fn init_generates_an_explicit_keyless_pi_route() {
             "example-llm",
             "--llm-credential-kind",
             "none",
+            "--llm-base-url",
+            "https://llm.example.invalid/v1",
         ])
         .output()
         .expect("run keyless Pi init");

@@ -21,6 +21,10 @@ Versioning once release artifacts are published.
   显式 keyless。凭据为静态秘密，内容 hash 进入 Profile 有效版本。
 - 新增 `braid provider import-auth` 一次性把 Pi 原生 `auth.json` 转换进 Braid
   secrets；runtime home 中的 `auth.json` 一律拒绝并指向该工具。
+- Pi 的 `models.json` 改为由 Pi adapter 从 `llm_providers` 声明派生：`base_url`、
+  可选 `api` 与 `[[llm_providers.models]]` 能力元数据按声明渲染，`apiKey` 仅在
+  `credential.kind = "api_key"` 时出现。模板或 runtime home 中的 `models.json`
+  在 schema 3 被明确拒绝；schema 2 保持旧模板路径可读。
 - `setup`/`init` 不再支持 `--api-key-environment`/`api_key_environment` 与
   `--api-key-file`/`api_key_file`（schema 3）；改用
   `--llm-credential-kind` 与 `--llm-credential-file`。schema 2 的旧字段继续

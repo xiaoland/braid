@@ -26,7 +26,7 @@ Pi 还要显式声明 LLM provider id 与凭据 kind：`api_key` 引用 `provide
 配置中声明环境变量：
 
 ```shell
-braid init --source /absolute/path/to/repository --config /absolute/path/to/harness/config.toml --name demo --endpoint http://127.0.0.1:18082 --adapter pi --executable /absolute/path/to/pi --model <MODEL> --llm-provider <PROVIDER_ID> --llm-credential-kind api_key --llm-credential-file /absolute/path/to/user/secrets/<provider>.toml
+braid init --source /absolute/path/to/repository --config /absolute/path/to/harness/config.toml --name demo --endpoint http://127.0.0.1:18082 --adapter pi --executable /absolute/path/to/pi --model <MODEL> --llm-provider <PROVIDER_ID> --llm-base-url https://llm.example.invalid/v1 --llm-credential-kind api_key --llm-credential-file /absolute/path/to/user/secrets/<provider>.toml
 braid config check --config /absolute/path/to/harness/config.toml
 braid migrate apply --config /absolute/path/to/harness/config.toml
 braid serve --config /absolute/path/to/harness/config.toml

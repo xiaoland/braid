@@ -108,6 +108,8 @@ fn no_browser_setup_can_be_completed_from_callback_url() {
             "example-llm",
             "--llm-credential-kind",
             "none",
+            "--llm-base-url",
+            "https://llm.example.invalid/v1",
         ])
         .args(["--callback-url", "http://127.0.0.1/callback?code=wrong&state=wrong"])
         .output()
@@ -124,6 +126,8 @@ fn no_browser_setup_can_be_completed_from_callback_url() {
             "example-llm",
             "--llm-credential-kind",
             "none",
+            "--llm-base-url",
+            "https://llm.example.invalid/v1",
         ])
         .args(["--runtime-executable"])
         .arg(fake_bin.join("pi"))

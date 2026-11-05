@@ -9,7 +9,9 @@ use anyhow::{Context as _, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, LlmProvider, PROVIDER_API_KEY_ENVIRONMENT, Profile};
+use crate::config::{
+    Config, CredentialKind, LlmProvider, PROVIDER_API_KEY_ENVIRONMENT, Profile, ProviderCredential,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EffectiveMaterials {
@@ -267,6 +269,7 @@ fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
     };
     let mut native_files = BTreeMap::new();
     let mut material_identities = BTreeMap::new();
+    let legacy_models_template = config.schema_version == 2;
     if let Some(source) = native_source {
         let root = source.canonicalize().with_context(|| {
             format!("cannot resolve Pi native material source {}", source.display())
@@ -274,6 +277,12 @@ fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
         for relative in [PathBuf::from("models.json"), PathBuf::from("settings.json")] {
             let path = root.join(&relative);
             if path.exists() {
+                if relative == Path::new("models.json") && !legacy_models_template {
+                    bail!(
+                        "Pi models.json is derived from llm_providers metadata; declare base_url/api/models there instead of the template at {}",
+                        path.display()
+                    );
+                }
                 if fs::symlink_metadata(&path)?.file_type().is_symlink() {
                     bail!("Pi native template cannot contain symlinks: {}", path.display());
                 }
@@ -329,11 +338,23 @@ fn collect_all(config: &Config, profile: &Profile) -> Result<Collected> {
                 if entry.file_type()?.is_symlink() {
                     bail!("Pi native template cannot contain symlinks: {}", entry.path().display());
                 }
-                if name != "models.json" && name != "settings.json" && name != "agents" {
+                if name != "settings.json"
+                    && name != "agents"
+                    && (legacy_models_template || name != "models.json")
+                {
                     bail!("unsupported Pi native template entry {}", entry.path().display());
                 }
             }
         }
+    }
+    if profile.adapter_type == "pi" && !legacy_models_template {
+        let provider = llm.expect("Pi profile resolved its LLM provider above");
+        let rendered = render_models_json(
+            provider,
+            credential.as_ref().expect("resolved credential for Pi profile"),
+        )?;
+        material_identities.insert("models.json".into(), sha(&rendered));
+        native_files.insert(PathBuf::from("models.json"), rendered);
     }
 
     let mut semantic = serde_json::to_value(profile)?;
@@ -534,7 +555,7 @@ fn sanitized_runtime_api_url(value: &str) -> Result<String> {
         let query_count = url.query_pairs().count();
         let safe_pairs: Vec<_> = url
             .query_pairs()
-            .filter(|(key, _)| !sensitive_query_name(key))
+            .filter(|(key, _)| !crate::config::sensitive_query_name(key))
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
             .collect();
         if safe_pairs.len() != query_count || empty_query {
@@ -567,25 +588,103 @@ fn sensitive_header_name(name: &str) -> bool {
     .any(|exact| name == *exact)
 }
 
-fn sensitive_query_name(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    [
-        "api-key",
-        "api_key",
-        "apikey",
-        "auth",
-        "authorization",
-        "token",
-        "secret",
-        "password",
-        "credential",
-        "signature",
-        "key",
-        "access-token",
-        "access_token",
-    ]
-    .iter()
-    .any(|exact| name == *exact)
+#[derive(Serialize)]
+struct RenderedModels<'a> {
+    providers: BTreeMap<&'a str, RenderedProvider<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RenderedProvider<'a> {
+    base_url: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    models: Vec<RenderedModel<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RenderedModel<'a> {
+    id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    input: &'a Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    thinking_level_map: &'a BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compat: Option<RenderedCompat<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RenderedCompat<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supports_store: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supports_developer_role: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supports_reasoning_effort: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supports_strict_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens_field: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_format: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zai_tool_stream: Option<bool>,
+}
+
+/// Render Pi's models.json from the declared provider metadata and credential
+/// kind. The adapter owns this runtime format; the config layer only declares
+/// provider facts in Braid schema.
+fn render_models_json(provider: &LlmProvider, credential: &ProviderCredential) -> Result<Vec<u8>> {
+    let base_url = provider.base_url.as_deref().with_context(|| {
+        format!("llm_providers {:?} requires base_url for Pi models.json derivation", provider.id)
+    })?;
+    if provider.models.is_empty() {
+        bail!("llm_providers {:?} declares no models for Pi models.json derivation", provider.id);
+    }
+    let api_key = (credential.kind == CredentialKind::ApiKey)
+        .then(|| format!("${PROVIDER_API_KEY_ENVIRONMENT}"));
+    let models = provider
+        .models
+        .iter()
+        .map(|model| RenderedModel {
+            id: &model.id,
+            name: model.name.as_deref(),
+            api: model.api.as_deref(),
+            reasoning: model.reasoning,
+            input: &model.input,
+            context_window: model.context_window,
+            max_tokens: model.max_tokens,
+            thinking_level_map: &model.thinking_level_map,
+            compat: model.compat.as_ref().map(|compat| RenderedCompat {
+                supports_store: compat.supports_store,
+                supports_developer_role: compat.supports_developer_role,
+                supports_reasoning_effort: compat.supports_reasoning_effort,
+                supports_strict_mode: compat.supports_strict_mode,
+                max_tokens_field: compat.max_tokens_field.as_deref(),
+                thinking_format: compat.thinking_format.as_deref(),
+                zai_tool_stream: compat.zai_tool_stream,
+            }),
+        })
+        .collect();
+    let providers = BTreeMap::from([(
+        provider.id.as_str(),
+        RenderedProvider { base_url, api: provider.api.as_deref(), api_key, models },
+    )]);
+    Ok(serde_json::to_vec_pretty(&RenderedModels { providers })?)
 }
 
 fn supported_header_value(header: &str, value: &str, credential_available: bool) -> bool {
@@ -699,9 +798,9 @@ fn reject_ambient_authority(
                                     url::Url::parse(base_url).map_or(true, |url| {
                                         !url.username().is_empty()
                                             || url.password().is_some()
-                                            || url
-                                                .query_pairs()
-                                                .any(|(name, _)| sensitive_query_name(&name))
+                                            || url.query_pairs().any(|(name, _)| {
+                                                crate::config::sensitive_query_name(&name)
+                                            })
                                     })
                                 }))
                     } else {

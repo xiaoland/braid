@@ -353,6 +353,9 @@ pub(crate) struct SetupArguments {
     /// Pi-only Braid-schema credential file; required unless kind is `none`.
     #[arg(long, value_name = "PATH")]
     pub(crate) llm_credential_file: Option<PathBuf>,
+    /// Pi-only provider endpoint rendered into models.json.
+    #[arg(long, value_name = "URL")]
+    pub(crate) llm_base_url: Option<String>,
     #[arg(long, value_name = "KEY", env = "BRAID_INSTANCE")]
     pub(crate) instance: Option<String>,
     #[arg(long, value_name = "DIR", env = "BRAID_USER_HOME", default_value = "~/.braid")]

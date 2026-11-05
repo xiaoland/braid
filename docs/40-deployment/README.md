@@ -41,8 +41,9 @@ reference or environment-variable name. The main sections are:
   surfaces/provider/workspace/resources;
 - scheduler quiet/count settings;
 - `[[runtimes]]` adapter executables/version pins and adapter home;
-- optional `[[llm_providers]]` credentials for Pi profiles (file references,
-  not values); Codex profiles do not declare them;
+- optional `[[llm_providers]]` for Pi profiles: explicit `credential` (file
+  references, not values) plus `base_url`/`api`/`models` declarations from which
+  the Pi adapter derives `models.json`; Codex profiles do not declare them;
 - SQLite/runtime/worktree directories;
 - loopback ingress/health ports and Wrangler path;
 - OTLP endpoint/protocol, trace sample ratio, and incident override;

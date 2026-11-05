@@ -52,7 +52,21 @@ experimental_schema_sha256 = "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b
 #
 # [[llm_providers]]
 # id = "example-llm"
+# base_url = "https://llm.example.invalid/v1"
+# api = "openai-completions"
 # credential = { kind = "api_key", file = "/absolute/path/to/user/secrets/example-llm.toml" }
+#
+# The Pi adapter derives models.json from this entry: baseUrl and the declared
+# models below; apiKey only appears when credential.kind is api_key. Do not put
+# models.json in a native template or runtime home — schema 3 rejects it.
+#
+# [[llm_providers.models]]
+# id = "example-chat"
+# name = "Example Chat"
+# reasoning = true
+# input = ["text"]
+# context_window = 1000000
+# max_tokens = 131072
 
 [tools]
 git = "/usr/bin/git"

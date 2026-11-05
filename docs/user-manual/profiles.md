@@ -37,14 +37,20 @@ system、profile 或任务输入。已选锁定插件附带的技能仍由安装
 项目或用户目录中未选择的技能不自动加入。仓库的 [braid-collaboration](../../skills/README.md)
 是可选方法材料，Braid 不自动安装或启用它。
 
-Pi 模板是材料源，允许 `models.json`、`settings.json` 和 `agents/*.md`，不携带
-auth、原生会话、缓存或临时文件。未指定模板时，已有 `RuntimeEntry.home` 的
-受支持语义文件作为只读来源，不能将整个 home 当作模板复制。没有这两种来源时
-使用空模板。每个执行工作树持有独立、持久的 Braid 原生材料目录，避免 Issue 与
-PR 改写共享 home；恢复不会用当前模板覆盖旧材料。
+Pi 模板是材料源，允许 `settings.json` 和 `agents/*.md`，不携带 auth、原生会话、
+缓存或临时文件。未指定模板时，已有 `RuntimeEntry.home` 的受支持语义文件作为
+只读来源，不能将整个 home 当作模板复制。没有这两种来源时使用空模板。每个执行
+工作树持有独立、持久的 Braid 原生材料目录，避免 Issue 与 PR 改写共享 home；
+恢复不会用当前模板覆盖旧材料。
 
-根模型及推理仍由 Profile 决定。`models.json` 提供原生模型 descriptor 和路由，
-不是第二套根模型选择；凭据由 `llm_providers` 条目的 `credential` 声明。`settings.json` 只支持有实际消费者的设置，不能另行选择根模型、
+`models.json` 不再是材料输入：Pi adapter 从 `llm_providers` 声明派生它。每个被
+Pi Profile 引用的条目需要 `base_url`、可选 `api`，以及至少包含 Profile `model`
+的 `[[llm_providers.models]]` 声明（`id`、`name`、`reasoning`、`input`、
+`context_window`、`max_tokens`、`thinking_level_map`、`compat` 均按声明渲染）。渲染出的
+`apiKey` 只在 `credential.kind = "api_key"` 时出现并引用 Braid 管理的
+`$BRAID_PROVIDER_API_KEY`；模板或 runtime home 中出现 `models.json` 会被明确拒绝并
+指向这份声明。根模型及推理仍由 Profile 决定，不是第二套根模型选择；凭据由
+`llm_providers` 条目的 `credential` 声明。`settings.json` 只支持有实际消费者的设置，不能另行选择根模型、
 凭据、扩展、技能或动态安装 package。扩展由 `RuntimeEntry.native_runtime` 的锁定
 manifest 提供。原生子角色的职责、模型、工具与继承范围由受支持的角色材料及
 Pi 插件决定；Braid 不把这些角色提升为 Issue/PR 负责人，也不承诺仓库代码的
