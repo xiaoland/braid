@@ -44,6 +44,17 @@ Versioning once release artifacts are published.
 - Release workflow 同时构建 macOS arm64 和 Linux x86_64 预编译产物；doctor
   的不可达 OTLP endpoint 降级为可选警告，不再阻断本机 runtime readiness。
 
+### Fixed
+
+- dogfood 修复：新增 repository 的首次 reconcile 不再因 repositories 行缺失
+  触发外键失败（begin 时 upsert），无 tracked work item 的仓库跳过空转周期，
+  且任一仓库的 reconcile 失败不再中止其他仓库。
+- GitHub 连接建立改为每步 30 秒有界超时并携带操作上下文，网络故障时启动
+  不再静默挂起数分钟；App webhook 恢复与隧道修复同样有界，systemd 停止
+  不再因断网挂起。
+- `braid profile inspect` 明确标注 models.json 由 `llm_providers` 声明派生，
+  runtime home / template 标签收窄为 settings/agents 来源。
+
 本版本不新增数据库 migration；配置 schema 保持 3。使用旧环境变量字段或
 在 schema 3 的非 Pi Profile 上声明 provider 的配置会被明确拒绝；schema 2
 Codex 配置中的旧 provider 标签及 LLM 协议/费用元数据仅作为惰性迁移字段读取。

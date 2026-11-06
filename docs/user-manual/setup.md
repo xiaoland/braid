@@ -58,6 +58,10 @@ copying it anywhere:
 braid provider import-auth <PROVIDER_ID> --from /path/to/auth.json
 ```
 
+The converter honors `BRAID_USER_HOME` (or `--user-home`) and prints the exact
+file it wrote. Run it in the same environment as the instance it serves; the
+printed path is the one to reference in `credential.file`.
+
 To migrate an existing configuration, remove `api_key_environment` and
 `api_key_file`, add an explicit `credential = { kind, file }` entry, and store
 the key in that file. Braid does not import legacy environment variables

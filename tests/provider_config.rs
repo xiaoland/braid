@@ -500,7 +500,18 @@ fn provider_import_auth_converts_pi_credentials() {
         .arg(&user_home)
         .output()
         .expect("reject overwrite without force");
-    let _ = fs::remove_dir_all(&temporary);
     assert!(!output.status.success());
     assert!(stderr(&output).contains("already exists"), "{}", stderr(&output));
+
+    // BRAID_USER_HOME is honored without an explicit --user-home flag.
+    let env_home = temporary.join("env-home");
+    let output = braid()
+        .args(["provider", "import-auth", "example-llm", "--from"])
+        .arg(&pi_auth)
+        .env("BRAID_USER_HOME", &env_home)
+        .output()
+        .expect("import honors BRAID_USER_HOME");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(env_home.join("secrets/example-llm.toml").is_file());
+    let _ = fs::remove_dir_all(&temporary);
 }

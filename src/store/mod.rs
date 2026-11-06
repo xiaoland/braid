@@ -858,10 +858,11 @@ impl StoreActor {
     pub fn begin_reconciliation(
         &self,
         repository_node_id: String,
+        repository_name: String,
     ) -> Result<ReconciliationRun, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::BeginReconciliation(repository_node_id, reply))
+            .send(Command::BeginReconciliation(repository_node_id, repository_name, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1404,7 +1405,7 @@ enum Command {
     ),
     TrackedWorkItems(Sender<Result<Vec<TrackedWorkItem>, StoreError>>),
     CanonicalObjects(String, Sender<Result<Vec<CanonicalObjectState>, StoreError>>),
-    BeginReconciliation(String, Sender<Result<ReconciliationRun, StoreError>>),
+    BeginReconciliation(String, String, Sender<Result<ReconciliationRun, StoreError>>),
     FinishReconciliation(
         ReconciliationRun,
         &'static str,
@@ -1644,8 +1645,12 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::CanonicalObjects(work_item_node_id, reply) => {
                 let _ = reply.send(canonical_objects(database, &work_item_node_id));
             }
-            Command::BeginReconciliation(repository_node_id, reply) => {
-                let _ = reply.send(begin_reconciliation(database, &repository_node_id));
+            Command::BeginReconciliation(repository_node_id, repository_name, reply) => {
+                let _ = reply.send(begin_reconciliation(
+                    database,
+                    &repository_node_id,
+                    &repository_name,
+                ));
             }
             Command::FinishReconciliation(
                 run,
@@ -3247,6 +3252,7 @@ fn canonical_objects(
 fn begin_reconciliation(
     database: &Path,
     repository_node_id: &str,
+    repository_name: &str,
 ) -> Result<ReconciliationRun, StoreError> {
     require_current_schema(database)?;
     let run = ReconciliationRun {
@@ -3255,6 +3261,14 @@ fn begin_reconciliation(
     };
     let connection = open_read_write(database)?;
     configure_connection(&connection)?;
+    // repositories rows are otherwise created lazily at canonical ingest; a
+    // configured repository with no history still needs one so the run row's
+    // foreign key resolves.
+    connection.execute(
+        "INSERT INTO repositories(node_id,name_with_owner,observed_at) VALUES (?1,?2,?3)
+         ON CONFLICT(node_id) DO UPDATE SET observed_at=excluded.observed_at",
+        params![repository_node_id, repository_name, now_rfc3339()],
+    )?;
     connection.execute(
         "INSERT INTO reconciliation_runs(run_id,repository_node_id,lifecycle,started_at)
          VALUES (?1,?2,'running',?3)",

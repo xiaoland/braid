@@ -239,6 +239,14 @@ pub async fn probe_public_webhook(config: &Config, url: &str) -> Result<()> {
 }
 
 pub(crate) async fn restore_webhook(github: &GitHubClient, prior: &AppWebhookConfig) -> Result<()> {
-    github.update_app_webhook(&prior.url, None).await?;
+    // Shutdown must stay bounded: on an unavailable network this request would
+    // otherwise hang until the OS TCP timeout and stall service stop.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        github.update_app_webhook(&prior.url, None),
+    )
+    .await
+    .context("restoring the prior App webhook timed out")?
+    .context("cannot restore the prior App webhook")?;
     Ok(())
 }

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt, fs, str::FromStr};
+use std::{collections::BTreeMap, fmt, fs, str::FromStr, time::Duration};
 
 use axum::http::StatusCode;
 use jsonwebtoken::EncodingKey;
@@ -34,6 +34,8 @@ pub enum GitHubError {
     InsufficientPermissions(String),
     #[error("GitHub client error: {0}")]
     Octocrab(String),
+    #[error("GitHub {operation} timed out after 30s (network unavailable or API unreachable)")]
+    Timeout { operation: String },
 }
 
 impl From<octocrab::Error> for GitHubError {
@@ -50,7 +52,7 @@ impl From<octocrab::Error> for GitHubError {
 
 impl GitHubError {
     pub fn is_unavailable(&self) -> bool {
-        matches!(self, Self::Octocrab(_) | Self::ConvergencePending(_))
+        matches!(self, Self::Octocrab(_) | Self::ConvergencePending(_) | Self::Timeout { .. })
             || matches!(self, Self::Http { status, .. } if status.is_server_error())
     }
 
@@ -168,26 +170,35 @@ impl GitHubClient {
             .app(octocrab::models::AppId(config.app_id), key)
             .build()
             .map_err(|error| GitHubError::Client(error.to_string()))?;
-        let app_info = app.current().app().await?;
+        let app_info = github_step("GET /app", app.current().app()).await?;
         let app_id = app_info.id.into_inner();
         if app_id != config.app_id {
             return Err(GitHubError::WrongApp { actual: app_id, expected: config.app_id });
         }
-        let installation =
-            app.apps().get_repository_installation(&repository.owner, &repository.name).await?;
+        let installation = github_step(
+            "GET repository installation",
+            app.apps().get_repository_installation(&repository.owner, &repository.name),
+        )
+        .await?;
         // Keep the raw id for the auto-refreshing installation client; a
         // fixed personal_token client would die permanently when the token
         // expires after one hour.
         let installation_raw_id = installation.id;
         let installation_id = installation_raw_id.into_inner();
-        let access: AccessTokenResponse = app
-            .post(&format!("/app/installations/{installation_id}/access_tokens"), None::<&()>)
-            .await?;
+        let access: AccessTokenResponse = github_step(
+            "POST installation access token",
+            app.post(&format!("/app/installations/{installation_id}/access_tokens"), None::<&()>),
+        )
+        .await?;
         let installation_client = app
             .installation(installation_raw_id)
             .map_err(|error| GitHubError::Client(error.to_string()))?;
-        let repository_info = repository_identity(&installation_client, repository).await?;
-        let actor = viewer_identity(&installation_client).await?;
+        let repository_info = github_step(
+            "repository identity",
+            repository_identity(&installation_client, repository),
+        )
+        .await?;
+        let actor = github_step("viewer identity", viewer_identity(&installation_client)).await?;
         validate_read_permissions(&access.permissions, config.projects_v2_enabled)?;
         Ok(Self {
             app,
@@ -996,4 +1007,21 @@ fn validate_read_permissions(
     } else {
         Err(GitHubError::InsufficientPermissions(missing.join(", ")))
     }
+}
+
+const GITHUB_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound one GitHub API step so an unavailable network fails with operation
+/// context instead of hanging until the OS TCP timeout.
+async fn github_step<T, E>(
+    operation: &str,
+    future: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, GitHubError>
+where
+    E: Into<GitHubError>,
+{
+    tokio::time::timeout(GITHUB_STEP_TIMEOUT, future)
+        .await
+        .map_err(|_| GitHubError::Timeout { operation: operation.to_owned() })?
+        .map_err(Into::into)
 }

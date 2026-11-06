@@ -103,23 +103,47 @@ pub(crate) async fn reconcile_once(
     github: &HashMap<String, Arc<GitHubClient>>,
     config: &Config,
 ) -> Result<usize> {
+    let tracked = store.tracked_work_items()?;
     let mut changes = 0;
     let mut failures = Vec::new();
     for (repository, client) in github {
-        let run = store.begin_reconciliation(client.identity().repository_node_id.clone())?;
+        if !tracked.iter().any(|work_item| &work_item.repository == repository) {
+            // Nothing to reconcile: skip the begin/finish cycle entirely for a
+            // repository with no tracked work items.
+            continue;
+        }
+        let run = match store
+            .begin_reconciliation(client.identity().repository_node_id.clone(), repository.clone())
+        {
+            Ok(run) => run,
+            Err(error) => {
+                failures.push(format!("{repository}: cannot begin reconciliation: {error:#}"));
+                continue;
+            }
+        };
         match Box::pin(reconcile_work_items(store, client, config, repository)).await {
             Ok((work_items, repository_changes)) => {
-                store.finish_reconciliation(
+                if let Err(error) = store.finish_reconciliation(
                     run,
                     "completed",
                     work_items,
                     repository_changes,
                     None,
-                )?;
+                ) {
+                    failures.push(format!("{repository}: cannot finish reconciliation: {error:#}"));
+                    continue;
+                }
                 changes += repository_changes;
             }
             Err(error) => {
-                store.finish_reconciliation(run, "failed", 0, 0, Some(error.to_string()))?;
+                if let Err(finish_error) =
+                    store.finish_reconciliation(run, "failed", 0, 0, Some(error.to_string()))
+                {
+                    failures.push(format!(
+                        "{repository}: {error:#}; cannot record failure: {finish_error:#}"
+                    ));
+                    continue;
+                }
                 failures.push(format!("{repository}: {error:#}"));
             }
         }

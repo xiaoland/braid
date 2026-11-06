@@ -32,7 +32,16 @@ pub fn profile_inspect(arguments: &ProfileInspect) -> Result<()> {
         println!("workspace: {}", profile.workspace().display());
         println!("effective materials: {}", materials.digest);
         println!("profile revision: {}", materials.revision);
-        println!("native material source: {}", materials.source.as_deref().unwrap_or("none"));
+        let source = match materials.source.as_deref() {
+            Some("profile_template") => "profile_template (settings/agents)",
+            Some("runtime_home") => "runtime_home (settings/agents)",
+            Some(other) => other,
+            None => "none",
+        };
+        println!("native material source: {source}");
+        if profile.adapter_type == "pi" && config.schema_version != 2 {
+            println!("models.json: derived from llm_providers declarations");
+        }
         for (path, digest) in &materials.files {
             println!("native material: {path} sha256={digest}");
         }
