@@ -91,17 +91,23 @@ async function prepareInitialMessage(args, cwd, stdinContent) {
 async function sessionManagerFor(parsed, cwd, settingsManager) {
   const sessionDir = parsed.sessionDir ? absolutePath(parsed.sessionDir, cwd) : settingsManager.getSessionDir();
   if (parsed.noSession || parsed.help) return SessionManager.inMemory(cwd, parsed.sessionId ? { id: parsed.sessionId } : undefined);
+  // Path-vs-id resolution mirrors the upstream CLI's resolveSessionPath:
+  // arguments containing a separator or ending in .jsonl are session file
+  // paths even when they do not exist yet (fresh subagents pass a lazily
+  // created path); bare id/prefix arguments resolve through the session index.
+  const looksLikePath = value =>
+    value.includes('/') || value.includes('\\') || value.endsWith('.jsonl');
   if (parsed.fork) {
-    const requested = absolutePath(parsed.fork, cwd);
-    const source = fs.existsSync(requested)
-      ? requested
+    const source = looksLikePath(parsed.fork)
+      ? absolutePath(parsed.fork, cwd)
       : (await SessionManager.listAll(sessionDir)).find(item => item.id.startsWith(parsed.fork))?.path;
     if (!source) throw new Error(`No session found matching '${parsed.fork}'.`);
     return SessionManager.forkFrom(source, cwd, sessionDir, parsed.sessionId ? { id: parsed.sessionId } : undefined);
   }
   if (parsed.session) {
-    const selected = absolutePath(parsed.session, cwd);
-    if (fs.existsSync(selected)) return SessionManager.open(selected, sessionDir, cwd);
+    if (looksLikePath(parsed.session)) {
+      return SessionManager.open(absolutePath(parsed.session, cwd), sessionDir, cwd);
+    }
     const matches = (await SessionManager.listAll(sessionDir)).filter(item => item.id.startsWith(parsed.session));
     if (matches.length !== 1) throw new Error(matches.length ? `Session '${parsed.session}' is ambiguous.` : `No session found matching '${parsed.session}'.`);
     return SessionManager.open(matches[0].path, sessionDir);
