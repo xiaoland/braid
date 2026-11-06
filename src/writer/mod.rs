@@ -31,6 +31,7 @@ pub struct CommentCreateRequest {
 }
 
 pub struct PullRequestEnsureRequest {
+    pub repository: crate::github::RepositoryName,
     pub comment_id: u64,
     pub head: Option<String>,
 }
@@ -42,7 +43,15 @@ pub async fn create_comment(
 ) -> Result<GhWriteReceipt> {
     helpers::require_configured_repository(config, &request.target)?;
     let profile = config.profile(&request.profile_id)?;
-    let github = GitHubClient::connect(&config.github, &request.target.repository)
+    if config.profile_repository(profile) != request.target.repository.to_string() {
+        bail!(
+            "Profile {:?} serves {}, not {}",
+            profile.id,
+            config.profile_repository(profile),
+            request.target.repository
+        );
+    }
+    let github = GitHubClient::connect(config.github()?, &request.target.repository)
         .await
         .context("cannot authenticate Braid App comment writer")?;
     let work_item = github.issue_or_pull_request(request.target.number).await?;
@@ -93,8 +102,11 @@ pub async fn ensure_pull_request(
     store: &StoreActor,
     request: PullRequestEnsureRequest,
 ) -> Result<ImplementationRequestReceipt> {
-    let repository = config.github.repository.parse()?;
-    let github = GitHubClient::connect(&config.github, &repository)
+    let repository = request.repository.clone();
+    if !config.github_repositories().contains(&repository.to_string().as_str()) {
+        bail!("repository {repository} is not configured for this instance");
+    }
+    let github = GitHubClient::connect(config.github()?, &repository)
         .await
         .context("cannot authenticate Braid App PR writer")?;
     let receipt =

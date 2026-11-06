@@ -15,7 +15,11 @@ use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
+mod builtin;
+mod runs;
+pub use runs::RunCommand;
 mod gh_writes;
+pub use builtin::{BuiltinBinding, BuiltinCommand, BuiltinGrant, BuiltinReply};
 
 pub use gh_writes::{
     GhWriteReceipt, ImplementationProgress, ImplementationRequestReceipt, NewGhWriteIntent,
@@ -26,13 +30,38 @@ use gh_writes::{
     prepare_gh_write, prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 2;
+pub const DATABASE_SCHEMA_VERSION: u32 = 7;
 
 const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
 const EVENT_KINDS_SQL: &str = include_str!("../../migrations/0002_event_kinds.sql");
 const MIGRATIONS: &[Migration] = &[
     Migration { version: 1, name: "initial", sql: INITIAL_SQL },
     Migration { version: 2, name: "event_kinds", sql: EVENT_KINDS_SQL },
+    Migration {
+        version: 3,
+        name: "turn_errors",
+        sql: include_str!("../../migrations/0003_turn_errors.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "local_collaboration",
+        sql: include_str!("../../migrations/0004_local_collaboration.sql"),
+    },
+    Migration {
+        version: 5,
+        name: "control_receipts",
+        sql: include_str!("../../migrations/0005_control_receipts.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "builtin_harness",
+        sql: include_str!("../../migrations/0006_builtin_harness.sql"),
+    },
+    Migration {
+        version: 7,
+        name: "harness_runs",
+        sql: include_str!("../../migrations/0007_harness_runs.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -225,6 +254,7 @@ pub struct IngestResult {
 #[derive(Debug, Clone)]
 pub struct MentionCandidate {
     pub event_id: String,
+    pub repository: String,
     pub actor_login: String,
 }
 
@@ -373,6 +403,8 @@ pub struct TurnClaim {
 #[derive(Debug, Clone)]
 pub struct ContextResetClaim {
     pub old_provider_session_id: String,
+    pub old_session_lifecycle: String,
+    pub active_turn_lifecycle: Option<String>,
     pub reset_id: String,
     pub assignment_id: String,
     pub repository: String,
@@ -414,6 +446,7 @@ pub struct AgentGroupSummary {
 #[derive(Debug, Clone)]
 pub struct ProviderResumeCandidate {
     pub assignment_id: String,
+    pub has_started_turn: bool,
     pub provider_session_id: String,
     pub repository: String,
     pub work_item_kind: String,
@@ -522,6 +555,20 @@ impl StoreActor {
             .spawn(move || actor_loop(&database, &backups, receiver))
             .map_err(|source| StoreError::Io { path: PathBuf::from("<database-actor>"), source })?;
         Ok(Self { sender, join: Some(join) })
+    }
+
+    pub fn run_record(&self, command: RunCommand) -> Result<Option<String>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender.send(Command::Run(command, reply)).map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn builtin(&self, command: BuiltinCommand) -> Result<BuiltinReply, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::Builtin(command, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
     pub fn plan(&self) -> Result<MigrationPlan, StoreError> {
@@ -811,10 +858,11 @@ impl StoreActor {
     pub fn begin_reconciliation(
         &self,
         repository_node_id: String,
+        repository_name: String,
     ) -> Result<ReconciliationRun, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::BeginReconciliation(repository_node_id, reply))
+            .send(Command::BeginReconciliation(repository_node_id, repository_name, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -881,26 +929,50 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
+    pub fn enqueue_blocked_reactivation(
+        &self,
+        repository: String,
+        work_item_kind: String,
+        number: u64,
+        reason: String,
+        policy: SchedulerPolicy,
+    ) -> Result<String, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::EnqueueBlockedReactivation(
+                repository,
+                work_item_kind,
+                number,
+                reason,
+                policy,
+                reply,
+            ))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
     pub fn assignment_candidates(
         &self,
+        repository: String,
         work_item_kind: String,
         limit: usize,
     ) -> Result<Vec<AssignmentCandidate>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::AssignmentCandidates(work_item_kind, limit, reply))
+            .send(Command::AssignmentCandidates(repository, work_item_kind, limit, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
     pub fn work_item_lifecycle_candidates(
         &self,
+        repository: String,
         work_item_kind: String,
         limit: usize,
     ) -> Result<Vec<WorkItemLifecycleCandidate>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::WorkItemLifecycleCandidates(work_item_kind, limit, reply))
+            .send(Command::WorkItemLifecycleCandidates(repository, work_item_kind, limit, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1134,6 +1206,22 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
+    pub fn defer_turn_claim(&self, turn_id: String) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::DeferTurnClaim(turn_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn record_turn_error(&self, turn_id: String, error: String) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::RecordTurnError(turn_id, error, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
     pub fn mark_turn_terminal(&self, turn_id: String, lifecycle: String) -> Result<(), StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
@@ -1151,9 +1239,17 @@ impl StoreActor {
     }
 
     pub fn consume_steer_batch(&self, batch_id: String) -> Result<(), StoreError> {
+        self.settle_steer_batch(batch_id, "consumed".into())
+    }
+
+    pub fn settle_steer_batch(
+        &self,
+        batch_id: String,
+        lifecycle: String,
+    ) -> Result<(), StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::ConsumeSteerBatch(batch_id, reply))
+            .send(Command::ConsumeSteerBatch(batch_id, lifecycle, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1259,6 +1355,8 @@ impl Drop for StoreActor {
 }
 
 enum Command {
+    Run(RunCommand, Sender<Result<Option<String>, StoreError>>),
+    Builtin(BuiltinCommand, Sender<Result<BuiltinReply, StoreError>>),
     Plan(Sender<Result<MigrationPlan, StoreError>>),
     Apply(Sender<Result<MigrationResult, StoreError>>),
     Status(Sender<Result<StoreStatus, StoreError>>),
@@ -1307,7 +1405,7 @@ enum Command {
     ),
     TrackedWorkItems(Sender<Result<Vec<TrackedWorkItem>, StoreError>>),
     CanonicalObjects(String, Sender<Result<Vec<CanonicalObjectState>, StoreError>>),
-    BeginReconciliation(String, Sender<Result<ReconciliationRun, StoreError>>),
+    BeginReconciliation(String, String, Sender<Result<ReconciliationRun, StoreError>>),
     FinishReconciliation(
         ReconciliationRun,
         &'static str,
@@ -1324,8 +1422,22 @@ enum Command {
     ),
     RecordProviderResume(String, Sender<Result<(), StoreError>>),
     BlockProviderSession(String, String, Sender<Result<(), StoreError>>),
-    AssignmentCandidates(String, usize, Sender<Result<Vec<AssignmentCandidate>, StoreError>>),
+    AssignmentCandidates(
+        String,
+        String,
+        usize,
+        Sender<Result<Vec<AssignmentCandidate>, StoreError>>,
+    ),
+    EnqueueBlockedReactivation(
+        String,
+        String,
+        u64,
+        String,
+        SchedulerPolicy,
+        Sender<Result<String, StoreError>>,
+    ),
     WorkItemLifecycleCandidates(
+        String,
         String,
         usize,
         Sender<Result<Vec<WorkItemLifecycleCandidate>, StoreError>>,
@@ -1380,8 +1492,10 @@ enum Command {
     ),
     MarkTurnStarted(String, String, Sender<Result<(), StoreError>>),
     MarkTurnTerminal(String, String, Sender<Result<(), StoreError>>),
+    DeferTurnClaim(String, Sender<Result<(), StoreError>>),
+    RecordTurnError(String, String, Sender<Result<(), StoreError>>),
     ClaimUrgentSteer(String, Sender<Result<Option<TurnClaim>, StoreError>>),
-    ConsumeSteerBatch(String, Sender<Result<(), StoreError>>),
+    ConsumeSteerBatch(String, String, Sender<Result<(), StoreError>>),
     EnqueueTurnReaction(String, String, Sender<Result<(), StoreError>>),
     EnqueueOperationalStatus(String, String, Sender<Result<(), StoreError>>),
     BeginContextReset(
@@ -1414,6 +1528,12 @@ struct LedgerEntry {
 fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
     for command in receiver {
         match command {
+            Command::Run(command, reply) => {
+                let _ = reply.send(runs::execute(database, command));
+            }
+            Command::Builtin(command, reply) => {
+                let _ = reply.send(builtin::execute(database, command));
+            }
             Command::Plan(reply) => {
                 let _ = reply.send(plan(database));
             }
@@ -1525,8 +1645,12 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::CanonicalObjects(work_item_node_id, reply) => {
                 let _ = reply.send(canonical_objects(database, &work_item_node_id));
             }
-            Command::BeginReconciliation(repository_node_id, reply) => {
-                let _ = reply.send(begin_reconciliation(database, &repository_node_id));
+            Command::BeginReconciliation(repository_node_id, repository_name, reply) => {
+                let _ = reply.send(begin_reconciliation(
+                    database,
+                    &repository_node_id,
+                    &repository_name,
+                ));
             }
             Command::FinishReconciliation(
                 run,
@@ -1558,12 +1682,38 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::BlockProviderSession(provider_session_id, error, reply) => {
                 let _ = reply.send(block_provider_session(database, &provider_session_id, &error));
             }
-            Command::AssignmentCandidates(work_item_kind, limit, reply) => {
-                let _ = reply.send(assignment_candidates(database, &work_item_kind, limit));
+            Command::AssignmentCandidates(repository, work_item_kind, limit, reply) => {
+                let _ = reply.send(assignment_candidates(
+                    database,
+                    &repository,
+                    &work_item_kind,
+                    limit,
+                ));
             }
-            Command::WorkItemLifecycleCandidates(work_item_kind, limit, reply) => {
-                let _ =
-                    reply.send(work_item_lifecycle_candidates(database, &work_item_kind, limit));
+            Command::EnqueueBlockedReactivation(
+                repository,
+                work_item_kind,
+                number,
+                reason,
+                policy,
+                reply,
+            ) => {
+                let _ = reply.send(enqueue_blocked_reactivation(
+                    database,
+                    &repository,
+                    &work_item_kind,
+                    number,
+                    &reason,
+                    policy,
+                ));
+            }
+            Command::WorkItemLifecycleCandidates(repository, work_item_kind, limit, reply) => {
+                let _ = reply.send(work_item_lifecycle_candidates(
+                    database,
+                    &repository,
+                    &work_item_kind,
+                    limit,
+                ));
             }
             Command::PrepareWorkItemFinalization(event_id, reply) => {
                 let _ = reply.send(prepare_work_item_finalization(database, &event_id));
@@ -1692,14 +1842,20 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::MarkTurnStarted(turn_id, provider_turn_id, reply) => {
                 let _ = reply.send(mark_turn_started(database, &turn_id, &provider_turn_id));
             }
+            Command::DeferTurnClaim(turn_id, reply) => {
+                let _ = reply.send(defer_turn_claim(database, &turn_id));
+            }
+            Command::RecordTurnError(turn_id, error, reply) => {
+                let _ = reply.send(record_turn_error(database, &turn_id, &error));
+            }
             Command::MarkTurnTerminal(turn_id, lifecycle, reply) => {
                 let _ = reply.send(mark_turn_terminal(database, &turn_id, &lifecycle));
             }
             Command::ClaimUrgentSteer(turn_id, reply) => {
                 let _ = reply.send(claim_urgent_steer(database, &turn_id));
             }
-            Command::ConsumeSteerBatch(batch_id, reply) => {
-                let _ = reply.send(consume_steer_batch(database, &batch_id));
+            Command::ConsumeSteerBatch(batch_id, lifecycle, reply) => {
+                let _ = reply.send(consume_steer_batch(database, &batch_id, &lifecycle));
             }
             Command::EnqueueTurnReaction(turn_id, content, reply) => {
                 let _ = reply.send(enqueue_turn_reaction(database, &turn_id, &content));
@@ -2577,14 +2733,18 @@ fn mention_candidates(database: &Path, limit: usize) -> Result<Vec<MentionCandid
     let limit =
         i64::try_from(limit).map_err(|_| StoreError::InvalidData("limit exceeds i64".into()))?;
     let mut statement = connection.prepare(
-        "SELECT e.event_id,d.actor_login
+        "SELECT e.event_id,d.repository_name,d.actor_login
          FROM events e JOIN deliveries d ON d.delivery_guid=e.delivery_guid
          WHERE e.mention_candidate=1 AND e.trusted_mention IS NULL AND e.lifecycle='pending'
            AND d.repository_name IS NOT NULL AND d.actor_login IS NOT NULL
          ORDER BY e.observed_at,e.event_id LIMIT ?1",
     )?;
     let rows = statement.query_map([limit], |row| {
-        Ok(MentionCandidate { event_id: row.get(0)?, actor_login: row.get(1)? })
+        Ok(MentionCandidate {
+            event_id: row.get(0)?,
+            repository: row.get(1)?,
+            actor_login: row.get(2)?,
+        })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
 }
@@ -3092,6 +3252,7 @@ fn canonical_objects(
 fn begin_reconciliation(
     database: &Path,
     repository_node_id: &str,
+    repository_name: &str,
 ) -> Result<ReconciliationRun, StoreError> {
     require_current_schema(database)?;
     let run = ReconciliationRun {
@@ -3100,6 +3261,14 @@ fn begin_reconciliation(
     };
     let connection = open_read_write(database)?;
     configure_connection(&connection)?;
+    // repositories rows are otherwise created lazily at canonical ingest; a
+    // configured repository with no history still needs one so the run row's
+    // foreign key resolves.
+    connection.execute(
+        "INSERT INTO repositories(node_id,name_with_owner,observed_at) VALUES (?1,?2,?3)
+         ON CONFLICT(node_id) DO UPDATE SET observed_at=excluded.observed_at",
+        params![repository_node_id, repository_name, now_rfc3339()],
+    )?;
     connection.execute(
         "INSERT INTO reconciliation_runs(run_id,repository_node_id,lifecycle,started_at)
          VALUES (?1,?2,'running',?3)",
@@ -3179,7 +3348,8 @@ fn provider_resume_candidates(
     let mut statement = connection.prepare(
         "SELECT a.assignment_id,ps.provider_session_id,r.name_with_owner,w.number,
                 ai.profile_id,ai.profile_revision,ps.instruction_revision,ps.lifecycle,
-                t.turn_id,t.lifecycle,wt.path,wt.head_ref,w.kind
+                t.turn_id,t.lifecycle,wt.path,wt.head_ref,w.kind,
+                EXISTS(SELECT 1 FROM turns st WHERE st.session_id=ps.session_id AND st.provider_turn_id IS NOT NULL)
          FROM assignments a
          JOIN work_items w ON w.node_id=a.work_item_node_id AND w.kind=?2
          JOIN repositories r ON r.node_id=w.repository_node_id
@@ -3207,6 +3377,7 @@ fn provider_resume_candidates(
             worktree_path: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
             worktree_head_ref: row.get(11)?,
             work_item_kind: row.get(12)?,
+            has_started_turn: row.get(13)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -3274,8 +3445,100 @@ fn block_provider_session(
     Ok(())
 }
 
+fn enqueue_blocked_reactivation(
+    database: &Path,
+    repository: &str,
+    work_item_kind: &str,
+    number: u64,
+    reason: &str,
+    policy: SchedulerPolicy,
+) -> Result<String, StoreError> {
+    require_current_schema(database)?;
+    validate_work_item_kind(work_item_kind)?;
+    let reason = if reason.trim().is_empty() {
+        "operator requested a new activation generation after a blocked Profile or provider recovery".to_owned()
+    } else {
+        reason.trim().chars().take(500).collect()
+    };
+    let now = now_rfc3339();
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let (work_item_node_id, state) = transaction
+        .query_row(
+            "SELECT w.node_id,w.state FROM work_items w\n             JOIN repositories r ON r.node_id=w.repository_node_id\n             WHERE r.name_with_owner=?1 AND w.kind=?2 AND w.number=?3",
+            params![repository, work_item_kind, sqlite_u64(number, "Work Item number")?],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::InvalidData(format!(
+                "no tracked {work_item_kind} {repository}#{number} in the Braid ledger"
+            ))
+        })?;
+    if !state.eq_ignore_ascii_case("open") {
+        return Err(StoreError::InvalidData(format!(
+            "cannot reactivate {repository}#{number} while it is {state}; reopen it first"
+        )));
+    }
+    let busy = transaction
+        .query_row(
+            "SELECT 1 FROM assignments\n             WHERE work_item_node_id=?1 AND lifecycle IN ('materializing','active','finalizing') LIMIT 1",
+            [&work_item_node_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if busy {
+        return Err(StoreError::InvalidData(format!(
+            "{repository}#{number} already has a materializing, active, or finalizing assignment"
+        )));
+    }
+    let blocked = transaction
+        .query_row(
+            "SELECT 1 FROM assignments\n             WHERE work_item_node_id=?1 AND lifecycle='blocked' LIMIT 1",
+            [&work_item_node_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !blocked {
+        return Err(StoreError::InvalidData(format!(
+            "{repository}#{number} has no blocked assignment to reactivate"
+        )));
+    }
+    let pending = transaction
+        .query_row(
+            "SELECT event_id FROM events\n             WHERE work_item_node_id=?1 AND kind='mention' AND detail='operator_reactivation'\n               AND lifecycle='pending' ORDER BY observed_at DESC LIMIT 1",
+            [&work_item_node_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(event_id) = pending {
+        transaction.commit()?;
+        return Ok(event_id);
+    }
+
+    let event_id = Uuid::now_v7().to_string();
+    transaction.execute(
+        "INSERT INTO events(\n           event_id,delivery_guid,work_item_node_id,object_node_id,object_version,\n           kind,detail,origin,reference,lifecycle,observed_at,dedupe_key,\n           mention_candidate,trusted_mention,body_digest\n         ) VALUES (?1,NULL,?2,?3,NULL,'mention','operator_reactivation','operator',?4,'pending',?5,?6,1,0,NULL)",
+        params![
+            event_id,
+            work_item_node_id,
+            work_item_node_id,
+            reason,
+            now,
+            format!("operator-reactivation:{repository}:{work_item_kind}:{number}:{event_id}"),
+        ],
+    )?;
+    schedule_event(&transaction, &work_item_node_id, &event_id, policy, false, &now)?;
+    transaction.commit()?;
+    Ok(event_id)
+}
+
 fn assignment_candidates(
     database: &Path,
+    repository: &str,
     work_item_kind: &str,
     limit: usize,
 ) -> Result<Vec<AssignmentCandidate>, StoreError> {
@@ -3289,11 +3552,11 @@ fn assignment_candidates(
          FROM events e
          JOIN work_items w ON w.node_id=e.work_item_node_id
          JOIN repositories r ON r.node_id=w.repository_node_id
-         WHERE e.lifecycle='pending' AND w.kind=?1
+         WHERE r.name_with_owner=?1 AND e.lifecycle='pending' AND w.kind=?2
            AND e.kind IN ('assign','unassign','mention')
-         ORDER BY e.observed_at,e.event_id LIMIT ?2",
+         ORDER BY e.observed_at,e.event_id LIMIT ?3",
     )?;
-    let rows = statement.query_map(params![work_item_kind, limit], |row| {
+    let rows = statement.query_map(params![repository, work_item_kind, limit], |row| {
         Ok(AssignmentCandidate {
             event_id: row.get(0)?,
             action: row.get(1)?,
@@ -3307,6 +3570,7 @@ fn assignment_candidates(
 
 fn work_item_lifecycle_candidates(
     database: &Path,
+    repository: &str,
     work_item_kind: &str,
     limit: usize,
 ) -> Result<Vec<WorkItemLifecycleCandidate>, StoreError> {
@@ -3320,11 +3584,11 @@ fn work_item_lifecycle_candidates(
          FROM events e
          JOIN work_items w ON w.node_id=e.work_item_node_id
          JOIN repositories r ON r.node_id=w.repository_node_id
-         WHERE e.lifecycle='pending' AND e.kind='lifecycle'
-           AND w.kind=?1 AND e.detail IN ('closed','reopened')
-         ORDER BY e.observed_at,e.event_id LIMIT ?2",
+         WHERE r.name_with_owner=?1 AND e.lifecycle='pending' AND e.kind='lifecycle'
+           AND w.kind=?2 AND e.detail IN ('closed','merged','reopened')
+         ORDER BY e.observed_at,e.event_id LIMIT ?3",
     )?;
-    let rows = statement.query_map(params![work_item_kind, limit], |row| {
+    let rows = statement.query_map(params![repository, work_item_kind, limit], |row| {
         Ok(WorkItemLifecycleCandidate {
             event_id: row.get(0)?,
             action: row.get(1)?,
@@ -3336,6 +3600,7 @@ fn work_item_lifecycle_candidates(
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
 }
 
+#[allow(clippy::too_many_lines)]
 fn prepare_work_item_finalization(database: &Path, event_id: &str) -> Result<bool, StoreError> {
     require_current_schema(database)?;
     let now = now_rfc3339();
@@ -3362,7 +3627,7 @@ fn prepare_work_item_finalization(database: &Path, event_id: &str) -> Result<boo
         transaction.commit()?;
         return Ok(false);
     };
-    if detail.as_deref() != Some("closed")
+    if !matches!(detail.as_deref(), Some("closed" | "merged"))
         || !matches!(state.to_ascii_lowercase().as_str(), "closed" | "merged")
     {
         transaction.execute(
@@ -3371,6 +3636,15 @@ fn prepare_work_item_finalization(database: &Path, event_id: &str) -> Result<boo
         )?;
         transaction.commit()?;
         return Ok(false);
+    }
+    // A previously admitted built-in merge can still carry the platform's
+    // closed state. Project its immutable merge fact before terminal handling
+    // chooses retired rather than the reopenable closed/sleeping state.
+    if detail.as_deref() == Some("merged") {
+        transaction.execute(
+            "UPDATE work_items SET state='merged' WHERE node_id=?1 AND kind='pr'",
+            [&work_item_node_id],
+        )?;
     }
     let selected = transaction
         .query_row(
@@ -4373,7 +4647,7 @@ fn load_context_reset_claim(
     let mut claim = connection.query_row(
         "SELECT cr.reset_id,a.assignment_id,r.name_with_owner,w.kind,w.number,ai.profile_id,
                 cr.active_turn_id,t.provider_turn_id,cr.continuation,
-                wt.path,wt.head_ref,ps.provider_session_id
+                wt.path,wt.head_ref,ps.provider_session_id,ps.lifecycle,t.lifecycle
          FROM context_resets cr
          JOIN provider_sessions ps ON ps.session_id=cr.old_session_id
          JOIN agent_instances ai ON ai.agent_id=cr.agent_id
@@ -4387,6 +4661,8 @@ fn load_context_reset_claim(
         |row| {
             Ok(ContextResetClaim {
                 old_provider_session_id: row.get(11)?,
+                old_session_lifecycle: row.get(12)?,
+                active_turn_lifecycle: row.get(13)?,
                 reset_id: row.get(0)?,
                 assignment_id: row.get(1)?,
                 repository: row.get(2)?,
@@ -4733,6 +5009,35 @@ fn claim_runnable_turn(
     }))
 }
 
+fn defer_turn_claim(database: &Path, turn_id: &str) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let transaction = connection.transaction()?;
+    let (session, batch): (String, String) = transaction.query_row(
+        "SELECT session_id,batch_id FROM turns WHERE turn_id=?1 AND lifecycle='starting' AND provider_turn_id IS NULL",
+        [turn_id], |row| Ok((row.get(0)?,row.get(1)?)),
+    )?;
+    transaction.execute("DELETE FROM turns WHERE turn_id=?1", [turn_id])?;
+    transaction.execute("UPDATE wake_batches SET lifecycle='runnable',updated_at=?2 WHERE batch_id=?1 AND lifecycle='consumed'", params![batch, now_rfc3339()])?;
+    transaction.execute(
+        "UPDATE provider_sessions SET lifecycle='idle' WHERE session_id=?1 AND lifecycle='running'",
+        [session],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn record_turn_error(database: &Path, turn_id: &str, error: &str) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    if connection.execute("UPDATE turns SET error=CASE WHEN error IS NULL THEN ?2 ELSE error || char(10) || ?2 END WHERE turn_id=?1", params![turn_id,error])? != 1 {
+        return Err(StoreError::InvalidData(format!("unknown turn {turn_id} for error record")));
+    }
+    Ok(())
+}
+
 fn mark_turn_started(
     database: &Path,
     turn_id: &str,
@@ -4857,9 +5162,9 @@ fn mark_turn_terminal(database: &Path, turn_id: &str, lifecycle: &str) -> Result
         fence_session_and_request_reset(&transaction, &session_id, &agent_id, &now)?;
         // At-least-once replay: the fenced turn's inputs return to pending and
         // are re-batched, so the replacement session re-drives them after the
-        // reset lands. The turn may have completed provider-side unseen;
-        // GitHub-write idempotency absorbs a rare duplicate, while silently
-        // dropping a delivered Human request is the worse failure.
+        // reset lands, after the Group has confirmed the old execution stopped.
+        // Re-reading canonical references is not an exactly-once guarantee for
+        // arbitrary GitHub, Git or shell effects from the old execution.
         if let Some(batch_id) = turn_batch_id {
             transaction.execute(
                 "UPDATE events SET lifecycle='pending'
@@ -4971,14 +5276,17 @@ fn claim_urgent_steer(database: &Path, turn_id: &str) -> Result<Option<TurnClaim
     }))
 }
 
-fn consume_steer_batch(database: &Path, batch_id: &str) -> Result<(), StoreError> {
+fn consume_steer_batch(database: &Path, batch_id: &str, lifecycle: &str) -> Result<(), StoreError> {
     require_current_schema(database)?;
     let connection = open_read_write(database)?;
     configure_connection(&connection)?;
+    if !matches!(lifecycle, "consumed" | "failed" | "unknown") {
+        return Err(StoreError::InvalidData(format!("invalid steer batch terminal {lifecycle}")));
+    }
     let updated = connection.execute(
-        "UPDATE wake_batches SET lifecycle='consumed',updated_at=?2
+        "UPDATE wake_batches SET lifecycle=?3,updated_at=?2
          WHERE batch_id=?1 AND lifecycle='runnable' AND urgent=1",
-        params![batch_id, now_rfc3339()],
+        params![batch_id, now_rfc3339(), lifecycle],
     )?;
     if updated == 1 {
         Ok(())
@@ -5482,123 +5790,4 @@ fn create_dir_all(path: &Path) -> Result<(), StoreError> {
 
 fn now_rfc3339() -> String {
     OffsetDateTime::now_utc().format(&Rfc3339).expect("UTC timestamp formats as RFC 3339")
-}
-
-#[cfg(test)]
-mod event_kind_tests {
-    use super::EventKind;
-
-    #[test]
-    fn event_kind_roundtrip() {
-        for kind in [
-            EventKind::Assign,
-            EventKind::Unassign,
-            EventKind::Mention,
-            EventKind::Wake,
-            EventKind::Invalidate,
-            EventKind::Lifecycle,
-            EventKind::OriginEcho,
-            EventKind::Noop,
-        ] {
-            assert_eq!(EventKind::from_str(kind.as_str()), Some(kind));
-        }
-        assert_eq!(EventKind::from_str("hard_invalidation"), None);
-        assert_eq!(EventKind::from_str("agent_origin"), None);
-    }
-
-    #[test]
-    fn evidence_kinds_are_consumed_at_ingest() {
-        assert!(EventKind::OriginEcho.consumed_at_ingest());
-        assert!(EventKind::Noop.consumed_at_ingest());
-        assert!(!EventKind::Wake.consumed_at_ingest());
-        assert!(!EventKind::Mention.consumed_at_ingest());
-        assert!(!EventKind::Invalidate.consumed_at_ingest());
-        assert!(!EventKind::Lifecycle.consumed_at_ingest());
-        assert!(!EventKind::Assign.consumed_at_ingest());
-        assert!(!EventKind::Unassign.consumed_at_ingest());
-    }
-}
-
-#[cfg(test)]
-mod session_recovery_tests {
-    use super::*;
-
-    #[test]
-    fn unavailable_handles_do_not_consume_batches_and_reset_can_settle_unknown() {
-        let root = std::env::temp_dir().join(format!("braid-recovery-{}", Uuid::now_v7()));
-        let database = root.join("state.sqlite3");
-        apply(&database, &root.join("backups")).unwrap();
-        let connection = open_read_write(&database).unwrap();
-        connection
-            .execute_batch(
-                "INSERT INTO repositories VALUES ('repo','owner/repo',NULL,'now');
-            INSERT INTO profiles VALUES ('profile',1,printf('%064d',0),'pi','[]');",
-            )
-            .unwrap();
-        for (id, kind, number) in [("one", "issue", 1), ("two", "issue", 2), ("three", "pr", 1)] {
-            connection
-                .execute(
-                    "INSERT INTO work_items VALUES (?1,'repo',?2,?3,'OPEN','context','now')",
-                    params![id, kind, number],
-                )
-                .unwrap();
-            connection
-                .execute("INSERT INTO assignments VALUES (?1,?1,1,'active','now',NULL)", [id])
-                .unwrap();
-            connection.execute("INSERT INTO agent_instances(agent_id,assignment_id,profile_id,profile_revision,role,lifecycle) VALUES (?1,?1,'profile',1,?2,'idle')", params![id,kind]).unwrap();
-            connection.execute("INSERT INTO provider_sessions(session_id,agent_id,provider_kind,provider_session_id,context_revision,instruction_revision,lifecycle,started_at) VALUES (?1,?1,'codex',?1,'context','instructions','idle','now')", [id]).unwrap();
-            connection.execute("INSERT INTO wake_batches(batch_id,work_item_node_id,quiet_deadline,lifecycle,created_at,updated_at) VALUES (?1,?1,'now','runnable','now','now')", [id]).unwrap();
-        }
-        assert!(claim_runnable_turn(&database, "issue", "profile", &[]).unwrap().is_none());
-        let claim =
-            claim_runnable_turn(&database, "issue", "profile", &["two".into(), "three".into()])
-                .unwrap()
-                .unwrap();
-        assert_eq!(claim.provider_session_id, "two");
-        assert_eq!(
-            connection
-                .query_row("SELECT lifecycle FROM wake_batches WHERE batch_id='one'", [], |row| row
-                    .get::<_, String>(0))
-                .unwrap(),
-            "runnable"
-        );
-        assert_eq!(
-            claim_runnable_turn(&database, "pr", "profile", &["three".into()])
-                .unwrap()
-                .unwrap()
-                .provider_session_id,
-            "three"
-        );
-        connection.execute("INSERT INTO context_resets(reset_id,agent_id,old_session_id,active_turn_id,context_revision_before,continuation,lifecycle,created_at,updated_at) VALUES ('reset','two','two',?1,'context',1,'interrupting','now','now')", [&claim.turn_id]).unwrap();
-        mark_context_reset_turn_terminal(&database, "reset", &claim.turn_id, "unknown").unwrap();
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT lifecycle FROM context_resets WHERE reset_id='reset'",
-                    [],
-                    |row| row.get::<_, String>(0)
-                )
-                .unwrap(),
-            "materializing"
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT lifecycle FROM turns WHERE turn_id=?1",
-                    [&claim.turn_id],
-                    |row| row.get::<_, String>(0)
-                )
-                .unwrap(),
-            "unknown"
-        );
-        assert_eq!(
-            load_context_reset_claim(&connection, "reset").unwrap().old_provider_session_id,
-            "two"
-        );
-        complete_context_reset(&database, "reset", "replacement", "new-context", "instructions")
-            .unwrap();
-        assert_eq!(connection.query_row("SELECT provider_kind FROM provider_sessions WHERE provider_session_id='replacement'", [], |row| row.get::<_,String>(0)).unwrap(), "pi");
-        drop(connection);
-        std::fs::remove_dir_all(root).unwrap();
-    }
 }

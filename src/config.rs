@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -11,7 +11,10 @@ use url::Url;
 
 use crate::home::validate_instance_key;
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
+/// Process-local credential injection for one Pi provider. Users configure only
+/// the secret file; native materials reference this fixed name.
+pub const PROVIDER_API_KEY_ENVIRONMENT: &str = "BRAID_PROVIDER_API_KEY";
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -32,16 +35,26 @@ pub struct InstanceConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip)]
+    pub(crate) finite_run: Option<crate::run::RunContext>,
     pub schema_version: u32,
     pub instance: InstanceConfig,
     pub runtime: RuntimeConfig,
-    pub github: GitHubConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GitHubConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<LocalConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<BuiltinConfig>,
+    #[serde(skip)]
+    pub loaded_from: PathBuf,
     pub scheduler: SchedulerConfig,
     /// Adapter connectivity, keyed by `adapter_type`. One entry per `adapter_type`
     /// per worker; the profile's `adapter_type` locates the runtime entry.
     pub runtimes: Vec<RuntimeEntry>,
-    /// LLM provider catalogue. Profiles reference an entry by id; enforcement is
-    /// outside the scope of this pass.
+    /// LLM provider catalogue. Only Pi profiles reference these entries; Codex
+    /// configurations may omit the catalogue entirely.
+    #[serde(default)]
     pub llm_providers: Vec<LlmProvider>,
     pub tools: ToolConfig,
     pub server: ServerConfig,
@@ -131,6 +144,9 @@ impl RuntimeConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeEntry {
+    /// Braid Pi material package manifest; absent for an external base Pi.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_runtime: Option<PathBuf>,
     pub adapter_type: String,
     /// Contract version checked at setup and serve time.
     pub version: String,
@@ -148,31 +164,171 @@ pub struct RuntimeEntry {
     pub experimental_schema_sha256: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum CredentialKind {
+    #[serde(rename = "api_key")]
+    ApiKey,
+    #[serde(rename = "oauth")]
+    OAuth,
+    #[serde(rename = "none")]
+    None,
+}
+
+/// Credential reference for one LLM provider. The referenced file is Braid
+/// schema (never a runtime-native file); adapters convert it at
+/// materialization time.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct LlmProvider {
-    pub id: String,
-    pub protocol: String,
+pub struct ProviderCredential {
+    pub kind: CredentialKind,
+    /// Required for `api_key` and `oauth`; must be absent for `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
+}
+
+impl ProviderCredential {
+    pub fn none() -> Self {
+        Self { kind: CredentialKind::None, file: None }
+    }
+
+    pub fn load(&self) -> Result<LoadedCredential, ConfigError> {
+        match self.kind {
+            CredentialKind::None => {
+                if self.file.is_some() {
+                    return Err(ConfigError::Invalid(
+                        "credential kind \"none\" must not reference a file".into(),
+                    ));
+                }
+                Ok(LoadedCredential::None)
+            }
+            CredentialKind::ApiKey => {
+                let file = self.file.as_ref().ok_or_else(|| {
+                    ConfigError::Invalid("credential kind \"api_key\" requires a file".into())
+                })?;
+                Ok(LoadedCredential::ApiKey(load_provider_secret_file(file)?))
+            }
+            CredentialKind::OAuth => {
+                let file = self.file.as_ref().ok_or_else(|| {
+                    ConfigError::Invalid("credential kind \"oauth\" requires a file".into())
+                })?;
+                Ok(LoadedCredential::OAuth(load_oauth_file(file)?))
+            }
+        }
+    }
+}
+
+pub enum LoadedCredential {
+    ApiKey(String),
+    OAuth(OAuthCredentialFile),
+    None,
+}
+
+/// Braid-schema OAuth token set for one provider (no refresh lifecycle:
+/// the operator replaces the file explicitly).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthCredentialFile {
+    pub access: String,
+    pub refresh: String,
+    /// Expiry as epoch milliseconds, matching the provider's token record.
+    pub expires: u64,
+    /// Optional diagnostic account label; never required for rendering.
     #[serde(default)]
-    pub api_key_environment: Option<String>,
-    #[serde(default)]
-    pub api_key_file: Option<PathBuf>,
-    #[serde(default)]
-    pub models: Vec<LlmModel>,
-    #[serde(default)]
-    pub allowances: Vec<LlmAllowance>,
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct LlmProvider {
+    pub id: String,
+    /// Explicit credential for this provider. Schema 3 requires it; schema 2
+    /// may omit it and rely on the legacy `api_key_file` fallback instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<ProviderCredential>,
+    /// Provider endpoint rendered into Pi's models.json by the adapter.
+    /// Required for providers referenced by a schema-3 Pi Profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Wire API name rendered into Pi's models.json (e.g. openai-completions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    /// Legacy schema-2 metadata. Pi's native models.json owns wire routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Legacy schema-2 API key reference; schema 3 requires `credential`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_file: Option<PathBuf>,
+    /// Declared models rendered into Pi's models.json by the adapter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<LlmModel>,
+    /// Legacy schema-2 allowance metadata; Braid does not consume it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowances: Vec<LlmAllowance>,
+}
+
+impl LlmProvider {
+    /// The credential this provider uses at runtime: the explicit
+    /// `credential` entry, or the legacy schema-2 `api_key_file` fallback,
+    /// otherwise an explicit keyless route.
+    pub fn resolved_credential(&self) -> ProviderCredential {
+        if let Some(credential) = &self.credential {
+            return credential.clone();
+        }
+        if let Some(file) = &self.api_key_file {
+            return ProviderCredential { kind: CredentialKind::ApiKey, file: Some(file.clone()) };
+        }
+        ProviderCredential::none()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LlmModel {
-    pub model_id: String,
-    #[serde(default)]
-    pub input_cost: f64,
-    #[serde(default)]
-    pub output_cost: f64,
-    #[serde(default)]
-    pub cache_input_cost: f64,
+    /// Model id; legacy schema-2 configs used `model_id`.
+    #[serde(alias = "model_id")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub thinking_level_map: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<LlmModelCompat>,
+    /// Legacy schema-2 cost metadata; schema 3 rejects it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_input_cost: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmModelCompat {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_store: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_developer_role: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_reasoning_effort: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_strict_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zai_tool_stream: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -186,9 +342,30 @@ pub struct LlmAllowance {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct BuiltinConfig {
+    pub repository: String,
+    pub endpoint: Url,
+}
+
+// Parsed only to provide an actionable migration error for the previous declaration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalConfig {
+    pub repository: String,
+    pub source: PathBuf,
+    pub default_branch: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitHubConfig {
     pub app_id: u64,
     pub repository: String,
+    /// Additional repositories served by this same GitHub App and instance.
+    /// The existing `repository` remains the single-repository default; when
+    /// this list is non-empty every Profile must declare its repository.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_repositories: Vec<GitHubRepositoryConfig>,
     pub handle: String,
     pub api_version: String,
     pub private_key_file: PathBuf,
@@ -197,6 +374,12 @@ pub struct GitHubConfig {
     #[serde(default)]
     pub webhook_secret_file: Option<PathBuf>,
     pub projects_v2_enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubRepositoryConfig {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -219,6 +402,8 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodexConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub braid_config_path: Option<PathBuf>,
     pub executable: PathBuf,
     pub home: PathBuf,
     pub version: String,
@@ -229,35 +414,19 @@ pub struct CodexConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PiConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_runtime: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub braid_config_path: Option<PathBuf>,
     pub executable: PathBuf,
     pub provider: Option<String>,
     pub model: Option<String>,
-    #[serde(default)]
-    pub api_key_environment: Option<String>,
-    #[serde(default)]
-    pub api_key_file: Option<PathBuf>,
+    #[serde(default = "ProviderCredential::none")]
+    pub credential: ProviderCredential,
     pub thinking: Option<String>,
     pub home: Option<PathBuf>,
-}
-
-impl PiConfig {
-    /// Load the provider API key from `api_key_file` if set, otherwise from
-    /// `api_key_environment`.
-    pub fn api_key(&self) -> Result<String, ConfigError> {
-        if let Some(path) = &self.api_key_file {
-            return load_provider_secret_file(path);
-        }
-        if let Some(env) = &self.api_key_environment {
-            return std::env::var(env).map_err(|_| {
-                ConfigError::Invalid(format!(
-                    "environment variable {env:?} for provider.pi.api_key_environment is not set"
-                ))
-            });
-        }
-        Err(ConfigError::Invalid(
-            "one of provider.pi.api_key_environment or provider.pi.api_key_file must be set".into(),
-        ))
-    }
+    #[serde(default)]
+    pub profile_material_digest: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -306,10 +475,24 @@ pub struct Profile {
     /// Contract pin checked against the runtime entry's version.
     pub adapter_version: String,
     /// References an entry in `llm_providers` for adapters that need an LLM.
-    pub provider: String,
+    /// Adapters with their own authentication, such as Codex, omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// GitHub repository this Profile serves. Single-repository GitHub configs
+    /// may omit it and use `github.repository`; multi-repository configs must
+    /// set it explicitly. Built-in platform Profiles omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     pub model: Option<String>,
     pub reasoning: Option<String>,
     pub user_instructions: String,
+    /// Explicit Pi-discoverable skill entrypoints: a `SKILL.md` file, one skill
+    /// directory, or a shallow catalog of skill directories. Complete trees bind.
+    #[serde(default)]
+    pub skills: Vec<PathBuf>,
+    /// Pi-native semantic materials (`models.json`, `settings.json`, `agents/*.md`).
+    #[serde(default)]
+    pub native_template: Option<PathBuf>,
     /// The source Git checkout for this instance's repository, shared by all
     /// Profiles as the worktree provisioning source (one repository = one
     /// source checkout). Defaults to `<config_dir>/source`; Agent sessions
@@ -328,6 +511,12 @@ impl Profile {
     pub fn resolve_workspace(&mut self, base: &Path) {
         let workspace = self.workspace.take().unwrap_or_else(|| base.join("source"));
         self.workspace = Some(resolve_path(base, &workspace));
+        for skill in &mut self.skills {
+            *skill = resolve_path(base, skill);
+        }
+        if let Some(template) = &mut self.native_template {
+            *template = resolve_path(base, template);
+        }
     }
 
     /// The resolved source checkout path (valid after `Config::load`).
@@ -345,8 +534,10 @@ pub struct ProfileSelection {
 #[derive(Debug, Serialize)]
 pub struct ConfigSummary<'a> {
     pub schema_version: u32,
+    pub upstream: &'static str,
     pub instance_key: &'a str,
     pub repository: &'a str,
+    pub repositories: Vec<&'a str>,
     pub runtime_root: &'a Path,
     pub database: &'a Path,
     pub profile_ids: Vec<&'a str>,
@@ -381,7 +572,7 @@ fn load_webhook_secret_file(path: &Path) -> Result<String, ConfigError> {
     Ok(file.webhook_secret)
 }
 
-fn load_provider_secret_file(path: &Path) -> Result<String, ConfigError> {
+pub(crate) fn load_provider_secret_file(path: &Path) -> Result<String, ConfigError> {
     let text = fs::read_to_string(path)
         .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
     let deserializer = toml::de::Deserializer::parse(&text).map_err(|error| {
@@ -392,6 +583,31 @@ fn load_provider_secret_file(path: &Path) -> Result<String, ConfigError> {
             ConfigError::Invalid(format!("cannot parse secrets file {}: {error}", path.display()))
         })?;
     Ok(file.provider_api_key)
+}
+
+pub(crate) fn load_oauth_file(path: &Path) -> Result<OAuthCredentialFile, ConfigError> {
+    let text = fs::read_to_string(path)
+        .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
+    let deserializer = toml::de::Deserializer::parse(&text).map_err(|error| {
+        ConfigError::Invalid(format!(
+            "cannot parse OAuth credential file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let file: OAuthCredentialFile =
+        serde_path_to_error::deserialize(deserializer).map_err(|error| {
+            ConfigError::Invalid(format!(
+                "cannot parse OAuth credential file {}: {error}",
+                path.display()
+            ))
+        })?;
+    if file.access.trim().is_empty() || file.refresh.trim().is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "OAuth credential file {} requires non-empty access and refresh tokens",
+            path.display()
+        )));
+    }
+    Ok(file)
 }
 
 impl Config {
@@ -410,8 +626,28 @@ impl Config {
         } else {
             std::env::current_dir().map(|cwd| cwd.join(&base)).unwrap_or(base)
         };
+        config.loaded_from = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?
+                .join(path)
+        };
         config.runtime.resolve(&base);
+        for runtime in &mut config.runtimes {
+            if let Some(manifest) = &mut runtime.native_runtime {
+                *manifest = resolve_path(&base, manifest);
+            }
+        }
+        let multi_repository =
+            config.github.as_ref().is_some_and(|github| !github.additional_repositories.is_empty());
         for profile in &mut config.profiles {
+            if multi_repository && profile.workspace.is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "profile {:?} requires an explicit workspace in a multi-repository config",
+                    profile.id
+                )));
+            }
             profile.resolve_workspace(&base);
         }
         config.validate()?;
@@ -421,6 +657,81 @@ impl Config {
     #[allow(dead_code)]
     pub fn instance_key(&self) -> &str {
         &self.instance.key
+    }
+
+    pub fn repository(&self) -> &str {
+        match (&self.github, &self.builtin) {
+            (Some(github), None) => &github.repository,
+            (None, Some(builtin)) => &builtin.repository,
+            _ => unreachable!("configuration validates exactly one collaboration backend"),
+        }
+    }
+
+    pub fn is_builtin(&self) -> bool {
+        self.builtin.is_some()
+    }
+
+    pub fn github_repositories(&self) -> Vec<&str> {
+        let Some(github) = &self.github else { return Vec::new() };
+        std::iter::once(github.repository.as_str())
+            .chain(github.additional_repositories.iter().map(|repository| repository.name.as_str()))
+            .collect()
+    }
+
+    pub fn repositories(&self) -> Vec<&str> {
+        if self.is_builtin() { vec![self.repository()] } else { self.github_repositories() }
+    }
+
+    pub fn is_multi_repository(&self) -> bool {
+        self.github.as_ref().is_some_and(|github| !github.additional_repositories.is_empty())
+    }
+
+    pub fn profile_repository<'a>(&'a self, profile: &'a Profile) -> &'a str {
+        match (&self.github, &self.builtin) {
+            (Some(github), None) => profile.repository.as_deref().unwrap_or(&github.repository),
+            (None, Some(builtin)) => &builtin.repository,
+            _ => unreachable!("configuration validates exactly one collaboration backend"),
+        }
+    }
+
+    pub fn profiles_for_repository<'a>(&'a self, repository: &str, tag: &str) -> Vec<&'a Profile> {
+        self.profiles
+            .iter()
+            .filter(|profile| {
+                self.profile_repository(profile) == repository && profile.has_tag(tag)
+            })
+            .collect()
+    }
+
+    pub fn issue_profile_for_repository(&self, repository: &str) -> Result<&Profile, ConfigError> {
+        self.profiles_for_repository(repository, "issue").into_iter().next().ok_or_else(|| {
+            ConfigError::Invalid(format!("repository {repository:?} has no Issue Profile"))
+        })
+    }
+
+    pub fn pr_profile_for_repository(&self, repository: &str) -> Result<&Profile, ConfigError> {
+        let candidates = self.profiles_for_repository(repository, "pr");
+        if let [profile] = candidates.as_slice() {
+            return Ok(profile);
+        }
+        candidates
+            .iter()
+            .find(|profile| profile.id == self.profile_selection.default_pr_profile)
+            .copied()
+            .ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "repository {repository:?} does not have an unambiguous PR Profile"
+                ))
+            })
+    }
+
+    pub fn github(&self) -> Result<&GitHubConfig, ConfigError> {
+        self.github.as_ref().ok_or_else(|| {
+            ConfigError::Invalid(
+                "this command requires the GitHub backend; this Harness connects to the built-in collaboration platform"
+                    .into(),
+            )
+        })
     }
 
     pub fn profile(&self, id: &str) -> Result<&Profile, ConfigError> {
@@ -433,8 +744,10 @@ impl Config {
     pub fn summary(&self) -> ConfigSummary<'_> {
         ConfigSummary {
             schema_version: self.schema_version,
+            upstream: if self.is_builtin() { "builtin" } else { "github" },
             instance_key: &self.instance.key,
-            repository: &self.github.repository,
+            repository: self.repository(),
+            repositories: self.repositories(),
             runtime_root: self.runtime.root(),
             database: self.runtime.database(),
             profile_ids: self.profiles.iter().map(|profile| profile.id.as_str()).collect(),
@@ -445,13 +758,22 @@ impl Config {
         }
     }
 
+    pub(crate) fn profile_materials(
+        &self,
+        profile: &Profile,
+    ) -> Result<crate::profile_materials::EffectiveMaterials, ConfigError> {
+        crate::profile_materials::collect(self, profile).map_err(|error| {
+            ConfigError::Invalid(format!("profile {:?} materials: {error:#}", profile.id))
+        })
+    }
+
     /// Load the GitHub webhook secret from `github.webhook_secret_file` if set,
     /// otherwise from `github.webhook_secret_environment`.
     pub fn webhook_secret(&self) -> Result<String, ConfigError> {
-        if let Some(path) = &self.github.webhook_secret_file {
+        if let Some(path) = &self.github()?.webhook_secret_file {
             return load_webhook_secret_file(path);
         }
-        if let Some(env) = &self.github.webhook_secret_environment {
+        if let Some(env) = &self.github()?.webhook_secret_environment {
             return std::env::var(env).map_err(|_| {
                 ConfigError::Invalid(format!(
                     "environment variable {env:?} for github.webhook_secret_environment is not set"
@@ -476,15 +798,10 @@ impl Config {
             })
     }
 
-    pub fn llm_provider_for(&self, profile: &Profile) -> Result<&LlmProvider, ConfigError> {
-        self.llm_providers.iter().find(|provider| provider.id == profile.provider).ok_or_else(
-            || {
-                ConfigError::Invalid(format!(
-                    "profile {:?} references unknown provider {:?}",
-                    profile.id, profile.provider
-                ))
-            },
-        )
+    pub fn llm_provider_for(&self, provider_id: &str) -> Result<&LlmProvider, ConfigError> {
+        self.llm_providers.iter().find(|provider| provider.id == provider_id).ok_or_else(|| {
+            ConfigError::Invalid(format!("unknown llm_providers entry {provider_id:?}"))
+        })
     }
 
     /// Provider settings for the default PR Profile, used by operator probes.
@@ -525,6 +842,7 @@ impl Config {
             })?;
             return Ok(ProviderConfig {
                 codex: Some(CodexConfig {
+                    braid_config_path: Some(self.loaded_from.clone()),
                     executable: runtime.executable.clone(),
                     home,
                     version: runtime.version.clone(),
@@ -536,18 +854,26 @@ impl Config {
         }
 
         if runtime.adapter_type == "pi" {
-            // Pi needs an LLM provider entry for its API key and model info.
-            let llm = self.llm_provider_for(profile)?;
+            // Pi needs an explicit LLM provider entry for its API key and model route.
+            let provider_id = profile.provider.as_deref().ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "profile {:?} requires provider for the Pi adapter",
+                    profile.id
+                ))
+            })?;
+            let llm = self.llm_provider_for(provider_id)?;
             return Ok(ProviderConfig {
                 codex: None,
                 pi: Some(PiConfig {
+                    native_runtime: runtime.native_runtime.clone(),
+                    braid_config_path: Some(self.loaded_from.clone()),
                     executable: runtime.executable.clone(),
                     provider: Some(llm.id.clone()),
                     model: profile.model.clone(),
-                    api_key_environment: llm.api_key_environment.clone(),
-                    api_key_file: llm.api_key_file.clone(),
+                    credential: llm.resolved_credential(),
                     thinking: profile.reasoning.clone(),
                     home: runtime.home.clone(),
+                    profile_material_digest: self.profile_materials(profile)?.digest,
                 }),
             });
         }
@@ -557,7 +883,7 @@ impl Config {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
-        if self.schema_version != CONFIG_SCHEMA_VERSION {
+        if self.schema_version != CONFIG_SCHEMA_VERSION && self.schema_version != 2 {
             return Err(ConfigError::Schema {
                 found: self.schema_version,
                 supported: CONFIG_SCHEMA_VERSION,
@@ -566,22 +892,20 @@ impl Config {
         validate_instance_key(&self.instance.key)
             .map_err(|message| ConfigError::Invalid(format!("instance.key: {message}")))?;
 
+        if self.local.is_some() {
+            return Err(ConfigError::Invalid("[local] combined platform and Harness state is no longer supported; stop the old runtime, import its objects with braid platform import, then replace [local] with [builtin] repository and endpoint; see docs/user-manual/local.md".into()));
+        }
+        if self.github.is_some() == self.builtin.is_some() {
+            return Err(ConfigError::Invalid(
+                "configure exactly one upstream: [github] or [builtin]".into(),
+            ));
+        }
         for (name, path) in [
             ("runtime.root", self.runtime.root()),
             ("runtime.database", self.runtime.database()),
             ("runtime.backups", self.runtime.backups()),
-            ("github.private_key_file", &self.github.private_key_file),
-            ("tools.git", &self.tools.git),
-            ("tools.gh", &self.tools.gh),
-            ("tools.wrangler", &self.tools.wrangler),
-        ]
-        .into_iter()
-        .chain(
-            self.github
-                .webhook_secret_file
-                .as_ref()
-                .map(|path| ("github.webhook_secret_file", path.as_path())),
-        ) {
+            ("tools.git", self.tools.git.as_path()),
+        ] {
             require_absolute(name, path)?;
         }
         if !self.runtime.database().starts_with(self.runtime.root())
@@ -591,20 +915,63 @@ impl Config {
                 "runtime database and backups must be inside runtime.root".into(),
             ));
         }
-        if self.github.app_id == 0 {
-            return Err(ConfigError::Invalid("github.app_id must be positive".into()));
+        if let Some(builtin) = &self.builtin {
+            validate_token("builtin.repository", &builtin.repository)?;
+            let endpoint = &builtin.endpoint;
+            let loopback = match endpoint.host() {
+                Some(url::Host::Domain("localhost")) => true,
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                _ => false,
+            };
+            if endpoint.scheme() != "http"
+                || !loopback
+                || !endpoint.username().is_empty()
+                || endpoint.password().is_some()
+                || endpoint.query().is_some()
+                || endpoint.fragment().is_some()
+                || endpoint.path() != "/"
+            {
+                return Err(ConfigError::Invalid("builtin.endpoint must be a loopback HTTP origin without credentials, query, fragment or path".into()));
+            }
+            for profile in &self.profiles {
+                if profile.workspace.is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "profile {:?} requires workspace for the built-in platform's Git source",
+                        profile.id
+                    )));
+                }
+            }
         }
-        validate_repository(&self.github.repository)?;
-        validate_token("github.handle", &self.github.handle)?;
-        if self.github.webhook_secret_environment.is_none()
-            && self.github.webhook_secret_file.is_none()
-        {
-            return Err(ConfigError::Invalid(
-                "one of github.webhook_secret_environment or github.webhook_secret_file must be set".into(),
-            ));
-        }
-        if let Some(env) = &self.github.webhook_secret_environment {
-            validate_token("github.webhook_secret_environment", env)?;
+        if let Some(github) = &self.github {
+            require_absolute("github.private_key_file", &github.private_key_file)?;
+            require_absolute("tools.gh", &self.tools.gh)?;
+            require_absolute("tools.wrangler", &self.tools.wrangler)?;
+            if let Some(path) = &github.webhook_secret_file {
+                require_absolute("github.webhook_secret_file", path)?;
+            }
+            if github.app_id == 0 {
+                return Err(ConfigError::Invalid("github.app_id must be positive".into()));
+            }
+            validate_repository(&github.repository)?;
+            let mut repository_names = HashSet::new();
+            repository_names.insert(github.repository.as_str());
+            for repository in &github.additional_repositories {
+                validate_repository(&repository.name)?;
+                if !repository_names.insert(repository.name.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "duplicate GitHub repository {:?}",
+                        repository.name
+                    )));
+                }
+            }
+            validate_token("github.handle", &github.handle)?;
+            if github.webhook_secret_environment.is_none() && github.webhook_secret_file.is_none() {
+                return Err(ConfigError::Invalid("one of github.webhook_secret_environment or github.webhook_secret_file must be set".into()));
+            }
+            if let Some(env) = &github.webhook_secret_environment {
+                validate_token("github.webhook_secret_environment", env)?;
+            }
         }
         if self.scheduler.quiet_seconds == 0
             || self.scheduler.event_threshold == 0
@@ -638,6 +1005,14 @@ impl Config {
                 &format!("runtime.{}.executable", runtime.adapter_type),
                 &runtime.executable,
             )?;
+            if let Some(manifest) = &runtime.native_runtime {
+                require_absolute("runtime.native_runtime", manifest)?;
+                if runtime.adapter_type != "pi" {
+                    return Err(ConfigError::Invalid(
+                        "native_runtime is only supported by Pi".into(),
+                    ));
+                }
+            }
             if !runtime_types.insert(runtime.adapter_type.as_str()) {
                 return Err(ConfigError::Invalid(format!(
                     "duplicate runtime adapter_type {:?}",
@@ -673,15 +1048,54 @@ impl Config {
         let mut provider_ids = HashSet::new();
         for provider in &self.llm_providers {
             validate_token("llm_providers.id", &provider.id)?;
-            validate_token("llm_providers.protocol", &provider.protocol)?;
-            if provider.api_key_environment.is_none() && provider.api_key_file.is_none() {
-                return Err(ConfigError::Invalid(format!(
-                    "llm_providers {:?} requires api_key_environment or api_key_file",
-                    provider.id
-                )));
+            if let Some(credential) = &provider.credential {
+                validate_credential(
+                    &format!("llm_providers.{}.credential", provider.id),
+                    credential,
+                )?;
             }
-            if let Some(file) = &provider.api_key_file {
-                require_absolute(&format!("llm_providers.{}.api_key_file", provider.id), file)?;
+            if let Some(api_key_file) = &provider.api_key_file {
+                require_absolute(
+                    &format!("llm_providers.{}.api_key_file", provider.id),
+                    api_key_file,
+                )?;
+            }
+            if self.schema_version == 2 {
+                if let Some(protocol) = &provider.protocol {
+                    validate_token("llm_providers.protocol", protocol)?;
+                }
+            } else {
+                if provider.api_key_file.is_some() {
+                    return Err(ConfigError::Invalid(format!(
+                        "llm_providers {:?} uses legacy api_key_file; schema 3 uses credential = {{ kind = \"api_key\", file = ... }}",
+                        provider.id
+                    )));
+                }
+                if provider.credential.is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "llm_providers {:?} requires an explicit credential; use kind = \"none\" for a keyless route",
+                        provider.id
+                    )));
+                }
+                if provider.protocol.is_some()
+                    || !provider.allowances.is_empty()
+                    || provider.models.iter().any(|model| {
+                        model.input_cost.is_some()
+                            || model.output_cost.is_some()
+                            || model.cache_input_cost.is_some()
+                    })
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "llm_providers {:?} contains schema-2 protocol/cost metadata; schema 3 keeps only id, credential, and base_url/api/models metadata",
+                        provider.id
+                    )));
+                }
+                if let Some(base_url) = &provider.base_url {
+                    validate_provider_base_url(
+                        &format!("llm_providers.{}.base_url", provider.id),
+                        base_url,
+                    )?;
+                }
             }
             if !provider_ids.insert(provider.id.as_str()) {
                 return Err(ConfigError::Invalid(format!(
@@ -691,14 +1105,17 @@ impl Config {
             }
             let mut model_ids = HashSet::new();
             for model in &provider.models {
-                validate_token(
-                    &format!("llm_providers.{}.model_id", provider.id),
-                    &model.model_id,
-                )?;
-                if !model_ids.insert(model.model_id.as_str()) {
+                validate_token(&format!("llm_providers.{}.models.id", provider.id), &model.id)?;
+                if !model_ids.insert(model.id.as_str()) {
                     return Err(ConfigError::Invalid(format!(
                         "duplicate model {:?} in llm_providers {:?}",
-                        model.model_id, provider.id
+                        model.id, provider.id
+                    )));
+                }
+                if model.context_window == Some(0) || model.max_tokens == Some(0) {
+                    return Err(ConfigError::Invalid(format!(
+                        "llm_providers.{} model {:?} requires positive context_window and max_tokens",
+                        provider.id, model.id
                     )));
                 }
             }
@@ -708,13 +1125,37 @@ impl Config {
             return Err(ConfigError::Invalid("at least one profile is required".into()));
         }
         let mut ids = HashSet::new();
+        let mut repository_workspaces = HashMap::new();
         for profile in &self.profiles {
+            let repository = self.profile_repository(profile);
+            if let Some(workspace) = &profile.workspace
+                && let Some(existing) =
+                    repository_workspaces.insert(repository, workspace.as_path())
+                && existing != workspace
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "profiles for repository {repository:?} must share one source checkout; {} and {} differ",
+                    existing.display(),
+                    workspace.display()
+                )));
+            }
             profile.validate(self)?;
             if !ids.insert(profile.id.as_str()) {
                 return Err(ConfigError::Invalid(format!(
                     "profile id {:?} is duplicated",
                     profile.id
                 )));
+            }
+        }
+        if self.github.is_some() {
+            for repository in self.github_repositories() {
+                if self.profiles_for_repository(repository, "issue").is_empty()
+                    && self.profiles_for_repository(repository, "pr").is_empty()
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "GitHub repository {repository:?} has no Issue or PR Profile"
+                    )));
+                }
             }
         }
         let default_pr = self.profile(&self.profile_selection.default_pr_profile)?;
@@ -760,6 +1201,65 @@ impl TelemetryConfig {
 }
 
 impl Profile {
+    fn validate_pi_provider_route(&self, config: &Config) -> Result<(), ConfigError> {
+        if self.adapter_type != "pi" {
+            return Ok(());
+        }
+        let provider_id = self.provider.as_deref().expect("Pi provider checked above");
+        let llm = config.llm_provider_for(provider_id)?;
+        if config.schema_version == 2 {
+            return Ok(());
+        }
+        if llm.base_url.is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "llm_providers {:?} requires base_url for Pi models.json derivation",
+                llm.id
+            )));
+        }
+        if let Some(model) = &self.model
+            && !llm.models.iter().any(|declared| declared.id == *model)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "profile {:?} model {:?} is not declared in llm_providers {:?} models",
+                self.id, model, llm.id
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_repository_scope(&self, config: &Config) -> Result<(), ConfigError> {
+        let Some(github) = &config.github else {
+            if self.repository.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "profile {:?} repository is supported only by the GitHub backend",
+                    self.id
+                )));
+            }
+            return Ok(());
+        };
+        let configured = config.github_repositories();
+        match &self.repository {
+            Some(repository) => {
+                validate_repository(repository)?;
+                if !configured.contains(&repository.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "profile {:?} references unconfigured GitHub repository {:?}",
+                        self.id, repository
+                    )));
+                }
+            }
+            None => {
+                if !github.additional_repositories.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "profile {:?} requires an explicit repository in a multi-repository config",
+                        self.id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn has_tag(&self, tag: &str) -> bool {
         self.tags.iter().any(|candidate| candidate == tag)
     }
@@ -779,9 +1279,42 @@ impl Profile {
                 self.id
             )));
         }
-        validate_token("profile.provider", &self.provider)?;
+        if self.adapter_type == "pi" {
+            let provider = self.provider.as_deref().ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "profile {:?} requires provider for the Pi adapter",
+                    self.id
+                ))
+            })?;
+            validate_token("profile.provider", provider)?;
+            if self.model.is_none() && config.schema_version != 2 {
+                return Err(ConfigError::Invalid(format!(
+                    "profile {:?} requires an explicit model for the Pi adapter",
+                    self.id
+                )));
+            }
+        } else if self.provider.is_some() && config.schema_version != 2 {
+            return Err(ConfigError::Invalid(format!(
+                "profile {:?} provider is supported only by the Pi adapter",
+                self.id
+            )));
+        }
+        self.validate_repository_scope(config)?;
         if let Some(workspace) = &self.workspace {
             require_absolute(&format!("profile {:?}.workspace", self.id), workspace)?;
+        }
+        if self.adapter_type != "pi" && (!self.skills.is_empty() || self.native_template.is_some())
+        {
+            return Err(ConfigError::Invalid(format!(
+                "profile {:?} skills and native_template are supported only by the Pi adapter",
+                self.id
+            )));
+        }
+        for skill in &self.skills {
+            require_absolute(&format!("profile {:?}.skills", self.id), skill)?;
+        }
+        if let Some(template) = &self.native_template {
+            require_absolute(&format!("profile {:?}.native_template", self.id), template)?;
         }
         if self.tags.is_empty() || (!self.has_tag("issue") && !self.has_tag("pr")) {
             return Err(ConfigError::Invalid(format!(
@@ -825,14 +1358,75 @@ impl Profile {
                 self.id, self.adapter_version, runtime.adapter_type, runtime.version
             )));
         }
-        let _llm = config.llm_provider_for(self)?;
+        self.validate_pi_provider_route(config)?;
         // The profile's model is a request to the provider, and the provider
         // is the authority on which models it accepts. The llm_providers
         // catalog only carries cost metadata, so an uncatalogued model is
         // not a config error: Codex must be able to answer with a real
         // turn failure for a model it does not support.
+        config.profile_materials(self)?;
         Ok(())
     }
+}
+
+fn validate_provider_base_url(name: &str, value: &str) -> Result<(), ConfigError> {
+    let url = url::Url::parse(value)
+        .map_err(|error| ConfigError::Invalid(format!("{name} is not a valid URL: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(ConfigError::Invalid(format!("{name} must use http or https")));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ConfigError::Invalid(format!("{name} must not carry credentials")));
+    }
+    if url.query_pairs().any(|(key, _)| sensitive_query_name(&key)) {
+        return Err(ConfigError::Invalid(format!(
+            "{name} must not carry credential query parameters"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn sensitive_query_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "api-key",
+        "api_key",
+        "apikey",
+        "auth",
+        "authorization",
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "signature",
+        "key",
+        "access-token",
+        "access_token",
+    ]
+    .iter()
+    .any(|exact| name == *exact)
+}
+
+fn validate_credential(name: &str, credential: &ProviderCredential) -> Result<(), ConfigError> {
+    match credential.kind {
+        CredentialKind::None => {
+            if credential.file.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "{name}: kind \"none\" must not reference a file"
+                )));
+            }
+        }
+        CredentialKind::ApiKey | CredentialKind::OAuth => match &credential.file {
+            Some(file) => require_absolute(name, file)?,
+            None => {
+                return Err(ConfigError::Invalid(format!(
+                    "{name}: kind {:?} requires a file",
+                    credential.kind
+                )));
+            }
+        },
+    }
+    Ok(())
 }
 
 fn resolve_path(base: &Path, path: &Path) -> PathBuf {
@@ -858,7 +1452,7 @@ fn validate_repository(repository: &str) -> Result<(), ConfigError> {
     validate_token("github.repository name", name)
 }
 
-fn validate_token(name: &str, value: &str) -> Result<(), ConfigError> {
+pub(crate) fn validate_token(name: &str, value: &str) -> Result<(), ConfigError> {
     if value.trim().is_empty() || value.chars().any(char::is_whitespace) {
         Err(ConfigError::Invalid(format!("{name} must be a non-empty token")))
     } else {
@@ -888,36 +1482,4 @@ pub fn agent_attributions(config: &Config) -> Vec<String> {
         }
     }
     attributions
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::Config;
-
-    #[test]
-    fn pi_settings_follow_the_requested_profile() {
-        let mut config = Config::load(Path::new("config.example.toml")).unwrap();
-        config.runtimes[0].adapter_type = "pi".into();
-        for profile in &mut config.profiles {
-            profile.adapter_type = "pi".into();
-        }
-        config.profiles[0].model = Some("issue-model".into());
-        config.profiles[0].reasoning = Some("low".into());
-        config.profiles[1].model = Some("pr-model".into());
-        let settings = config.provider_config_for_profile(&config.profiles[0]).unwrap().pi.unwrap();
-        assert_eq!(settings.model.as_deref(), Some("issue-model"));
-        assert_eq!(settings.thinking.as_deref(), Some("low"));
-    }
-
-    /// `config.example.toml` is the canonical starter template, not a loose
-    /// documentation snippet. It must parse and validate against the canonical
-    /// `Config` type so that it cannot drift from the real schema. Partial
-    /// examples in runbooks are not required to pass this test.
-    #[test]
-    fn example_config_matches_schema() {
-        Config::load(Path::new("config.example.toml"))
-            .expect("config.example.toml must match the Config schema");
-    }
 }

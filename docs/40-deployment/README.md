@@ -6,9 +6,10 @@ GitHub mutation authority by itself.
 
 ## Supported Shape
 
-The first supported artifact is a signed/checksummed macOS arm64 `braid` binary.
-It runs without Python, PDM, Cargo, or a source checkout. Linux x86_64 is the
-next target. Runtime prerequisites remain explicit:
+The supported packaged artifacts are signed/checksummed macOS arm64 and
+Linux x86_64 `braid` binaries produced by the release workflow from the same
+locked source. They run without Python, PDM, Cargo, or a source checkout.
+Runtime prerequisites remain explicit:
 
 - Git and `gh` for Agent workflows;
 - pinned Codex executable and authenticated provider home;
@@ -20,29 +21,46 @@ Release artifacts include `braid`, `LICENSE`, `README`, default config example,
 OTel Collector example for optional tail sampling, SHA-256 checksums, and
 release notes generated from `CHANGELOG.md` under SemVer.
 
+Pi 可使用外部基础 CLI 或 [锁定原生材料](../../native/pi/README.md)。需要
+subagents/background 的共同结果与停止合同时，先安装材料并明确选用插件，
+配置 `[[runtimes]].executable` 与 `native_runtime` 为同一安装的入口与 manifest。
+`doctor` 校验文件身份，实际启动核对 live 能力；安装或升级不修改系统全局 Pi。
+
 ## Configuration
 
 The instance `config.toml` is versioned independently from binary and
-database schema. It
-contains no secret values; secrets use file references or environment-variable
-names. The main sections are:
+database schema. It contains no secret values. Provider credentials always use
+explicit `credential = { kind, file }` references (Braid-schema `api_key` /
+`oauth` files, or `none`); the GitHub webhook secret separately supports a file
+reference or environment-variable name. The main sections are:
 
-- GitHub App/repository/handle, API version, webhook and reconciliation;
+- GitHub App/repository or explicitly configured multi-repository set,
+  handle, API version, webhook and reconciliation;
 - the instance key under `[instance]`;
 - Profile definitions/tags/default PR Profile/context byte budgets/status
   surfaces/provider/workspace/resources;
 - scheduler quiet/count settings;
-- `[[runtimes]]` adapter executables/version pins and provider home;
-- `[[llm_providers]]` provider credentials (file references, not values);
+- `[[runtimes]]` adapter executables/version pins and adapter home;
+- optional `[[llm_providers]]` for Pi profiles: explicit `credential` (file
+  references, not values) plus `base_url`/`api`/`models` declarations from which
+  the Pi adapter derives `models.json`; Codex profiles do not declare them;
 - SQLite/runtime/worktree directories;
 - loopback ingress/health ports and Wrangler path;
 - OTLP endpoint/protocol, trace sample ratio, and incident override;
 - log format and bounded health/status settings.
 
 `braid config check` prints the effective non-secret declaration and validates
-its static invariants. `braid doctor` runs filesystem, SQLite, GitHub, Codex
+its static invariants. Single-repository GitHub configs may omit
+`profile.repository`; a config with `github.additional_repositories` requires
+every Profile to declare its repository and explicit workspace. The App and
+webhook secret stay instance-level, while Profiles, scheduling, worktrees, and
+writes remain repository-scoped. `braid doctor` runs filesystem, SQLite,
+GitHub, Codex
 schema, Git/gh, OTLP, and Wrangler precondition probes. Profiles expose
 their effective mapped provider settings through `braid profile inspect`.
+
+Pi Profile 的可选技能、原生模板、独立 home 和有效身份操作见
+[Profile 指南](../user-manual/profiles.md)。协作技能包独立交付，不属于默认运行材料。
 
 ## Filesystem Layout
 
@@ -55,13 +73,13 @@ Everything below is scoped by trust boundary:
   config.toml                   # optional user defaults (future)
   secrets/                      # user-level provider API keys
   instances/<key>/
-    config.toml                 # instance config, schema version 2
+    config.toml                 # Harness config, schema version 3 (GitHub v2 still readable)
     github-app.pem              # GitHub App private key
     secrets.toml                # webhook secret
     state/
       braid.sqlite3
       backups/
-      worktrees/<repository>/<pr-number>-<assignment-generation>/
+      worktrees/<repository>/<issue-or-pr-number>-<assignment-generation>/
     provider/                   # adapter home (e.g. Codex provider state)
     logs/                       # optional sampled-log export
 ```
@@ -69,6 +87,13 @@ Everything below is scoped by trust boundary:
 The default `runtime.root` is `<config_dir>/state`. `braid setup` writes
 `instances/<key>` explicitly with the layout above. Multiple instances share
 the same user root but have isolated databases, webhooks, and worktrees.
+A provider credential file is Braid schema (`provider_api_key = "..."` for
+`api_key`, or an `access`/`refresh`/`expires` token set for `oauth`) and must
+be mode `0600`. Its path and provider id are explicit user choices. The Pi
+adapter converts it at session materialization — injecting `api_key` as the
+managed environment reference or rendering `oauth` into the session home
+`auth.json`; `kind = "none"` injects nothing. Runtime homes never carry
+`auth.json`; convert existing ones once with `braid provider import-auth`.
 
 ## Database Lifecycle
 
@@ -187,3 +212,55 @@ Then drive only the real campaign in
 [`../10-prd/acceptance.md`](../10-prd/acceptance.md). Source-tree execution,
 private DB edits, fake events, or a manually signed local request cannot accept
 the release.
+
+## 内建平台与 Harness 接入
+
+内建平台使用独立声明、schema 与数据库，作为 Harness 的上游与 GitHub 并列。
+`braid platform init/serve/import` 管理平台；`braid init` 只声明 Harness 执行环境
+与 `[builtin]` repository/endpoint，不创建 GitHub App 或保存 API key 值。
+平台 source 与默认分支独立绑定，不能通过修改 endpoint 静默切换空间身份。
+
+Harness 配置 schema 3 选择 `[github]` 或 `[builtin]`。原 GitHub schema 2 声明
+继续有效，旧 `[local]` 明确拒绝，并给出显式平台导入指引。导入前停止旧进程
+和写入入口，核实在途意图；保留原数据库、对象身份、事件及对象回执。Harness
+数据库迁移至 schema 6，平台此后使用自己的 schema，不读取执行表。迁移及
+启动命令见[内建平台指南](../user-manual/local.md)。
+
+平台当前 schema 2 持有自己的嵌入迁移名称与 SHA-256 校验。旧平台 schema 1
+在启动时先备份再向前升级，保留空间身份、对象和回执；不通过重建空库升级。
+未知版本或迁移校验不一致明确拒绝。历史候选与合并提交保留平台专属 Git 引用，
+避免工作分支移动或清理后丢失已接受的提交。
+
+两个上游经过同一 Harness 运行入口、lease、调度和 Group/provider 停止合同。
+内建 adapter 使用 HTTP 平台接口，事件 cursor 和 grant 能力保留在 Harness
+ledger；平台不为每个消费者修改事件。`--transport-only` 接入对象事件和队列，
+不启动原生模型会话。GitHub 专属命令在内建上游明确拒绝。
+
+Agent 子进程取得 `BRAID_CONFIG` 与 `BRAID_AGENT`，对象 gateway 通过专属 cwd、
+当前 assignment/session/turn 选择有效 grant；平台提交事务核验授权版本。撤销
+失败传播并阻断执行替换，不把一次 gateway 读取当作提交时仍有效的证明。同
+账户进程不是安全沙箱的隔离对手。平台对象、provider history 与 Git 资料保留
+各自身份和数据库，停止 Harness 不删除平台。
+
+## Braid Collector 与 Console
+
+`braid console` 提供 loopback OTLP HTTP/protobuf、独立原始证据库和内嵌 Web。
+`--config` 可连接任一上游的 Harness；`--platform-config` 可便捷托管独立平台，
+也可只配置平台而不配置 Harness。对象操作经过固定平台 API，执行 snapshot
+只读 Harness ledger，runtime manager 持有真实任务与启停回执。Console 不走
+CLI 子进程，也不由 OTLP 重建权威。停止 Harness 后平台和 Collector 继续在线。
+使用方法和未确认停止的处置见[Console 指南](../user-manual/console.md)。
+
+平台命令回执属于平台数据库，启停回执属于 Harness。普通对象变更、事件和
+回执原子提交，Git 候选保留自己的意图与 ref CAS。监督器等待所有 Group/provider
+停止结果，任何未确认停止进入 blocked 并禁止替代启动。Console 可在同进程
+装配三项职责，但不因此合并权威，亦不提供进程级故障隔离。
+
+真实指标使用低基数标签：runtime 观察代次开始/结束次数、provider 生命周期事件计数、接纳到
+终态的单调时钟观察时长，以及 provider payload 的采样和关联覆盖计数。时长是
+观察区间，Unknown 不是停止证明；没有原生 usage 事实时不推测 token 或费用。
+
+OTLP 信号接口的失败响应按[协议规范](https://opentelemetry.io/docs/specs/otlp/#failures)
+使用 protobuf Status；正常批次因存储不可用不能接受时返回 503，让 exporter 可以
+重试。成功响应只表示持久接收，不承诺 Exactly Once；Web 查询和控制错误另用
+JSON，避免浏览器把诊断响应当作业务回执。

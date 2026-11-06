@@ -227,18 +227,26 @@ pub async fn probe_public_webhook(config: &Config, url: &str) -> Result<()> {
     if secret.is_empty() {
         bail!("GitHub webhook secret must not be empty");
     }
-    let repository = config.github.repository.parse::<RepositoryName>()?;
-    let github = GitHubClient::connect(&config.github, &repository).await?;
+    let repository = config.repository().parse::<RepositoryName>()?;
+    let github = GitHubClient::connect(config.github()?, &repository).await?;
     signed_public_probe(
         url,
         secret.as_bytes(),
-        &config.github.repository,
+        config.repository(),
         &github.identity().repository_node_id,
     )
     .await
 }
 
 pub(crate) async fn restore_webhook(github: &GitHubClient, prior: &AppWebhookConfig) -> Result<()> {
-    github.update_app_webhook(&prior.url, None).await?;
+    // Shutdown must stay bounded: on an unavailable network this request would
+    // otherwise hang until the OS TCP timeout and stall service stop.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        github.update_app_webhook(&prior.url, None),
+    )
+    .await
+    .context("restoring the prior App webhook timed out")?
+    .context("cannot restore the prior App webhook")?;
     Ok(())
 }

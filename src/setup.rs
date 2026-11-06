@@ -16,21 +16,20 @@ use axum::{
     routing::get,
 };
 use rand::Rng as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::cli::SetupArguments;
 
-mod discovery;
+pub(crate) mod discovery;
 mod logo;
 
+use crate::config::LlmProvider;
 use crate::config::{
     CONFIG_SCHEMA_VERSION, Config, GitHubConfig, LogFormat, Profile, ProfileSelection,
-    ProviderSecretFile, RuntimeConfig, RuntimeEntry, SchedulerConfig, ServerConfig,
-    TelemetryConfig, ToolConfig,
+    RuntimeConfig, RuntimeEntry, SchedulerConfig, ServerConfig, TelemetryConfig, ToolConfig,
 };
-use crate::config::{LlmAllowance, LlmModel, LlmProvider};
 use crate::home::{InstanceEntry, UserHome, allocate_server_ports, validate_instance_key};
 
 #[allow(dead_code)]
@@ -50,6 +49,56 @@ struct CallbackState {
     state: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetupDraft {
+    repository: String,
+    instance_key: String,
+    state: String,
+}
+
+fn save_setup_draft(user_home: &UserHome, draft: &SetupDraft) -> Result<PathBuf> {
+    let directory = user_home.setup_drafts_dir();
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("cannot create setup draft directory {}", directory.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = fs::metadata(&directory)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&directory, permissions)?;
+    }
+    let path = user_home.setup_draft_path(&draft.instance_key);
+    write_secret(&path, toml::to_string(draft)?.as_bytes())?;
+    Ok(path)
+}
+
+fn load_setup_draft(user_home: &UserHome, instance_key: &str) -> Result<SetupDraft> {
+    let path = user_home.setup_draft_path(instance_key);
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("cannot read pending setup draft {}", path.display()))?;
+    toml::from_str(&text)
+        .with_context(|| format!("cannot parse pending setup draft {}", path.display()))
+}
+
+fn callback_code_from_url(raw_url: &str, draft: &SetupDraft) -> Result<String> {
+    let url = url::Url::parse(raw_url).context("callback URL is not a valid absolute URL")?;
+    let mut code = None;
+    let mut state = None;
+    for (name, value) in url.query_pairs() {
+        match name.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    let state = state.context("callback URL is missing state")?;
+    if state != draft.state {
+        bail!("callback URL state does not match the pending setup draft");
+    }
+    code.filter(|code| !code.is_empty()).context("callback URL is missing code")
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn run(arguments: SetupArguments) -> Result<()> {
     let user_home = UserHome::resolve(Some(&arguments.user_home))?;
@@ -63,6 +112,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     println!("Target repository: {owner}/{repo}");
     let instance_key = arguments.instance.clone().unwrap_or_else(|| owner.to_lowercase());
     validate_instance_key(&instance_key)?;
+    reject_non_pi_llm_options(&arguments)?;
 
     let mut registry = user_home.load_registry()?;
     let instance_dir = user_home.instance_dir(&instance_key);
@@ -73,11 +123,31 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         );
     }
 
-    let state = random_hex(16);
+    let pending_draft = if arguments.callback_url.is_some() {
+        let draft = load_setup_draft(&user_home, &instance_key)?;
+        if draft.repository != arguments.repository || draft.instance_key != instance_key {
+            bail!("pending setup draft does not match this repository and instance");
+        }
+        Some(draft)
+    } else {
+        None
+    };
+    let state = pending_draft.as_ref().map_or_else(|| random_hex(16), |draft| draft.state.clone());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    let redirect_url = format!("http://127.0.0.1:{port}/callback");
+    let listener = if arguments.callback_url.is_none() {
+        Some(tokio::net::TcpListener::bind("127.0.0.1:0").await?)
+    } else {
+        None
+    };
+    let redirect_url = listener.as_ref().map_or_else(
+        || "http://127.0.0.1/callback".to_owned(),
+        |listener| {
+            format!(
+                "http://127.0.0.1:{}/callback",
+                listener.local_addr().expect("bound listener").port()
+            )
+        },
+    );
 
     let manifest = json!({
         "name": format!("braid-of-{owner}"),
@@ -89,9 +159,11 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         "default_events": [
             "issues",
             "issue_comment",
+            "issue_dependencies",
             "pull_request",
             "pull_request_review",
-            "pull_request_review_comment"
+            "pull_request_review_comment",
+            "pull_request_review_thread"
         ],
         "default_permissions": {
             "metadata": "read",
@@ -112,6 +184,12 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     };
 
     if arguments.no_browser {
+        let draft = SetupDraft {
+            repository: arguments.repository.clone(),
+            instance_key: instance_key.clone(),
+            state: state.clone(),
+        };
+        let draft_path = save_setup_draft(&user_home, &draft)?;
         let html_path = write_manifest_html(&form_action, &manifest_json)?;
         print_manual_guide(
             &arguments.repository,
@@ -122,29 +200,45 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
             html_path.as_os_str().to_str().unwrap_or(""),
             &manifest_json,
         );
+        println!("Saved pending setup state to: {}", draft_path.display());
         return Ok(());
     }
 
-    let html_path = write_manifest_html(&form_action, &manifest_json)?;
+    let model = arguments
+        .model
+        .clone()
+        .context("setup requires --model when writing an instance configuration")?;
+    let llm_provider = select_llm_provider(&arguments, &model)?;
+    ensure_setup_tools()?;
 
-    let shared = Arc::new(Mutex::new(CallbackState::default()));
-    let app = Router::new()
-        .route("/callback", get(callback))
-        .route("/", get(|| async { Html("<h1>Waiting for GitHub redirect...</h1>") }))
-        .with_state(Arc::clone(&shared));
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(tokio::time::sleep(Duration::from_secs(300)))
-            .await;
-    });
+    let code = if let Some(callback_url) = &arguments.callback_url {
+        callback_code_from_url(callback_url, pending_draft.as_ref().expect("callback draft"))?
+    } else {
+        let html_path = write_manifest_html(&form_action, &manifest_json)?;
+        let listener = listener.expect("browser setup listener");
+        let shared = Arc::new(Mutex::new(CallbackState::default()));
+        let app = Router::new()
+            .route("/callback", get(callback))
+            .route("/", get(|| async { Html("<h1>Waiting for GitHub redirect...</h1>") }))
+            .with_state(Arc::clone(&shared));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(tokio::time::sleep(Duration::from_secs(300)))
+                .await;
+        });
 
-    println!("\nOpening browser to create the GitHub App...");
-    open_browser(html_path.as_os_str().to_str().unwrap_or(""))?;
-    println!("If the browser did not open, open this file manually:\n{}\n", html_path.display());
+        println!("\nOpening browser to create the GitHub App...");
+        open_browser(html_path.as_os_str().to_str().unwrap_or(""))?;
+        println!(
+            "If the browser did not open, open this file manually:\n{}\n",
+            html_path.display()
+        );
 
-    println!("Waiting for GitHub to redirect back with the manifest code...");
-    let code = wait_for_code(shared).await?;
-    server.abort();
+        println!("Waiting for GitHub to redirect back with the manifest code...");
+        let code = wait_for_code(shared, &state).await?;
+        server.abort();
+        code
+    };
 
     println!("Exchanging manifest code for App credentials...");
     let app: AppConversion = gh_api_json(&format!("app-manifests/{code}/conversions"), Some(""))
@@ -173,26 +267,18 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     let webhook_toml = format!("webhook_secret = {webhook_secret:?}\n");
     write_secret(&secrets_path, webhook_toml.as_bytes())?;
 
-    let provider_secret_path =
-        write_provider_secret(&user_home, &runtime.adapter_type, &arguments.api_key_environment)?;
-
-    let llm_provider = build_llm_provider(
-        &runtime.adapter_type,
-        &arguments.model,
-        &arguments.api_key_environment,
-        &provider_secret_path,
-    );
-
     let config_path = base_dir.join("config.toml");
     let mut config = build_config(
         &base_dir,
         app.id,
         &instance_key,
         &arguments,
+        &model,
+        arguments.reasoning.as_deref(),
         &pem_path,
         &secrets_path,
         runtime,
-        llm_provider,
+        llm_provider.clone(),
     )?;
     config.server.ingress = ingress;
     config.server.health = health;
@@ -210,8 +296,8 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
             source.display()
         );
     }
-    let runtime_home = base_dir.join("provider").join(&arguments.provider);
-    bootstrap_provider_home(&runtime_home, &arguments.provider)?;
+    let runtime_home = base_dir.join("provider").join(&arguments.adapter);
+    bootstrap_provider_home(&runtime_home, &arguments.adapter)?;
 
     let config_text = toml::to_string(&config).context("cannot serialize generated config")?;
     write_secret(&config_path, config_text.as_bytes())?;
@@ -220,7 +306,12 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
 
     println!("\nWrote configuration to: {}", config_path.display());
     println!("Wrote instance secrets to: {}", secrets_path.display());
-    println!("Wrote provider secret to: {}", provider_secret_path.display());
+    if let Some(provider) = &llm_provider
+        && let Some(credential) = &provider.credential
+        && let Some(file) = &credential.file
+    {
+        println!("Using provider credential ({:?}): {}", credential.kind, file.display());
+    }
     println!("\nNext, install the App on {}:\n{}\n", arguments.repository, install_url(&app.slug));
     println!(
         "Then run:\n  braid doctor --instance {instance_key}\n  braid serve --instance {instance_key} --tunnel\n"
@@ -249,6 +340,13 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         Err(error) => {
             eprintln!("Could not generate App logo: {error}");
         }
+    }
+
+    if arguments.callback_url.is_some() {
+        let draft_path = user_home.setup_draft_path(&instance_key);
+        fs::remove_file(&draft_path).with_context(|| {
+            format!("cannot remove completed setup draft {}", draft_path.display())
+        })?;
     }
 
     Ok(())
@@ -280,8 +378,13 @@ fn print_manual_guide(
     println!("Manifest JSON:\n{manifest_json}\n");
     println!(
         "Because `--no-browser` runs no local callback server, the browser redirect\n\
-         to the manifest's redirect_url will fail to load. That is expected: copy the\n\
-         `code` query parameter from the failing address bar, then exchange it:\n\n\
+         to the manifest's redirect_url will fail to load. That is expected. Copy the\n\
+         complete failing URL, then finish setup on this machine with the same options\n\
+         and `--callback-url` instead of `--no-browser`:\n\n\
+            braid setup {repository} --callback-url '<complete-redirect-url>'\n\n\
+         The pending setup draft proves the state value; Braid rejects a mismatched\n\
+         callback instead of converting the wrong App. Manual App credential import\n\
+         remains available below for recovery:\n\n\
             gh api -X POST app-manifests/<code>/conversions\n\n\
          The JSON response contains the App's `id`, `slug`, and `pem` (private key).\n"
     );
@@ -356,11 +459,14 @@ async fn callback(
     )
 }
 
-async fn wait_for_code(state: Arc<Mutex<CallbackState>>) -> Result<String> {
+async fn wait_for_code(state: Arc<Mutex<CallbackState>>, expected_state: &str) -> Result<String> {
     for _ in 0..3000 {
         {
             let guard = state.lock().await;
             if let Some(code) = guard.code.clone() {
+                if guard.state.as_deref() != Some(expected_state) {
+                    bail!("GitHub App manifest callback state does not match this setup");
+                }
                 return Ok(code);
             }
         }
@@ -441,33 +547,30 @@ fn write_secret(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 async fn select_runtime(arguments: &SetupArguments) -> Result<RuntimeEntry> {
-    if let Some(api_url) = &arguments.runtime_api_url {
-        return discovery::from_api_url(&arguments.provider, api_url.clone());
-    }
     if let Some(executable) = &arguments.runtime_executable {
-        return discovery::from_executable(&arguments.provider, executable).await;
+        return discovery::from_executable(&arguments.adapter, executable).await;
     }
 
-    let candidates = discovery::discover(&arguments.provider).await?;
+    let candidates = discovery::discover(&arguments.adapter).await?;
     if candidates.is_empty() {
         eprintln!(
             "No {} runtime found on this machine.\n\n{}",
-            arguments.provider,
-            discovery::install_hint(&arguments.provider)
+            arguments.adapter,
+            discovery::install_hint(&arguments.adapter)
         );
-        bail!("setup requires a {} runtime; install it and re-run", arguments.provider);
+        bail!("setup requires a {} runtime; install it and re-run", arguments.adapter);
     }
 
     let chosen = if candidates.len() == 1 {
         println!(
             "Found one {} runtime: {} ({})",
-            arguments.provider,
+            arguments.adapter,
             candidates[0].executable.display(),
             candidates[0].source
         );
         candidates.into_iter().next().expect("one candidate")
     } else {
-        println!("Found {} {} runtimes:", candidates.len(), arguments.provider);
+        println!("Found {} {} runtimes:", candidates.len(), arguments.adapter);
         for (index, candidate) in candidates.iter().enumerate() {
             println!(
                 "  [{}] {} ({}) version {}",
@@ -493,72 +596,85 @@ async fn select_runtime(arguments: &SetupArguments) -> Result<RuntimeEntry> {
 
     discovery::verify(chosen)
         .await
-        .with_context(|| format!("cannot verify {} runtime", arguments.provider))
+        .with_context(|| format!("cannot verify {} runtime", arguments.adapter))
 }
 
-fn provider_secret_path(user_home: &UserHome, adapter_type: &str) -> PathBuf {
-    let provider_id = if adapter_type == "codex" { "openai" } else { "deepseek" };
-    user_home.secrets_dir().join(format!("{provider_id}.toml"))
+fn reject_non_pi_llm_options(arguments: &SetupArguments) -> Result<()> {
+    if arguments.adapter != "pi"
+        && (arguments.llm_provider.is_some()
+            || arguments.llm_credential_kind.is_some()
+            || arguments.llm_credential_file.is_some())
+    {
+        bail!("--llm-provider and --llm-credential-* are only supported for the Pi adapter");
+    }
+    Ok(())
 }
 
-#[allow(clippy::collapsible_if)]
-fn write_provider_secret(
-    user_home: &UserHome,
-    adapter_type: &str,
-    api_key_environment: &str,
-) -> Result<PathBuf> {
-    let path = provider_secret_path(user_home, adapter_type);
-    if let Ok(text) = fs::read_to_string(&path) {
-        if let Ok(file) = toml::from_str::<ProviderSecretFile>(&text) {
-            if !file.provider_api_key.is_empty() {
-                return Ok(path);
-            }
+fn select_llm_provider(arguments: &SetupArguments, model: &str) -> Result<Option<LlmProvider>> {
+    if arguments.adapter != "pi" {
+        reject_non_pi_llm_options(arguments)?;
+        if arguments.llm_base_url.is_some() {
+            bail!("--llm-base-url is only supported for the Pi adapter");
         }
+        return Ok(None);
     }
 
-    let api_key = if adapter_type == "pi" {
-        std::env::var(api_key_environment).with_context(|| {
-            format!(
-                "provider API key environment variable {api_key_environment} must be set during setup, \
-                 or the user secret file {} must already contain provider_api_key",
-                path.display()
-            )
-        })?
-    } else {
-        std::env::var(api_key_environment).unwrap_or_default()
-    };
-    let toml = format!("provider_api_key = {api_key:?}\n");
-    write_secret(&path, toml.as_bytes())?;
-    Ok(path)
+    let id = arguments
+        .llm_provider
+        .clone()
+        .context("Pi setup requires --llm-provider; Braid does not infer one from the adapter")?;
+    let kind = arguments
+        .llm_credential_kind
+        .as_deref()
+        .context("Pi setup requires --llm-credential-kind api_key|oauth|none")
+        .and_then(parse_credential_kind)?;
+    let credential = resolve_credential_arguments(kind, arguments.llm_credential_file.as_deref())?;
+    let base_url = arguments
+        .llm_base_url
+        .clone()
+        .context("Pi setup requires --llm-base-url for models.json derivation")?;
+
+    Ok(Some(LlmProvider {
+        id,
+        credential: Some(credential),
+        base_url: Some(base_url),
+        api: None,
+        protocol: None,
+        api_key_file: None,
+        models: vec![crate::config::LlmModel { id: model.to_owned(), ..Default::default() }],
+        allowances: vec![],
+    }))
 }
 
-fn build_llm_provider(
-    adapter_type: &str,
-    model: &str,
-    api_key_environment: &str,
-    provider_secret_file: &Path,
-) -> LlmProvider {
-    let (id, protocol) = if adapter_type == "codex" {
-        ("openai".to_owned(), "openai".to_owned())
-    } else {
-        ("deepseek".to_owned(), "openai-compatible".to_owned())
-    };
-    LlmProvider {
-        id,
-        protocol,
-        api_key_environment: Some(api_key_environment.to_owned()),
-        api_key_file: Some(provider_secret_file.to_path_buf()),
-        models: vec![LlmModel {
-            model_id: model.to_owned(),
-            input_cost: 0.0,
-            output_cost: 0.0,
-            cache_input_cost: 0.0,
-        }],
-        allowances: vec![LlmAllowance {
-            since: "2026-01-01".to_owned(),
-            until: "2027-01-01".to_owned(),
-            amount: 0.0,
-        }],
+pub(crate) fn parse_credential_kind(value: &str) -> Result<crate::config::CredentialKind> {
+    match value {
+        "api_key" => Ok(crate::config::CredentialKind::ApiKey),
+        "oauth" => Ok(crate::config::CredentialKind::OAuth),
+        "none" => Ok(crate::config::CredentialKind::None),
+        other => bail!("unsupported credential kind {other:?}; expected api_key|oauth|none"),
+    }
+}
+
+pub(crate) fn resolve_credential_arguments(
+    kind: crate::config::CredentialKind,
+    file: Option<&Path>,
+) -> Result<crate::config::ProviderCredential> {
+    match kind {
+        crate::config::CredentialKind::None => {
+            if file.is_some() {
+                bail!("--llm-credential-file is not allowed when --llm-credential-kind is none");
+            }
+            Ok(crate::config::ProviderCredential::none())
+        }
+        crate::config::CredentialKind::ApiKey | crate::config::CredentialKind::OAuth => {
+            let file = file
+                .context("--llm-credential-file is required unless --llm-credential-kind is none")?
+                .canonicalize()
+                .context("cannot resolve LLM credential file")?;
+            let credential = crate::config::ProviderCredential { kind, file: Some(file) };
+            credential.load().context("cannot load LLM credential file")?;
+            Ok(credential)
+        }
     }
 }
 
@@ -568,13 +684,16 @@ fn build_config(
     app_id: u64,
     instance_key: &str,
     arguments: &SetupArguments,
+    model: &str,
+    reasoning: Option<&str>,
     private_key_file: &Path,
     secrets_file: &Path,
     runtime: RuntimeEntry,
-    llm_provider: LlmProvider,
+    llm_provider: Option<LlmProvider>,
 ) -> anyhow::Result<Config> {
     let runtime_version = runtime.version.clone();
     let mut config = Config {
+        finite_run: None,
         schema_version: CONFIG_SCHEMA_VERSION,
         instance: crate::config::InstanceConfig {
             key: instance_key.to_owned(),
@@ -586,27 +705,31 @@ fn build_config(
             worktrees: None,
             auto_migrate: false,
         },
-        github: GitHubConfig {
+        local: None,
+        builtin: None,
+        loaded_from: base_dir.join("config.toml"),
+        github: Some(GitHubConfig {
             app_id,
             repository: arguments.repository.clone(),
+            additional_repositories: vec![],
             handle: "braid".to_owned(),
             api_version: "2022-11-28".to_owned(),
             private_key_file: private_key_file.to_path_buf(),
             webhook_secret_environment: None,
             webhook_secret_file: Some(secrets_file.to_path_buf()),
             projects_v2_enabled: false,
-        },
+        }),
         scheduler: SchedulerConfig {
             quiet_seconds: 30,
             event_threshold: 8,
             reconciliation_seconds: 60,
         },
         runtimes: vec![runtime],
-        llm_providers: vec![llm_provider],
+        llm_providers: llm_provider.clone().into_iter().collect(),
         tools: ToolConfig {
-            git: PathBuf::from(tool_path("git", "/usr/bin/git")),
-            gh: PathBuf::from(tool_path("gh", "/opt/homebrew/bin/gh")),
-            wrangler: PathBuf::from(tool_path("wrangler", "wrangler")),
+            git: required_tool_path("git")?,
+            gh: required_tool_path("gh")?,
+            wrangler: required_tool_path("wrangler")?,
         },
         server: ServerConfig {
             ingress: "127.0.0.1:18080".parse().expect("valid socket address"),
@@ -624,20 +747,19 @@ fn build_config(
             id: "default".to_owned(),
             display_name: "Braid Agent".to_owned(),
             tags: vec!["issue".to_owned(), "pr".to_owned()],
-            adapter_type: arguments.provider.clone(),
+            adapter_type: arguments.adapter.clone(),
             // Pin the profile to the runtime that setup actually discovered:
             // config validation requires adapter_version == runtime.version,
             // so a hardcoded string breaks the moment the local runtime
             // upgrades.
             adapter_version: runtime_version,
-            provider: if arguments.provider == "codex" {
-                "openai".to_owned()
-            } else {
-                "deepseek".to_owned()
-            },
-            model: Some(arguments.model.clone()),
-            reasoning: Some("high".to_owned()),
+            provider: llm_provider.map(|provider| provider.id),
+            repository: None,
+            model: Some(model.to_owned()),
+            reasoning: reasoning.map(str::to_owned),
             user_instructions: "You are Braid, a helpful coding assistant. Work from the supplied GitHub Context, publish concise public comments, and keep descriptions and implementation state current.".to_owned(),
+            skills: Vec::new(),
+            native_template: None,
             workspace: None,
             github_actor_node_id: None,
             status_surfaces: vec!["issue".to_owned(), "pr".to_owned()],
@@ -656,8 +778,9 @@ fn build_config(
 /// Prepare the instance-scoped provider home so the runtime can actually
 /// authenticate. Codex isolates `CODEX_HOME` per instance, so its global
 /// credentials do not apply: import `~/.codex/auth.json` when present,
-/// otherwise print explicit login instructions. Pi authenticates through the
-/// persisted provider API key and needs no home bootstrap.
+/// otherwise print explicit login instructions. Pi uses its explicit model
+/// route and, when declared, its provider API key file; it needs no home
+/// bootstrap.
 /// The instance source checkout: one Git clone of the configured repository,
 /// shared by all Profiles as the worktree provisioning source. Clone when
 /// missing or empty; never overwrite a non-Git directory.
@@ -716,144 +839,15 @@ fn bootstrap_provider_home(home: &Path, adapter_type: &str) -> Result<()> {
     Ok(())
 }
 
-fn tool_path(name: &str, fallback: &str) -> String {
-    which::which(name).map_or_else(|_| fallback.to_owned(), |p| p.to_string_lossy().into_owned())
+fn required_tool_path(name: &str) -> Result<PathBuf> {
+    which::which(name).with_context(|| {
+        format!("{name} executable not found; install {name} before running braid setup")
+    })
 }
 
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use super::*;
-
-    fn args(repo: &str, provider: &str, model: &str) -> SetupArguments {
-        SetupArguments {
-            repository: repo.to_owned(),
-            provider: provider.to_owned(),
-            model: model.to_owned(),
-            api_key_environment: "DEEPSEEK_API_KEY".to_owned(),
-            instance: None,
-            user_home: PathBuf::from("/tmp/braid-setup-test"),
-            runtime_executable: None,
-            runtime_api_url: None,
-            no_browser: false,
-        }
+fn ensure_setup_tools() -> Result<()> {
+    for name in ["git", "gh", "wrangler"] {
+        let _ = required_tool_path(name)?;
     }
-
-    #[test]
-    fn bootstrap_provider_home_is_noop_for_pi() {
-        let dir = std::env::temp_dir().join(format!("braid-pi-home-{:?}", std::process::id()));
-        let dir = dir.with_file_name(format!(
-            "braid-pi-home-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        bootstrap_provider_home(&dir, "pi").expect("pi bootstrap");
-        assert!(dir.is_dir());
-        assert!(!dir.join("auth.json").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn bootstrap_provider_home_respects_existing_codex_auth() {
-        let dir = std::env::temp_dir().join(format!(
-            "braid-codex-home-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("create dir");
-        std::fs::write(dir.join("auth.json"), "{}").expect("seed auth");
-        bootstrap_provider_home(&dir, "codex").expect("codex bootstrap");
-        assert_eq!(std::fs::read_to_string(dir.join("auth.json")).expect("read"), "{}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn generated_config_loads_for_pi() {
-        let home = PathBuf::from("/tmp/braid-setup-test");
-        fs::create_dir_all(&home).unwrap();
-        let webhook_secret_path = home.join("secrets.toml");
-        std::fs::write(&webhook_secret_path, "webhook_secret = \"test\"\n").unwrap();
-        let provider_secret_path = home.join("secrets/deepseek.toml");
-        std::fs::create_dir_all(provider_secret_path.parent().unwrap()).unwrap();
-        std::fs::write(&provider_secret_path, "provider_api_key = \"key\"\n").unwrap();
-        let runtime = RuntimeEntry {
-            adapter_type: "pi".to_owned(),
-            version: "0.84.3".to_owned(),
-            executable: PathBuf::from("/tmp/pi"),
-            api_url: None,
-            home: None,
-            stable_schema_sha256: None,
-            experimental_schema_sha256: None,
-        };
-        let llm_provider =
-            build_llm_provider("pi", "deepseek-chat", "DEEPSEEK_API_KEY", &provider_secret_path);
-        let config = build_config(
-            &home,
-            123_456,
-            "xiaoland",
-            &args("xiaoland/braid", "pi", "deepseek-chat"),
-            &home.join("key.pem"),
-            &webhook_secret_path,
-            runtime,
-            llm_provider,
-        )
-        .expect("config should build");
-        let text = toml::to_string(&config).expect("config should serialize");
-        let parsed: Config = toml::from_str(&text).expect("serialized config should parse");
-        assert_eq!(parsed.schema_version, 2);
-        assert!(!parsed.runtimes.is_empty());
-        assert!(!parsed.llm_providers.is_empty());
-        assert!(!parsed.profiles.is_empty());
-        assert_eq!(parsed.profile_selection.default_pr_profile, "default");
-    }
-
-    #[test]
-    fn generated_config_loads_for_codex() {
-        let home = PathBuf::from("/tmp/braid-setup-test");
-        fs::create_dir_all(&home).unwrap();
-        let webhook_secret_path = home.join("secrets.toml");
-        std::fs::write(&webhook_secret_path, "webhook_secret = \"test\"\n").unwrap();
-        let provider_secret_path = home.join("secrets/openai.toml");
-        std::fs::create_dir_all(provider_secret_path.parent().unwrap()).unwrap();
-        std::fs::write(&provider_secret_path, "provider_api_key = \"key\"\n").unwrap();
-        let runtime = RuntimeEntry {
-            adapter_type: "codex".to_owned(),
-            version: "codex-cli 0.147.0-alpha.6.5".to_owned(),
-            executable: PathBuf::from("/tmp/codex"),
-            api_url: None,
-            home: Some(home.join("provider")),
-            stable_schema_sha256: Some(
-                "7d79fe309dd7520843459070f3884ecf0e39cee2620c1c49aad6efb4eca76ecb".to_owned(),
-            ),
-            experimental_schema_sha256: Some(
-                "a14d4878fe7b8cdd31059dbca11d7167d8cfd06effa2f7991b5364439063a5c8".to_owned(),
-            ),
-        };
-        let llm_provider =
-            build_llm_provider("codex", "gpt-4o", "OPENAI_API_KEY", &provider_secret_path);
-        let config = build_config(
-            &home,
-            123_456,
-            "xiaoland",
-            &args("xiaoland/braid", "codex", "gpt-4o"),
-            &home.join("key.pem"),
-            &webhook_secret_path,
-            runtime,
-            llm_provider,
-        )
-        .expect("codex config should build");
-        let text = toml::to_string(&config).expect("config should serialize");
-        let parsed: Config = toml::from_str(&text).expect("serialized codex config should parse");
-        assert_eq!(parsed.schema_version, 2);
-        assert!(!parsed.runtimes.is_empty());
-        assert!(!parsed.llm_providers.is_empty());
-        assert!(!parsed.profiles.is_empty());
-    }
+    Ok(())
 }

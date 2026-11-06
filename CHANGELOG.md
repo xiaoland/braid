@@ -3,6 +3,84 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
+## [Unreleased]
+
+## [0.3.3] - 2026-10-13
+
+### Changed
+
+- Runtime adapter 与 LLM provider 解耦：`setup`/`init` 使用 `--adapter`
+  选择 Pi/Codex；Pi 需要显式 `--llm-provider` 和 `--model`，仅使用 API key
+  的 route 才需要 `--api-key-file`。Codex 继续使用隔离 provider home，不再
+  生成或引用伪造的 LLM API key 文件。Braid 不再生成硬编码 reasoning、协议
+  或费用配方。
+- Provider 凭据改为显式 `credential = { kind = "api_key" | "oauth" | "none", file }`
+  声明，文件为 Braid schema（`provider_api_key` 或 OAuth token set），不是任何
+  runtime 的文件格式。Pi adapter 在材料化时转换：`api_key` 注入
+  `BRAID_PROVIDER_API_KEY`，`oauth` 渲染 session home 的 `auth.json`，`none`
+  显式 keyless。凭据为静态秘密，内容 hash 进入 Profile 有效版本。
+- 新增 `braid provider import-auth` 一次性把 Pi 原生 `auth.json` 转换进 Braid
+  secrets；runtime home 中的 `auth.json` 一律拒绝并指向该工具。
+- Pi 的 `models.json` 改为由 Pi adapter 从 `llm_providers` 声明派生：`base_url`、
+  可选 `api` 与 `[[llm_providers.models]]` 能力元数据按声明渲染，`apiKey` 仅在
+  `credential.kind = "api_key"` 时出现。模板或 runtime home 中的 `models.json`
+  在 schema 3 被明确拒绝；schema 2 保持旧模板路径可读。
+- `setup`/`init` 不再支持 `--api-key-environment`/`api_key_environment` 与
+  `--api-key-file`/`api_key_file`（schema 3）；改用
+  `--llm-credential-kind` 与 `--llm-credential-file`。schema 2 的旧字段继续
+  惰性兼容。Pi 原生材料统一引用 Braid 管理的进程内 `BRAID_PROVIDER_API_KEY`，
+  旧配置须显式迁移，不会自动导入旧环境变量。
+- 一个 GitHub instance 可以服务多个显式配置的 repository。GitHub App、
+  webhook、进程与 runtime catalogs 共享；Profile、workspace、调度、worktree、
+  mention、outbox、reconcile 和 `pr ensure` 均按 repository 路由。多仓库配置
+  中每个 Profile 必须声明 repository 和显式 workspace，`braid gh pr ensure`
+  必须显式 `--repository`。
+- `setup --no-browser` 改为可完成的 headless 两段流程：保留 pending setup
+  draft，随后用完整 `--callback-url` 完成 App conversion 和 instance 写入；
+  state 不匹配会拒绝。setup 默认 webhook 事件补齐 `issue_dependencies` 和
+  `pull_request_review_thread`，Linux 下不再硬编码 Homebrew `gh` 路径。
+- 新增 `braid assignment reactivate`：对已 blocked 的 open Work Item 显式
+  排队新的 activation generation；不会静默恢复不兼容 Profile session。
+- Release workflow 同时构建 macOS arm64 和 Linux x86_64 预编译产物；doctor
+  的不可达 OTLP endpoint 降级为可选警告，不再阻断本机 runtime readiness。
+
+### Fixed
+
+- dogfood 修复：新增 repository 的首次 reconcile 不再因 repositories 行缺失
+  触发外键失败（begin 时 upsert），无 tracked work item 的仓库跳过空转周期，
+  且任一仓库的 reconcile 失败不再中止其他仓库。
+- GitHub 连接建立改为每步 30 秒有界超时并携带操作上下文，网络故障时启动
+  不再静默挂起数分钟；App webhook 恢复与隧道修复同样有界，systemd 停止
+  不再因断网挂起。
+- `braid profile inspect` 明确标注 models.json 由 `llm_providers` 声明派生，
+  runtime home / template 标签收窄为 settings/agents 来源。
+
+本版本不新增数据库 migration；配置 schema 保持 3。使用旧环境变量字段或
+在 schema 3 的非 Pi Profile 上声明 provider 的配置会被明确拒绝；schema 2
+Codex 配置中的旧 provider 标签及 LLM 协议/费用元数据仅作为惰性迁移字段读取。
+
+## [Unreleased pre-0.3.3]
+
+- 有限 run 的 Issue 指派保留真实执行输入，首次轮次前处理已有 Context reset；普通 serve 指派仍保持空闲会话合同。
+- 受控 Pi background Bash 使用非登录 shell，原生入口移除 BASH_ENV/ENV，工具路径与缓存由实例明确提供。
+- 内建协作的 Harness ledger 写命令先取得 IMMEDIATE 事务准入，纯读仍为 DEFERRED；绑定错误保留账本路径与 SQLite extended code。
+
+- 新增与常驻 `serve` 并列的 `braid run`：从顶层 root Issue 或 description 驱动自主拆分、指派、PR 实现与交付，首版接入独立 built-in 平台。
+- 平台原子保存父子 Issue，冻结 run/client/交付分支边界；范围关闭和 pending 授权撤销保留停止门控。Console 通过共享接口控制 run，支持原输入接续与独立终态展示。
+- Harness schema 7 保存有限运行身份和结果，平台 schema 3 增加任务树与范围授权。配置 schema 保持 3，旧迁移不改写。
+
+- 内建协作平台与 GitHub 作为 Harness 的同层上游。平台独立配置、schema、对象库
+  与 HTTP API，不再依赖 Harness 会话表或 `local` 运行模式。
+- Web Console 属于整个 Braid，集成 OTLP 三信号原始证据与可视化，直接控制任一
+  上游的 Harness，并可便捷托管独立平台；停止 Harness 不关闭平台或 Collector。
+- Harness 自存上游事件游标及写入授权。平台 grant、对象 revision、命令回执与
+  Git 候选意图保留并发和停止边界，过期执行不能继续发布。
+- 配置 schema 3 使用互斥 `[github]` / `[builtin]`；原 GitHub schema 2 配置可继续
+  读取。旧 `[local]` 必须停止后显式导入平台，保留原对象身份、历史与回执。
+- Harness 数据库 schema 6 曾增加接入状态，平台 schema 独立演进。旧迁移保持不可变，
+  新版本使用前须迁移，旧二进制不能读取更新后的 Harness 数据库。
+- 修复输入接纳、首次 Context 持久化、完整错误保存与停止证明不足时的恢复门控。
+
 ## [0.3.2] - 2026-09-19
 
 ### Changed
@@ -333,6 +411,10 @@ Versioning once release artifacts are published.
   `40_context_lifecycle.sh` for the collapsed schema version 1.
 
 ## [Unreleased]
+
+- 新增与常驻 `serve` 并列的 `braid run`：从顶层 root Issue 或 description 驱动自主拆分、指派、PR 实现与交付，首版接入独立 built-in 平台。
+- 平台原子保存父子 Issue，冻结 run/client/交付分支边界；范围关闭和 pending 授权撤销保留停止门控。Console 通过共享接口控制 run，支持原输入接续与独立终态展示。
+- Harness schema 7 保存有限运行身份和结果，平台 schema 3 增加任务树与范围授权。配置 schema 保持 3，旧迁移不改写。
 
 ### Changed
 

@@ -10,15 +10,21 @@ Group 不根据 backend 决定连接数量或故障范围。
 创建结果包含 opaque provider session ID 与中立句柄，store 保存它与 Agent/assignment
 的绑定。Resume 返回同一持久化身份的新句柄，不改变 assignment 或 worktree。
 
+两种上游的 Codex 与 Pi 子进程都取得当前 Harness 配置的绝对路径
+`BRAID_CONFIG` 和 `BRAID_AGENT=1`。原生工具因此使用所属运行的配置，不能因
+GitHub 接入而遗漏路径、继承宿主的其它实例或自行寻找旧运行配置。这提供明确
+绑定，不构成对同账户进程的文件系统隔离。
+
 | Core method | Adapter behavior |
 | --- | --- |
 | `SessionFactory::check()` | 检查 adapter 的启动前置条件；共享运行资源由 adapter 自己维护。 |
 | `SessionFactory::start/resume` | 创建或恢复会话并返回中立句柄。Codex 内部共享 app-server，Pi 每个会话持有独立进程；上层接口相同。 |
-| `send_user_msg(msg, steering)` | Idle 时启动 turn；running 且 steering 时发送 steer；否则返回 Acknowledged，由 queue 保留后续输入。 |
+| `send_user_msg(msg, steering)` | Idle 时申请启动 turn；已知拒收返回 Deferred，queue 保留输入。Acknowledged 只代表原生执行明确接纳，结果不明返回具体 Unknown。 |
+| `steer_user_msg(msg, expected_turn_id)` | 只向已观察且仍匹配的 active turn 投递，不偷换为新 turn；明确拒收返回 Deferred，结果不明保留具体 Unknown。 |
 | `interrupt()` | 尝试停止已观察到的 active turn；terminal 仍通过事件流返回。 |
 | `events()` | 将 provider 的响应与通知去重为 TurnStarted / TurnTerminal；dispatch 前订阅，同一 receiver 随 RunningAgentTurn 交给 driver。失效的 active handle 合成 Unknown，不能伪造失败。 |
 | `is_unavailable()` | 句柄失效后永久返回 true；idle 或晚订阅也可观察。恢复创建新句柄，不复活旧句柄。 |
-| `close()` | 停止使用该句柄，尝试 interrupt，取消监听并释放资源；不能影响其他会话。 |
+| `close()` | 确认所属执行停止后释放资源；失败保留句柄与具体原因，阻断替代执行，不能影响其它会话。 |
 
 具体 `AgentProvider` 接口只在 adapter 内使用。共享 Codex 进程退出会使其所有
 句柄失效；独立 Pi 进程退出只影响所属句柄。释放旧句柄会取消旧监听任务，
@@ -117,6 +123,61 @@ Only `turn/completed` is terminal. Its status is
 retryable and is not terminal. Disconnect without a terminal leaves the turn
 unknown. Provider terminal state never proves product success.
 
+Pi 通过 `--append-system-prompt` 注入 Braid 与 Profile 指令，保留核心默认系统提示。
+`message_end` 只更新最近一条 assistant 消息的 `stopReason`，不结束 turn；Pi 仍可能
+持久化、压缩或重试。Adapter 等待 `agent_settled`，只有最终 `stopReason=stop` 才报告
+completed；`length`、错误或缺少停止原因均报告 failed。每次 `agent_start` 清空上一轮
+停止原因，避免沿用旧 turn 的成功状态。
+Pi 1.1.0 的原生 settled `aborted=true` 报告 interrupted；消费端也识别保留的旧材料
+`cancelled=true` 与外部 Pi 的 `stopReason=aborted`，供关闭和 Context reset 保存实际中断结果。
+
+Pi 的初始 GitHub Context 是用户数据，仅在尚未进入原生历史时随首条输入送入；
+后续 turn 不重复拼接 Braid/Profile 指令或这份 Context。由于 Pi 的 RPC 没有持久
+注入接口，会话路径也可能在首次 prompt 前尚未落盘，Braid 在原生 session 文件旁
+保存 `.braid-context` 固定初始输入。保存成功才完成 Context 物化；恢复时核对原生
+session 身份和 `get_entries` 的当前分支祖先中的实际 user message，决定是否仍需
+注入。工具引用、其它分支或 ACK 本身都不证明消费；无法核对时明确失败。旁文件
+不是新的当前 Context 权威，也不据此重发结果未知的事件输入。
+
+Pi 的锁定原生材料由 `native/pi/` 交付，CLI 与 RPC 使用同一安装入口。
+受管材料通过 Pi 根包的公开 SDK 创建 runtime，Braid 自有 host 接线负责材料边界、
+受控 Bash 和推理交接；标准 RPC 与 print 仍由 Pi 的公开实现处理。
+实际运行握手的版本来自已加载 SDK 的 VERSION，能力来自 host 实现，不能回显
+manifest 的声明来冒充实际能力。Rust 将实际版本与冻结 manifest 核对。
+周期 readiness 仅检查可执行入口与凭据，不重复遍历整份安装的文件哈希。
+每次新建或恢复物理 Pi 前，以及显式 doctor，仍完整校验材料；readiness 成功
+不能当作安装目录当前完整性证明。
+`RuntimeEntry.native_runtime` 指向相邻 `runtime-manifest.json`；adapter 在启动前
+核对所有声明文件、入口与固定 Node 的 SHA-256，启动后通过 `get_state` 核对当前
+execution ID 和实际生命周期能力。`doctor` 的静态材料检查不能代替这个 live 握手。
+外部 Pi 保留基础接入，关闭环境自动扩展发现；需要插件共同合同时必须使用声明材料，
+不能继承宿主的未锁定插件。
+
+Pi 1.1.0 的 session observer 提供 `agent_end.willRetry`；扩展不依赖该字段，
+改在公开的 `agent_before_settle` 边界完成结果交接，该边界位于自动重试和压缩之后。
+自有接线保留 extension_error，最终终态仍以原生 settled 为准。
+最终模型错误后，尚未消费的 steering/follow-up 输入先保存到原生历史的 Braid
+custom entry，再从 Pi 队列移出，阻止错误后自主推理；下次明确输入前恢复这些义务。
+保存或恢复失败须报告具体错误并阻断继续。终态扩展 hook 失败会请求公开 abort，
+保留错误触发停止的独立事实；原始 aborted 标记不改写，错误事实仍优先判 failed。
+插件不能自行越过 Braid 发起下一轮推理；后台有限工作
+和长期服务分别登记，结果未被消费时仍属于 busy。异步 subagent 的返回必须等待
+真实 child 启动回执；runner PID 不等于 child 已启动，启动失败保留具体原因和
+清理结果。Core 的 turn idle 不代表 managed
+execution 静止，长期服务 busy 也不统一阻断普通输入。
+
+每次 Pi 物理启动取得新的 execution/start ID，所属工作目录下的
+`.braid/native-executions/<execution-id>` 保存进程登记、结果和停止回执。
+锁定材料关闭先请求 owned stop，再释放 stdin 发送 EOF、等待父进程，最后用固定 Node
+执行同一材料的离线清理并核对 exact execution 回执。Mac 与 Linux 都核对 OS 出生身份、
+登记进程组和继承 execution 标记；身份或停止范围不明时返回 unknown。
+这不构成安全沙箱，也不追踪主动擦除标记、脱离登记范围的进程或撤销已发出的外部请求。
+外部基础 Pi 仍使用 abort 与父退出依据，不声称具备插件后代清理合同。
+
+Codex 关闭保留共享 app-server，只接受目标 turn 的确定终态作为停止依据。
+停止失败向 Group 返回具体错误，不能吞掉错误后仅凭数据库 fence 启动替代会话。
+强制清理成功保留原关闭失败，不能改写为正常停止。
+
 Braid does not publish item/delta/tool/reasoning/assistant activity to GitHub.
 Those protocol events are retained only in sampled full-fidelity telemetry and
 provider-owned history. Agent public prose is created by the Agent through
@@ -126,8 +187,11 @@ GitHub.
 
 `thread/resume` is used only after transport/process restart when the persisted
 physical thread ID, Context Revision, effective instruction revision, Profile
-revision, cwd, and sandbox remain compatible. If any differs, Braid executes
-the normal fresh-session Context materialization path. An empty thread that has
+revision and cwd remain compatible. A persisted Profile or instruction revision
+mismatch blocks resume with an Operational Status update; it does not silently
+start a replacement under new materials. Context changes use the normal
+fresh-session Context materialization path after the old execution is stopped.
+An empty thread that has
 not yet materialized a rollout is not considered resumable; assignment startup
 must complete context injection before the session becomes `idle`.
 

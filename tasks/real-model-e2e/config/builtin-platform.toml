@@ -1,0 +1,7 @@
+schema_version = 1
+repository = "braid-poc-test"
+source = "/Volumes/WorkSSD/Development/braid-e2e/source/builtin"
+default_branch = "main"
+database = "/Volumes/WorkSSD/Development/braid-e2e/platform/state/platform.sqlite3"
+backups = "/Volumes/WorkSSD/Development/braid-e2e/platform/backups"
+listen = "127.0.0.1:18282"

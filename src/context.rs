@@ -38,13 +38,13 @@ pub enum ContextError {
     InvalidPageSize(usize),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Actor {
     pub node_id: String,
     pub login: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItemReference {
     pub node_id: String,
     pub repository_node_id: String,
@@ -62,30 +62,35 @@ impl WorkItemReference {
             WorkItemKind::Issue => "Issue",
             WorkItemKind::PullRequest => "PR",
         };
-        format!("GitHub {noun}: {}#{}", self.repository, self.number)
+        format!(
+            "{} {noun}: {}#{}",
+            surface_name(&self.repository_node_id),
+            self.repository,
+            self.number
+        )
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkItemKind {
     Issue,
     PullRequest,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectEntry {
     pub title: String,
     pub fields: Vec<ProjectField>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectField {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommentSnapshot {
     pub node_id: String,
     pub database_id: String,
@@ -101,7 +106,7 @@ pub struct CommentSnapshot {
     pub deleted: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssueSnapshot {
     pub node_id: String,
     pub database_id: String,
@@ -129,7 +134,7 @@ pub struct IssueSnapshot {
     pub comments: Vec<CommentSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewSnapshot {
     pub node_id: String,
     pub database_id: String,
@@ -142,7 +147,7 @@ pub struct ReviewSnapshot {
     pub minimized_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewThreadSnapshot {
     pub node_id: String,
     pub path: String,
@@ -155,7 +160,7 @@ pub struct ReviewThreadSnapshot {
     pub comments: Vec<CommentSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequestSnapshot {
     pub node_id: String,
     pub database_id: String,
@@ -182,14 +187,14 @@ pub struct PullRequestSnapshot {
     pub review_threads: Vec<ReviewThreadSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CanonicalContext {
     Issue(IssueSnapshot),
     PullRequest(PullRequestSnapshot),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextPressure {
     Normal,
@@ -197,7 +202,7 @@ pub enum ContextPressure {
     Hard,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderedContext {
     pub text: String,
     pub revision: String,
@@ -799,8 +804,20 @@ fn deleted_comment(
     }
 }
 
+fn surface_name(repository_node_id: &str) -> &'static str {
+    if repository_node_id.starts_with("local:") { "Braid" } else { "GitHub" }
+}
+
 fn render_issue(output: &mut String, issue: &IssueSnapshot, complete: bool) {
-    push_line(output, &format!("# GitHub Issue: {}#{}", issue.repository, issue.number));
+    push_line(
+        output,
+        &format!(
+            "# {} Issue: {}#{}",
+            surface_name(&issue.repository_node_id),
+            issue.repository,
+            issue.number
+        ),
+    );
     push_line(output, &issue.title);
     output.push('\n');
     push_state(output, &issue.state, issue.state_reason.as_deref());
@@ -832,13 +849,22 @@ fn render_issue(output: &mut String, issue: &IssueSnapshot, complete: bool) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_pull_request(output: &mut String, pull_request: &PullRequestSnapshot) {
     for issue in &pull_request.associated_issues {
         let complete = !issue.state.eq_ignore_ascii_case("closed");
         render_issue(output, issue, complete);
         output.push_str("\n---\n\n");
     }
-    push_line(output, &format!("# GitHub PR: {}#{}", pull_request.repository, pull_request.number));
+    push_line(
+        output,
+        &format!(
+            "# {} PR: {}#{}",
+            surface_name(&pull_request.repository_node_id),
+            pull_request.repository,
+            pull_request.number
+        ),
+    );
     push_line(output, &pull_request.title);
     output.push('\n');
     push_line(output, &format!("State: {}", pull_request.state.to_ascii_lowercase()));

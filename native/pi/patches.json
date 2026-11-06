@@ -1,0 +1,70 @@
+[
+  {
+    "package": "@earendil-works/pi-coding-agent",
+    "path": "patches/pi-1.1.0-compaction-threshold.patch",
+    "targets": [
+      "dist/core/compaction/compaction.js",
+      "dist/core/compaction/compaction.d.ts",
+      "dist/core/settings-manager.js",
+      "dist/core/settings-manager.d.ts"
+    ]
+  },
+  {
+    "package": "@earendil-works/pi-ai",
+    "path": "patches/pi-ai-1.1.0-connection-reset.patch",
+    "targets": [
+      "dist/utils/retry.js"
+    ]
+  },
+  {
+    "package": "pi-subagents",
+    "path": "patches/pi-subagents-0.56.0-braid.patch",
+    "targets": [
+      "src/extension/index.ts",
+      "src/runs/background/async-execution.ts",
+      "src/runs/background/notify.ts",
+      "src/runs/background/result-watcher.ts",
+      "src/runs/background/stale-run-reconciler.ts",
+      "src/runs/background/subagent-runner.ts",
+      "src/runs/background/subagent-wait.ts",
+      "src/runs/foreground/execution.ts",
+      "src/runs/foreground/subagent-executor.ts",
+      "src/runs/shared/model-exclusions.ts",
+      "src/runs/shared/model-fallback.ts",
+      "src/runs/shared/pi-args.ts",
+      "src/runs/shared/session-lease.ts",
+      "src/shared/types.ts",
+      "src/shared/utils.ts",
+      "src/runs/shared/external-job-bridge.ts",
+      "src/runs/background/async-retention.ts",
+      "src/missions/workflow-state.ts"
+    ],
+    "plugin": "subagents"
+  },
+  {
+    "package": "pi-background-bash",
+    "path": "patches/pi-background-bash-1.0.5-braid.patch",
+    "targets": [
+      "bin/pbb.js",
+      "extensions/background-bash.ts",
+      "skills/pbb/SKILL.md"
+    ],
+    "plugin": "background"
+  },
+  {
+    "package": "@upstash/context7-pi",
+    "path": "patches/context7-pi-0.1.2-errors.patch",
+    "targets": [
+      "lib/api.ts"
+    ],
+    "plugin": "context7"
+  },
+  {
+    "package": "mcporter",
+    "path": "patches/mcporter-0.14.0-owned-service.patch",
+    "targets": [
+      "dist/daemon/launch.js"
+    ],
+    "plugin": "mcporter"
+  }
+]

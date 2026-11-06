@@ -17,7 +17,7 @@ use crate::{
 pub(crate) struct IngressState {
     pub(crate) store: Arc<StoreActor>,
     pub(crate) policy: SchedulerPolicy,
-    pub(crate) repository: String,
+    pub(crate) repositories: Vec<String>,
     pub(crate) handle: String,
     pub(crate) app_actor_node_id: String,
     pub(crate) app_actor_login: String,
@@ -40,7 +40,7 @@ pub(crate) async fn webhook_handler(
         },
         &body,
         &state.webhook_secret,
-        &state.repository,
+        &state.repositories,
         &state.handle,
         webhook::ActorPolicy {
             app_node_id: &state.app_actor_node_id,

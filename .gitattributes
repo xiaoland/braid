@@ -1,0 +1,2 @@
+# Unified patches retain upstream context markers and indentation.
+native/pi/patches/*.patch -whitespace

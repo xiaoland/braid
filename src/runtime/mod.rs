@@ -1,5 +1,9 @@
 #![allow(clippy::large_futures)]
-use std::sync::{Arc, Mutex as StdMutex};
+mod builtin;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex as StdMutex},
+};
 
 use anyhow::{Context as _, Result, bail};
 use axum::{
@@ -49,9 +53,79 @@ impl Drop for RuntimeLeaseGuard {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+pub(crate) fn initial_health(config: &Config, provider_enabled: bool) -> HealthSnapshot {
+    if config.is_builtin() {
+        return builtin::initial_health(config, provider_enabled);
+    }
+    HealthSnapshot {
+        ready: false,
+        ingress: config.server.ingress.to_string(),
+        repository: config.github_repositories().join(", "),
+        tunnel: "disabled",
+        webhook_url: None,
+        reconciliation: "starting",
+        provider: if provider_enabled { "starting" } else { "disabled" },
+        last_error: None,
+    }
+}
+
 pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -> Result<()> {
+    if config.is_builtin() && quick_tunnel {
+        bail!("built-in upstream does not use a GitHub webhook tunnel");
+    }
     let telemetry = TelemetryGuard::install(&config.telemetry, config.instance_key())?;
+    let generation = Uuid::now_v7().to_string();
+    crate::telemetry::set_runtime_generation(Some(generation.clone()));
+    let health = Arc::new(RwLock::new(initial_health(&config, provider_enabled)));
+    let (stop, shutdown) = watch::channel(false);
+    let mut runtime = Box::pin(async move {
+        if config.is_builtin() {
+            serve_managed(config, provider_enabled, shutdown, health).await
+        } else {
+            serve_github_managed(config, quick_tunnel, provider_enabled, shutdown, health).await
+        }
+    });
+    let result = tokio::select! {
+        result=&mut runtime=>result,
+        signal=wait_for_shutdown_signal()=>{let _=stop.send(true);signal.and(runtime.await)}
+    };
+    tracing::info!(name="braid.runtime.stop",braid.runtime.generation=%generation,braid.runtime.stop_confirmed=result.is_ok(),braid.runtime.error=result.as_ref().err().map(|error|format!("{error:#}")).as_deref().unwrap_or(""),"standalone runtime ended");
+    crate::telemetry::set_runtime_generation(None);
+    match (result, telemetry.shutdown()) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Err(error), Err(exporter)) => {
+            Err(error.context(format!("telemetry shutdown also failed: {exporter}")))
+        }
+    }
+}
+
+pub(crate) async fn serve_managed(
+    config: Config,
+    provider_enabled: bool,
+    stop: watch::Receiver<bool>,
+    health: Arc<RwLock<HealthSnapshot>>,
+) -> Result<()> {
+    if config.is_builtin() {
+        builtin::serve_managed(config, provider_enabled, stop, health).await
+    } else {
+        serve_github_managed(config, false, provider_enabled, stop, health).await
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn serve_github_managed(
+    config: Config,
+    quick_tunnel: bool,
+    provider_enabled: bool,
+    mut external_stop: watch::Receiver<bool>,
+    health: Arc<RwLock<HealthSnapshot>>,
+) -> Result<()> {
+    if *external_stop.borrow() {
+        return Ok(());
+    }
+    *health.write().await = initial_health(&config, provider_enabled);
     let store = Arc::new(StoreActor::start(
         config.runtime.database().to_path_buf(),
         config.runtime.backups().to_path_buf(),
@@ -68,22 +142,47 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
             );
         }
     }
+    let connection = rusqlite::Connection::open_with_flags(
+        config.runtime.database(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let local_space: i64 =
+        connection.query_row("SELECT COUNT(*) FROM local_space", [], |row| row.get(0))?;
+    if local_space != 0 {
+        bail!(
+            "this database contains legacy collaboration objects; import them into the built-in platform and use a separate Harness ledger for GitHub"
+        );
+    }
+    drop(connection);
     let owner_id = Uuid::now_v7().to_string();
     let lease = store.acquire_runtime_lease("runtime".into(), owner_id, LEASE_TTL_SECONDS)?;
     let lease = Arc::new(StdMutex::new(lease));
     let _lease_guard = RuntimeLeaseGuard { store: Arc::clone(&store), lease: Arc::clone(&lease) };
     store.recover_writes()?;
 
-    let repository = config.github.repository.parse::<RepositoryName>()?;
-    let github = Arc::new(GitHubClient::connect(&config.github, &repository).await?);
-    if !github
-        .identity()
-        .permissions
-        .get("issues")
-        .is_some_and(|permission| permission == "write" || permission == "admin")
-    {
-        bail!("Slice 2 requires GitHub App Issues: write for Braid-owned reactions");
+    let repositories = config
+        .github_repositories()
+        .into_iter()
+        .map(str::parse::<RepositoryName>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut github_client_map = HashMap::new();
+    for repository in &repositories {
+        let client = GitHubClient::connect(config.github()?, repository).await?;
+        if !client
+            .identity()
+            .permissions
+            .get("issues")
+            .is_some_and(|permission| permission == "write" || permission == "admin")
+        {
+            bail!(
+                "GitHub repository {repository} requires Issues: write for Braid-owned reactions"
+            );
+        }
+        github_client_map.insert(repository.name_with_owner(), Arc::new(client));
     }
+    let github =
+        github_client_map.get(config.repository()).expect("primary repository client").clone();
+    let github_clients = Arc::new(github_client_map);
     let secret = config
         .webhook_secret()
         .with_context(|| "cannot load GitHub webhook secret from configured source")?;
@@ -94,21 +193,11 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
         quiet_seconds: config.scheduler.quiet_seconds,
         event_threshold: config.scheduler.event_threshold,
     };
-    let health = Arc::new(RwLock::new(HealthSnapshot {
-        ready: false,
-        ingress: config.server.ingress.to_string(),
-        repository: config.github.repository.clone(),
-        tunnel: if quick_tunnel { "starting" } else { "disabled" },
-        webhook_url: None,
-        reconciliation: "starting",
-        provider: if provider_enabled { "starting" } else { "disabled" },
-        last_error: None,
-    }));
     let state = Arc::new(IngressState {
         store: Arc::clone(&store),
         policy,
-        repository: config.github.repository.clone(),
-        handle: config.github.handle.clone(),
+        repositories: config.github_repositories().into_iter().map(str::to_owned).collect(),
+        handle: config.github()?.handle.clone(),
         app_actor_node_id: github.identity().actor_node_id.clone(),
         app_actor_login: github.identity().actor_login.clone(),
         agent_actor_node_ids: config
@@ -125,39 +214,52 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
     let health_server =
         spawn_health(config.server.health, Arc::clone(&health), shutdown_receiver.clone()).await?;
     let mut workers = JoinSet::new();
-    workers.spawn(queue_worker(Arc::clone(&store), shutdown_receiver.clone()));
-    workers.spawn(mention_worker(
+    workers.spawn(worker_result(queue_worker(Arc::clone(&store), shutdown_receiver.clone())));
+    workers.spawn(worker_result(mention_worker(
         Arc::clone(&store),
-        Arc::clone(&github),
+        Arc::clone(&github_clients),
         policy,
         shutdown_receiver.clone(),
-    ));
-    workers.spawn(outbox_worker(
+    )));
+    workers.spawn(worker_result(outbox_worker(
         Arc::clone(&store),
-        Arc::clone(&github),
+        Arc::clone(&github_clients),
         shutdown_receiver.clone(),
-    ));
-    workers.spawn(reconciliation_worker(
+    )));
+    workers.spawn(worker_result(reconciliation_worker(
         Arc::clone(&store),
-        Arc::clone(&github),
+        Arc::clone(&github_clients),
         config.clone(),
         Arc::clone(&health),
         shutdown_receiver.clone(),
-    ));
-    workers.spawn(lease_worker(Arc::clone(&store), Arc::clone(&lease), shutdown_receiver.clone()));
+    )));
+    workers.spawn(worker_result(lease_worker(
+        Arc::clone(&store),
+        Arc::clone(&lease),
+        shutdown_receiver.clone(),
+    )));
 
     if provider_enabled {
         let factories = crate::provider::session_factories(&config)?;
-        let specs = [GroupKind::Issue, GroupKind::Pr]
+        let mut spec_scopes = Vec::new();
+        for repository in config.github_repositories() {
+            for kind in [GroupKind::Issue, GroupKind::Pr] {
+                if !config.profiles_for_repository(repository, kind.as_str()).is_empty() {
+                    spec_scopes.push((repository, kind));
+                }
+            }
+        }
+        let specs = spec_scopes
             .into_iter()
-            .map(|kind| GroupSpec::new(kind, &config, &store))
+            .map(|(repository, kind)| GroupSpec::new(kind, &config, &store, repository))
             .collect::<Result<Vec<_>>>()?;
         let (reports, receiver) = tokio::sync::mpsc::channel(8);
-        workers.spawn(crate::health::provider_health_worker(
+        workers.spawn(worker_result(crate::health::provider_health_worker(
             Arc::clone(&health),
+            specs.len(),
             receiver,
             shutdown_receiver.clone(),
-        ));
+        )));
         for spec in specs {
             let factory = factories
                 .get(spec.profile_id())
@@ -165,7 +267,10 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
                 .clone();
             workers.spawn(agent_group_worker(
                 Arc::clone(&store),
-                Arc::clone(&github),
+                github_clients
+                    .get(&spec.repository)
+                    .context("repository GitHub client missing")?
+                    .clone(),
                 config.clone(),
                 spec,
                 factory,
@@ -188,7 +293,7 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
             &config,
             &local_url,
             &state.webhook_secret,
-            &config.github.repository,
+            config.repository(),
             &github.identity().repository_node_id,
         )
         .await?;
@@ -212,21 +317,18 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
         tunnel = Some(started);
     }
     health.write().await.ready = true;
-    tracing::info!(repository = %config.github.repository, "Braid transport runtime is ready");
+    tracing::info!(repositories = %config.github_repositories().join(", "), "Braid transport runtime is ready");
 
     let mut tunnel_poll = tokio::time::interval(Duration::from_secs(2));
     tunnel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut shutdown_signal = Box::pin(wait_for_shutdown_signal());
     let mut runtime_failure = None;
     loop {
         tokio::select! {
-            result = &mut shutdown_signal => {
-                result?;
-                break;
-            }
+            _ = external_stop.changed() => {break;}
             worker = workers.join_next() => {
                 let message = match worker {
-                    Some(Ok(())) => "a supervised runtime worker stopped unexpectedly".to_owned(),
+                    Some(Ok(Ok(()))) => "a supervised runtime worker stopped unexpectedly".to_owned(),
+                    Some(Ok(Err(error))) => format!("a supervised runtime worker failed: {error:#}"),
                     Some(Err(error)) => format!("a supervised runtime worker failed: {error}"),
                     None => "all supervised runtime workers stopped unexpectedly".to_owned(),
                 };
@@ -278,17 +380,39 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
         tracing::error!(%error, "cannot stop Wrangler Quick Tunnel");
     }
     let _ = shutdown_sender.send(true);
-    let workers_stopped = tokio::time::timeout(Duration::from_secs(15), async {
-        while let Some(worker) = workers.join_next().await {
-            if let Err(error) = worker {
-                tracing::error!(%error, "runtime worker did not stop cleanly");
+    let workers_stopped =
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(worker) = workers.join_next().await {
+                match worker {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        let reason = format!("runtime worker did not confirm shutdown: {error:#}");
+                        runtime_failure =
+                            Some(runtime_failure.take().map_or(reason.clone(), |previous| {
+                                format!("{previous}\n{reason}")
+                            }));
+                    }
+                    Err(error) => {
+                        let reason = format!("runtime worker did not stop cleanly: {error}");
+                        runtime_failure =
+                            Some(runtime_failure.take().map_or(reason.clone(), |previous| {
+                                format!("{previous}\n{reason}")
+                            }));
+                    }
+                }
             }
-        }
-    })
-    .await
-    .is_ok();
+        })
+        .await
+        .is_ok();
     if !workers_stopped {
-        tracing::error!("runtime workers exceeded the shutdown deadline; aborting them");
+        let reason =
+            "runtime workers exceeded the shutdown deadline; execution stop is unconfirmed";
+        runtime_failure = Some(
+            runtime_failure
+                .take()
+                .map_or(reason.to_owned(), |previous| format!("{previous}\n{reason}")),
+        );
+        tracing::error!("{reason}");
         workers.abort_all();
         while workers.join_next().await.is_some() {}
     }
@@ -298,20 +422,24 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
         if status.pending_writes == 0 && status.uncertain_writes == 0 {
             break;
         }
-        drain_one_write(&store, &github).await;
+        drain_one_write(&store, &github_clients).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let _ = tokio::time::timeout(Duration::from_secs(5), ingress).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), health_server).await;
     drop(store);
-    telemetry.shutdown()?;
     if let Some(error) = runtime_failure {
         bail!(error);
     }
     Ok(())
 }
 
-async fn wait_for_shutdown_signal() -> Result<()> {
+pub(crate) async fn worker_result(future: impl std::future::Future<Output = ()>) -> Result<()> {
+    future.await;
+    Ok(())
+}
+
+pub(crate) async fn wait_for_shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
         let mut terminate =
@@ -350,7 +478,7 @@ async fn spawn_ingress(
     }))
 }
 
-async fn spawn_health(
+pub(crate) async fn spawn_health(
     address: std::net::SocketAddr,
     state: Arc<RwLock<HealthSnapshot>>,
     mut shutdown: watch::Receiver<bool>,
@@ -375,4 +503,14 @@ async fn health_handler(State(state): State<Arc<RwLock<HealthSnapshot>>>) -> imp
     let snapshot = state.read().await.clone();
     let status = if snapshot.ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (status, axum::Json(snapshot))
+}
+
+pub(crate) async fn builtin_run_managed(
+    config: Config,
+    request: crate::run::RunRequest,
+    store: Arc<StoreActor>,
+    stop: watch::Receiver<bool>,
+    health: Arc<RwLock<HealthSnapshot>>,
+) -> Result<crate::run::RunResult> {
+    builtin::finite_managed(config, request, store, stop, health).await
 }

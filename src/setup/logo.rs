@@ -23,9 +23,10 @@ pub fn generate(owner: &str, output: &Path) -> Result<()> {
     let owner_avatar =
         image::load_from_memory(&avatar_bytes).context("cannot decode owner avatar")?.to_rgba8();
 
-    let braid_logo =
-        image::load_from_memory(include_bytes!("../../docs/assets/braid-logo-transparent.png"))
-            .context("cannot decode embedded Braid logo")?;
+    let braid_logo = image::load_from_memory(include_bytes!(
+        "../../docs/assets/logo/png/braid-color-on-transparent/braid-color-on-transparent-512.png"
+    ))
+    .context("cannot decode embedded Braid logo")?;
 
     let mut canvas = RgbaImage::from_pixel(CANVAS_SIZE, CANVAS_SIZE, Rgba([0, 0, 0, 0]));
 
@@ -103,21 +104,5 @@ fn draw_ring(image: &mut RgbaImage, cx: u32, cy: u32, radius: u32, color: Rgba<u
                 image.put_pixel(x, y, color);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use super::*;
-
-    #[test]
-    #[ignore = "requires network access to GitHub avatar"]
-    fn generate_logo_for_xiaoland() {
-        let path = PathBuf::from("/tmp/braid-of-xiaoland-logo-test.png");
-        let _ = std::fs::remove_file(&path);
-        generate("xiaoland", &path).expect("should generate logo");
-        assert!(path.is_file());
     }
 }

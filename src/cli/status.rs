@@ -13,7 +13,7 @@ pub fn status(arguments: &ConfigPath) -> Result<()> {
         binary_version: env!("CARGO_PKG_VERSION"),
         config_schema: config.schema_version,
         instance_key: &config.instance.key,
-        repository: &config.github.repository,
+        repository: config.repositories().join(", "),
         default_pr_profile: &config.profile_selection.default_pr_profile,
         database,
         telemetry_endpoint: config.telemetry.endpoint.to_string(),
@@ -26,7 +26,7 @@ pub fn status(arguments: &ConfigPath) -> Result<()> {
     } else {
         println!("braid {}", status.binary_version);
         println!("instance: {}", status.instance_key);
-        println!("repository: {}", status.repository);
+        println!("repositories: {}", status.repository);
         println!(
             "database schema: {}/{} ({} pending)",
             status.database.schema_version,

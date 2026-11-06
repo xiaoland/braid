@@ -33,10 +33,21 @@ pub async fn gh(command: GhCommand) -> Result<()> {
             let config_path = arguments.source.resolve_config_path()?;
             let config = helpers::load(&config_path)?;
             let actor = helpers::store(&config)?;
+            let repository = match arguments.repository {
+                Some(repository) => repository.parse::<RepositoryName>()?,
+                None if config.is_multi_repository() => {
+                    bail!("pr ensure requires --repository in a multi-repository instance")
+                }
+                None => config.repository().parse::<RepositoryName>()?,
+            };
             let receipt = writer::ensure_pull_request(
                 &config,
                 &actor,
-                PullRequestEnsureRequest { comment_id: arguments.comment, head: arguments.head },
+                PullRequestEnsureRequest {
+                    repository,
+                    comment_id: arguments.comment,
+                    head: arguments.head,
+                },
             )
             .await?;
             if arguments.json {
