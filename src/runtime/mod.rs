@@ -165,9 +165,19 @@ async fn serve_github_managed(
         .into_iter()
         .map(str::parse::<RepositoryName>)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut github_client_map = HashMap::new();
+    let mut github_client_map: HashMap<String, Arc<GitHubClient>> = HashMap::new();
+    let rate_limits = Arc::new(crate::github::RateLimits::default());
     for repository in &repositories {
-        let client = GitHubClient::connect(config.github()?, repository).await?;
+        let client = if let Some(existing) = github_client_map.values().next() {
+            Box::pin(existing.for_repository(repository)).await?
+        } else {
+            Box::pin(GitHubClient::connect_shared(
+                config.github()?,
+                repository,
+                Arc::clone(&rate_limits),
+            ))
+            .await?
+        };
         if !client
             .identity()
             .permissions

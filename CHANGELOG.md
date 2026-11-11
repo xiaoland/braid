@@ -5,6 +5,18 @@ Versioning once release artifacts are published.
 
 ## [Unreleased]
 
+### Fixed
+
+- GitHub 巡检不再每分钟完整重读所有历史 Work Item：OPEN 或仍有存活 Assignment
+  的条目默认 60 秒，已完成收尾的终态历史项 30 分钟。Schema 8 独立记录完整成功与
+  尝试时钟，失败不导致每 5 秒本地检查都重新联网；跨仓库按最久未尝试优先，单项
+  失败不阻断后续对象，成功项不因其他项失败或重启反复读取。升级需要迁移数据库。
+- GraphQL 请求统一采集 installation 预算并共享准入/冷却。后台保留前台余量，遵守
+  reset/Retry-After，缺提示限流和网络错误有界退避、到期自动探测；首次限流即保留
+  写入重试资格。已准入请求含响应解析限时 30 秒；关闭隐式 transport 重试，REST
+  429 仍交由持久写入队列恢复。派生客户端共享自动刷新 token 缓存，而不是复制缓存。
+  此机制不协调进程外消费者，不自动解除业务 blocked，也不声称已测得线上节省量。
+
 ## [0.3.3] - 2026-10-13
 
 ### Changed

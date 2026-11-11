@@ -201,8 +201,14 @@ restore the pre-migration backup rather than executing a down migration.
   observable by 45 seconds absent recorded GitHub/provider outage;
 - eight-event threshold or trusted mention: provider acceptance/reaction by 15
   seconds;
-- reconciliation-only missed event: observable processing by 105 seconds with
-  a 60-second interval;
+- reconciliation-only missed event on OPEN/live-assignment Work Items: observable
+  processing by 110 seconds under normal budget with a 60-second successful
+  traversal interval (includes up to five seconds of local due-check delay);
+- closed/merged history without materializing/active/finalizing Assignments:
+  missed-event recovery is due 30 minutes after the last complete traversal,
+  plus up to five seconds of local due-check delay and processing time; quota or
+  network pressure explicitly reports degraded/delayed instead of meeting these
+  normal-budget timing targets;
 - unassignment and Cross-surface description invalidation: debounce before
   retirement/interruption.
 

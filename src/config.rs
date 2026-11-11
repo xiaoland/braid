@@ -387,6 +387,7 @@ pub struct GitHubRepositoryConfig {
 pub struct SchedulerConfig {
     pub quiet_seconds: u64,
     pub event_threshold: u32,
+    /// Minimum interval after a complete hot traversal; local due checks run at most 5s apart.
     pub reconciliation_seconds: u64,
 }
 

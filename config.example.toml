@@ -27,6 +27,7 @@ projects_v2_enabled = false
 [scheduler]
 quiet_seconds = 30
 event_threshold = 8
+# Minimum successful hot-traversal interval; local due checks run at most 5s apart.
 reconciliation_seconds = 60
 
 [[runtimes]]

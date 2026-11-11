@@ -264,3 +264,33 @@ OTLP 信号接口的失败响应按[协议规范](https://opentelemetry.io/docs/
 使用 protobuf Status；正常批次因存储不可用不能接受时返回 503，让 exporter 可以
 重试。成功响应只表示持久接收，不承诺 Exactly Once；Web 查询和控制错误另用
 JSON，避免浏览器把诊断响应当作业务回执。
+
+## GitHub GraphQL quota recovery
+
+正常预算下，OPEN 或仍有 materializing/active/finalizing Assignment 的 Work Item
+完整巡检成功后默认 60 秒再次到期；其他已关闭/合并历史项为 30 分钟。
+`scheduler.reconciliation_seconds` 控制 hot 成功间隔，不是 worker tick；本地
+到期检查每 `min(reconciliation_seconds, 5)` 秒执行，另有遍历、网络与预算等待。
+失败项至少间隔一个 hot 周期再试；已知 installation 冷却期间不会反复联网，
+巡检只在进入降级状态时告警。
+
+升级需应用 schema 8 迁移，新增独立的完整成功/尝试时钟；旧记录起初均到期，
+但仍受 installation 准入限制。重启应保留 runtime 数据库，避免丢失成功事实。
+旧二进制不能直接打开升级后的数据库；回滚遵守上文 Database Lifecycle。
+
+观察 `GitHub GraphQL response budget` 日志中的 installation、请求计数、used
+及差值、remaining、reset（Unix 秒）和 HTTP 状态。used 差值可能包含其他调用者，
+不等于单 query cost。`GitHub GraphQL delayed` 与巡检 `degraded/delayed` 健康
+状态解释预算余量和冷却；采样可能减少可见记录，不应把本地回归当作线上节省测量。
+
+后台在剩余点数不大于 100 时让出余量；主限额耗尽等 reset，次级限流遵守
+Retry-After，缺提示的限流或网络故障有界退避，到期重新探测。不要反复重启绕过
+冷却：预算只在进程内共享，重启后首次响应前未知，而 GitHub 的安装额度不会重置。
+独立 CLI、其他进程和 REST/App token 操作不受此 GraphQL gate 协调。若活跃集合
+本身超预算，应减少消耗或调整目标周期，退避不能创造额外吞吐。
+
+**自动恢复范围有限。**巡检和仍待处理的请求可在冷却后继续；首次 setup/serve 的
+身份读取失败发生在 worker 启动前，需要额度恢复后重试启动。已因 Context 物化
+失败进入 `blocked` 的 Issue 激活或 Context replacement 不会被一次成功探测自动
+解除；先排除权限、配置和外部故障，再使用既有 operator reactivation 路径。
+不要把 API 配额恢复等同于所有 Agent 业务自动继续。

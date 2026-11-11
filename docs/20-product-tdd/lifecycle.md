@@ -121,6 +121,11 @@ from the edited prose.
   needed, and queues one normal debounced Wake turn.
 - Delivery duplicates and events received while sleeping cannot grant a second
   Finalization Turn.
+- GitHub reconciliation keeps closed roots hot while their Assignment is still
+  materializing, active, or finalizing. Only terminal history without a live
+  Assignment moves to the 30-minute recovery interval. Installation budget
+  pressure delays canonical reads and is exposed as degraded/delayed health;
+  it introduces no new Agent Group lifecycle state (see `github.md`).
 
 ## Reaction State
 

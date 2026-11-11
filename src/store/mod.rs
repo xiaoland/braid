@@ -15,6 +15,8 @@ use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
+mod reconciliation;
+pub use reconciliation::TrackedWorkItem;
 mod builtin;
 mod runs;
 pub use runs::RunCommand;
@@ -30,7 +32,7 @@ use gh_writes::{
     prepare_gh_write, prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 7;
+pub const DATABASE_SCHEMA_VERSION: u32 = 8;
 
 const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
 const EVENT_KINDS_SQL: &str = include_str!("../../migrations/0002_event_kinds.sql");
@@ -61,6 +63,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 7,
         name: "harness_runs",
         sql: include_str!("../../migrations/0007_harness_runs.sql"),
+    },
+    Migration {
+        version: 8,
+        name: "reconciliation_clock",
+        sql: include_str!("../../migrations/0008_reconciliation_clock.sql"),
     },
 ];
 
@@ -314,15 +321,6 @@ pub struct PendingGitHubWrite {
     pub remote_database_id: Option<String>,
     pub lifecycle: String,
     pub created_at: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct TrackedWorkItem {
-    pub node_id: String,
-    pub repository: String,
-    pub kind: String,
-    pub number: u64,
-    pub state: String,
 }
 
 #[derive(Debug, Clone)]
@@ -836,10 +834,21 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub fn tracked_work_items(&self) -> Result<Vec<TrackedWorkItem>, StoreError> {
+    pub fn due_reconciliation_work_items(
+        &self,
+        hot_seconds: u64,
+    ) -> Result<Vec<TrackedWorkItem>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::TrackedWorkItems(reply))
+            .send(Command::DueReconciliationWorkItems(hot_seconds, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn record_reconciliation(&self, node_id: String, complete: bool) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::RecordReconciliation(node_id, complete, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1403,7 +1412,8 @@ enum Command {
         Option<String>,
         Sender<Result<(), StoreError>>,
     ),
-    TrackedWorkItems(Sender<Result<Vec<TrackedWorkItem>, StoreError>>),
+    DueReconciliationWorkItems(u64, Sender<Result<Vec<TrackedWorkItem>, StoreError>>),
+    RecordReconciliation(String, bool, Sender<Result<(), StoreError>>),
     CanonicalObjects(String, Sender<Result<Vec<CanonicalObjectState>, StoreError>>),
     BeginReconciliation(String, String, Sender<Result<ReconciliationRun, StoreError>>),
     FinishReconciliation(
@@ -1639,8 +1649,20 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
                     error.as_deref(),
                 ));
             }
-            Command::TrackedWorkItems(reply) => {
-                let _ = reply.send(tracked_work_items(database));
+            Command::DueReconciliationWorkItems(hot_seconds, reply) => {
+                let _ = reply.send(due_reconciliation_work_items(database, hot_seconds));
+            }
+            Command::RecordReconciliation(node_id, complete, reply) => {
+                let result = open_read_write(database).and_then(|connection| {
+                    reconciliation::record(
+                        &connection,
+                        &node_id,
+                        OffsetDateTime::now_utc().unix_timestamp(),
+                        complete,
+                    )
+                    .map_err(StoreError::from)
+                });
+                let _ = reply.send(result);
             }
             Command::CanonicalObjects(work_item_node_id, reply) => {
                 let _ = reply.send(canonical_objects(database, &work_item_node_id));
@@ -3202,24 +3224,14 @@ fn finish_github_write(
     Ok(())
 }
 
-fn tracked_work_items(database: &Path) -> Result<Vec<TrackedWorkItem>, StoreError> {
+fn due_reconciliation_work_items(
+    database: &Path,
+    hot_seconds: u64,
+) -> Result<Vec<TrackedWorkItem>, StoreError> {
     require_current_schema(database)?;
     let connection = open_read_only(database)?;
-    let mut statement = connection.prepare(
-        "SELECT w.node_id,r.name_with_owner,w.kind,w.number,w.state
-         FROM work_items w JOIN repositories r ON r.node_id=w.repository_node_id
-         ORDER BY r.name_with_owner,w.kind,w.number",
-    )?;
-    let rows = statement.query_map([], |row| {
-        Ok(TrackedWorkItem {
-            node_id: row.get(0)?,
-            repository: row.get(1)?,
-            kind: row.get(2)?,
-            number: sqlite_i64_to_u64(row.get(3)?, "work-item number")?,
-            state: row.get(4)?,
-        })
-    })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    reconciliation::due(&connection, OffsetDateTime::now_utc().unix_timestamp(), hot_seconds)
+        .map_err(StoreError::from)
 }
 
 fn canonical_objects(

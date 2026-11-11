@@ -177,10 +177,57 @@ See GitHub's [linking contract](https://docs.github.com/en/issues/tracking-your-
 
 ## Reconciliation and Tombstones
 
-Webhook is an observation, not a complete history. Reconciliation runs every
-60 seconds by default, separately from debounce, and after reconnect, unknown
-variants, delivery gaps, or outbox uncertainty. It rereads active Work Items,
-direct associations, and all Context connections.
+Webhook 是观察，不是完整历史。巡检在正常预算下按两档到期：OPEN Work Item，
+或仍有 materializing/active/finalizing Assignment 的条目，完整巡检成功后默认
+60 秒再次到期；其他已关闭或合并的历史条目为 **30 分钟**。关闭不意味着收尾已
+完成，finalizing 不降频。历史条目的 reopen webhook 若丢失，可能需要 30 分钟
+加上扫描、网络和配额等待时间才能恢复。Webhook 与前台 Context/turn 语义不变。
+
+`scheduler.reconciliation_seconds` 是 hot 条目的最小成功间隔，不是 worker tick。
+worker 每 `min(reconciliation_seconds, 5)` 秒检查本地到期事实与已知预算；本地
+检查本身不请求 GitHub。检查额外延迟至多 5 秒，不包括其他对象遍历及网络/预算
+等待。正常预算下的周期不是独立于 GitHub 可用性的硬 SLA。
+
+Schema 8 分别持久化完整成功时间和尝试时间。Webhook、关联读取、Context Revision
+写入与普通 `observed_at` 不推进成功时间；失败或部分读取也不算成功。尝试之间
+至少间隔一个 hot 周期，避免每 5 秒检查变成每 5 秒重试。成功项不会因后续条目
+失败或进程重启被重新全读。到期项跨仓库按最久未尝试优先，每次尝试保留巡检回执，
+单项失败不阻断后续条目。没有实际遍历的空检查不清除已有降级健康状态。
+
+巡检仍完整读取直接关联和全部 Context connection，不使用跨轮 Context 缓存，
+也不根据根对象 `updatedAt` 跳过子连接。只有完整物化后才能推断 tombstone，
+不能把预算中止的部分列表当作删除证据。
+
+### Installation GraphQL budget
+
+实例内显式共享一个按 installation 分组的准入 owner。运行期仓库客户端及
+`for_repository` 派生客户端共享它，不同 installation 独立。每个安装的锁覆盖
+GraphQL 请求至响应记账，确认限流后排队请求不能继续穿透。派生客户端用
+`Arc<Octocrab>` 共享自动刷新 token 缓存，而不是复制缓存或每次重新签发 token。
+同 installation 的跨仓库派生也无需重复完整 App connect/token/viewer 初始化。
+
+所有 GraphQL 调用（含启动时 repository/viewer 身份读取）统一走 raw transport。
+准入失败立即返回，不在请求内 sleep 或循环重试；每个已准入请求及 body decode
+合计限时 30 秒。Octocrab transport 隐式重试关闭，REST 429/5xx 仍是可恢复错误，
+由持久 outbox 重试，而不是永久拒绝。App discovery/token 和 REST 不受 GraphQL
+预算控制。首次确认限流即返回可恢复错误，不能等到后续本地拒绝时才允许写入重试。
+明确的权限拒绝仍是权限错误，不作为 installation 耗尽处理。
+
+响应记录请求计数、`x-ratelimit-used` 及可用的非负差值、remaining、reset 和 HTTP
+状态。used 差值可能包含其他进程的消耗，**不是可归属单次查询的 cost**；不改写
+任意 query 字符串，也不假设每个请求成本相同。
+
+主限额耗尽等待 reset，次级限流遵守 `Retry-After` 秒数。缺少提示的限流和网络
+故障从 10 秒开始指数退避，上限 300 秒加至多 25% 抖动；后续失败不能缩短已收到
+的服务端冷却期限。到期仅允许串行探测，成功响应重置退避。后台在剩余点数不大于
+100 时让出余量；缺少 reset 则有界冷却后探测，不永久停摆。这只是前台余量，
+不是保证任何大 Context 都能在剩余配额中完成。
+
+预算不足时巡检报告 `degraded/delayed`，保留未完成条目供后续尝试，不强行追赶。
+预算/冷却只在进程内共享，不持久化：重启保留对象成功时钟，但首次响应前不知道
+剩余额度；独立 CLI 和其他消费者仍可能耗尽共享 installation 配额。自动恢复只
+涵盖仍有重试入口的操作，不自动解除业务 `blocked`（操作边界见部署文档）。
+本地 HTTP/时钟回归验证机制，**不是线上 installation 消耗测量**。
 
 An object previously observed but now missing becomes a tombstone carrying only
 stable ID, last known author/time metadata, and `deleted`. Local state never

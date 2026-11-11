@@ -21,7 +21,7 @@ use crate::{
     health::HealthSnapshot,
     store::{
         CanonicalObjectState, EventKind, IngressEvent, ReactionTarget, RuntimeLease,
-        SchedulerPolicy, StoreActor,
+        SchedulerPolicy, StoreActor, TrackedWorkItem,
     },
     webhook,
 };
@@ -72,25 +72,30 @@ pub(crate) async fn reconciliation_worker(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut tick =
-        tokio::time::interval(Duration::from_secs(config.scheduler.reconciliation_seconds));
+        tokio::time::interval(Duration::from_secs(config.scheduler.reconciliation_seconds.min(5)));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
             _ = tick.tick() => {
                 match Box::pin(reconcile_once(&store, &github, &config)).await {
-                    Ok(changes) => {
+                    Ok(Some(changes)) => {
                         let mut current = health.write().await;
                         current.reconciliation = "current";
                         if changes > 0 {
                             tracing::info!(changes, "canonical GitHub reconciliation observed changes");
                         }
                     }
+                    // A local due check is not evidence of recovered GitHub
+                    // state. Keep a previous failure visible until a traversal succeeds.
+                    Ok(None) => {}
                     Err(error) => {
                         let mut current = health.write().await;
-                        current.reconciliation = "unavailable";
+                        if current.reconciliation != "degraded/delayed" {
+                            tracing::warn!(%error, "canonical GitHub reconciliation degraded/delayed");
+                        }
+                        current.reconciliation = "degraded/delayed";
                         current.last_error = Some(error.to_string());
-                        tracing::error!(%error, "canonical GitHub reconciliation failed");
                     }
                 }
             }
@@ -102,135 +107,132 @@ pub(crate) async fn reconcile_once(
     store: &StoreActor,
     github: &HashMap<String, Arc<GitHubClient>>,
     config: &Config,
-) -> Result<usize> {
-    let tracked = store.tracked_work_items()?;
+) -> Result<Option<usize>> {
+    let tracked = store.due_reconciliation_work_items(config.scheduler.reconciliation_seconds)?;
+    let mut attempted = false;
     let mut changes = 0;
     let mut failures = Vec::new();
-    for (repository, client) in github {
-        if !tracked.iter().any(|work_item| &work_item.repository == repository) {
-            // Nothing to reconcile: skip the begin/finish cycle entirely for a
-            // repository with no tracked work items.
+    let mut delayed_installations = std::collections::HashSet::new();
+    // Global least-recently-attempted order, not a fixed repository/first-item order.
+    for work_item in &tracked {
+        let Some(client) = github.get(&work_item.repository) else { continue };
+        if delayed_installations.contains(&client.identity().installation_id) {
             continue;
         }
-        let run = match store
-            .begin_reconciliation(client.identity().repository_node_id.clone(), repository.clone())
-        {
+        if let Some(reason) = client.reconciliation_delay().await {
+            delayed_installations.insert(client.identity().installation_id);
+            failures.push(format!("installation {}: {reason}", client.identity().installation_id));
+            continue;
+        }
+        let client = client.background();
+        let run = match store.begin_reconciliation(
+            client.identity().repository_node_id.clone(),
+            work_item.repository.clone(),
+        ) {
             Ok(run) => run,
             Err(error) => {
-                failures.push(format!("{repository}: cannot begin reconciliation: {error:#}"));
+                failures.push(error.to_string());
                 continue;
             }
         };
-        match Box::pin(reconcile_work_items(store, client, config, repository)).await {
-            Ok((work_items, repository_changes)) => {
-                if let Err(error) = store.finish_reconciliation(
-                    run,
-                    "completed",
-                    work_items,
-                    repository_changes,
-                    None,
-                ) {
-                    failures.push(format!("{repository}: cannot finish reconciliation: {error:#}"));
-                    continue;
-                }
-                changes += repository_changes;
+        store.record_reconciliation(work_item.node_id.clone(), false)?;
+        attempted = true;
+        match Box::pin(reconcile_work_item(store, &client, config, work_item)).await {
+            Ok(item_changes) => {
+                store.record_reconciliation(work_item.node_id.clone(), true)?;
+                store.finish_reconciliation(run, "completed", 1, item_changes, None)?;
+                changes += item_changes;
             }
             Err(error) => {
-                if let Err(finish_error) =
-                    store.finish_reconciliation(run, "failed", 0, 0, Some(error.to_string()))
-                {
-                    failures.push(format!(
-                        "{repository}: {error:#}; cannot record failure: {finish_error:#}"
-                    ));
-                    continue;
+                if error.chain().any(|cause| {
+                    cause.downcast_ref::<crate::github::GitHubError>().is_some_and(|error| {
+                        matches!(error, crate::github::GitHubError::Delayed(_))
+                    })
+                }) {
+                    delayed_installations.insert(client.identity().installation_id);
                 }
-                failures.push(format!("{repository}: {error:#}"));
+                store.finish_reconciliation(run, "failed", 0, 0, Some(error.to_string()))?;
+                failures.push(format!("{}#{}: {error:#}", work_item.repository, work_item.number));
             }
         }
     }
-    if failures.is_empty() { Ok(changes) } else { anyhow::bail!(failures.join("; ")) }
+    if failures.is_empty() {
+        Ok(attempted.then_some(changes))
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
 }
 
-pub(crate) async fn reconcile_work_items(
+async fn reconcile_work_item(
     store: &StoreActor,
     github: &GitHubClient,
     config: &Config,
-    repository: &str,
-) -> Result<(usize, usize)> {
-    let tracked = store
-        .tracked_work_items()?
-        .into_iter()
-        .filter(|work_item| work_item.repository == repository)
-        .collect::<Vec<_>>();
-    if tracked.is_empty() {
-        return Ok((0, 0));
-    }
+    work_item: &TrackedWorkItem,
+) -> Result<usize> {
     let mut changes = 0;
-    for work_item in &tracked {
-        let repository = work_item.repository.parse::<RepositoryName>()?;
-        let locator = WorkItemLocator { repository, number: work_item.number };
-        let mut canonical = if work_item.kind == "issue" {
-            CanonicalContext::Issue(context::materialize_issue(github, &locator, 100).await?)
-        } else if work_item.kind == "pr" {
-            CanonicalContext::PullRequest(
-                context::materialize_pull_request(github, &locator, 100).await?,
+    let repository = work_item.repository.parse::<RepositoryName>()?;
+    let locator = WorkItemLocator { repository, number: work_item.number };
+    let mut canonical = if work_item.kind == "issue" {
+        CanonicalContext::Issue(context::materialize_issue(github, &locator, 100).await?)
+    } else if work_item.kind == "pr" {
+        CanonicalContext::PullRequest(
+            context::materialize_pull_request(github, &locator, 100).await?,
+        )
+    } else {
+        return Ok(0);
+    };
+    let prior = store
+        .canonical_objects(work_item.node_id.clone())?
+        .into_iter()
+        .filter(|object| {
+            matches!(
+                object.object_kind.as_str(),
+                "issue"
+                    | "pr"
+                    | "issue_comment"
+                    | "pr_comment"
+                    | "review"
+                    | "review_comment"
+                    | "review_thread"
             )
-        } else {
-            continue;
-        };
-        let prior = store
-            .canonical_objects(work_item.node_id.clone())?
-            .into_iter()
-            .filter(|object| {
-                matches!(
-                    object.object_kind.as_str(),
-                    "issue"
-                        | "pr"
-                        | "issue_comment"
-                        | "pr_comment"
-                        | "review"
-                        | "review_comment"
-                        | "review_thread"
-                )
-            })
-            .map(|object| (object.node_id.clone(), object))
-            .collect::<BTreeMap<_, _>>();
-        let scope = match &canonical {
-            CanonicalContext::Issue(issue) => ReconcileScope {
-                work_item_node_id: issue.node_id.clone(),
-                work_item_kind: "issue",
-                work_item_number: issue.number,
-                work_item_state: issue.state.clone(),
-                previous_work_item_state: work_item.state.clone(),
-                repository_node_id: issue.repository_node_id.clone(),
-                repository: issue.repository.clone(),
-            },
-            CanonicalContext::PullRequest(pull_request) => ReconcileScope {
-                work_item_node_id: pull_request.node_id.clone(),
-                work_item_kind: "pr",
-                work_item_number: pull_request.number,
-                work_item_state: context::pull_request_work_item_state(pull_request),
-                previous_work_item_state: work_item.state.clone(),
-                repository_node_id: pull_request.repository_node_id.clone(),
-                repository: pull_request.repository.clone(),
-            },
-        };
-        let observations = context::canonical_observations(&canonical);
-        changes += reconcile_observations(store, github, config, &scope, &prior, &observations)?;
-        context::reconcile_local_state(&mut canonical, store)?;
-        let profile = if work_item.kind == "pr" {
-            config.pr_profile_for_repository(&work_item.repository)?
-        } else {
-            config.issue_profile_for_repository(&work_item.repository)?
-        };
-        let rendered = context::render_complete(
-            &canonical,
-            profile.github_context_soft_ratio,
-            profile.github_context_hard_bytes,
-        );
-        context::record_context_revision(&canonical, &rendered, store)?;
-    }
-    Ok((tracked.len(), changes))
+        })
+        .map(|object| (object.node_id.clone(), object))
+        .collect::<BTreeMap<_, _>>();
+    let scope = match &canonical {
+        CanonicalContext::Issue(issue) => ReconcileScope {
+            work_item_node_id: issue.node_id.clone(),
+            work_item_kind: "issue",
+            work_item_number: issue.number,
+            work_item_state: issue.state.clone(),
+            previous_work_item_state: work_item.state.clone(),
+            repository_node_id: issue.repository_node_id.clone(),
+            repository: issue.repository.clone(),
+        },
+        CanonicalContext::PullRequest(pull_request) => ReconcileScope {
+            work_item_node_id: pull_request.node_id.clone(),
+            work_item_kind: "pr",
+            work_item_number: pull_request.number,
+            work_item_state: context::pull_request_work_item_state(pull_request),
+            previous_work_item_state: work_item.state.clone(),
+            repository_node_id: pull_request.repository_node_id.clone(),
+            repository: pull_request.repository.clone(),
+        },
+    };
+    let observations = context::canonical_observations(&canonical);
+    changes += reconcile_observations(store, github, config, &scope, &prior, &observations)?;
+    context::reconcile_local_state(&mut canonical, store)?;
+    let profile = if work_item.kind == "pr" {
+        config.pr_profile_for_repository(&work_item.repository)?
+    } else {
+        config.issue_profile_for_repository(&work_item.repository)?
+    };
+    let rendered = context::render_complete(
+        &canonical,
+        profile.github_context_soft_ratio,
+        profile.github_context_hard_bytes,
+    );
+    context::record_context_revision(&canonical, &rendered, store)?;
+    Ok(changes)
 }
 
 #[allow(clippy::too_many_lines)]
