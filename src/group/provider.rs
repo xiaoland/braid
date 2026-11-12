@@ -172,6 +172,9 @@ pub(crate) fn render_event_references(config: &Config, claim: &TurnClaim) -> Str
         "# Braid Event References\n\nGitHub {label}: {}#{}\n",
         claim.repository, claim.number,
     );
+    if !config.is_builtin() {
+        writeln!(output, "\nPublication identity: pass `--source-turn {}` to every `braid gh` mutation. This turn reference is verified against your durable assignment/session/context and actual cwd; never use --operator. --profile is an assertion, not identity selection. For body maintenance: `braid gh pr read OWNER/REPO#N --output /tmp/body-snapshot.json` (or `issue read`), inspect that snapshot, then `braid gh pr edit OWNER/REPO#N --snapshot /tmp/body-snapshot.json --body-file /tmp/body.md --profile PROFILE --source-turn {} --request-id STABLE_TOKEN`. Use `braid gh status` receipts to confirm applied before relying on publication. Edits preserve request markers/closing references, reject changed canonical versions, and cannot atomically CAS GitHub. PR source may correct its currently directly associated OPEN Issues, always under PR attribution.", claim.turn_id, claim.turn_id).expect("String write");
+    }
     for reference in &claim.references {
         output.push_str("- ");
         output.push_str(reference);

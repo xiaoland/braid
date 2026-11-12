@@ -12,6 +12,7 @@ use crate::{
     store::{RuntimeLease, StoreActor},
 };
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn drain_one_write(
     store: &StoreActor,
     github_clients: &HashMap<String, Arc<GitHubClient>>,
@@ -99,6 +100,11 @@ pub(crate) async fn drain_one_write(
                     } else {
                         "pending"
                     }
+                }
+                OutboxWriteError::GitHub(crate::github::GitHubError::Http { status, .. })
+                    if *status == axum::http::StatusCode::CONFLICT =>
+                {
+                    "conflict"
                 }
                 OutboxWriteError::GitHub(_) => "rejected",
             };

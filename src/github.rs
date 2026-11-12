@@ -1,3 +1,7 @@
+#[path = "github/body.rs"]
+mod body;
+#[allow(unused_imports)]
+pub use body::BodySnapshot;
 use std::{collections::BTreeMap, fmt, fs, str::FromStr, sync::Arc, time::Duration};
 
 #[path = "github/error.rs"]

@@ -39,7 +39,7 @@ therefore wake or invalidate the Agent.
 
 ## Durable Publication Receipts
 
-`braid gh comment create` and `braid gh pr ensure` accept valid local requests
+`braid gh comment create`, `braid gh pr ensure`, and body edits accept valid local requests
 before connecting to GitHub. Acceptance atomically creates one durable execution
 obligation. The command exits with `queued` and a stable public request ID even
 when the service is offline or remote validation is rate-limited. The service,
@@ -56,11 +56,46 @@ is retried forever. `applied` for ensure includes native association and initial
 Activation, not just PR creation. Internal intent and node IDs are not public
 request IDs and are not included in the receipt.
 
-Acceptance is not remote authorization: canonical target kind, installation
-permissions and Profile compatibility are checked before publication. Source
-assignment/Profile revision/session/turn provenance, when available, is retained;
-normal turn completion does not discard the obligation, but Context invalidation
-and generation replacement fence old output. Existing launch environment flags
-are not permission proofs. Source-aware invocation binding remains the extension
-boundary for maintenance capabilities; ordinary `gh`, `git`, and shell remain
-outside this convenience surface.
+Acceptance is not remote authorization. The public role comes from the source
+Group, never the target kind or Profile tags. Tags select eligible roles; they
+are not target permissions. Agent mutations require the `--source-turn` reference
+supplied in the current runtime prompt. It is only a selector: Braid independently
+checks actual cwd, durable worktree, repository, assignment generation, Profile
+revision/materials, session, turn and Context fence. `--profile` can only assert
+that identity. Removing `BRAID_AGENT` does not enable an implicit human fallback.
+An explicit `--operator` entry outside Agent worktrees is audited as Operator;
+this is an honest runtime boundary, not an OS sandbox against same-UID attackers.
+Ordinary completed turns retain accepted obligations; session/Context/generation
+replacement or invalidation forbids further old-source mutations. Recovery can
+still confirm a mutation that already happened.
+
+## Canonical Body Maintenance
+
+Issue Agents maintain their own open Issue. PR Implementation Agents maintain
+their own open PR title/body and may correct the design of its currently native,
+directly associated open Issues. The latter still carries PR Implementation
+Agent attribution. Relevant direct cross-surface comments remain allowed; this
+does not authorize unrelated targets, relationship editing, close/merge/ready,
+or scheduling another Group.
+
+Read a canonical snapshot, inspect it, then submit an offline-durable edit:
+
+```shell
+braid gh pr read owner/repository#123 --output /tmp/pr-snapshot.json
+braid gh pr edit owner/repository#123 --profile pr-codex \
+  --source-turn TURN_FROM_RUNTIME_PROMPT --snapshot /tmp/pr-snapshot.json \
+  --body-file /tmp/pr-body.md --title 'Current scope' --request-id delivery-update-1
+# Use `issue read` / `issue edit` for an Issue. Query the returned request ID.
+```
+
+The snapshot carries the canonical version/digest; callers need not guess one.
+Title and body are optional independently; empty supplied values and oversized
+UTF-8 bytes are rejected. Title-only edits retain the body. Body edits add exactly
+one source attribution and retain ensure request markers and closing-reference
+lines. The executor revalidates target state, association and source before
+mutation and compares the canonical snapshot again after validation. An external
+edit produces a `conflict` receipt, never a blind overwrite. GitHub does not offer
+atomic compare-and-swap here: a concurrent edit in the final read/PATCH interval
+remains possible. After an uncertain send, exact remote title/body is reconciled
+before retry; different external content is conflict, not claimed success. No
+second execution queue or schema authority is introduced.

@@ -15,13 +15,21 @@ use crate::{
 };
 
 mod comment;
+mod edit;
+pub use edit::{EditRequest, edit, read_for_edit};
 mod ensure;
 pub(crate) mod helpers;
 mod prepare;
 
 const COMMENT_BODY_LIMIT: usize = 60_000;
 
+pub enum Invocation {
+    Agent(String),
+    Operator,
+}
+
 pub struct CommentCreateRequest {
+    pub invocation: Invocation,
     pub target: WorkItemLocator,
     pub profile_id: String,
     pub body: String,
@@ -29,6 +37,7 @@ pub struct CommentCreateRequest {
 }
 
 pub struct PullRequestEnsureRequest {
+    pub invocation: Invocation,
     pub repository: crate::github::RepositoryName,
     pub comment_id: u64,
     pub head: Option<String>,
@@ -52,6 +61,14 @@ pub fn create_comment(
     config.github()?;
     // Snapshot the local profile; remote kind and permissions remain unvalidated.
     helpers::render_agent_comment(profile, "PR Implementation Agent", &request.body)?;
+    let source = resolve_source(config, Some(&profile.id), &request.invocation)?;
+    let role = match source.as_ref().map(|s| s.role.as_str()) {
+        Some("issue_agent") => "Issue Agent",
+        Some("pr_implementation_agent") => "PR Implementation Agent",
+        Some(_) => bail!("unknown source role"),
+        None => "Operator",
+    };
+    let scope = source.as_ref().map_or("operator", |s| s.assignment_id.as_str());
     let payload = serde_json::to_string(&AcceptedRequest::Comment {
         profile: profile.clone(),
         body: request.body.trim().to_owned(),
@@ -61,15 +78,15 @@ pub fn create_comment(
     store
         .prepare_gh_write(NewGhWriteIntent {
             request_key: format!(
-                "comment_create\0{}\0{}\0{}\0{}",
-                request.target.repository, request.target.number, profile.id, idempotency
+                "comment_create\0{}\0{}\0{}\0{}\0{}",
+                request.target.repository, request.target.number, profile.id, scope, idempotency
             ),
             operation: "comment_create",
             repository: request.target.repository.to_string(),
             target: request.target.to_string(),
             profile_id: profile.id.clone(),
-            role: "pending_validation".into(),
-            source: source(config, Some(&profile.id))?,
+            role: role.into(),
+            source,
             request_digest: helpers::digest(&payload),
             payload,
         })
@@ -96,7 +113,7 @@ pub fn ensure_pull_request(
     if !profile.has_tag("pr") {
         bail!("PR Profile must be tagged pr");
     }
-    let source = source(config, None)?;
+    let source = resolve_source(config, None, &request.invocation)?;
     if source.as_ref().is_some_and(|source| source.role != "issue_agent") {
         bail!("initial PR ensure requires an Issue Agent source");
     }
@@ -127,6 +144,7 @@ pub fn ensure_pull_request(
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub(crate) enum AcceptedRequest {
     Comment { profile: Profile, body: String },
+    Edit { profile: Profile, expected: String, title: String, body: String },
     Ensure { comment_id: u64, head: Option<String>, profile: Profile },
 }
 
@@ -146,18 +164,16 @@ pub(crate) async fn execute(
     receipt.recovery_until = Some(write.recovery_until.clone());
     receipt.execution_owner = Some(write.owner.clone());
     receipt.attempts = u64::from(write.lifecycle == "uncertain");
+    if receipt.operation == "body_edit" {
+        return edit::execute(config, github, &receipt, mutation_possible).await;
+    }
     if receipt.operation == "comment_create" {
         let target: WorkItemLocator = receipt.target.parse()?;
         let item = github.issue_or_pull_request(target.number).await?;
-        if receipt.role == "pending_validation" {
-            let AcceptedRequest::Comment { profile, body } = serde_json::from_str(&receipt.payload)
-                .map_err(|e| GitHubError::GraphQl(e.to_string()))?
-            else {
-                return Err(WriteFailure::GitHub(GitHubError::GraphQl(
-                    "invalid comment request".into(),
-                )));
-            };
-            let role = helpers::role_for_target(&profile, item.kind())
+        if let Ok(AcceptedRequest::Comment { profile, body }) =
+            serde_json::from_str(&receipt.payload)
+        {
+            let role = helpers::publication_role(&profile, receipt.source.as_ref(), item.kind())
                 .map_err(|e| GitHubError::GraphQl(e.to_string()))?;
             receipt.payload = helpers::render_agent_comment(&profile, role, &body)
                 .map_err(|e| GitHubError::GraphQl(e.to_string()))?;
@@ -170,6 +186,10 @@ pub(crate) async fn execute(
             )
             .map_err(|e| GitHubError::GraphQl(e.to_string()))?;
         }
+        if let Some(remote) = comment::recover_comment(github, target.number, &receipt).await? {
+            return Ok(remote);
+        }
+        edit::authorize(config, github, &receipt, false).await?;
         comment::converge_comment(config, github, target.number, &receipt, mutation_possible).await
     } else {
         let mut plan = if let Some(plan) = store
@@ -187,11 +207,13 @@ pub(crate) async fn execute(
                 )));
             };
             prepare::prepare_pull_request(
+                config,
                 store,
                 github,
                 &receipt,
                 profile,
                 PullRequestEnsureRequest {
+                    invocation: Invocation::Operator,
                     repository: receipt.repository.parse()?,
                     comment_id,
                     head,
@@ -211,17 +233,38 @@ pub(crate) async fn execute(
     }
 }
 
-fn source(
+pub(crate) fn resolve_source(
     config: &Config,
     profile: Option<&str>,
+    invocation: &Invocation,
 ) -> Result<Option<crate::store::publication_source::PublicationSource>> {
-    crate::store::publication_source::resolve(
-        config.runtime.database(),
-        &std::env::current_dir()?,
-        profile,
-        std::env::var_os("BRAID_AGENT").is_some(),
-    )
-    .map_err(Into::into)
+    let cwd = std::env::current_dir()?;
+    match invocation {
+        Invocation::Agent(turn) => {
+            let source = crate::store::publication_source::resolve_turn(
+                config.runtime.database(),
+                &cwd,
+                profile,
+                turn,
+            )?;
+            let materials = config.profile_materials(config.profile(&source.profile_id)?)?;
+            if u64::try_from(source.profile_revision)? != materials.revision {
+                bail!("publication Profile materials differ from the running assignment");
+            }
+            Ok(Some(source))
+        }
+        Invocation::Operator => {
+            if std::env::var_os("BRAID_AGENT").is_some()
+                || crate::store::publication_source::is_runtime_worktree(
+                    config.runtime.database(),
+                    &cwd,
+                )?
+            {
+                bail!("operator entry is unavailable inside an Agent runtime worktree");
+            }
+            Ok(None)
+        }
+    }
 }
 
 pub(crate) fn check_source(config: &Config, receipt: &GhWriteReceipt) -> Result<(), GitHubError> {
@@ -232,6 +275,13 @@ pub(crate) fn check_source(config: &Config, receipt: &GhWriteReceipt) -> Result<
     if let Some(source) = &receipt.source {
         crate::store::publication_source::check(config.runtime.database(), source)
             .map_err(|e| GitHubError::GraphQl(e.to_string()))?;
+        let profile =
+            config.profile(&source.profile_id).map_err(|e| GitHubError::GraphQl(e.to_string()))?;
+        let materials =
+            config.profile_materials(profile).map_err(|e| GitHubError::GraphQl(e.to_string()))?;
+        if u64::try_from(source.profile_revision).ok() != Some(materials.revision) {
+            return Err(GitHubError::GraphQl("publication Profile materials changed".into()));
+        }
     }
     Ok(())
 }

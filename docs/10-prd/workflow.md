@@ -54,3 +54,14 @@ closed-unmerged PR sleeps and a merged PR retires. A mention on a closed Work
 Item does not wake the sleeping group; Reopen is the designed re-entry. Reopen
 rematerializes Context and starts one ordinary debounced turn. Duplicate
 deliveries never grant extra finalization turns.
+
+### Maintaining accepted working memory
+
+Use the source-bound `braid gh pr read` / `issue read --output PATH` snapshot and
+`pr edit` / `issue edit --snapshot PATH` workflow described in
+[Publication](publication.md#canonical-body-maintenance). Keep accepted Issue
+design and PR implementation scope, verification and risks in their respective
+bodies. A PR Agent correcting its current directly associated open Issue remains
+publicly a PR Implementation Agent. Confirm the returned receipt is applied;
+queued design is not yet published. This maintenance action does not schedule
+another Group or alter associations.

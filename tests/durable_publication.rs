@@ -429,10 +429,41 @@ fn cli_exits_offline_with_queryable_receipt_and_no_remote_credentials() {
         output
     };
     run(&["migrate", "apply"]);
+    let snapshot: github::BodySnapshot = serde_json::from_value(serde_json::json!({"id":1,"node_id":"item","title":"Title","body":"Closes #2\n\nImplementation request: durable-marker","state":"open","updated_at":"version-1","pull_request":{}})).unwrap();
+    let snapshot_file = dir.join("snapshot.json");
+    fs::write(&snapshot_file,serde_json::to_string(&serde_json::json!({"target":"owner/repository#1","digest":snapshot.digest(),"snapshot":snapshot})).unwrap()).unwrap();
+    let body_file = dir.join("body.md");
+    fs::write(&body_file, "Implementation scope and verification").unwrap();
+    let edited = run(&[
+        "gh",
+        "pr",
+        "edit",
+        "owner/repository#1",
+        "--operator",
+        "--profile",
+        "pr-codex",
+        "--snapshot",
+        snapshot_file.to_str().unwrap(),
+        "--body-file",
+        body_file.to_str().unwrap(),
+        "--request-id",
+        "offline-body",
+        "--json",
+    ]);
+    let edited: serde_json::Value = serde_json::from_slice(&edited.stdout).unwrap();
+    assert_eq!(edited["state"], "queued");
+    assert_eq!(edited["operation"], "body_edit");
+    assert_eq!(edited["role"], "Operator");
+    let status = run(&["gh", "status", edited["request_id"].as_str().unwrap(), "--json"]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap()["state"],
+        "queued"
+    );
     let output = run(&[
         "gh",
         "comment",
         "create",
+        "--operator",
         "owner/repository#1",
         "--profile",
         "issue-codex",
@@ -454,6 +485,7 @@ fn cli_exits_offline_with_queryable_receipt_and_no_remote_credentials() {
         "gh",
         "comment",
         "create",
+        "--operator",
         "owner/repository#1",
         "--profile",
         "issue-codex",

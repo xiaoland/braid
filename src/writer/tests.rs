@@ -46,13 +46,26 @@ impl Fixture {
     }
     fn bind_source(&self) {
         self.db().execute_batch("INSERT INTO repositories VALUES ('repo','owner/repository',1,'now'); INSERT INTO work_items(node_id,repository_node_id,kind,number,state,context_revision,observed_at) VALUES ('item','repo','issue',1,'open','context','now'); INSERT INTO profiles VALUES ('issue-codex',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','codex','issue'); INSERT INTO assignments VALUES ('assignment','item',1,'active','now',NULL); INSERT INTO agent_instances(agent_id,assignment_id,profile_id,profile_revision,role,lifecycle) VALUES ('agent','assignment','issue-codex',1,'issue_agent','idle'); INSERT INTO provider_sessions(session_id,agent_id,provider_kind,provider_session_id,context_revision,instruction_revision,lifecycle,started_at) VALUES ('session','agent','codex','provider','context','instructions','idle','now'); INSERT INTO turns(turn_id,session_id,context_revision,trigger_kind,lifecycle) VALUES ('turn','session','context','wake','completed');").unwrap();
+        let revision = self
+            .config
+            .profile_materials(self.config.profile("issue-codex").unwrap())
+            .unwrap()
+            .revision;
+        let revision = i64::try_from(revision).unwrap();
+        self.db().execute("INSERT INTO profiles SELECT profile_id,?1,effective_digest,provider_kind,tags FROM profiles WHERE revision=1", [revision]).unwrap();
+        self.db().execute("UPDATE agent_instances SET profile_revision=?1", [revision]).unwrap();
         self.db().execute("INSERT INTO worktrees(worktree_id,agent_id,path,repository_node_id,lifecycle,observed_at) VALUES ('tree','agent',?1,'repo','active','now')", [std::env::current_dir().unwrap().to_str().unwrap()]).unwrap();
+    }
+    fn invocation(&self) -> Invocation {
+        let turn = self.db().query_row("SELECT turn_id FROM turns ORDER BY CASE lifecycle WHEN 'running' THEN 0 WHEN 'starting' THEN 0 ELSE 1 END,rowid DESC LIMIT 1", [], |r| r.get::<_, String>(0));
+        turn.map_or(Invocation::Operator, Invocation::Agent)
     }
     fn comment(&self) -> GhWriteReceipt {
         create_comment(
             &self.config,
             &self.store,
             CommentCreateRequest {
+                invocation: self.invocation(),
                 target: "owner/repository#1".parse().unwrap(),
                 profile_id: "issue-codex".into(),
                 body: "update".into(),
@@ -224,6 +237,7 @@ async fn issue_source_ensures_pr_with_frozen_plan_and_one_native_activation() {
             &fixture.config,
             &fixture.store,
             CommentCreateRequest {
+                invocation: fixture.invocation(),
                 target: "owner/repository#1".parse().unwrap(),
                 profile_id: "pr-codex".into(),
                 body: "forged".into(),
@@ -236,6 +250,7 @@ async fn issue_source_ensures_pr_with_frozen_plan_and_one_native_activation() {
         &fixture.config,
         &fixture.store,
         PullRequestEnsureRequest {
+            invocation: fixture.invocation(),
             repository: "owner/repository".parse().unwrap(),
             comment_id: 7,
             head: Some("head".into()),
@@ -286,7 +301,7 @@ async fn source_invalidation_and_missing_permissions_reject_before_mutation() {
         }
         if invalidated {
             // No environment flag is needed to reject a stale cwd binding.
-            assert!(source(&fixture.config, None).is_err());
+            assert!(resolve_source(&fixture.config, None, &fixture.invocation()).is_err());
         }
         let remote = Arc::new(Mutex::new(Remote::default()));
         let (github, task) = server(remote.clone(), invalidated).await;
@@ -304,6 +319,7 @@ async fn initial_ensure_bootstrap_pr_association_and_restart_do_not_duplicate_mu
         &fixture.config,
         &fixture.store,
         PullRequestEnsureRequest {
+            invocation: fixture.invocation(),
             repository: "owner/repository".parse().unwrap(),
             comment_id: 7,
             head: Some("head".into()),
@@ -325,25 +341,22 @@ async fn initial_ensure_bootstrap_pr_association_and_restart_do_not_duplicate_mu
 }
 
 #[tokio::test]
-async fn dual_tag_profile_can_publish_across_both_surfaces_without_weakening_source_fences() {
+async fn source_role_can_publish_related_cross_surface_without_target_profile_tags() {
     for target_pr in [true, false] {
         for fence in ["valid", "invalidated", "profile_changed"] {
-            let mut fixture = Fixture::new(true);
-            fixture
-                .config
-                .profiles
-                .iter_mut()
-                .find(|p| p.id == "issue-codex")
-                .unwrap()
-                .tags
-                .push("pr".into());
+            let fixture = Fixture::new(true);
             if !target_pr {
                 fixture
                     .db()
                     .execute("UPDATE agent_instances SET role='pr_implementation_agent'", [])
                     .unwrap();
             }
-            assert!(source(&fixture.config, Some("pr-codex")).is_err());
+            if !target_pr {
+                fixture.db().execute("UPDATE work_items SET kind='pr',number=9", []).unwrap();
+            }
+            assert!(
+                resolve_source(&fixture.config, Some("pr-codex"), &fixture.invocation()).is_err()
+            );
             let receipt = fixture.comment();
             match fence {
                 "invalidated" => {
@@ -377,3 +390,5 @@ async fn dual_tag_profile_can_publish_across_both_surfaces_without_weakening_sou
 }
 
 mod turn_start;
+
+mod body_edit;

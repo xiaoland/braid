@@ -79,10 +79,12 @@ pub(super) fn validate(
         .query_row(
             "SELECT 1 FROM agent_instances a
          JOIN assignments g ON g.assignment_id=a.assignment_id
-         JOIN worktrees w ON w.agent_id=a.agent_id AND w.lifecycle='active'
+         JOIN work_items item ON item.node_id=g.work_item_node_id
+         JOIN worktrees w ON w.agent_id=a.agent_id AND w.lifecycle='active' AND w.repository_node_id=item.repository_node_id
          JOIN provider_sessions s ON s.agent_id=a.agent_id
          JOIN turns t ON t.session_id=s.session_id
          WHERE a.agent_id=?1 AND g.assignment_id=?2 AND g.generation=?3
+           AND ((a.role='issue_agent' AND item.kind='issue') OR (a.role='pr_implementation_agent' AND item.kind='pr'))
            AND a.profile_id=?4 AND a.profile_revision=?5 AND a.role=?9 AND s.session_id=?6
            AND t.turn_id=?7 AND t.context_revision=?8 AND s.context_revision=?8
            AND t.lifecycle IN ('running','completed')
@@ -93,6 +95,7 @@ pub(super) fn validate(
                AND (e.detail IS NOT 'cross_surface' OR EXISTS (
                  SELECT 1 FROM wake_batches wb JOIN wake_batch_events be ON be.batch_id=wb.batch_id
                  WHERE be.event_id=e.event_id AND wb.lifecycle='runnable')))
+           AND NOT EXISTS (SELECT 1 FROM provider_sessions newer_session WHERE newer_session.agent_id=a.agent_id AND newer_session.rowid>s.rowid)
            AND NOT EXISTS (
              SELECT 1 FROM assignments newer WHERE newer.work_item_node_id=g.work_item_node_id
                AND newer.generation>g.generation)",
@@ -117,4 +120,49 @@ pub(super) fn validate(
         ));
     }
     Ok(())
+}
+
+/// A turn reference is supplied in the runtime prompt; it is only a selector.
+/// Durable fences and the actual worktree path are independently checked.
+pub fn resolve_turn(
+    database: &Path,
+    cwd: &Path,
+    profile: Option<&str>,
+    turn: &str,
+) -> Result<PublicationSource, StoreError> {
+    let source = resolve(database, cwd, profile, true)?
+        .ok_or_else(|| StoreError::InvalidData("missing publication source".into()))?;
+    if source.turn_id != turn {
+        return Err(StoreError::InvalidData(
+            "publication turn does not match current runtime worktree".into(),
+        ));
+    }
+    Ok(source)
+}
+
+pub fn work_item(
+    database: &Path,
+    source: &PublicationSource,
+) -> Result<(String, String, u64), StoreError> {
+    let connection = open_read_only(database)?;
+    validate(&connection, source)?;
+    let (repository, kind, number) = connection.query_row("SELECT r.name_with_owner,i.kind,i.number FROM assignments a JOIN work_items i ON i.node_id=a.work_item_node_id JOIN repositories r ON r.node_id=i.repository_node_id WHERE a.assignment_id=?1", [&source.assignment_id], |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)?)))?;
+    Ok((
+        repository,
+        kind,
+        u64::try_from(number).map_err(|e| StoreError::InvalidData(e.to_string()))?,
+    ))
+}
+
+/// Operator entry must not depend on whether a session has produced a turn yet.
+pub fn is_runtime_worktree(database: &Path, cwd: &Path) -> Result<bool, StoreError> {
+    let connection = open_read_only(database)?;
+    let cwd = cwd.canonicalize().map_err(|e| StoreError::InvalidData(e.to_string()))?;
+    let mut statement = connection.prepare("SELECT path FROM worktrees")?;
+    for path in statement.query_map([], |row| row.get::<_, String>(0))? {
+        if Path::new(&path?).canonicalize().is_ok_and(|path| cwd.starts_with(path)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

@@ -268,16 +268,16 @@ The first shipped write vertical is intentionally small and recoverable:
 ```shell
 braid gh comment create owner/repository#123 \
   --config /absolute/path/to/braid.toml \
-  --profile issue-codex \
+  --profile issue-codex --source-turn TURN_FROM_RUNTIME_PROMPT \
   --request-id stable-agent-message-key \
   --body 'Concise public update'
 
-braid gh pr ensure --comment 123456789 \
+braid gh pr ensure --comment 123456789 --source-turn TURN_FROM_RUNTIME_PROMPT \
   --config /absolute/path/to/braid.toml
 ```
 
-`comment create` derives the public role from the canonical Issue/PR target and
-the Profile tags. The writer prepends one attribution block and removes exact
+`comment create` derives the public role from its durable source Group, not the
+canonical target or Profile tags. Tags only select role eligibility. The writer prepends one attribution block and removes exact
 repetitions of that generated block from the start of the supplied body, so a
 caller retry or model mistake cannot duplicate it. `--request-id` is optional;
 exact locally accepted request content provides the fallback retry identity, while an
@@ -313,7 +313,7 @@ Receipt projections include operation, target, lifecycle, ensure stage/head/base
 and confirmed GitHub references; queued is not published. Same key and digest
 returns the same receipt; a changed request conflicts. Raw comment content and a
 Profile snapshot are accepted as a typed, not-yet-target-validated request.
-Canonical target kind, Profile compatibility and installation write permissions
+Canonical target kind, operation/source association and installation write permissions
 are still verified before mutation. This does not expand operation/target rights.
 
 Only the runtime-owned outbox claims and settles writes, with runtime generation,
@@ -379,3 +379,40 @@ comment Profile as an assertion, not an identity override. REST publication shar
 installation cooldown/admission with GraphQL while keeping REST response counters
 out of GraphQL point accounting; server Retry-After/reset deadlines reach the
 outbox's durable next-attempt deadline.
+
+### Source-bound title/body maintenance
+
+`PublicationSource` remains the single durable provenance model in
+`write_intents.source_binding`. Agent CLI entry requires a runtime-prompt
+`--source-turn`; resolution cross-checks the actual canonical cwd with the active
+worktree, assignment generation/repository/role, configured Profile materials
+revision, current session and Context revision, observed running or completed
+turn, invalidation and replacement fences. An unobserved starting turn never
+borrows an older completed identity. The selector is not a bearer capability.
+`--operator` is explicit, forbidden in Agent runtime worktrees, and recorded as
+Operator. This does not claim hostile same-UID process isolation.
+
+`pr read`/`issue read --output PATH` exports a typed canonical title/body snapshot
+including updated version and SHA-256 digest. `pr edit`/`issue edit --snapshot PATH`
+accepts `--title` and/or `--body-file`, with Profile assertion, invocation binding
+and stable `--request-id`. It serializes `AcceptedRequest::Edit` into the existing
+intent + unique `agent_write` outbox transaction before any GitHub access. No
+migration or additional executor is required. Only the existing runtime owner
+may execute; all existing attempt/restart/installation cooldown fences apply.
+
+The own-Item permission and native direct cross-surface association are checked
+separately from source attribution. PR source may edit only its own PR or its
+current directly associated OPEN Issue; Issue source may edit only its own Issue.
+Related comments remain valid in both directions. The source role never changes
+to the target's role. PR ensure additionally requires its Issue source to own the
+request comment's Issue.
+
+Before body mutation the executor reads a canonical snapshot, rejects a changed
+digest as `conflict`, revalidates target state/association/installation rights,
+reads again, and checks the source/owner fence immediately before PATCH. It
+preserves ensure markers and closing-reference lines when rendering source
+attribution once. PATCH's returned title/body must match; an unconfirmed send
+stays uncertain and is read back before retry. Exact resulting content confirms
+applied even if authority has since expired; any different version is a conflict,
+not proof of success. This is optimistic conflict checking, not atomic GitHub CAS;
+the final read/PATCH interval remains a documented concurrency limitation.

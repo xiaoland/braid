@@ -2,6 +2,7 @@
 use super::*;
 
 pub async fn prepare_pull_request(
+    config: &Config,
     store: &StoreActor,
     github: &GitHubClient,
     accepted: &GhWriteReceipt,
@@ -9,12 +10,13 @@ pub async fn prepare_pull_request(
     request: PullRequestEnsureRequest,
 ) -> Result<ImplementationRequestReceipt, GitHubError> {
     let repository = request.repository.clone();
-    prepare_plan(store, github, accepted, profile, request, repository).await.map_err(|e| {
+    prepare_plan(config, store, github, accepted, profile, request, repository).await.map_err(|e| {
         e.downcast::<GitHubError>().unwrap_or_else(|e| GitHubError::GraphQl(e.to_string()))
     })
 }
 
 async fn prepare_plan(
+    config: &Config,
     store: &StoreActor,
     github: &GitHubClient,
     accepted: &GhWriteReceipt,
@@ -32,6 +34,16 @@ async fn prepare_plan(
             request.comment_id,
             issue_number
         );
+    }
+    if let Some(source) = &accepted.source {
+        let (source_repository, source_kind, source_number) =
+            crate::store::publication_source::work_item(config.runtime.database(), source)?;
+        if source_repository != repository.to_string()
+            || source_kind != "issue"
+            || source_number != issue_number
+        {
+            bail!("initial PR ensure must originate from its own Issue source");
+        }
     }
     let repository_details = github.repository_details().await?;
     let base_ref = repository_details.default_branch;

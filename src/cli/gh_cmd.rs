@@ -3,6 +3,35 @@ use super::*;
 
 pub fn gh(command: GhCommand) -> Result<()> {
     match command {
+        GhCommand::Pr { command: GhPrCommand::Read(arguments) }
+        | GhCommand::Issue { command: GhBodyCommand::Read(arguments) } => {
+            let config = helpers::load(&arguments.source.resolve_config_path()?)?;
+            let target = arguments.target.parse::<WorkItemLocator>()?;
+            let snapshot = tokio::runtime::Runtime::new()?
+                .block_on(writer::read_for_edit(&config, &target))?;
+            fs::write(&arguments.output, snapshot)?;
+            println!("canonical snapshot: {}", arguments.output.display());
+            Ok(())
+        }
+        GhCommand::Pr { command: GhPrCommand::Edit(arguments) }
+        | GhCommand::Issue { command: GhBodyCommand::Edit(arguments) } => {
+            let config = helpers::load(&arguments.source.resolve_config_path()?)?;
+            let actor = helpers::store(&config)?;
+            let receipt = writer::edit(
+                &config,
+                &actor,
+                writer::EditRequest {
+                    invocation: arguments.invocation.resolve(),
+                    target: arguments.target.parse()?,
+                    profile_id: arguments.profile,
+                    snapshot: fs::read_to_string(arguments.snapshot)?,
+                    title: arguments.title,
+                    body: arguments.body_file.map(fs::read_to_string).transpose()?,
+                    request_id: arguments.request_id,
+                },
+            )?;
+            print_gh_receipt(&receipt, arguments.json, &actor)
+        }
         GhCommand::Status(arguments) => {
             let config = helpers::load(&arguments.source.resolve_config_path()?)?;
             if !arguments.request_id.starts_with("request-") {
@@ -30,6 +59,7 @@ pub fn gh(command: GhCommand) -> Result<()> {
                 &config,
                 &actor,
                 CommentCreateRequest {
+                    invocation: arguments.invocation.resolve(),
                     target,
                     profile_id: arguments.profile,
                     body,
@@ -53,6 +83,7 @@ pub fn gh(command: GhCommand) -> Result<()> {
                 &config,
                 &actor,
                 PullRequestEnsureRequest {
+                    invocation: arguments.invocation.resolve(),
                     repository,
                     comment_id: arguments.comment,
                     head: arguments.head,

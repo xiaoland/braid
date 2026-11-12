@@ -80,6 +80,7 @@ impl AgentProvider for DelayedProvider {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn native_start_authorizes_current_publication_before_start_rpc_response() {
     for old_completed in [false, true] {
         for reply in [Reply::Success, Reply::LateError] {
@@ -95,7 +96,10 @@ async fn native_start_authorizes_current_publication_before_start_rpc_response()
             fixture.db().execute_batch("UPDATE provider_sessions SET lifecycle='running'; INSERT INTO turns(turn_id,session_id,context_revision,trigger_kind,lifecycle) VALUES ('current','session','context','wake','starting');").unwrap();
             // An unobserved starting turn must fence publication, not fall back
             // to an older completed turn with a non-null timestamp.
-            assert!(source(&fixture.config, Some("issue-codex")).is_err());
+            assert!(
+                resolve_source(&fixture.config, Some("issue-codex"), &fixture.invocation())
+                    .is_err()
+            );
             let provider = DelayedProvider::new(reply);
             let session = ProviderAgentSession::start(
                 provider.clone(),
@@ -128,12 +132,18 @@ async fn native_start_authorizes_current_publication_before_start_rpc_response()
                     }
                     tokio::task::yield_now().await;
                 }
-                let resolved = source(&fixture.config, Some("issue-codex")).unwrap().unwrap();
+                let resolved =
+                    resolve_source(&fixture.config, Some("issue-codex"), &fixture.invocation())
+                        .unwrap()
+                        .unwrap();
                 assert_eq!(resolved.turn_id, "current");
                 let receipt = fixture.comment(); // same production acceptance path used by the CLI
                 assert_eq!(receipt.source.unwrap().turn_id, "current");
                 fixture.db().execute("INSERT INTO events(event_id,work_item_node_id,origin,reference,lifecycle,observed_at,kind) VALUES ('invalidate','item','human','changed','pending','now','invalidate')", []).unwrap();
-                assert!(source(&fixture.config, Some("issue-codex")).is_err());
+                assert!(
+                    resolve_source(&fixture.config, Some("issue-codex"), &fixture.invocation())
+                        .is_err()
+                );
                 assert!(
                     crate::store::publication_source::check(
                         fixture.config.runtime.database(),
@@ -211,7 +221,7 @@ async fn unobserved_deferred_and_unknown_start_never_authorize_publication() {
             Reply::Unknown => assert!(matches!(result, Err(SessionError::Unknown(_)))),
             _ => unreachable!(),
         }
-        assert!(source(&fixture.config, None).is_err());
+        assert!(resolve_source(&fixture.config, None, &fixture.invocation()).is_err());
         assert!(events.try_recv().is_err());
     }
 }

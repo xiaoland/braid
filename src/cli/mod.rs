@@ -186,6 +186,10 @@ enum GhCommand {
         #[command(subcommand)]
         command: GhPrCommand,
     },
+    Issue {
+        #[command(subcommand)]
+        command: GhBodyCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -205,6 +209,61 @@ enum GhCommentCommand {
 #[derive(Debug, Subcommand)]
 enum GhPrCommand {
     Ensure(GhPrEnsure),
+    Read(GhBodyRead),
+    Edit(GhBodyEdit),
+}
+
+#[derive(Debug, Subcommand)]
+enum GhBodyCommand {
+    Read(GhBodyRead),
+    Edit(GhBodyEdit),
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct GhInvocation {
+    /// Turn reference supplied by the Braid runtime prompt (verified against durable state and cwd).
+    #[arg(long)]
+    source_turn: Option<String>,
+    /// Explicit audited human entry; unavailable inside Agent runtime worktrees.
+    #[arg(long)]
+    operator: bool,
+}
+impl GhInvocation {
+    fn resolve(self) -> writer::Invocation {
+        self.source_turn.map_or(writer::Invocation::Operator, writer::Invocation::Agent)
+    }
+}
+
+#[derive(Debug, Args)]
+struct GhBodyRead {
+    target: String,
+    #[command(flatten)]
+    source: ConfigSource,
+    /// Save the canonical snapshot for a later edit.
+    #[arg(long)]
+    output: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct GhBodyEdit {
+    target: String,
+    #[command(flatten)]
+    source: ConfigSource,
+    #[command(flatten)]
+    invocation: GhInvocation,
+    #[arg(long)]
+    profile: String,
+    #[arg(long)]
+    snapshot: PathBuf,
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long)]
+    body_file: Option<PathBuf>,
+    #[arg(long)]
+    request_id: String,
+    #[arg(long)]
+    json: bool,
 }
 
 /// Shared config source: exact `--config <PATH>` or registry lookup via
@@ -312,6 +371,8 @@ struct GitHubRedeliver {
 
 #[derive(Debug, Args)]
 struct GhCommentCreate {
+    #[command(flatten)]
+    invocation: GhInvocation,
     #[arg(value_name = "OWNER/REPOSITORY#NUMBER")]
     target: String,
     #[command(flatten)]
@@ -330,6 +391,8 @@ struct GhCommentCreate {
 
 #[derive(Debug, Args)]
 struct GhPrEnsure {
+    #[command(flatten)]
+    invocation: GhInvocation,
     #[arg(long, value_name = "ISSUE_COMMENT_ID")]
     comment: u64,
     #[command(flatten)]

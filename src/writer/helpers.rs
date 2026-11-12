@@ -21,6 +21,22 @@ pub fn role_for_target(profile: &Profile, kind: &str) -> Result<&'static str> {
     }
 }
 
+pub fn publication_role(
+    profile: &Profile,
+    source: Option<&crate::store::publication_source::PublicationSource>,
+    kind: &str,
+) -> Result<&'static str> {
+    match source.map(|source| source.role.as_str()) {
+        Some("issue_agent") => Ok("Issue Agent"),
+        Some("pr_implementation_agent") => Ok("PR Implementation Agent"),
+        Some(_) => bail!("unknown publication source role"),
+        None => {
+            role_for_target(profile, kind)?;
+            Ok("Operator")
+        }
+    }
+}
+
 pub fn render_agent_comment(profile: &Profile, role: &str, body: &str) -> Result<String> {
     let attribution = format!("> **Braid Agent · {}**\n> {}", profile.display_name, role);
     let mut body = body.trim();

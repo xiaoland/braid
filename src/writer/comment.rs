@@ -9,6 +9,26 @@ pub async fn converge_comment(
     receipt: &GhWriteReceipt,
     mutation_possible: &mut bool,
 ) -> WriteResult {
+    if let Some(remote) = recover_comment(github, issue_number, receipt).await? {
+        return Ok(remote);
+    }
+    let item = github.issue_or_pull_request(issue_number).await?;
+    github.require_write_permissions(&[if item.kind() == "pr" {
+        "pull_requests"
+    } else {
+        "issues"
+    }])?;
+    check_source(config, receipt)?;
+    *mutation_possible = true;
+    let comment = github.create_issue_comment(issue_number, &receipt.payload).await?;
+    Ok(RemoteWrite { database_id: comment.id.to_string(), node_id: comment.node_id })
+}
+
+pub async fn recover_comment(
+    github: &GitHubClient,
+    issue_number: u64,
+    receipt: &GhWriteReceipt,
+) -> Result<Option<RemoteWrite>, WriteFailure> {
     if receipt.attempts > 0 {
         let candidates = github
             .issue_comments(issue_number)
@@ -29,23 +49,14 @@ pub async fn converge_comment(
             .collect::<Vec<_>>();
         match candidates.as_slice() {
             [comment] => {
-                return Ok(RemoteWrite {
+                return Ok(Some(RemoteWrite {
                     database_id: comment.id.to_string(),
                     node_id: comment.node_id.clone(),
-                });
+                }));
             }
             [] => {}
             _ => return Err(WriteFailure::Ambiguous("multiple matching App comments".into())),
         }
     }
-    let item = github.issue_or_pull_request(issue_number).await?;
-    github.require_write_permissions(&[if item.kind() == "pr" {
-        "pull_requests"
-    } else {
-        "issues"
-    }])?;
-    check_source(config, receipt)?;
-    *mutation_possible = true;
-    let comment = github.create_issue_comment(issue_number, &receipt.payload).await?;
-    Ok(RemoteWrite { database_id: comment.id.to_string(), node_id: comment.node_id })
+    Ok(None)
 }

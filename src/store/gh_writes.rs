@@ -237,7 +237,7 @@ fn validate_gh_write(write: &NewGhWriteIntent) -> Result<(), StoreError> {
         || write.role.is_empty()
         || write.payload.is_empty()
         || write.request_digest.len() != 64
-        || !matches!(write.operation, "comment_create" | "pr_ensure")
+        || !matches!(write.operation, "comment_create" | "pr_ensure" | "body_edit")
     {
         return Err(StoreError::InvalidData("invalid braid gh write intent".into()));
     }
