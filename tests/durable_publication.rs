@@ -525,6 +525,33 @@ fn cli_exits_offline_with_queryable_receipt_and_no_remote_credentials() {
 }
 
 #[test]
+fn gh_read_runs_on_existing_runtime_without_nested_runtime_panic() {
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(format!("braid-cli-read-{}-", uuid::Uuid::now_v7()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    let example = include_str!("../config.example.toml");
+    fs::write(&path, example.replace("/absolute/path/to/instance", dir.to_str().unwrap())).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_braid"))
+        .args(["gh", "pr", "read", "owner/repository#1"])
+        .arg("--output")
+        .arg(dir.join("snapshot.json"))
+        .arg("--config")
+        .arg(&path)
+        .env_remove("BRAID_AGENT")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Cannot start a runtime from within a runtime"),
+        "nested runtime panic: {stderr}"
+    );
+    assert!(!output.status.success(), "read must fail without GitHub credentials");
+    assert!(output.status.code() != Some(101), "cli panicked: {stderr}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn completed_turn_keeps_obligation_but_invalidation_and_generation_replace_fence_it() {
     let db = Database::new(true);
     let connection = db.connect();

@@ -8,8 +8,12 @@ pub fn gh(command: GhCommand) -> Result<()> {
         | GhCommand::Issue { command: GhBodyCommand::Read(arguments) } => {
             let config = helpers::load(&arguments.source.resolve_config_path()?)?;
             let target = arguments.target.parse::<WorkItemLocator>()?;
-            let snapshot = tokio::runtime::Runtime::new()?
-                .block_on(writer::read_for_edit(&config, &target))?;
+            // `cli::run` already executes on the `#[tokio::main]` runtime, so a
+            // nested `Runtime::new().block_on` panics; park this worker thread
+            // and drive the read on the existing runtime instead.
+            let snapshot = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(writer::read_for_edit(&config, &target))
+            })?;
             fs::write(&arguments.output, snapshot)?;
             println!("canonical snapshot: {}", arguments.output.display());
             Ok(())
