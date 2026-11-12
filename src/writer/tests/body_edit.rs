@@ -63,30 +63,31 @@ pub(super) async fn body_server(
         .route("/repos/owner/repository/issues/9", get(move || { let remote=pr_read.clone(); async move {Json(json!({"id":9,"node_id":"pr","number":9,"title":"Source PR","html_url":"pr","state":if remote.lock().unwrap().pr_closed {"closed"} else {"open"},"pull_request":{}}))}}))
         .route("/graphql", post(move |Json(request): Json<Value>| { let remote=association.clone(); async move {
             let state=remote.lock().unwrap();
+            if state.limited { return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE); }
             let query=request["query"].as_str().unwrap();
             let repository=json!({"id":"repo","nameWithOwner":"owner/repository"});
-            let issue_ref=json!({"id":"item","number":1,"title":"Canonical","state":"OPEN","repository":repository});
-            let pr_ref=json!({"id":"pr","number":9,"title":"Existing PR","state":"OPEN","repository":repository});
+            let issue_ref=json!({"id":"item","number":1,"title":"Canonical","state":state.snapshot.state.to_uppercase(),"repository":repository});
+            let pr_ref=json!({"id":"pr","number":9,"title":"Existing PR","state":if state.pr_closed {"CLOSED"} else {"OPEN"},"repository":repository});
             let mut nodes=Vec::new();
             if query.contains("items:") {
                 if query.contains("closingIssuesReferences") && state.associated {nodes.push(issue_ref);}
                 if query.contains("closedByPullRequestsReferences") && state.associated {nodes.push(pr_ref);}
                 let connection=json!({"items":{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}});
                 let root=if query.contains("pullRequest(number:") {"pullRequest"} else {"issue"};
-                return Json(json!({"data":{"repository":{root:connection}}}));
+                return Ok(Json(json!({"data":{"repository":{root:connection}}})));
             }
             if query.contains("fullDatabaseId") {
                 let core=if query.contains("pullRequest(number:") {
-                    json!({"id":"pr","fullDatabaseId":"9","number":9,"title":"Existing PR","body":"Closes #1","state":"OPEN","isDraft":false,"merged":false,"updatedAt":"pr-v1","baseRefName":"main","headRefName":"work","headRepository":repository})
+                    json!({"id":"pr","fullDatabaseId":"9","number":9,"title":"Existing PR","body":"Closes #1","state":if state.pr_closed {"CLOSED"} else {"OPEN"},"isDraft":false,"merged":false,"updatedAt":"pr-v1","baseRefName":"main","headRefName":"work","headRepository":repository})
                 } else {
-                    json!({"id":"item","fullDatabaseId":"1","number":1,"title":state.snapshot.title,"body":state.snapshot.body,"state":"OPEN","updatedAt":state.snapshot.updated_at})
+                    json!({"id":"item","fullDatabaseId":"1","number":1,"title":state.snapshot.title,"body":state.snapshot.body,"state":state.snapshot.state.to_uppercase(),"updatedAt":state.snapshot.updated_at})
                 };
                 let root=if query.contains("pullRequest(number:") {"pullRequest"} else {"issue"};
-                return Json(json!({"data":{"repository":{"id":"repo","nameWithOwner":"owner/repository",root:core}}}));
+                return Ok(Json(json!({"data":{"repository":{"id":"repo","nameWithOwner":"owner/repository",root:core}}})));
             }
             if state.associated {nodes.push(json!({"number":1,"repository":{"nameWithOwner":"owner/repository"}}));}
             if state.associated_999 {nodes.push(json!({"number":999,"repository":{"nameWithOwner":"owner/repository"}}));}
-            Json(json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}))
+            Ok(Json(json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}})))
         }}));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

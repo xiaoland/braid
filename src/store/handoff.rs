@@ -164,33 +164,48 @@ pub(crate) fn batch_needs_refresh(database: &Path, batch: &str) -> Result<bool, 
     Ok(open_read_only(database)?.query_row("SELECT EXISTS(SELECT 1 FROM pr_handoffs h JOIN wake_batch_events be ON be.event_id=h.event_id WHERE be.batch_id=?1)", [batch], |r| r.get(0))?)
 }
 
-/// The ordinary batch must not deliver an old handoff into a replacement generation.
-pub(crate) fn batch_sources(
-    database: &Path,
-    batch: &str,
-) -> Result<Vec<(String, u64)>, StoreError> {
+/// Canonical invalidity retires only this historical Wake, never its applied receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetirementReason {
+    TargetGenerationChanged,
+    TargetClosed,
+    SourceNotOpenAssociated,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RetiredInput {
+    pub event_id: String,
+    pub reason: RetirementReason,
+}
+
+pub(crate) struct BatchSource {
+    pub event_id: String,
+    pub repository: String,
+    pub number: u64,
+    pub current_generation: bool,
+}
+
+/// Post-delivery source authority is historical: do not revalidate the source
+/// turn/assignment fence. Only canonical association/OPEN state still matters.
+pub(crate) fn batch_sources(database: &Path, batch: &str) -> Result<Vec<BatchSource>, StoreError> {
     let connection = open_read_only(database)?;
-    let mut statement = connection.prepare("SELECT w.repository,w.target,h.target_assignment_id,w.source_binding FROM pr_handoffs h JOIN write_intents w ON w.intent_id=h.intent_id JOIN wake_batch_events be ON be.event_id=h.event_id WHERE be.batch_id=?1")?;
+    let mut statement = connection.prepare("SELECT h.event_id,w.repository,i.number,
+        NOT EXISTS (SELECT 1 FROM assignments newer WHERE newer.work_item_node_id=a.work_item_node_id AND newer.generation>a.generation)
+        AND EXISTS (SELECT 1 FROM turns t JOIN provider_sessions ps ON ps.session_id=t.session_id JOIN agent_instances ai ON ai.agent_id=ps.agent_id WHERE t.batch_id=be.batch_id AND t.lifecycle='starting' AND ai.assignment_id=a.assignment_id)
+        FROM pr_handoffs h JOIN write_intents w ON w.intent_id=h.intent_id
+        JOIN assignments a ON a.assignment_id=h.target_assignment_id
+        JOIN assignments source ON source.assignment_id=json_extract(w.source_binding,'$.assignment_id')
+        JOIN work_items i ON i.node_id=source.work_item_node_id
+        JOIN wake_batch_events be ON be.event_id=h.event_id WHERE be.batch_id=?1")?;
     let rows = statement.query_map([batch], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-        ))
+        Ok(BatchSource {
+            event_id: r.get(0)?,
+            repository: r.get(1)?,
+            number: super::sqlite_i64_to_u64(r.get(2)?, "handoff source number")?,
+            current_generation: r.get(3)?,
+        })
     })?;
-    let mut sources = Vec::new();
-    for row in rows {
-        let (repository, target, bound, source) = row?;
-        if target_assignment(&connection, &repository, &target)? != bound {
-            return Err(invalid("handoff batch belongs to an old target generation"));
-        }
-        let source: publication_source::PublicationSource =
-            serde_json::from_str(&source).map_err(|e| invalid(&e.to_string()))?;
-        let number: i64 = connection.query_row("SELECT i.number FROM assignments a JOIN work_items i ON i.node_id=a.work_item_node_id WHERE a.assignment_id=?1", [&source.assignment_id], |r| r.get(0))?;
-        sources.push((repository, u64::try_from(number).map_err(|e| invalid(&e.to_string()))?));
-    }
-    Ok(sources)
+    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
 }
 
 /// Delivery and receipt settlement share the caller's outbox attempt transaction.

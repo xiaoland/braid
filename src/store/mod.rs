@@ -1212,6 +1212,18 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
+    pub(crate) fn retire_handoff_inputs(
+        &self,
+        claim: TurnClaim,
+        inputs: Vec<handoff::RetiredInput>,
+    ) -> Result<Option<TurnClaim>, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::RetireHandoffInputs(claim, inputs, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
     pub fn record_turn_error(&self, turn_id: String, error: String) -> Result<(), StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
@@ -1482,6 +1494,11 @@ enum Command {
     MarkTurnStarted(String, String, Sender<Result<(), StoreError>>),
     MarkTurnTerminal(String, String, Sender<Result<(), StoreError>>),
     DeferTurnClaim(String, Sender<Result<(), StoreError>>),
+    RetireHandoffInputs(
+        TurnClaim,
+        Vec<handoff::RetiredInput>,
+        Sender<Result<Option<TurnClaim>, StoreError>>,
+    ),
     RecordTurnError(String, String, Sender<Result<(), StoreError>>),
     ClaimUrgentSteer(String, Sender<Result<Option<TurnClaim>, StoreError>>),
     ConsumeSteerBatch(String, String, Sender<Result<(), StoreError>>),
@@ -1820,6 +1837,9 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             }
             Command::MarkTurnStarted(turn_id, provider_turn_id, reply) => {
                 let _ = reply.send(mark_turn_started(database, &turn_id, &provider_turn_id));
+            }
+            Command::RetireHandoffInputs(claim, inputs, reply) => {
+                let _ = reply.send(retire_handoff_inputs(database, claim, &inputs));
             }
             Command::DeferTurnClaim(turn_id, reply) => {
                 let _ = reply.send(defer_turn_claim(database, &turn_id));
@@ -4880,6 +4900,75 @@ fn defer_turn_claim(database: &Path, turn_id: &str) -> Result<(), StoreError> {
     )?;
     transaction.commit()?;
     Ok(())
+}
+
+/// Short fenced transaction: no network IO, no new assignment or scheduling.
+fn retire_handoff_inputs(
+    database: &Path,
+    mut claim: TurnClaim,
+    inputs: &[handoff::RetiredInput],
+) -> Result<Option<TurnClaim>, StoreError> {
+    require_current_schema(database)?;
+    let mut connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    let tx = connection.transaction()?;
+    let session: String = tx.query_row(
+        "SELECT t.session_id FROM turns t JOIN provider_sessions ps ON ps.session_id=t.session_id
+         JOIN wake_batches b ON b.batch_id=t.batch_id
+         WHERE t.turn_id=?1 AND t.batch_id=?2 AND t.lifecycle='starting'
+         AND t.provider_turn_id IS NULL AND ps.provider_session_id=?3
+         AND ps.lifecycle='running' AND b.lifecycle='consumed'",
+        params![claim.turn_id, claim.batch_id, claim.provider_session_id],
+        |r| r.get(0),
+    )?;
+    for input in inputs {
+        // Check membership and handoff identity before touching an event. Receipt
+        // and pr_handoffs rows remain immutable historical delivery evidence.
+        let removed = tx.execute("DELETE FROM wake_batch_events WHERE batch_id=?1 AND event_id=?2 AND EXISTS (SELECT 1 FROM pr_handoffs h WHERE h.event_id=?2)", params![claim.batch_id, input.event_id])?;
+        if removed != 1 {
+            return Err(StoreError::InvalidData("handoff retirement membership changed".into()));
+        }
+        tx.execute(
+            "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
+            [&input.event_id],
+        )?;
+    }
+    let (references, trusted) = batch_references(&tx, &claim.batch_id)?;
+    // The batch already passed debounce and was claimed. Keep that admission
+    // (and quiet_deadline), rather than re-debouncing its surviving inputs.
+    // Concurrent arrivals retain their own open batch and scheduling facts.
+    // Handoff events are always non-urgent. Any urgency of a nonempty
+    // surviving batch therefore belongs to its other inputs (including reset
+    // continuations), not just trusted mentions.
+    let count = i64::try_from(references.len()).expect("SQLite event count fits i64");
+    tx.execute(
+        "UPDATE wake_batches SET event_count=?2,urgent=CASE WHEN ?2=0 THEN 0 ELSE urgent END,updated_at=?3 WHERE batch_id=?1",
+        params![claim.batch_id, count, now_rfc3339()],
+    )?;
+    let result = if references.is_empty() {
+        tx.execute("DELETE FROM turns WHERE turn_id=?1", [&claim.turn_id])?;
+        tx.execute(
+            "UPDATE provider_sessions SET lifecycle='idle' WHERE session_id=?1",
+            [&session],
+        )?;
+        None
+    } else {
+        claim.references = references;
+        claim.trusted_mention = trusted;
+        if claim.trigger_kind != "finalization" {
+            claim.trigger_kind = if trusted { "trusted_mention" } else { "wake_batch" }.into();
+        }
+        tx.execute(
+            "UPDATE turns SET trigger_kind=?2 WHERE turn_id=?1",
+            params![claim.turn_id, claim.trigger_kind],
+        )?;
+        Some(claim)
+    };
+    tx.commit()?;
+    for input in inputs {
+        tracing::info!(event = %input.event_id, reason = ?input.reason, "retired invalid historical handoff input");
+    }
+    Ok(result)
 }
 
 fn record_turn_error(database: &Path, turn_id: &str, error: &str) -> Result<(), StoreError> {

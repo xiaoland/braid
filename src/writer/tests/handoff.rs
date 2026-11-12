@@ -24,7 +24,11 @@ fn runnable(f: &Fixture) {
 }
 fn claim(f: &Fixture) -> Option<crate::store::TurnClaim> {
     f.store
-        .claim_runnable_turn("pr".into(), "issue-codex".into(), vec!["pr-provider".into()])
+        .claim_runnable_turn(
+            "pr".into(),
+            "issue-codex".into(),
+            vec!["pr-provider".into(), "new-pr-provider".into()],
+        )
         .unwrap()
 }
 
@@ -184,7 +188,7 @@ async fn applied_issue_design_is_materialized_at_handoff_safe_boundary_not_from_
             &mut denied
         )
         .await
-        .is_err()
+        .is_ok_and(|d| matches!(d, crate::group::handoff::RefreshDisposition::Retire(_)))
     );
     assert!(denied.is_empty());
     task.abort();
@@ -296,7 +300,8 @@ async fn refresh_failure_defers_and_merges_an_arriving_handoff_without_losing_in
     let first = claim(&f).unwrap();
     handoff(&f, "arrives-during-refresh").unwrap();
     f.drain(github.clone()).await;
-    remote.lock().unwrap().associated = false;
+    add_input(&f, "wake", "HumanWake arriving during network failure");
+    remote.lock().unwrap().limited = true;
     let backend = crate::collaboration::CollaborationBackend::GitHub(github);
     let mut input = String::new();
     assert!(
@@ -324,7 +329,21 @@ async fn refresh_failure_defers_and_merges_an_arriving_handoff_without_losing_in
         1
     );
     let retry = claim(&f).unwrap();
-    assert_eq!(retry.references.len(), 2);
+    assert_eq!(retry.references.len(), 3);
+    remote.lock().unwrap().limited = false;
+    // A fresh HTTP client models process restart after the transient failure;
+    // the original client correctly retains its installation cooldown.
+    let (recovered_github, recovered_task) = body_edit::body_server(remote.clone()).await;
+    let backend = crate::collaboration::CollaborationBackend::GitHub(recovered_github);
+    let recorder = RecordingSession::new();
+    send_prepared(&f, &backend, retry, &recorder).await;
+    assert_eq!(recorder.inputs.lock().unwrap().len(), 1);
+    assert!(recorder.inputs.lock().unwrap()[0].contains("Current canonical handoff Context"));
+    assert_eq!(count(&f, "pr_handoffs"), 2);
+    assert!(
+        recorder.inputs.lock().unwrap()[0].contains("HumanWake arriving during network failure")
+    );
+    recovered_task.abort();
     task.abort();
 }
 
@@ -340,5 +359,292 @@ async fn uncertain_issue_design_is_not_handed_off_as_published() {
     assert_eq!(f.receipt(&edit.request_id).lifecycle, "uncertain");
     assert!(handoff(&f, "must-wait").is_err());
     assert_eq!(count(&f, "pr_handoffs"), 0);
+    task.abort();
+}
+
+/// Provider-boundary recorder: the production send/observe path must record a
+/// native start, not merely make the batch claimable again.
+struct RecordingSession {
+    events: tokio::sync::broadcast::Sender<crate::agent_session::SessionEvent>,
+    inputs: Mutex<Vec<String>>,
+}
+impl RecordingSession {
+    fn new() -> Self {
+        Self { events: tokio::sync::broadcast::channel(8).0, inputs: Mutex::new(Vec::new()) }
+    }
+}
+#[async_trait::async_trait]
+impl crate::agent_session::AgentSession for RecordingSession {
+    fn events(&self) -> tokio::sync::broadcast::Receiver<crate::agent_session::SessionEvent> {
+        self.events.subscribe()
+    }
+    fn is_unavailable(&self) -> bool {
+        false
+    }
+    async fn close(&self) -> std::result::Result<(), crate::agent_session::SessionError> {
+        Ok(())
+    }
+    async fn interrupt(&self) -> std::result::Result<(), crate::agent_session::SessionError> {
+        Ok(())
+    }
+    async fn steer_user_msg(
+        &self,
+        _: String,
+        _: &str,
+    ) -> std::result::Result<crate::agent_session::SendResult, crate::agent_session::SessionError>
+    {
+        panic!("handoff must not steer")
+    }
+    async fn send_user_msg(
+        &self,
+        msg: String,
+        steering: bool,
+    ) -> std::result::Result<crate::agent_session::SendResult, crate::agent_session::SessionError>
+    {
+        assert!(!steering);
+        self.inputs.lock().unwrap().push(msg);
+        self.events
+            .send(crate::agent_session::SessionEvent::TurnStarted {
+                provider_turn_id: "native-start".into(),
+            })
+            .unwrap();
+        Ok(crate::agent_session::SendResult::Started)
+    }
+}
+async fn send_prepared(
+    f: &Fixture,
+    backend: &crate::collaboration::CollaborationBackend,
+    turn: crate::store::TurnClaim,
+    recorder: &RecordingSession,
+) {
+    use crate::agent_session::AgentSession;
+    let (turn, input) = crate::group::handoff::prepare_input(
+        &f.config,
+        backend,
+        &f.store,
+        f.config.profile("issue-codex").unwrap(),
+        turn,
+    )
+    .await
+    .unwrap()
+    .expect("surviving input");
+    let mut events = recorder.events();
+    let native = crate::group::turn_start::send_and_observe(
+        &f.store,
+        &turn.turn_id,
+        &turn.provider_session_id,
+        recorder,
+        &mut events,
+        input,
+    )
+    .await
+    .unwrap();
+    assert_eq!(native.as_deref(), Some("native-start"));
+    f.store.mark_turn_terminal(turn.turn_id, "completed".into()).unwrap();
+}
+
+fn add_input(f: &Fixture, kind: &str, reference: &str) {
+    f.db().execute("INSERT INTO events(event_id,work_item_node_id,kind,detail,origin,reference,lifecycle,observed_at) VALUES ('other-input','pr',?1,NULL,'human',?2,'pending','now')", rusqlite::params![kind, reference]).unwrap();
+    f.db().execute_batch("INSERT INTO wake_batch_events SELECT batch_id,'other-input',(SELECT COALESCE(MAX(ordinal)+1,0) FROM wake_batch_events be WHERE be.batch_id=b.batch_id) FROM wake_batches b WHERE lifecycle IN ('pending','runnable'); UPDATE wake_batches SET event_count=event_count+1,urgent=1 WHERE lifecycle IN ('pending','runnable');").unwrap();
+    // A trusted HumanWake is the durable source of urgency.
+    f.db().execute("UPDATE events SET trusted_mention=1 WHERE event_id='other-input'", []).unwrap();
+}
+
+#[tokio::test]
+async fn canonical_invalid_handoff_retires_only_itself_and_survivors_really_send() {
+    for mode in ["association-removed", "source-closed", "target-closed", "new-generation"] {
+        let f = Fixture::new(true);
+        bind_pr(&f);
+        let receipt = handoff(&f, mode).unwrap();
+        let remote = Arc::new(Mutex::new(body_edit::BodyRemote::new(false)));
+        let (github, task) = body_edit::body_server(remote.clone()).await;
+        f.drain(github.clone()).await;
+        assert_eq!(f.receipt(&receipt.request_id).lifecycle, "applied");
+        let reference = match mode {
+            "target-closed" => "Legitimate Finalization cleanup",
+            "new-generation" => "New generation activation Wake",
+            _ => "Legitimate HumanWake",
+        };
+        add_input(&f, if mode == "target-closed" { "lifecycle" } else { "wake" }, reference);
+        match mode {
+            "association-removed" => remote.lock().unwrap().associated = false,
+            "source-closed" => remote.lock().unwrap().snapshot.state = "closed".into(),
+            "target-closed" => {
+                remote.lock().unwrap().pr_closed = true;
+                f.db().execute_batch("UPDATE work_items SET state='closed' WHERE node_id='pr'; UPDATE assignments SET lifecycle='finalizing' WHERE assignment_id='pr-assignment'; UPDATE agent_instances SET lifecycle='finalizing' WHERE agent_id='pr-agent';").unwrap();
+            }
+            "new-generation" => {
+                f.db().execute_batch("UPDATE assignments SET lifecycle='retired' WHERE assignment_id='pr-assignment'; INSERT INTO assignments VALUES ('new-pr','pr',2,'active','now',NULL); UPDATE agent_instances SET lifecycle='retired' WHERE agent_id='pr-agent'; UPDATE provider_sessions SET lifecycle='retired' WHERE session_id='pr-session'; INSERT INTO agent_instances(agent_id,assignment_id,profile_id,profile_revision,role,lifecycle) SELECT 'new-pr-agent','new-pr',profile_id,profile_revision,role,'idle' FROM agent_instances WHERE agent_id='pr-agent'; INSERT INTO provider_sessions(session_id,agent_id,provider_kind,provider_session_id,context_revision,instruction_revision,lifecycle,started_at) VALUES ('new-pr-session','new-pr-agent','codex','new-pr-provider','new-pr-context','instructions','idle','now');").unwrap();
+                // Generation mismatch is local durable proof: no GitHub read required.
+                remote.lock().unwrap().limited = true;
+            }
+            _ => unreachable!(),
+        }
+        runnable(&f);
+        let turn = claim(&f).unwrap();
+        assert_eq!(turn.references.len(), 2);
+        if mode == "target-closed" {
+            assert_eq!(turn.trigger_kind, "finalization");
+        }
+        if mode == "new-generation" {
+            assert_eq!(turn.provider_session_id, "new-pr-provider");
+        }
+        let batch = turn.batch_id.clone();
+        let recorder = RecordingSession::new();
+        let backend = crate::collaboration::CollaborationBackend::GitHub(github);
+        send_prepared(&f, &backend, turn, &recorder).await;
+        let inputs = recorder.inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 1, "{mode}");
+        assert!(inputs[0].contains(reference), "{mode}: {}", inputs[0]);
+        assert!(!inputs[0].contains("Explicit Issue handoff"), "{mode}");
+        assert!(!inputs[0].contains("Current canonical handoff Context"), "{mode}");
+        assert_eq!(f.receipt(&receipt.request_id).lifecycle, "applied");
+        assert_eq!(count(&f, "pr_handoffs"), 1);
+        assert_eq!(
+            f.db()
+                .query_row("SELECT lifecycle FROM events WHERE detail='pr_handoff'", [], |r| r
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+            "consumed"
+        );
+        assert_eq!(
+            f.db()
+                .query_row(
+                    "SELECT event_count FROM wake_batches WHERE batch_id=?1",
+                    [&batch],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        f.store.advance_scheduler().unwrap();
+        assert!(claim(&f).is_none(), "no duplicate finalization/wake: {mode}");
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn invalid_handoff_only_batch_ends_and_returns_claim_without_losing_concurrent_input() {
+    let f = Fixture::new(true);
+    bind_pr(&f);
+    handoff(&f, "empty").unwrap();
+    let remote = Arc::new(Mutex::new(body_edit::BodyRemote::new(false)));
+    let (github, task) = body_edit::body_server(remote.clone()).await;
+    f.drain(github.clone()).await;
+    runnable(&f);
+    let turn = claim(&f).unwrap();
+    let empty_batch = turn.batch_id.clone();
+    remote.lock().unwrap().associated = false;
+    // Another ordinary input arriving during refresh owns its own debounce.
+    f.db().execute_batch("INSERT INTO wake_batches(batch_id,work_item_node_id,event_count,quiet_deadline,urgent,lifecycle,created_at,updated_at) VALUES ('next','pr',0,'2099-01-01T00:00:00Z',0,'pending','now','now')").unwrap();
+    add_input(&f, "wake", "Arrived during refresh");
+    let backend = crate::collaboration::CollaborationBackend::GitHub(github);
+    assert!(
+        crate::group::handoff::prepare_input(
+            &f.config,
+            &backend,
+            &f.store,
+            f.config.profile("issue-codex").unwrap(),
+            turn
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(
+        f.db()
+            .query_row(
+                "SELECT event_count FROM wake_batches WHERE batch_id=?1",
+                [&empty_batch],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        f.db()
+            .query_row("SELECT COUNT(*) FROM turns WHERE batch_id=?1", [&empty_batch], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        f.db()
+            .query_row(
+                "SELECT lifecycle FROM provider_sessions WHERE session_id='pr-session'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "idle"
+    );
+    assert!(claim(&f).is_none()); // surviving arrival is still debouncing
+    runnable(&f);
+    let recorder = RecordingSession::new();
+    send_prepared(&f, &backend, claim(&f).unwrap(), &recorder).await;
+    assert!(recorder.inputs.lock().unwrap()[0].contains("Arrived during refresh"));
+    assert!(claim(&f).is_none());
+    task.abort();
+}
+
+#[tokio::test]
+async fn retirement_is_fenced_atomic_and_preserves_other_handoff_and_historical_source() {
+    use crate::store::handoff::{RetiredInput, RetirementReason};
+    let f = Fixture::new(true);
+    bind_pr(&f);
+    let first = handoff(&f, "first").unwrap();
+    let remote = Arc::new(Mutex::new(body_edit::BodyRemote::new(false)));
+    let (github, task) = body_edit::body_server(remote).await;
+    f.drain(github.clone()).await;
+    handoff(&f, "survivor").unwrap();
+    f.drain(github.clone()).await;
+    runnable(&f);
+    let turn = claim(&f).unwrap();
+    let event: String = f
+        .db()
+        .query_row("SELECT event_id FROM pr_handoffs WHERE intent_id=?1", [&first.intent_id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let input =
+        RetiredInput { event_id: event.clone(), reason: RetirementReason::SourceNotOpenAssociated };
+    // A bad second membership must roll back the first retirement as well.
+    assert!(
+        f.store
+            .retire_handoff_inputs(
+                turn.clone(),
+                vec![
+                    input.clone(),
+                    RetiredInput {
+                        event_id: "not-a-member".into(),
+                        reason: RetirementReason::TargetClosed
+                    }
+                ]
+            )
+            .is_err()
+    );
+    assert_eq!(
+        f.db()
+            .query_row("SELECT lifecycle FROM events WHERE event_id=?1", [&event], |r| r
+                .get::<_, String>(0))
+            .unwrap(),
+        "pending"
+    );
+    let remaining =
+        f.store.retire_handoff_inputs(turn.clone(), vec![input.clone()]).unwrap().unwrap();
+    assert_eq!(remaining.references.len(), 1);
+    // Applied delivery is historical; later source retirement/generation does
+    // not revoke it while the source Issue remains OPEN and associated.
+    f.db().execute("UPDATE assignments SET lifecycle='retired',generation=2 WHERE assignment_id='assignment'", []).unwrap();
+    let recorder = RecordingSession::new();
+    let backend = crate::collaboration::CollaborationBackend::GitHub(github);
+    send_prepared(&f, &backend, remaining, &recorder).await;
+    assert!(recorder.inputs.lock().unwrap()[0].contains("Current canonical handoff Context"));
+    // No mutation using a stale claim after the provider boundary.
+    assert!(f.store.retire_handoff_inputs(turn, vec![input]).is_err());
+    assert_eq!(count(&f, "pr_handoffs"), 2);
+    assert_eq!(f.receipt(&first.request_id).lifecycle, "applied");
     task.abort();
 }
