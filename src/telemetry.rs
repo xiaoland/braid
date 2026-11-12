@@ -31,6 +31,12 @@ use export::{ExportObservation, ObservedExporter};
 // Full evidence is OTLP-log-only, never a span attribute or ordinary diagnostic.
 const EVIDENCE_TARGET: &str = "braid::evidence";
 
+fn is_otel_internal_target(target: &str) -> bool {
+    // otel_* macros target CARGO_PKG_NAME, including `opentelemetry-otlp`
+    // (hyphen) and `opentelemetry_sdk` (underscore), not just module paths.
+    target.starts_with("opentelemetry")
+}
+
 #[derive(Debug, Error)]
 pub enum TelemetryError {
     #[error("cannot construct OTLP exporter: {0}")]
@@ -569,16 +575,23 @@ impl TelemetryGuard {
 
         let tracer = opentelemetry::trace::TracerProvider::tracer(&tracer_provider, "braid");
         let trace_layer = tracing_opentelemetry::layer().with_tracer(tracer).with_filter(
-            tracing_subscriber::filter::filter_fn(|metadata| metadata.target() != EVIDENCE_TARGET),
+            tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.target() != EVIDENCE_TARGET && !is_otel_internal_target(metadata.target())
+            }),
         );
+        // Raw SDK/exporter diagnostics can contain echoed payloads or credentials.
+        // Never send them back through OTLP or let RUST_LOG enable them on stderr;
+        // ObservedExporter owns safe endpoint/signal/stage/failure diagnostics.
         let log_filter = EnvFilter::new("info")
-            .add_directive("opentelemetry=off".parse().expect("valid filter"))
-            .add_directive("reqwest=off".parse().expect("valid filter"));
+            .add_directive("reqwest=off".parse().expect("valid filter"))
+            .and(tracing_subscriber::filter::filter_fn(|metadata| {
+                !is_otel_internal_target(metadata.target())
+            }));
         let log_layer = OpenTelemetryTracingBridge::new(&logger_provider).with_filter(log_filter);
         let fmt_filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("info"))
             .and(tracing_subscriber::filter::filter_fn(|metadata| {
-                metadata.target() != EVIDENCE_TARGET
+                metadata.target() != EVIDENCE_TARGET && !is_otel_internal_target(metadata.target())
             }));
         let fmt_layer = match config.log_format {
             // Logs are diagnostics and belong on stderr; stdout is reserved

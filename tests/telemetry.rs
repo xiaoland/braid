@@ -39,6 +39,7 @@ use std::{
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 const SENTINEL: &str = "PRIVATE_PAYLOAD_SENTINEL_";
+const RESPONSE_SENTINEL: &str = "PRIVATE_COLLECTOR_RESPONSE_SENTINEL";
 
 #[test]
 fn telemetry_child() {
@@ -118,19 +119,31 @@ fn telemetry_child() {
 }
 
 #[test]
-fn telemetry_routes_complete_evidence_only_to_otlp_and_reports_failures() {
+fn telemetry_routes_complete_evidence_only_to_otlp() {
     for format in ["text", "json"] {
         for ratio in ["0", "1"] {
-            verify(format, ratio, false, false);
+            verify(format, ratio, false, false, "trace");
         }
     }
-    verify("json", "1", false, true);
-    verify("text", "1", true, true);
+    verify("json", "1", false, true, "trace");
+}
+
+// Also run with --features opentelemetry-otlp/internal-logs to exercise its raw
+// response_body diagnostic, which is disabled in the production feature set.
+#[test]
+fn telemetry_isolates_collector_rejection_bodies_from_ordinary_diagnostics() {
+    for format in ["text", "json"] {
+        for rust_log in ["debug", "trace", "trace,opentelemetry-otlp=trace,opentelemetry_sdk=trace"]
+        {
+            verify(format, "1", true, true, rust_log);
+            verify(format, "1", true, false, rust_log);
+        }
+    }
 }
 
 type Requests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
-fn verify(format: &str, ratio: &str, fail: bool, probe: bool) {
+fn verify(format: &str, ratio: &str, fail: bool, probe: bool, rust_log: &str) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -173,8 +186,16 @@ fn verify(format: &str, ratio: &str, fail: bool, probe: bool) {
                 buffer.extend_from_slice(&chunk[..count]);
             }
             received.lock().unwrap().push((path, buffer[header_end..].to_vec()));
-            let status = if fail { "400 Bad Request" } else { "200 OK" };
-            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/x-protobuf\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            // reqwest rejects 4xx/5xx before OTLP can inspect the body. A 300
+            // without Location reaches OTLP's non-2xx StatusError diagnostic.
+            let status = if fail { "300 Multiple Choices" } else { "200 OK" };
+            // Rejections can echo credentials or the original evidence payload.
+            let response = if fail {
+                format!("{RESPONSE_SENTINEL}: credential={SENTINEL}echoed")
+            } else {
+                String::new()
+            };
+            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/x-protobuf\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
         }
     });
     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -183,7 +204,7 @@ fn verify(format: &str, ratio: &str, fail: bool, probe: bool) {
         .env("BRAID_TEST_OTLP", &endpoint)
         .env("BRAID_TEST_FORMAT", format)
         .env("BRAID_TEST_RATIO", ratio)
-        .env("RUST_LOG", "trace");
+        .env("RUST_LOG", rust_log);
     if probe {
         command.env("BRAID_TEST_PROBE", "1");
     }
@@ -192,14 +213,34 @@ fn verify(format: &str, ratio: &str, fail: bool, probe: bool) {
     server.join().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
-    assert!(!stderr.contains(SENTINEL), "payload leaked to {format} stderr");
+    assert!(!stderr.contains(SENTINEL), "payload leaked to {format} stderr ({rust_log})");
+    assert!(
+        !stderr.contains(RESPONSE_SENTINEL),
+        "collector response leaked to {format} stderr ({rust_log})"
+    );
+    if !probe {
+        assert!(stderr.contains("ordinary diagnostic after evidence"), "{stderr}");
+    }
     if fail {
+        assert!(!stderr.contains("HttpClient.StatusError"), "{stderr}");
+        assert!(!stderr.contains("opentelemetry_sdk"), "{stderr}");
         assert!(stderr.contains("stage=sdk_export outcome=failed"), "{stderr}");
-        assert!(stderr.contains("signal=logs"), "{stderr}");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("\"failed_batches\":1"), "{stdout}");
-        assert!(stdout.contains("\"queue_dropped_records\":null"));
-        return;
+        for signal in ["logs", "traces", "metrics"] {
+            assert!(stderr.contains(&format!("signal={signal}")), "{stderr}");
+        }
+        if probe {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let result: serde_json::Value =
+                stdout.lines().find_map(|line| serde_json::from_str(line).ok()).unwrap();
+            let signals = result["signals"].as_array().unwrap();
+            assert_eq!(signals.len(), 3);
+            for signal in signals {
+                assert_eq!(signal["failed_batches"], 1);
+                assert!(signal["failed_records"].as_u64().unwrap() > 0);
+                assert_eq!(signal["successful_batches"], 0);
+                assert!(signal["queue_dropped_records"].is_null());
+            }
+        }
     }
     verify_otlp(&requests.lock().unwrap(), ratio, probe);
 }
@@ -214,6 +255,10 @@ fn verify_otlp(requests: &[(String, Vec<u8>)], ratio: &str, probe: bool) {
                     ExportLogsServiceRequest::decode(body.as_slice()).unwrap().resource_logs
                 {
                     for scope in resource.scope_logs {
+                        assert!(
+                            !scope.scope.as_ref().unwrap().name.starts_with("opentelemetry"),
+                            "raw SDK/exporter diagnostics recursed into OTLP logs"
+                        );
                         log_records.extend(scope.log_records);
                     }
                 }
@@ -242,6 +287,10 @@ fn verify_otlp(requests: &[(String, Vec<u8>)], ratio: &str, probe: bool) {
     let payload = format!("{SENTINEL}{}END", "x".repeat(100_000));
     let mut payload_records = 0;
     for record in log_records {
+        assert!(
+            !serde_json::to_string(&record).unwrap().contains(RESPONSE_SENTINEL),
+            "collector response recursed into OTLP logs"
+        );
         let matches: Vec<_> = record.attributes.iter().filter(|attribute| {
             attribute.value.as_ref().is_some_and(|value| matches!(&value.value, Some(opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(text)) if text.contains(SENTINEL)))
         }).collect();
