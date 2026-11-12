@@ -229,7 +229,7 @@ impl GitHubClient {
         // Reuse the installation's auto-refreshing credential and admission owner.
         let mut client = self.clone();
         let data: RepositoryIdentityData = client.graphql(
-            "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id nameWithOwner}}",
+            "query RepositoryIdentity($owner:String!,$name:String!){rateLimit{cost} repository(owner:$owner,name:$name){id nameWithOwner}}",
             &serde_json::json!({"owner":repository.owner,"name":repository.name}),
         ).await?;
         let identity = data.repository.ok_or(GitHubError::MissingData)?;
@@ -238,6 +238,7 @@ impl GitHubClient {
         Ok(client)
     }
 
+    #[tracing::instrument(skip_all, fields(repository = %self.identity.repository))]
     pub async fn graphql<V, T>(&self, query: &str, variables: &V) -> Result<T, GitHubError>
     where
         V: Serialize + ?Sized,
@@ -917,7 +918,7 @@ async fn repository_identity(
 ) -> Result<RepositoryIdentityNode, GitHubError> {
     let data: RepositoryIdentityData = graphql::request(
         client, rate_limits, installation_id, false,
-        "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id nameWithOwner}}",
+        "query RepositoryIdentity($owner:String!,$name:String!){rateLimit{cost} repository(owner:$owner,name:$name){id nameWithOwner}}",
         &serde_json::json!({"owner":repository.owner,"name":repository.name}),
     ).await?;
     data.repository.ok_or(GitHubError::MissingData)
@@ -933,7 +934,7 @@ async fn viewer_identity(
         rate_limits,
         installation_id,
         false,
-        "query{viewer{id login}}",
+        "query ViewerIdentity{rateLimit{cost} viewer{id login}}",
         &(),
     )
     .await?;

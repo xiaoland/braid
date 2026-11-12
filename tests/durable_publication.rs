@@ -1,5 +1,10 @@
 // Support shims retain production Result signatures.
 #![allow(dead_code, clippy::unnecessary_wraps)]
+#[path = "../src/telemetry/github.rs"]
+pub mod github_metrics;
+mod telemetry {
+    pub use super::github_metrics as github;
+}
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
     fs,

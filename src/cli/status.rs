@@ -46,6 +46,33 @@ pub fn status(arguments: &ConfigPath) -> Result<()> {
                 transport.uncertain_writes,
                 transport.context_resets.len()
             );
+            println!(
+                "scheduler: durable-eligible={} (provider availability unknown; runnable is a raw lifecycle count)",
+                transport.durable_eligible_batches
+            );
+            for batch in &transport.batches {
+                println!(
+                    "  {}#{} {}: {}",
+                    batch.repository,
+                    batch.work_item_number,
+                    batch.lifecycle,
+                    batch
+                        .scheduler
+                        .ineligible_reason
+                        .unwrap_or("durable_eligible_provider_unknown")
+                );
+            }
+            for group in &transport.agent_groups {
+                println!(
+                    "  {}#{} generation={} {} assignment={} session={}",
+                    group.work_item_kind,
+                    group.work_item_number,
+                    group.assignment_generation,
+                    if group.current_generation { "current" } else { "historical" },
+                    group.assignment_lifecycle,
+                    group.session_lifecycle.as_deref().unwrap_or("none")
+                );
+            }
         }
     }
     Ok(())

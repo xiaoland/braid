@@ -16,7 +16,9 @@ use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_kn
 use uuid::Uuid;
 
 mod reconciliation;
+mod scheduler_status;
 pub use reconciliation::TrackedWorkItem;
+pub use scheduler_status::BatchEligibility;
 mod builtin;
 mod runs;
 pub use runs::RunCommand;
@@ -287,6 +289,7 @@ pub struct RuntimeStoreStatus {
     pub unknown_deliveries: u64,
     pub pending_batches: u64,
     pub runnable_batches: u64,
+    pub durable_eligible_batches: usize,
     pub pending_mentions: u64,
     pub pending_writes: u64,
     pub uncertain_writes: u64,
@@ -298,6 +301,7 @@ pub struct RuntimeStoreStatus {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WakeBatchSummary {
+    pub scheduler: BatchEligibility,
     pub batch_id: String,
     pub repository: String,
     pub work_item_kind: String,
@@ -441,6 +445,7 @@ pub struct AgentGroupSummary {
     pub work_item_number: u64,
     pub profile_id: String,
     pub assignment_generation: u64,
+    pub current_generation: bool,
     pub assignment_lifecycle: String,
     pub provider_session_id: Option<String>,
     pub session_lifecycle: Option<String>,
@@ -2857,6 +2862,10 @@ fn runtime_status(database: &Path) -> Result<RuntimeStoreStatus, StoreError> {
                 |row| row.get(0),
             )
             .optional()?,
+        durable_eligible_batches: batches
+            .iter()
+            .filter(|batch| batch.scheduler.durable_eligible)
+            .count(),
         batches,
         agent_groups,
         context_resets,
@@ -2877,6 +2886,11 @@ fn load_wake_batches(
     )?;
     let rows = statement.query_map([], |row| {
         Ok(WakeBatchSummary {
+            scheduler: BatchEligibility {
+                durable_eligible: false,
+                ineligible_reason: None,
+                provider_availability: "unknown_not_in_database",
+            },
             batch_id: row.get(0)?,
             repository: row.get(1)?,
             work_item_kind: row.get(2)?,
@@ -2888,7 +2902,11 @@ fn load_wake_batches(
             lifecycle: row.get(8)?,
         })
     })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    let mut batches = rows.collect::<Result<Vec<_>, _>>()?;
+    for batch in &mut batches {
+        batch.scheduler = scheduler_status::batch_eligibility(connection, &batch.batch_id)?;
+    }
+    Ok(batches)
 }
 
 fn load_agent_groups(
@@ -2909,7 +2927,8 @@ fn load_agent_groups(
                  ORDER BY ft.rowid DESC LIMIT 1),
                 COALESCE(ps.resume_count,0),ps.last_resumed_at,
                 ai.context_pressure,ai.context_bytes,ai.context_error,
-                wt.path,wt.lifecycle,wt.head_ref
+                wt.path,wt.lifecycle,wt.head_ref,
+                a.generation=(SELECT MAX(current.generation) FROM assignments current WHERE current.work_item_node_id=a.work_item_node_id)
          FROM assignments a
          JOIN work_items w ON w.node_id=a.work_item_node_id
          JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
@@ -2926,6 +2945,7 @@ fn load_agent_groups(
             profile_id: row.get(2)?,
             assignment_generation: sqlite_i64_to_u64(row.get(3)?, "assignment generation")?,
             assignment_lifecycle: row.get(4)?,
+            current_generation: row.get(20)?,
             provider_session_id: row.get(5)?,
             session_lifecycle: row.get(6)?,
             active_turn_id: row.get(7)?,
@@ -4773,21 +4793,19 @@ fn claim_runnable_turn(
     let transaction = connection.transaction()?;
     let selected = transaction
         .query_row(
-            "SELECT b.batch_id,ps.session_id,ps.provider_session_id,
+            &format!(
+                "SELECT b.batch_id,ps.session_id,ps.provider_session_id,
                     r.name_with_owner,w.kind,w.number,
                     COALESCE(w.context_revision,ps.context_revision),ai.profile_id,a.lifecycle
              FROM wake_batches b
              JOIN work_items w ON w.node_id=b.work_item_node_id
              JOIN repositories r ON r.node_id=w.repository_node_id
-             JOIN assignments a ON a.work_item_node_id=w.node_id
-               AND a.lifecycle IN ('active','finalizing')
-             JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
-               AND ((a.lifecycle='active' AND ai.lifecycle='idle')
-                    OR (a.lifecycle='finalizing' AND ai.lifecycle='finalizing'))
-             JOIN provider_sessions ps ON ps.agent_id=ai.agent_id AND ps.lifecycle='idle'
+             {durable_joins}
              WHERE b.lifecycle='runnable' AND w.kind=?1 AND ai.profile_id=?2
                AND ps.provider_session_id IN (SELECT value FROM json_each(?3))
              ORDER BY b.created_at,b.batch_id LIMIT 1",
+                durable_joins = scheduler_status::DURABLE_TURN_JOINS
+            ),
             params![
                 work_item_kind,
                 profile_id,

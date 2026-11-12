@@ -16,7 +16,9 @@ Local 后端使用同一 canonical snapshot 和渲染合同，在单个 SQLite �
 For one Work Item Braid reads every required GitHub connection to exhaustion,
 then checks the root object `updatedAt` and relationship version again. If the
 root or association graph changed during the read, it discards the partial
-snapshot and retries a bounded number of times. Missing permission, unsupported
+snapshot and retries a bounded number of times. Stateless first-page connection
+combination changes only the HTTP grouping: continuation cursors, full bodies,
+association expansion and before/after marker checks remain mandatory. Missing permission, unsupported
 union members, pagination failure, or repeated drift produces
 `context-unavailable`; Braid never emits a partial Context.
 

@@ -278,6 +278,19 @@ Loopback `/healthz` and `braid status` expose bounded, non-semantic state:
 - oldest pending/uncertain write intent;
 - OTel exporter and sampling mode.
 
+`runnable_batches` remains the compatible raw batch-lifecycle count, not a claim
+or execution promise. `durable_eligible_batches` and each batch's `scheduler`
+projection use the same assignment/agent/session conditions as durable claim:
+active + idle agent, or finalizing + finalizing agent, with an idle provider
+session. Reasons distinguish non-runnable, no active/finalizing assignment,
+no matching agent and no idle session. Physical provider availability is explicitly
+`unknown_not_in_database`; claim additionally filters the worker's available
+physical sessions and requested kind/Profile. Closed/merged alone is not an
+exclusion: finalization can remain eligible. Diagnostics never delete/consume
+residual batches or change Group lifecycle. Agent groups mark `current_generation`
+by the highest durable assignment generation for that Work Item; historical blocked
+records are not current-generation failures. Both JSON and text expose this split.
+
 Health never reports task acceptance, design readiness, or implementation
 success. Operational Status Comments are the GitHub-visible projection for
 specific blocked Work Items.
@@ -366,10 +379,22 @@ JSON，避免浏览器把诊断响应当作业务回执。
 但仍受 installation 准入限制。重启应保留 runtime 数据库，避免丢失成功事实。
 旧二进制不能直接打开升级后的数据库；回滚遵守上文 Database Lifecycle。
 
-观察 `GitHub GraphQL response budget` 日志中的 installation、请求计数、used
-及差值、remaining、reset（Unix 秒）和 HTTP 状态。used 差值可能包含其他调用者，
-不等于单 query cost。`GitHub GraphQL delayed` 与巡检 `degraded/delayed` 健康
-状态解释预算余量和冷却；采样可能减少可见记录，不应把本地回归当作线上节省测量。
+普通成功预算事件已降为 DEBUG。以下指标/归因日志的 coverage 仅为 Braid GraphQL
+transport（包括 canonical Context 完整遍历），不是所有 GitHub 调用。REST（含
+`write_rest`）及 App/installation-token 请求的请求数、时长和成本仍为 unknown。
+按 `braid.github.requests`（GraphQL HTTP请求，不是points）与
+`braid.github.request.duration` 聚合 operation/class/resource/outcome/cost_known，
+其中 metric 的 resource 固定为 `graphql`；
+`braid.github.graphql.points` 只统计实际返回 `rateLimit.cost`，不能用 unknown 样本
+推导总点数。指标不带 repository/installation/object/session 标签；DEBUG/span 以
+repository/work item、installation、request ID、status/latency、used/remaining/reset
+归因，WARN 保留准入/限流/退避失败。used delta 在同一resource/reset窗口内才可比，
+仍可能包含别的调用者。字段缺失明确 unknown，不能冒称 querycost。body/token/vars
+不进入这些普通日志；完整采样证据的受控路由不变。
+
+本地 mock GraphQL HTTP 单页、无项目/关联/线程/drift 的完整读取账单 Issue13→5、PR10→5；
+关联Issue、线程评论、项目字段及分页另外计费。该下降不证明线上 points 同比例下降。
+正常预算窗口需在真实backend对操作指标与限额事件联合观察，再决定后续优化。
 
 后台在剩余点数不大于 100 时让出余量；主限额耗尽等 reset，次级限流遵守
 Retry-After，缺提示的限流或网络故障有界退避，到期重新探测。不要反复重启绕过

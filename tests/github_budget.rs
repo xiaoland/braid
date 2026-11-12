@@ -1,3 +1,9 @@
+#[allow(dead_code)]
+#[path = "../src/telemetry/github.rs"]
+pub mod github_metrics;
+mod telemetry {
+    pub use super::github_metrics as github;
+}
 #[path = "../src/github/error.rs"]
 pub mod error;
 #[path = "../src/github/graphql.rs"]

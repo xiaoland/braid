@@ -148,6 +148,23 @@ review-thread resolution. Braid paginates every connection to completion:
 - PR conversation comments, reviews, and every review thread/comment page with
   resolution/collapse/outdated/path/line metadata.
 
+Context snapshot connections share one stateless first-page GraphQL operation
+(`IssueFirstPages` / `PrFirstPages`). Each connection with `hasNextPage` continues
+independently using its existing cursor query; Project V2 is selected only when
+enabled. Root and complete native-association markers still bracket every read.
+There is no cross-round cache or root-marker shortcut. Associated Issues, project
+field values and review-thread comments retain their complete independent reads.
+Partial data/errors and unknown unions fail the snapshot, not merely one section.
+
+The local HTTP bill (Projects disabled, single page, empty associations/threads,
+no drift) is Issue **13 → 5** and PR **10 → 5** requests. Previously association
+connections were read three times (before marker, snapshot, after marker); they
+still are, but the snapshot read now shares the first-page operation. Two root
+reads and two association-marker reads remain deliberately separate. A comments
+continuation adds one request; a full drift retry repeats the bill. An open
+associated Issue adds its own Issue bill and each thread/project field connection
+adds its pages. These are mock HTTP counts, **not measured GitHub point savings**.
+
 REST supplements GraphQL for endpoints or lifecycle evidence not exposed in a
 stable query. Requests pin an explicit supported API version.
 
@@ -213,9 +230,23 @@ GraphQL 请求至响应记账，确认限流后排队请求不能继续穿透。
 预算控制。首次确认限流即返回可恢复错误，不能等到后续本地拒绝时才允许写入重试。
 明确的权限拒绝仍是权限错误，不作为 installation 耗尽处理。
 
-响应记录请求计数、`x-ratelimit-used` 及可用的非负差值、remaining、reset 和 HTTP
-状态。used 差值可能包含其他进程的消耗，**不是可归属单次查询的 cost**；不改写
-任意 query 字符串，也不假设每个请求成本相同。
+响应 DEBUG 记录可信静态 operation、foreground/background class、installation、
+response resource、请求计数、request ID、HTTP status、latency、used、remaining/reset
+配额窗口；repository/work item 仅在日志/span，不是 metric 标签。普通成功不再逐条
+INFO 刷预算；准入/限流/失败保留 WARN 事件及响应元数据（若已收到），不包含正文、
+token 或 variables。采样证据路由不变。header used delta 仅在可比 resource/reset
+窗口内计算，仍可能包含别的消费者，**不是单 operation cost**。
+
+Braid-owned Context/identity queries显式选择 `rateLimit { cost }`，仅服务器实际返回
+的值被计入 `braid.github.graphql.points`；缺少该字段是 unknown，不推测为零。
+`braid.github.requests` 与 `braid.github.request.duration` 按低基数
+operation/class/resource/outcome/cost_known 聚合，独立记录已准入请求与单调时长。
+这些指标及上述归因日志的 coverage **仅为 Braid GraphQL transport**，包括 canonical
+Context 完整遍历；`resource=graphql` 是固定的 metric 标签。REST（包括 `write_rest`）
+和 App/installation-token 请求不在此测量范围，其请求数、时长和成本仍为 unknown，
+不能把这些指标视为所有 GitHub 调用的总账。
+未收响应/失败也有请求计数；本地准入拒绝没有 HTTP 请求，不计入 requests。
+任意未识别 query 名归为 `other`，不改写调用者 query，不把其名字变成无限标签。
 
 主限额耗尽等待 reset，次级限流遵守 `Retry-After` 秒数。缺少提示的限流和网络
 故障从 10 秒开始指数退避，上限 300 秒加至多 25% 抖动；后续失败不能缩短已收到

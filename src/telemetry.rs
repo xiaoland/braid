@@ -26,6 +26,8 @@ use crate::config::{LogFormat, TelemetryConfig};
 
 #[path = "telemetry/export.rs"]
 mod export;
+#[path = "telemetry/github.rs"]
+pub(crate) mod github;
 use export::{ExportObservation, ObservedExporter};
 
 // Full evidence is OTLP-log-only, never a span attribute or ordinary diagnostic.
@@ -102,6 +104,7 @@ struct RuntimeMetrics {
 static RUNTIME_METRICS: OnceLock<RuntimeMetrics> = OnceLock::new();
 
 fn install_runtime_metrics(provider: &SdkMeterProvider) {
+    github::install(provider);
     let meter = provider.meter("braid.runtime");
     RUNTIME_METRICS.get_or_init(|| RuntimeMetrics {
         transitions: meter

@@ -32,6 +32,7 @@ pub struct Budget {
     pub used: Option<u64>,
     pub remaining: Option<u64>,
     pub reset: Option<u64>,
+    resource: Option<String>,
     until: u64,
     failures: u32,
 }
@@ -80,7 +81,15 @@ impl Budget {
             headers.get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok())
         };
         let used = number("x-ratelimit-used");
-        let delta = used.zip(self.used).and_then(|(new, old)| new.checked_sub(old));
+        let reset = number("x-ratelimit-reset");
+        let resource =
+            headers.get("x-ratelimit-resource").and_then(|v| v.to_str().ok()).map(str::to_owned);
+        // Missing or changed windows/resources do not establish comparable counters.
+        let comparable = reset.is_some() && reset == self.reset && resource == self.resource;
+        let delta = comparable
+            .then(|| used.zip(self.used).and_then(|(new, old)| new.checked_sub(old)))
+            .flatten();
+        self.resource = resource;
         self.used = used.or(self.used);
         self.remaining = number("x-ratelimit-remaining").or(self.remaining);
         self.reset = number("x-ratelimit-reset").or(self.reset);
@@ -184,5 +193,25 @@ mod tests {
         budget.success();
         budget.defer(1400, None);
         assert!((1410..=1412).contains(&budget.until));
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    #[test]
+    fn used_delta_is_unknown_across_windows_and_resources() {
+        let mut budget = Budget::default();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-used", "10".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "500".parse().unwrap());
+        headers.insert("x-ratelimit-resource", "graphql".parse().unwrap());
+        assert_eq!(budget.observe(&headers), None);
+        headers.insert("x-ratelimit-used", "12".parse().unwrap());
+        assert_eq!(budget.observe(&headers), Some(2));
+        headers.insert("x-ratelimit-reset", "600".parse().unwrap());
+        assert_eq!(budget.observe(&headers), None);
+        headers.insert("x-ratelimit-resource", "core".parse().unwrap());
+        assert_eq!(budget.observe(&headers), None);
     }
 }
