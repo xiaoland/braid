@@ -110,46 +110,106 @@ fn render_maintained_body(
     while body.starts_with("> **Braid Agent ·") {
         body = body.split_once("\n\n").map_or("", |(_, rest)| rest).to_owned();
     }
-    let protected = protected_body_sections(old_body);
+    let protected = protected_body_sections(old_body)?;
     let prefix = protected.join("\n\n");
     while !prefix.is_empty() && body.starts_with(&prefix) {
         body = body[prefix.len()..].trim_start().to_owned();
     }
-    // Prefix complete original Markdown paragraphs so an unclosed code fence or
+    // Prefix complete original Markdown blocks so an unclosed code fence or
     // HTML comment in the replacement cannot hide a closing reference/marker.
     if !protected.is_empty() {
         body = format!("{prefix}\n\n{body}");
     }
-    helpers::render_agent_comment(profile, role, &body)
+    let rendered = helpers::render_agent_comment(profile, role, &body)?;
+    validate_maintained_body(old_body, &rendered)?;
+    Ok(rendered)
 }
 
-fn protected_body_sections(old_body: &str) -> Vec<String> {
+/// This is a conservative maintenance boundary, not GitHub's closing parser.
+/// Freeze every block containing a closing keyword (even without a target) or
+/// ensure marker. New prose cannot introduce such a block. Only self-contained
+/// top-level paragraphs/headings can be moved safely; links/reference definitions,
+/// HTML and nested blocks need a different editing surface, not this API.
+fn protected_body_sections(body: &str) -> Result<Vec<String>> {
     use comrak::{Arena, Options, nodes::NodeValue, parse_document};
     let arena = Arena::new();
-    let root = parse_document(&arena, old_body, &Options::default());
-    let lines: Vec<_> = old_body.lines().collect();
-    root.descendants()
-        .filter_map(|node| {
-            let data = node.data.borrow();
-            if !matches!(data.value, NodeValue::Paragraph) {
-                return None;
+    let root = parse_document(&arena, body, &Options::default());
+    let lines: Vec<_> = body.lines().collect();
+    let mut covered = vec![false; lines.len()];
+    let mut protected = Vec::new();
+    for node in root.children() {
+        let data = node.data.borrow();
+        let start = data.sourcepos.start.line.saturating_sub(1);
+        let end = data.sourcepos.end.line;
+        let Some(block_lines) = lines.get(start..end) else { continue };
+        let section = block_lines.join("\n");
+        // Also examine decoded inline text: entities, escapes, emphasis and link
+        // labels must not disguise keywords in newly supplied Markdown.
+        let mut text = String::new();
+        for descendant in node.descendants() {
+            match &descendant.data.borrow().value {
+                NodeValue::Text(value) => text.push_str(value),
+                NodeValue::Code(value) => text.push_str(&value.literal),
+                NodeValue::SoftBreak | NodeValue::LineBreak => text.push(' '),
+                _ => {}
             }
-            let section = lines
-                .get(data.sourcepos.start.line.saturating_sub(1)..data.sourcepos.end.line)?
-                .join("\n");
-            let lower = section.to_ascii_lowercase();
-            let closing = (section.contains('#') || section.contains("/issues/"))
-                && [
-                    "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves",
-                    "resolved",
-                ]
-                .iter()
-                .any(|word| {
-                    lower.split(|c: char| !c.is_ascii_alphabetic()).any(|token| token == *word)
-                });
-            (closing || section.contains("Implementation request:")).then_some(section)
+        }
+        if !maintenance_sensitive(&section) && !maintenance_sensitive(&text) {
+            continue;
+        }
+        // Brackets include unresolved reference links, whose meaning could be
+        // changed by a definition added later. Do not try to emulate GitHub's
+        // private parser or silently move context-dependent Markdown.
+        if !matches!(data.value, NodeValue::Paragraph | NodeValue::Heading(_))
+            || section.contains(['[', ']', '<', '>'])
+        {
+            bail!(
+                "body maintenance requires self-contained paragraph/heading closing and request blocks without links or HTML; keep this body unchanged"
+            );
+        }
+        covered[start..end].fill(true);
+        protected.push(section);
+    }
+    // Reference definitions may not have AST nodes. Fail closed rather than
+    // dropping a keyword/marker in source not represented by a supported block.
+    let remainder = lines
+        .iter()
+        .zip(covered)
+        .filter_map(|(line, covered)| (!covered).then_some(*line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if maintenance_sensitive(&remainder) {
+        bail!("body maintenance cannot change context-dependent closing or request blocks");
+    }
+    Ok(protected)
+}
+
+fn maintenance_sensitive(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("implementation request:")
+        || lower.split(|c: char| !c.is_ascii_alphabetic()).any(|token| {
+            matches!(
+                token,
+                "close"
+                    | "closes"
+                    | "closed"
+                    | "fix"
+                    | "fixes"
+                    | "fixed"
+                    | "resolve"
+                    | "resolves"
+                    | "resolved"
+            )
         })
-        .collect()
+}
+
+fn validate_maintained_body(old_body: &str, body: &str) -> Result<()> {
+    if body != old_body && protected_body_sections(old_body)? != protected_body_sections(body)? {
+        bail!(
+            "body maintenance cannot add, remove or change closing-keyword or implementation-request blocks"
+        );
+    }
+    Ok(())
 }
 
 /// Operation permission is independent of Profile selection tags.
@@ -243,6 +303,8 @@ pub(super) async fn execute(
         }
         .into());
     }
+    validate_maintained_body(current.body.as_deref().unwrap_or_default(), &body)
+        .map_err(|e| GitHubError::GraphQl(e.to_string()))?;
     check_source(config, receipt)?;
     *mutation_possible = true;
     let result = github.edit_body(target.number, &title, &body).await?;

@@ -91,9 +91,23 @@ braid gh pr edit owner/repository#123 --profile pr-codex \
 The snapshot carries the canonical version/digest; callers need not guess one.
 Title and body are optional independently; empty supplied values and oversized
 UTF-8 bytes are rejected. Title-only edits retain the body. Body edits add exactly
-one source attribution and retain ensure request markers and closing-reference
-lines. The executor revalidates target state, association and source before
-mutation and compares the canonical snapshot again after validation. An external
+one source attribution and retain complete ensure-request and closing-keyword
+Markdown blocks, including ATX and Setext headings. This is deliberately a
+conservative maintenance boundary, not a reproduction of GitHub's private
+closing-reference parser: existing blocks containing any closing keyword
+(`close/closes/closed`, `fix/fixes/fixed`, `resolve/resolves/resolved`, ignoring
+case) or `Implementation request:` are frozen. Replacement prose cannot add
+such blocks, even when the keyword is ordinary prose rather than a relationship.
+Supported frozen blocks are self-contained top-level paragraphs and headings;
+blocks with square brackets (including Markdown/reference links), HTML angle
+brackets, or nested/list/code-block context are refused rather than moved or
+silently discarded. Title-only edits can retain these unsupported bodies
+unchanged. Raw source and decoded Markdown text are checked, and the final
+rendered body is checked again before PATCH. This API cannot add or retarget
+native closing relationships; use a separate authorized GitHub editing surface
+when relationship or context-dependent Markdown changes are intended. The executor
+revalidates target state, association and source before mutation and compares the
+canonical snapshot again after validation. An external
 edit produces a `conflict` receipt, never a blind overwrite. GitHub does not offer
 atomic compare-and-swap here: a concurrent edit in the final read/PATCH interval
 remains possible. After an uncertain send, exact remote title/body is reconciled
