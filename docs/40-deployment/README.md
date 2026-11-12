@@ -220,6 +220,86 @@ result back before trusting a backend's limits. Remote Docker contexts require
 host-local files and deliberate port access; do not mistake their daemon's
 loopback for the CLI machine's loopback.
 
+### Managed single-host dogfood backend
+
+The disposable template above must **not** receive real sensitive evidence.
+For a controlled dogfood window, use the small
+`deploy/compose.observability.dogfood.yaml` override. This is a Braid-owned,
+retained resource, not task temporary storage. It is not production multi-tenant
+security: host users with access to the private directory and Docker admins can
+read all evidence. Only Grafana queries are authenticated; ingest and Collector
+metrics remain host-loopback-only. Keep backend ports private, never publish a
+public tunnel; remote UI access may use an operator-only SSH loopback forward.
+
+Install the exact committed templates into a private managed directory, e.g.
+`~/.braid-inkcre/observability/dogfood2` (not another project's stack/volume):
+
+```sh
+umask 077
+managed="$HOME/.braid-inkcre/observability/dogfood2"
+mkdir -p "$managed"
+chmod 700 "$managed"
+cp deploy/compose.observability*.yaml deploy/otel-collector.example.yaml \
+   deploy/loki.observability.yaml deploy/start-dogfood-lgtm.sh "$managed/"
+cd "$managed"
+# Only the managed copy changes; full-field/reject-not-truncate limits stay intact.
+sed 's/retention_period: 24h/retention_period: 168h/' loki.observability.yaml > loki.tmp
+mv loki.tmp loki.observability.yaml
+# Generate once, never print or commit. Grafana reads via __FILE, not environment value.
+test -e grafana-admin-password || openssl rand -hex 32 > grafana-admin-password
+chmod 600 grafana-admin-password
+# Use this same project + both files for every lifecycle command.
+docker compose -p braid-dogfood2 -f compose.observability.yaml \
+  -f compose.observability.dogfood.yaml config --quiet
+docker compose -p braid-dogfood2 -f compose.observability.yaml \
+  -f compose.observability.dogfood.yaml up -d
+```
+
+The override disables anonymous access and signup, mounts the mode-0600 password
+as a file secret, sets `unless-stopped`, and persists `/data` in the dedicated
+`braid-dogfood2_data` volume. Local Compose secrets are file mounts, not encrypted
+secret storage. Before routing real evidence, verify unauthenticated Grafana
+`/api/datasources` returns **401**, authenticated queries work, mounts and file
+modes are correct, and restart/recreate retains a synthetic probe. Grafana login
+is `admin`; obtain the password directly from the private password file, never
+paste it into issue comments, command output, or model context. Password changes
+after initialization require Grafana's admin rotation procedure; replacing the
+bootstrap file alone does not rotate the database password.
+
+Default managed retention is **7 days**: installed Loki copy uses `168h`, the
+pinned-image startup wrapper sets Tempo block retention to `168h` and Prometheus
+TSDB retention to `7d`. Deletion is asynchronous (not a hard erasure deadline),
+and WAL/head data may outlive the nominal query window. Grafana configuration
+persists until explicit destruction. Verify actual config/flags after upgrades;
+the wrapper is tied to LGTM 0.11.0. No second Collector sampling or debug exporter.
+The original disposable template remains 24h Loki / ephemeral layers.
+
+During dogfood, check daily and after failures: host `df -h`, volume `du`, container
+restart/state and bounded logs, Collector receiver refusals/export failures, Loki
+rejections and actual Loki/Tempo/Prometheus query results. Investigate any nonzero
+failures or missing probe; stop/shorten the window before disk exhaustion (reserve
+at least 20% free). Restart policy is not a per-component watchdog: LGTM may stay
+running after an internal process dies. Check backend readiness and queries, not
+container state alone. No automatic alerting or backup is supplied by this small
+single-host stack. The operator owns these checks. Backups contain raw secrets and
+transcripts: keep access as restrictive as live storage, encrypt off-host copies,
+record their own expiry, and authorize restoration/destruction. For a consistent
+volume backup stop the stack first; never treat a live filesystem copy as one.
+
+`stop` preserves evidence for the next window. For authorized final destruction:
+
+```sh
+cd "$HOME/.braid-inkcre/observability/dogfood2"
+docker compose -p braid-dogfood2 -f compose.observability.yaml \
+  -f compose.observability.dogfood.yaml down -v
+# After separately handling authorized backups, delete the private managed files.
+rm -f grafana-admin-password
+```
+
+Destroying this volume does not erase separately saved backups or host snapshots.
+Do not remove existing Velune or other Braid Collector resources. Disposable
+verification projects must separately run their original `down -v` at task close.
+
 ## Startup and Supervision
 
 Startup is ordered:
