@@ -1,8 +1,13 @@
 use std::{collections::BTreeMap, fmt, fs, str::FromStr, sync::Arc, time::Duration};
 
+#[path = "github/error.rs"]
 mod error;
+#[path = "github/graphql.rs"]
 mod graphql;
+#[path = "github/rate_limit.rs"]
 mod rate_limit;
+#[path = "github/write_rest.rs"]
+mod write_rest;
 pub use error::GitHubError;
 use error::bounded;
 pub use rate_limit::RateLimits;
@@ -245,6 +250,23 @@ impl GitHubClient {
         .await
     }
 
+    pub async fn write_retry_after(&self) -> u64 {
+        self.rate_limits
+            .installation(self.identity.installation_id)
+            .lock()
+            .await
+            .retry_after(rate_limit::now())
+    }
+
+    pub async fn pull_request(&self, number: u64) -> Result<PullRequest, GitHubError> {
+        self.write_rest(
+            "GET",
+            &format!("/repos/{}/pulls/{number}", self.identity.repository),
+            None::<&()>,
+        )
+        .await
+    }
+
     pub async fn reconciliation_delay(&self) -> Option<String> {
         self.rate_limits
             .installation(self.identity.installation_id)
@@ -286,7 +308,7 @@ impl GitHubClient {
             }
         };
         let reaction: ReactionResponse =
-            self.installation.post(&path, Some(&ReactionRequest { content })).await?;
+            self.write_rest("POST", &path, Some(&ReactionRequest { content })).await?;
         Ok(reaction.id)
     }
 
@@ -317,13 +339,12 @@ impl GitHubClient {
         issue_number: u64,
         body: &str,
     ) -> Result<CreatedIssueComment, GitHubError> {
-        self.installation
-            .post(
-                &format!("/repos/{}/issues/{issue_number}/comments", self.identity.repository),
-                Some(&IssueCommentRequest { body }),
-            )
-            .await
-            .map_err(GitHubError::from)
+        self.write_rest(
+            "POST",
+            &format!("/repos/{}/issues/{issue_number}/comments", self.identity.repository),
+            Some(&IssueCommentRequest { body }),
+        )
+        .await
     }
 
     pub async fn issue_comments(
@@ -332,12 +353,14 @@ impl GitHubClient {
     ) -> Result<Vec<IssueComment>, GitHubError> {
         let mut comments = Vec::new();
         for page in 1_u16..=100 {
-            let params = PaginationParams { per_page: 100, page };
             let page_comments: Vec<IssueComment> = self
-                .installation
-                .get(
-                    &format!("/repos/{}/issues/{issue_number}/comments", self.identity.repository),
-                    Some(&params),
+                .write_rest(
+                    "GET",
+                    &format!(
+                        "/repos/{}/issues/{issue_number}/comments?per_page=100&page={page}",
+                        self.identity.repository
+                    ),
+                    None::<&()>,
                 )
                 .await?;
             let complete = page_comments.len() < 100;
@@ -356,23 +379,21 @@ impl GitHubClient {
         comment_id: &str,
         body: &str,
     ) -> Result<CreatedIssueComment, GitHubError> {
-        self.installation
-            .patch(
-                &format!("/repos/{}/issues/comments/{comment_id}", self.identity.repository),
-                Some(&IssueCommentRequest { body }),
-            )
-            .await
-            .map_err(GitHubError::from)
+        self.write_rest(
+            "PATCH",
+            &format!("/repos/{}/issues/comments/{comment_id}", self.identity.repository),
+            Some(&IssueCommentRequest { body }),
+        )
+        .await
     }
 
     pub async fn issue_comment(&self, comment_id: u64) -> Result<IssueComment, GitHubError> {
-        self.installation
-            .get(
-                &format!("/repos/{}/issues/comments/{comment_id}", self.identity.repository),
-                None::<&()>,
-            )
-            .await
-            .map_err(GitHubError::from)
+        self.write_rest(
+            "GET",
+            &format!("/repos/{}/issues/comments/{comment_id}", self.identity.repository),
+            None::<&()>,
+        )
+        .await
     }
 
     pub fn require_write_permissions(&self, permissions: &[&str]) -> Result<(), GitHubError> {
@@ -400,33 +421,41 @@ impl GitHubClient {
         &self,
         number: u64,
     ) -> Result<IssueOrPullRequest, GitHubError> {
-        self.installation
-            .get(&format!("/repos/{}/issues/{number}", self.identity.repository), None::<&()>)
-            .await
-            .map_err(GitHubError::from)
-    }
-
-    pub async fn repository_details(&self) -> Result<RepositoryDetails, GitHubError> {
-        self.installation
-            .get(&format!("/repos/{}", self.identity.repository), None::<&()>)
-            .await
-            .map_err(GitHubError::from)
-    }
-
-    pub async fn git_reference(&self, name: &str) -> Result<Option<GitReference>, GitHubError> {
-        let encoded = encode_path(name);
-        octocrab_get_optional(
-            &self.installation,
-            &format!("/repos/{}/git/ref/heads/{encoded}", self.identity.repository),
+        self.write_rest(
+            "GET",
+            &format!("/repos/{}/issues/{number}", self.identity.repository),
+            None::<&()>,
         )
         .await
     }
 
-    pub async fn git_commit(&self, sha: &str) -> Result<GitCommit, GitHubError> {
-        self.installation
-            .get(&format!("/repos/{}/git/commits/{sha}", self.identity.repository), None::<&()>)
+    pub async fn repository_details(&self) -> Result<RepositoryDetails, GitHubError> {
+        self.write_rest("GET", &format!("/repos/{}", self.identity.repository), None::<&()>).await
+    }
+
+    pub async fn git_reference(&self, name: &str) -> Result<Option<GitReference>, GitHubError> {
+        let encoded = encode_path(name);
+        match self
+            .write_rest(
+                "GET",
+                &format!("/repos/{}/git/ref/heads/{encoded}", self.identity.repository),
+                None::<&()>,
+            )
             .await
-            .map_err(GitHubError::from)
+        {
+            Ok(reference) => Ok(Some(reference)),
+            Err(GitHubError::Http { status, .. }) if status == StatusCode::NOT_FOUND => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn git_commit(&self, sha: &str) -> Result<GitCommit, GitHubError> {
+        self.write_rest(
+            "GET",
+            &format!("/repos/{}/git/commits/{sha}", self.identity.repository),
+            None::<&()>,
+        )
+        .await
     }
 
     pub async fn create_git_commit(
@@ -438,19 +467,18 @@ impl GitHubClient {
     ) -> Result<GitCommit, GitHubError> {
         let actor = format!("{}[bot]", self.identity.app_slug);
         let email = format!("{}+{}@users.noreply.github.com", self.identity.app_id, actor);
-        self.installation
-            .post(
-                &format!("/repos/{}/git/commits", self.identity.repository),
-                Some(&CreateGitCommit {
-                    message,
-                    tree,
-                    parents: [parent],
-                    author: GitSignature { name: &actor, email: &email, date: authored_at },
-                    committer: GitSignature { name: &actor, email: &email, date: authored_at },
-                }),
-            )
-            .await
-            .map_err(GitHubError::from)
+        self.write_rest(
+            "POST",
+            &format!("/repos/{}/git/commits", self.identity.repository),
+            Some(&CreateGitCommit {
+                message,
+                tree,
+                parents: [parent],
+                author: GitSignature { name: &actor, email: &email, date: authored_at },
+                committer: GitSignature { name: &actor, email: &email, date: authored_at },
+            }),
+        )
+        .await
     }
 
     pub async fn create_git_reference(
@@ -459,13 +487,12 @@ impl GitHubClient {
         sha: &str,
     ) -> Result<GitReference, GitHubError> {
         let reference = format!("refs/heads/{name}");
-        self.installation
-            .post(
-                &format!("/repos/{}/git/refs", self.identity.repository),
-                Some(&CreateGitReference { reference: &reference, sha }),
-            )
-            .await
-            .map_err(GitHubError::from)
+        self.write_rest(
+            "POST",
+            &format!("/repos/{}/git/refs", self.identity.repository),
+            Some(&CreateGitReference { reference: &reference, sha }),
+        )
+        .await
     }
 
     pub async fn update_git_reference(
@@ -474,31 +501,32 @@ impl GitHubClient {
         sha: &str,
     ) -> Result<GitReference, GitHubError> {
         let encoded = encode_path(name);
-        self.installation
-            .patch(
-                &format!("/repos/{}/git/refs/heads/{encoded}", self.identity.repository),
-                Some(&UpdateGitReference { sha, force: false }),
-            )
-            .await
-            .map_err(GitHubError::from)
+        self.write_rest(
+            "PATCH",
+            &format!("/repos/{}/git/refs/heads/{encoded}", self.identity.repository),
+            Some(&UpdateGitReference { sha, force: false }),
+        )
+        .await
     }
 
-    pub async fn open_pull_requests_for_head(
+    pub async fn pull_requests_for_head(
         &self,
         head: &str,
         base: &str,
     ) -> Result<Vec<PullRequest>, GitHubError> {
         let owner = self.identity.repository.split_once('/').map_or("", |(owner, _)| owner);
-        let params = PullRequestsParams {
-            state: "open",
-            head: format!("{owner}:{head}"),
-            base,
-            per_page: 100,
-        };
-        self.installation
-            .get(&format!("/repos/{}/pulls", self.identity.repository), Some(&params))
-            .await
-            .map_err(GitHubError::from)
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("state", "all")
+            .append_pair("head", &format!("{owner}:{head}"))
+            .append_pair("base", base)
+            .append_pair("per_page", "100")
+            .finish();
+        self.write_rest(
+            "GET",
+            &format!("/repos/{}/pulls?{query}", self.identity.repository),
+            None::<&()>,
+        )
+        .await
     }
 
     pub async fn create_draft_pull_request(
@@ -508,13 +536,12 @@ impl GitHubClient {
         head: &str,
         base: &str,
     ) -> Result<PullRequest, GitHubError> {
-        self.installation
-            .post(
-                &format!("/repos/{}/pulls", self.identity.repository),
-                Some(&CreatePullRequest { title, body, head, base, draft: true }),
-            )
-            .await
-            .map_err(GitHubError::from)
+        self.write_rest(
+            "POST",
+            &format!("/repos/{}/pulls", self.identity.repository),
+            Some(&CreatePullRequest { title, body, head, base, draft: true }),
+        )
+        .await
     }
 
     pub async fn pull_request_closing_issues(
@@ -650,21 +677,7 @@ struct PermissionResponse {
 }
 
 #[derive(Serialize)]
-struct PaginationParams {
-    per_page: u8,
-    page: u16,
-}
-
-#[derive(Serialize)]
 struct AppDeliveriesParams {
-    per_page: u8,
-}
-
-#[derive(Serialize)]
-struct PullRequestsParams<'a> {
-    state: &'a str,
-    head: String,
-    base: &'a str,
     per_page: u8,
 }
 
@@ -923,21 +936,6 @@ async fn viewer_identity(
     Ok(data.viewer)
 }
 
-async fn octocrab_get_optional<T: DeserializeOwned>(
-    client: &Octocrab,
-    route: impl AsRef<str>,
-) -> Result<Option<T>, GitHubError> {
-    match client.get::<T, _, _>(route.as_ref(), None::<&()>).await {
-        Ok(value) => Ok(Some(value)),
-        Err(octocrab::Error::GitHub { source, .. })
-            if source.status_code == StatusCode::NOT_FOUND =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
 async fn octocrab_delete(client: &Octocrab, route: impl AsRef<str>) -> Result<(), GitHubError> {
     let response = client._delete(route.as_ref(), None::<&()>).await?;
     let status = response.status();
@@ -998,3 +996,7 @@ where
         .map_err(|_| GitHubError::Timeout { operation: operation.to_owned() })?
         .map_err(Into::into)
 }
+
+#[cfg(test)]
+#[path = "../tests/support/publication_github.rs"]
+mod publication_github;

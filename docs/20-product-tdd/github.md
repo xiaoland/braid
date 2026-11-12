@@ -280,7 +280,7 @@ braid gh pr ensure --comment 123456789 \
 the Profile tags. The writer prepends one attribution block and removes exact
 repetitions of that generated block from the start of the supplied body, so a
 caller retry or model mistake cannot duplicate it. `--request-id` is optional;
-exact attributed body content provides the fallback retry identity, while an
+exact locally accepted request content provides the fallback retry identity, while an
 explicit value lets the Agent name retry intent. Command results expose only
 bounded operation/target/Profile/lifecycle and semantic GitHub comment/PR
 references. Internal write IDs, node IDs, digests, and retry counters remain in
@@ -299,6 +299,54 @@ Draft PR, establishes native association, and records ActivationIntent. GitHub
 requires Contents write for App installation
 [commit](https://docs.github.com/en/rest/git/commits) and
 [reference](https://docs.github.com/en/rest/git/refs) creation.
+
+### Durable acceptance and one executor
+
+`comment create` and `pr ensure` perform local configuration, format, Profile and
+available source-binding checks before any GitHub await. One transaction records
+an immutable request in `write_intents` and its execution obligation in
+`github_write_outbox`. The CLI never claims or mutates; it immediately returns
+`queued` and a stable public `request-…` ID, including when the service is offline.
+`braid gh status <request-ID> --config <path> --json` retrieves the receipt without
+resubmitting body content. The public ID is separate from the internal intent ID.
+Receipt projections include operation, target, lifecycle, ensure stage/head/base,
+and confirmed GitHub references; queued is not published. Same key and digest
+returns the same receipt; a changed request conflicts. Raw comment content and a
+Profile snapshot are accepted as a typed, not-yet-target-validated request.
+Canonical target kind, Profile compatibility and installation write permissions
+are still verified before mutation. This does not expand operation/target rights.
+
+Only the runtime-owned outbox claims and settles writes, with runtime generation,
+owner ID and monotonically increasing attempt fences. Network awaits never run
+inside SQLite transactions. A known pre-mutation failure stays pending; uncertain
+execution requires canonical recovery, never blind replay. Per-task durable
+`next_attempt_at` honors the shared installation reset/cooldown and bounded
+exponential backoff; the 250ms local worker tick is not a quota probe. Restart
+recovers sending work as uncertain, including migrated legacy CLI obligations.
+Reactions and operational status continue on the same executor; Built-in uses
+its existing upstream adapter and the same fenced claim/settlement API.
+
+Ensure accepts raw comment ID/head/Profile before planning. Remote planning freezes
+base/head, request comment and Issue identity, bootstrap authored time and PR
+Profile once in `implementation_requests`. That table is domain progress, not
+another queue. Recovery reuses `planned → head_ready → pull_request_ready →
+associated → activation_pending`, including a confirmed PR number even when it
+is no longer in open-PR listings. Native association and the delivery-key-idempotent
+initial Activation must finish before applied. Changed activation Profile
+configuration is rejected rather than silently activating another Profile.
+
+`PublicationSource` is the typed extension seam for source-aware maintenance:
+agent/assignment/generation, Profile/revision, session/turn and Context revision
+are captured from durable worktree/session state and rechecked before mutation.
+Completed turns retain accepted obligations; pending invalidations, replaced
+sessions and newer assignment generations fence old output. An uncertain comment
+is first looked up and acknowledged if uniquely found, even if the source was
+subsequently fenced; it is never resent under a stale fence. Current launchers
+only supply `BRAID_AGENT`, not a runtime-signed invocation handle. Worktree lookup
+is therefore a provenance check, **not** an environment-based authority proof or
+an OS sandbox. The source-aware memory component must provide an explicit bound
+invocation/operator distinction; removing an environment variable cannot be
+claimed to be securely prevented by this layer.
 
 Every Braid-owned mutation first commits an immutable write intent. States are
 `pending`, `sending`, `uncertain`, `applied`, `conflict`, `ambiguous`,
@@ -323,3 +371,11 @@ key, excludes its ID from Context, and never hides debug metadata in the body.
 Profiles choose Issue, PR, or both direct surfaces. Status covers context
 pressure/unavailability, provider/transport unknown, blocked Profile/worktree,
 and ambiguous/rejected Braid writes.
+
+For initial `pr ensure`, the source is the calling Issue assignment; the frozen
+PR Profile selects the new implementation role and must not replace that source.
+Cwd/session resolution checks the durable source role and treats an explicit
+comment Profile as an assertion, not an identity override. REST publication shares
+installation cooldown/admission with GraphQL while keeping REST response counters
+out of GraphQL point accounting; server Retry-After/reset deadlines reach the
+outbox's durable next-attempt deadline.

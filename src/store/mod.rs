@@ -21,6 +21,9 @@ mod builtin;
 mod runs;
 pub use runs::RunCommand;
 mod gh_writes;
+mod write_execution;
+use write_execution::{claim_github_write, finish_github_write, recover_writes};
+pub mod publication_source;
 pub use builtin::{BuiltinBinding, BuiltinCommand, BuiltinGrant, BuiltinReply};
 
 pub use gh_writes::{
@@ -28,11 +31,11 @@ pub use gh_writes::{
     NewImplementationRequest,
 };
 use gh_writes::{
-    claim_gh_write, finish_gh_write, gh_write_receipt, implementation_request_receipt,
-    prepare_gh_write, prepare_implementation_request, record_implementation_progress,
+    gh_write_receipt, implementation_request_receipt, prepare_gh_write,
+    prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 8;
+pub const DATABASE_SCHEMA_VERSION: u32 = 9;
 
 const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
 const EVENT_KINDS_SQL: &str = include_str!("../../migrations/0002_event_kinds.sql");
@@ -68,6 +71,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 8,
         name: "reconciliation_clock",
         sql: include_str!("../../migrations/0008_reconciliation_clock.sql"),
+    },
+    Migration {
+        version: 9,
+        name: "durable_publication",
+        sql: include_str!("../../migrations/0009_durable_publication.sql"),
     },
 ];
 
@@ -321,6 +329,10 @@ pub struct PendingGitHubWrite {
     pub remote_database_id: Option<String>,
     pub lifecycle: String,
     pub created_at: String,
+    pub attempt: i64,
+    pub retry_after: u64,
+    pub recovery_until: String,
+    pub owner: RuntimeLease,
 }
 
 #[derive(Debug, Clone)]
@@ -719,17 +731,20 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub fn claim_github_write(&self) -> Result<Option<PendingGitHubWrite>, StoreError> {
+    pub fn claim_github_write(
+        &self,
+        owner: RuntimeLease,
+    ) -> Result<Option<PendingGitHubWrite>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::ClaimGitHubWrite(reply))
+            .send(Command::ClaimGitHubWrite(owner, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
     pub fn finish_github_write(
         &self,
-        intent_id: String,
+        write: PendingGitHubWrite,
         lifecycle: &'static str,
         remote_database_id: Option<String>,
         remote_node_id: Option<String>,
@@ -738,7 +753,7 @@ impl StoreActor {
         let (reply, receiver) = mpsc::channel();
         self.sender
             .send(Command::FinishGitHubWrite(
-                intent_id,
+                write,
                 lifecycle,
                 remote_database_id,
                 remote_node_id,
@@ -790,14 +805,6 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub fn claim_gh_write(&self, intent_id: String) -> Result<bool, StoreError> {
-        let (reply, receiver) = mpsc::channel();
-        self.sender
-            .send(Command::ClaimGhWrite(intent_id, reply))
-            .map_err(|_| StoreError::ActorUnavailable)?;
-        receiver.recv().map_err(|_| StoreError::ActorStopped)?
-    }
-
     pub fn record_implementation_progress(
         &self,
         intent_id: String,
@@ -806,30 +813,6 @@ impl StoreActor {
         let (reply, receiver) = mpsc::channel();
         self.sender
             .send(Command::RecordImplementationProgress(intent_id, progress, reply))
-            .map_err(|_| StoreError::ActorUnavailable)?;
-        receiver.recv().map_err(|_| StoreError::ActorStopped)?
-    }
-
-    pub fn finish_gh_write(
-        &self,
-        intent_id: String,
-        lifecycle: &'static str,
-        remote_database_id: Option<String>,
-        remote_node_id: Option<String>,
-        remote_url: Option<String>,
-        error: Option<String>,
-    ) -> Result<(), StoreError> {
-        let (reply, receiver) = mpsc::channel();
-        self.sender
-            .send(Command::FinishGhWrite(
-                intent_id,
-                lifecycle,
-                remote_database_id,
-                remote_node_id,
-                remote_url,
-                error,
-                reply,
-            ))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1382,9 +1365,9 @@ enum Command {
     RenewRuntimeLease(RuntimeLease, u64, Sender<Result<RuntimeLease, StoreError>>),
     ReleaseRuntimeLease(RuntimeLease, Sender<Result<(), StoreError>>),
     RecoverWrites(Sender<Result<u64, StoreError>>),
-    ClaimGitHubWrite(Sender<Result<Option<PendingGitHubWrite>, StoreError>>),
+    ClaimGitHubWrite(RuntimeLease, Sender<Result<Option<PendingGitHubWrite>, StoreError>>),
     FinishGitHubWrite(
-        String,
+        PendingGitHubWrite,
         &'static str,
         Option<String>,
         Option<String>,
@@ -1401,17 +1384,7 @@ enum Command {
         String,
         Sender<Result<Option<ImplementationRequestReceipt>, StoreError>>,
     ),
-    ClaimGhWrite(String, Sender<Result<bool, StoreError>>),
     RecordImplementationProgress(String, ImplementationProgress, Sender<Result<(), StoreError>>),
-    FinishGhWrite(
-        String,
-        &'static str,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Sender<Result<(), StoreError>>,
-    ),
     DueReconciliationWorkItems(u64, Sender<Result<Vec<TrackedWorkItem>, StoreError>>),
     RecordReconciliation(String, bool, Sender<Result<(), StoreError>>),
     CanonicalObjects(String, Sender<Result<Vec<CanonicalObjectState>, StoreError>>),
@@ -1592,11 +1565,11 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::RecoverWrites(reply) => {
                 let _ = reply.send(recover_writes(database));
             }
-            Command::ClaimGitHubWrite(reply) => {
-                let _ = reply.send(claim_github_write(database));
+            Command::ClaimGitHubWrite(owner, reply) => {
+                let _ = reply.send(claim_github_write(database, &owner));
             }
             Command::FinishGitHubWrite(
-                intent_id,
+                write,
                 lifecycle,
                 remote_database_id,
                 remote_node_id,
@@ -1605,7 +1578,7 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             ) => {
                 let _ = reply.send(finish_github_write(
                     database,
-                    &intent_id,
+                    &write,
                     lifecycle,
                     remote_database_id.as_deref(),
                     remote_node_id.as_deref(),
@@ -1624,30 +1597,8 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::ImplementationRequestReceipt(intent_id, reply) => {
                 let _ = reply.send(implementation_request_receipt(database, &intent_id));
             }
-            Command::ClaimGhWrite(intent_id, reply) => {
-                let _ = reply.send(claim_gh_write(database, &intent_id));
-            }
             Command::RecordImplementationProgress(intent_id, progress, reply) => {
                 let _ = reply.send(record_implementation_progress(database, &intent_id, &progress));
-            }
-            Command::FinishGhWrite(
-                intent_id,
-                lifecycle,
-                remote_database_id,
-                remote_node_id,
-                remote_url,
-                error,
-                reply,
-            ) => {
-                let _ = reply.send(finish_gh_write(
-                    database,
-                    &intent_id,
-                    lifecycle,
-                    remote_database_id.as_deref(),
-                    remote_node_id.as_deref(),
-                    remote_url.as_deref(),
-                    error.as_deref(),
-                ));
             }
             Command::DueReconciliationWorkItems(hot_seconds, reply) => {
                 let _ = reply.send(due_reconciliation_work_items(database, hot_seconds));
@@ -3086,141 +3037,6 @@ fn release_runtime_lease(database: &Path, lease: &RuntimeLease) -> Result<(), St
             lease.owner_id
         ],
     )?;
-    Ok(())
-}
-
-fn recover_writes(database: &Path) -> Result<u64, StoreError> {
-    require_current_schema(database)?;
-    let connection = open_read_write(database)?;
-    configure_connection(&connection)?;
-    let changed = connection.execute(
-        "UPDATE github_write_outbox SET lifecycle='uncertain',next_attempt_at=?1,updated_at=?1
-         WHERE lifecycle='sending'",
-        [now_rfc3339()],
-    )?;
-    Ok(u64::try_from(changed).expect("SQLite change count fits u64"))
-}
-
-fn claim_github_write(database: &Path) -> Result<Option<PendingGitHubWrite>, StoreError> {
-    require_current_schema(database)?;
-    let now = now_rfc3339();
-    let mut connection = open_read_write(database)?;
-    configure_connection(&connection)?;
-    let transaction = connection.transaction()?;
-    let write = transaction
-        .query_row(
-            "SELECT intent_id,repository,target_kind,target_database_id,operation,content,
-                    remote_database_id,lifecycle,created_at
-             FROM github_write_outbox
-             WHERE lifecycle IN ('pending','uncertain') AND next_attempt_at<=?1
-             ORDER BY created_at,intent_id LIMIT 1",
-            [&now],
-            |row| {
-                Ok(PendingGitHubWrite {
-                    intent_id: row.get(0)?,
-                    repository: row.get(1)?,
-                    target_kind: row.get(2)?,
-                    target_database_id: row.get(3)?,
-                    operation: row.get(4)?,
-                    content: row.get(5)?,
-                    remote_database_id: row.get(6)?,
-                    lifecycle: row.get(7)?,
-                    created_at: row.get(8)?,
-                })
-            },
-        )
-        .optional()?;
-    if let Some(write) = &write {
-        transaction.execute(
-            "UPDATE github_write_outbox SET lifecycle='sending',attempts=attempts+1,
-               last_error=NULL,updated_at=?2 WHERE intent_id=?1",
-            params![write.intent_id, now],
-        )?;
-    }
-    transaction.commit()?;
-    Ok(write)
-}
-
-fn finish_github_write(
-    database: &Path,
-    intent_id: &str,
-    lifecycle: &str,
-    remote_database_id: Option<&str>,
-    remote_node_id: Option<&str>,
-    error: Option<&str>,
-) -> Result<(), StoreError> {
-    require_current_schema(database)?;
-    if !matches!(lifecycle, "applied" | "uncertain" | "rejected" | "conflict" | "ambiguous") {
-        return Err(StoreError::InvalidData(format!("invalid write terminal {lifecycle}")));
-    }
-    let mut connection = open_read_write(database)?;
-    configure_connection(&connection)?;
-    let transaction = connection.transaction()?;
-    let (attempts, operation, repository, target_kind, target_database_id, content) = transaction
-        .query_row(
-            "SELECT attempts,operation,repository,target_kind,target_database_id,content
-             FROM github_write_outbox WHERE intent_id=?1 AND lifecycle='sending'",
-            [intent_id],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            },
-        )
-        .optional()?
-        .ok_or_else(|| {
-            StoreError::InvalidData(format!("write intent {intent_id} is not sending"))
-        })?;
-    let retry_exponent = u32::try_from(attempts).unwrap_or(6).min(6);
-    let retry_seconds = 2_u64.pow(retry_exponent).min(60);
-    let next_attempt_at =
-        if lifecycle == "uncertain" { deadline_rfc3339(retry_seconds)? } else { now_rfc3339() };
-    let updated = transaction.execute(
-        "UPDATE github_write_outbox SET lifecycle=?2,remote_database_id=?3,last_error=?4,
-           next_attempt_at=?5,updated_at=?6 WHERE intent_id=?1 AND lifecycle='sending'",
-        params![intent_id, lifecycle, remote_database_id, error, next_attempt_at, now_rfc3339()],
-    )?;
-    if updated != 1 {
-        return Err(StoreError::InvalidData(format!("write intent {intent_id} is not sending")));
-    }
-    if lifecycle == "applied" && operation == "reaction_add" && content == "rocket" {
-        let terminal_exists = transaction
-            .query_row(
-                "SELECT 1 FROM github_write_outbox
-                 WHERE repository=?1 AND target_kind=?2 AND target_database_id=?3
-                   AND operation='reaction_add' AND content IN ('+1','confused')
-                   AND lifecycle NOT IN ('rejected','conflict','ambiguous','superseded') LIMIT 1",
-                params![repository, target_kind, target_database_id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if terminal_exists {
-            enqueue_rocket_removal(
-                &transaction,
-                &repository,
-                &target_kind,
-                &target_database_id,
-                &now_rfc3339(),
-            )?;
-        }
-    }
-    if matches!(operation.as_str(), "comment_create" | "comment_update") {
-        settle_operational_status(
-            &transaction,
-            intent_id,
-            lifecycle,
-            remote_database_id,
-            remote_node_id,
-            &now_rfc3339(),
-        )?;
-    }
-    transaction.commit()?;
     Ok(())
 }
 
@@ -5802,4 +5618,8 @@ fn create_dir_all(path: &Path) -> Result<(), StoreError> {
 
 fn now_rfc3339() -> String {
     OffsetDateTime::now_utc().format(&Rfc3339).expect("UTC timestamp formats as RFC 3339")
+}
+
+pub fn check_publication_owner(database: &Path, owner: &RuntimeLease) -> Result<(), StoreError> {
+    gh_writes::require_owner(&open_read_only(database)?, owner)
 }

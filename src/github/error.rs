@@ -17,6 +17,10 @@ pub enum GitHubError {
     Http { status: StatusCode, body: String },
     #[error("GitHub GraphQL returned errors: {0}")]
     GraphQl(String),
+    #[error("ambiguous GitHub write: {0}")]
+    Ambiguous(String),
+    #[error("GitHub REST rate limited ({retry_after}s): {message}")]
+    RateLimited { retry_after: u64, message: String },
     #[error("GitHub API delayed: {0}")]
     Delayed(String),
     #[error("GitHub GraphQL returned no data")]
@@ -46,14 +50,21 @@ impl From<octocrab::Error> for GitHubError {
 }
 
 impl GitHubError {
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, Self::Delayed(_) | Self::RateLimited { .. })
+            || matches!(self, Self::Http {status, body} if *status == StatusCode::TOO_MANY_REQUESTS || (*status == StatusCode::FORBIDDEN && { let message=body.to_ascii_lowercase(); message.contains("rate limit") || message.contains("secondary rate") }))
+    }
+
     pub fn is_unavailable(&self) -> bool {
-        matches!(
-            self,
-            Self::Octocrab(_)
-                | Self::ConvergencePending(_)
-                | Self::Timeout { .. }
-                | Self::Delayed(_)
-        ) || matches!(self, Self::Http { status, .. }
+        self.is_rate_limited()
+            || matches!(
+                self,
+                Self::Octocrab(_)
+                    | Self::ConvergencePending(_)
+                    | Self::Timeout { .. }
+                    | Self::Delayed(_)
+            )
+            || matches!(self, Self::Http { status, .. }
             if status.is_server_error() || *status == StatusCode::TOO_MANY_REQUESTS)
     }
 

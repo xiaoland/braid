@@ -146,10 +146,11 @@ async fn managed(
     workers.spawn(worker_result(queue_worker(Arc::clone(&store), receiver.clone())));
     workers.spawn(worker_result(crate::producer::lease_worker(
         Arc::clone(&store),
-        lease,
+        Arc::clone(&lease),
         receiver.clone(),
     )));
     workers.spawn(object_worker(
+        lease.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
         Arc::clone(&store),
         Arc::clone(&client),
         config.clone(),
@@ -238,7 +239,8 @@ async fn managed(
             if status.pending_writes == 0 {
                 break;
             }
-            if let Err(error) = advance_objects(&store, &client, &config).await {
+            let owner = lease.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            if let Err(error) = advance_objects(&owner, &store, &client, &config).await {
                 if let Some(result) = &mut outcome {
                     result.state = crate::run::RunState::Blocked;
                     result.reason = Some(format!("shutdown outbox failed: {error:#}"));
@@ -309,6 +311,7 @@ async fn managed(
 }
 
 async fn object_worker(
+    owner: crate::store::RuntimeLease,
     store: Arc<StoreActor>,
     client: Arc<BuiltinClient>,
     config: Config,
@@ -320,7 +323,7 @@ async fn object_worker(
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),
             _ = tick.tick() => {
-                advance_objects(&store, &client, &config).await.context("cannot advance built-in collaboration")?;
+                advance_objects(&owner, &store, &client, &config).await.context("cannot advance built-in collaboration")?;
             }
         }
     }
@@ -337,6 +340,7 @@ fn client_cursor(store: &StoreActor) -> Result<u64> {
 
 #[allow(clippy::too_many_lines)]
 async fn advance_objects(
+    owner: &crate::store::RuntimeLease,
     store: &StoreActor,
     client: &BuiltinClient,
     config: &Config,
@@ -441,7 +445,7 @@ async fn advance_objects(
         feed.next_after == cursor,
         "platform nextAfter does not match delivered event sequence"
     );
-    if let Some(write) = store.claim_github_write()? {
+    if let Some(write) = store.claim_github_write(owner.clone())? {
         match client.apply_write(&write).await {
             Ok((database_id, node_id)) => {
                 tracing::info!(
@@ -452,13 +456,7 @@ async fn advance_objects(
                     braid.outbox.lifecycle="applied",
                     "built-in upstream write applied"
                 );
-                store.finish_github_write(
-                    write.intent_id,
-                    "applied",
-                    database_id,
-                    node_id,
-                    None,
-                )?;
+                store.finish_github_write(write.clone(), "applied", database_id, node_id, None)?;
             }
             Err(error) => {
                 let lifecycle = if error
@@ -479,7 +477,7 @@ async fn advance_objects(
                     "built-in upstream write failed"
                 );
                 store.finish_github_write(
-                    write.intent_id,
+                    write.clone(),
                     lifecycle,
                     None,
                     None,

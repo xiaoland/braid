@@ -1,11 +1,12 @@
+use sha2::Digest as _;
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use super::{
-    StoreError, configure_connection, deadline_rfc3339, now_rfc3339, open_read_only,
-    open_read_write, require_current_schema, sqlite_i64_to_u64, sqlite_u64,
+    StoreError, configure_connection, now_rfc3339, open_read_only, open_read_write,
+    require_current_schema, sqlite_i64_to_u64, sqlite_u64,
 };
 
 #[derive(Debug, Clone)]
@@ -18,11 +19,16 @@ pub struct NewGhWriteIntent {
     pub role: String,
     pub payload: String,
     pub request_digest: String,
+    pub source: Option<super::publication_source::PublicationSource>,
 }
 
 #[derive(Debug, Clone)]
 pub struct GhWriteReceipt {
     pub intent_id: String,
+    pub request_id: String,
+    pub execution_owner: Option<super::RuntimeLease>,
+    pub recovery_until: Option<String>,
+    pub source: Option<super::publication_source::PublicationSource>,
     pub operation: String,
     pub repository: String,
     pub target: String,
@@ -81,6 +87,9 @@ pub(super) fn prepare_gh_write(
     let mut connection = open_read_write(database)?;
     configure_connection(&connection)?;
     let transaction = connection.transaction()?;
+    if let Some(source) = &write.source {
+        super::publication_source::validate(&transaction, source)?;
+    }
     let existing = transaction
         .query_row(
             "SELECT intent_id,request_digest FROM write_intents WHERE request_key=?1",
@@ -102,8 +111,8 @@ pub(super) fn prepare_gh_write(
         transaction.execute(
             "INSERT INTO write_intents(
                intent_id,operation,request_digest,lifecycle,attempts,created_at,updated_at,
-               request_key,repository,target,profile_id,role,payload
-             ) VALUES (?1,?2,?3,'pending',0,?4,?4,?5,?6,?7,?8,?9,?10)",
+               request_key,repository,target,profile_id,role,payload,source_binding
+             ) VALUES (?1,?2,?3,'pending',0,?4,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 intent_id,
                 write.operation,
@@ -115,10 +124,17 @@ pub(super) fn prepare_gh_write(
                 write.profile_id,
                 write.role,
                 write.payload,
+                write
+                    .source
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| StoreError::InvalidData(e.to_string()))?,
             ],
         )?;
         intent_id
     };
+    enqueue(&transaction, &intent_id)?;
     let receipt = gh_write_receipt_on(&transaction, &intent_id)?.ok_or_else(|| {
         StoreError::InvalidData(format!("write intent {intent_id} disappeared during prepare"))
     })?;
@@ -159,8 +175,8 @@ pub(super) fn prepare_implementation_request(
         transaction.execute(
             "INSERT INTO write_intents(
                intent_id,operation,request_digest,lifecycle,attempts,created_at,updated_at,
-               request_key,repository,target,profile_id,role,payload
-             ) VALUES (?1,'pr_ensure',?2,'pending',0,?3,?3,?4,?5,?6,?7,?8,?9)",
+               request_key,repository,target,profile_id,role,payload,source_binding
+             ) VALUES (?1,'pr_ensure',?2,'pending',0,?3,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 intent_id,
                 request.write.request_digest,
@@ -171,29 +187,38 @@ pub(super) fn prepare_implementation_request(
                 request.write.profile_id,
                 request.write.role,
                 request.write.payload,
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO implementation_requests(
-               intent_id,repository,comment_database_id,comment_node_id,issue_node_id,issue_number,
-               issue_title,base_ref,head_ref,pr_profile_id,bootstrap_authored_at,stage,updated_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'planned',?11)",
-            params![
-                intent_id,
-                request.write.repository,
-                sqlite_u64(request.comment_database_id, "Implementation Request comment ID",)?,
-                request.comment_node_id,
-                request.issue_node_id,
-                sqlite_u64(request.issue_number, "Implementation Request Issue number")?,
-                request.issue_title,
-                request.base_ref,
-                request.head_ref,
-                request.pr_profile_id,
-                now,
+                request
+                    .write
+                    .source
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| StoreError::InvalidData(e.to_string()))?,
             ],
         )?;
         intent_id
     };
+    let now = now_rfc3339();
+    transaction.execute(
+        "INSERT OR IGNORE INTO implementation_requests(
+               intent_id,repository,comment_database_id,comment_node_id,issue_node_id,issue_number,
+               issue_title,base_ref,head_ref,pr_profile_id,bootstrap_authored_at,stage,updated_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'planned',?11)",
+        params![
+            intent_id,
+            request.write.repository,
+            sqlite_u64(request.comment_database_id, "Implementation Request comment ID",)?,
+            request.comment_node_id,
+            request.issue_node_id,
+            sqlite_u64(request.issue_number, "Implementation Request Issue number")?,
+            request.issue_title,
+            request.base_ref,
+            request.head_ref,
+            request.pr_profile_id,
+            now,
+        ],
+    )?;
+    enqueue(&transaction, &intent_id)?;
     let receipt =
         implementation_request_receipt_on(&transaction, &intent_id)?.ok_or_else(|| {
             StoreError::InvalidData(format!(
@@ -234,10 +259,11 @@ fn gh_write_receipt_on(
 ) -> Result<Option<GhWriteReceipt>, StoreError> {
     connection
         .query_row(
-            "SELECT intent_id,operation,repository,target,profile_id,role,
-                    lifecycle,attempts,remote_database_id,
-                    last_error,created_at,payload
-             FROM write_intents WHERE intent_id=?1 AND request_key IS NOT NULL",
+            "SELECT w.intent_id,w.operation,w.repository,w.target,w.profile_id,w.role,
+                    COALESCE(o.lifecycle,w.lifecycle),COALESCE(o.attempts,w.attempts),w.remote_database_id,
+                    COALESCE(o.last_error,w.last_error),w.created_at,w.payload,w.public_request_id,w.source_binding
+             FROM write_intents w LEFT JOIN github_write_outbox o ON o.intent_id=w.intent_id
+             WHERE (w.intent_id=?1 OR w.public_request_id=?1) AND w.request_key IS NOT NULL",
             [intent_id],
             |row| {
                 Ok(GhWriteReceipt {
@@ -253,6 +279,10 @@ fn gh_write_receipt_on(
                     last_error: row.get(9)?,
                     created_at: row.get(10)?,
                     payload: row.get(11)?,
+                    request_id: row.get(12)?,
+                    execution_owner: None,
+                    recovery_until: None,
+                    source: row.get::<_,Option<String>>(13)?.map(|value| serde_json::from_str(&value)).transpose().map_err(|e| rusqlite::Error::FromSqlConversionFailure(13,rusqlite::types::Type::Text,Box::new(e)))?,
                 })
             },
         )
@@ -306,23 +336,6 @@ fn implementation_request_receipt_on(
         )
         .optional()
         .map_err(StoreError::from)
-}
-
-pub(super) fn claim_gh_write(database: &Path, intent_id: &str) -> Result<bool, StoreError> {
-    require_current_schema(database)?;
-    let now = now_rfc3339();
-    let expires_at = deadline_rfc3339(60)?;
-    let connection = open_read_write(database)?;
-    configure_connection(&connection)?;
-    let changed = connection.execute(
-        "UPDATE write_intents SET lifecycle='sending',attempts=attempts+1,
-           claim_expires_at=?2,last_error=NULL,updated_at=?1
-         WHERE intent_id=?3 AND request_key IS NOT NULL
-           AND (lifecycle IN ('pending','uncertain')
-                OR (lifecycle='sending' AND claim_expires_at<=?1))",
-        params![now, expires_at, intent_id],
-    )?;
-    Ok(changed == 1)
 }
 
 pub(super) fn record_implementation_progress(
@@ -427,40 +440,20 @@ fn reject_progress_change(
     Ok(())
 }
 
-pub(super) fn finish_gh_write(
-    database: &Path,
-    intent_id: &str,
-    lifecycle: &str,
-    remote_database_id: Option<&str>,
-    remote_node_id: Option<&str>,
-    remote_url: Option<&str>,
-    error: Option<&str>,
+pub(super) fn require_owner(
+    connection: &Connection,
+    owner: &super::RuntimeLease,
 ) -> Result<(), StoreError> {
-    require_current_schema(database)?;
-    if !matches!(lifecycle, "applied" | "uncertain" | "rejected" | "conflict" | "ambiguous") {
-        return Err(StoreError::InvalidData(format!("invalid braid gh terminal {lifecycle}")));
+    let valid: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM owner_leases WHERE scope=?1 AND generation=?2 AND owner_id=?3 AND expires_at>?4)", params![owner.scope,sqlite_u64(owner.generation,"owner generation")?,owner.owner_id,now_rfc3339()], |row| row.get(0))?;
+    if !valid || owner.scope != "runtime" {
+        return Err(StoreError::InvalidData("outbox runtime owner expired or replaced".into()));
     }
-    let connection = open_read_write(database)?;
-    configure_connection(&connection)?;
-    let changed = connection.execute(
-        "UPDATE write_intents SET lifecycle=?2,remote_database_id=COALESCE(?3,remote_database_id),
-           remote_node_id=COALESCE(?4,remote_node_id),remote_url=COALESCE(?5,remote_url),
-           last_error=?6,claim_expires_at=NULL,updated_at=?7
-         WHERE intent_id=?1 AND request_key IS NOT NULL AND lifecycle='sending'",
-        params![
-            intent_id,
-            lifecycle,
-            remote_database_id,
-            remote_node_id,
-            remote_url,
-            error,
-            now_rfc3339(),
-        ],
-    )?;
-    if changed != 1 {
-        return Err(StoreError::InvalidData(format!(
-            "braid gh write intent {intent_id} is not sending"
-        )));
-    }
+    Ok(())
+}
+
+fn enqueue(connection: &Connection, intent_id: &str) -> Result<(), StoreError> {
+    connection.execute("UPDATE write_intents SET public_request_id=COALESCE(public_request_id,?2) WHERE intent_id=?1", params![intent_id,format!("request-{}",Uuid::now_v7())])?;
+    connection.execute("INSERT OR IGNORE INTO github_write_outbox(intent_id,repository,target_kind,target_database_id,operation,content,request_digest,lifecycle,next_attempt_at,created_at,updated_at)
+        SELECT intent_id,repository,'agent',target,'agent_write',payload,?2,'pending',created_at,created_at,created_at FROM write_intents WHERE intent_id=?1", params![intent_id, hex::encode(sha2::Sha256::digest(format!("outbox:{intent_id}").as_bytes()))])?;
     Ok(())
 }

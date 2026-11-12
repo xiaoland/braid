@@ -2,11 +2,25 @@
 use super::*;
 
 pub async fn prepare_pull_request(
-    config: &Config,
     store: &StoreActor,
     github: &GitHubClient,
-    repository: crate::github::RepositoryName,
+    accepted: &GhWriteReceipt,
+    profile: Profile,
     request: PullRequestEnsureRequest,
+) -> Result<ImplementationRequestReceipt, GitHubError> {
+    let repository = request.repository.clone();
+    prepare_plan(store, github, accepted, profile, request, repository).await.map_err(|e| {
+        e.downcast::<GitHubError>().unwrap_or_else(|e| GitHubError::GraphQl(e.to_string()))
+    })
+}
+
+async fn prepare_plan(
+    store: &StoreActor,
+    github: &GitHubClient,
+    accepted: &GhWriteReceipt,
+    profile: Profile,
+    request: PullRequestEnsureRequest,
+    repository: crate::github::RepositoryName,
 ) -> Result<ImplementationRequestReceipt> {
     github.require_write_permissions(&["pull_requests", "contents"])?;
     let comment = github.issue_comment(request.comment_id).await?;
@@ -46,27 +60,18 @@ pub async fn prepare_pull_request(
     if head_ref == base_ref {
         bail!("Implementation Request head must differ from the default branch {base_ref:?}");
     }
-    let profile = config.pr_profile_for_repository(&repository.to_string())?;
-    if !profile.has_tag("pr") {
-        bail!("PR Profile {:?} for {} is not tagged pr", profile.id, repository);
-    }
-    let profile_digest = helpers::digest(&serde_json::to_string(profile)?);
-    let request_key = format!("pr_ensure\0{}\0{}", repository, request.comment_id);
-    let request_digest = helpers::digest(&format!(
-        "pr_ensure\0{}\0{}\0{}\0{}\0{}\0{}",
-        repository, request.comment_id, base_ref, head_ref, profile.id, profile_digest
-    ));
     store
         .prepare_implementation_request(NewImplementationRequest {
             write: NewGhWriteIntent {
-                request_key,
+                request_key: format!("pr_ensure\0{}\0{}", repository, request.comment_id),
                 operation: "pr_ensure",
                 repository: repository.to_string(),
-                target: comment.html_url.clone(),
+                target: accepted.target.clone(),
                 profile_id: profile.id.clone(),
                 role: "PR Implementation Agent".into(),
-                payload: comment.html_url.clone(),
-                request_digest,
+                payload: accepted.payload.clone(),
+                source: accepted.source.clone(),
+                request_digest: helpers::digest(&accepted.payload),
             },
             comment_database_id: request.comment_id,
             comment_node_id: comment.node_id,

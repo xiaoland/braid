@@ -177,6 +177,7 @@ enum GitHubCommand {
 
 #[derive(Debug, Subcommand)]
 enum GhCommand {
+    Status(GhWriteStatus),
     Comment {
         #[command(subcommand)]
         command: GhCommentCommand,
@@ -185,6 +186,15 @@ enum GhCommand {
         #[command(subcommand)]
         command: GhPrCommand,
     },
+}
+
+#[derive(Debug, Args)]
+struct GhWriteStatus {
+    request_id: String,
+    #[command(flatten)]
+    source: ConfigSource,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -412,26 +422,17 @@ struct ContextReport<'a> {
 
 #[derive(Debug, Serialize)]
 struct CommentWriteResult<'a> {
+    request_id: &'a str,
+    stage: Option<&'a str>,
+    head: Option<&'a str>,
+    base: Option<&'a str>,
+    pull_request: Option<String>,
     operation: &'a str,
     state: &'a str,
     target: &'a str,
     profile: &'a str,
     role: &'a str,
     comment: Option<String>,
-    error: Option<&'a str>,
-}
-
-#[derive(Debug, Serialize)]
-struct PullRequestEnsureResult<'a> {
-    operation: &'static str,
-    state: &'a str,
-    stage: &'a str,
-    implementation_request_comment: u64,
-    issue: String,
-    base: &'a str,
-    head: &'a str,
-    profile: &'a str,
-    pull_request: Option<String>,
     error: Option<&'a str>,
 }
 
@@ -472,7 +473,7 @@ pub async fn run() -> Result<()> {
         }
         Command::Context { command } => Box::pin(context_cmd::context(command)).await?,
         Command::Github { command } => gh::github(command).await?,
-        Command::Gh { command } => Box::pin(gh_cmd::gh(command)).await?,
+        Command::Gh { command } => gh_cmd::gh(command)?,
         Command::Telemetry { command: TelemetryCommand::Probe(arguments) } => {
             telemetry_cmd::telemetry_probe(arguments).await?;
         }

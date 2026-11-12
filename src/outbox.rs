@@ -7,25 +7,28 @@ use tokio::{
 use anyhow::Result;
 
 use crate::{
+    config::Config,
     github::{CreatedIssueComment, GitHubClient},
-    store::StoreActor,
+    store::{RuntimeLease, StoreActor},
 };
 
 pub(crate) async fn drain_one_write(
     store: &StoreActor,
     github_clients: &HashMap<String, Arc<GitHubClient>>,
+    config: &Config,
+    owner: &RuntimeLease,
 ) {
-    let write = match store.claim_github_write() {
+    let write = match store.claim_github_write(owner.clone()) {
         Ok(write) => write,
         Err(error) => {
             tracing::error!(%error, "cannot claim GitHub write");
             return;
         }
     };
-    let Some(write) = write else { return };
+    let Some(mut write) = write else { return };
     let Some(github) = github_clients.get(&write.repository) else {
         let _ = store.finish_github_write(
-            write.intent_id,
+            write.clone(),
             "rejected",
             None,
             None,
@@ -35,7 +38,7 @@ pub(crate) async fn drain_one_write(
     };
     if write.repository != github.identity().repository {
         let _ = store.finish_github_write(
-            write.intent_id,
+            write.clone(),
             "rejected",
             None,
             None,
@@ -43,11 +46,28 @@ pub(crate) async fn drain_one_write(
         );
         return;
     }
-    let result = apply_github_write(github, &write).await;
+    let mut mutation_possible = write.lifecycle == "uncertain";
+    let result = if write.operation == "agent_write" {
+        Box::pin(crate::writer::execute(config, store, github, &write, &mut mutation_possible))
+            .await
+            .map(|remote| AppliedWrite {
+                database_id: Some(remote.database_id),
+                node_id: Some(remote.node_id),
+            })
+            .map_err(|error| match error {
+                crate::writer::helpers::WriteFailure::GitHub(e) => OutboxWriteError::GitHub(e),
+                crate::writer::helpers::WriteFailure::Ambiguous(e) => {
+                    OutboxWriteError::Ambiguous(e)
+                }
+            })
+    } else {
+        mutation_possible = true;
+        apply_github_write(github, &write).await
+    };
     match result {
         Ok(remote_id) => {
             if let Err(error) = store.finish_github_write(
-                write.intent_id,
+                write.clone(),
                 "applied",
                 remote_id.database_id,
                 remote_id.node_id,
@@ -57,13 +77,33 @@ pub(crate) async fn drain_one_write(
             }
         }
         Err(error) => {
+            write.retry_after = github.write_retry_after().await;
+            if let OutboxWriteError::GitHub(crate::github::GitHubError::RateLimited {
+                retry_after,
+                ..
+            }) = &error
+            {
+                write.retry_after = write.retry_after.max(*retry_after);
+            }
             let lifecycle = match &error {
-                OutboxWriteError::Ambiguous(_) => "ambiguous",
-                OutboxWriteError::GitHub(error) if error.is_unavailable() => "uncertain",
+                OutboxWriteError::Ambiguous(_)
+                | OutboxWriteError::GitHub(crate::github::GitHubError::Ambiguous(_)) => "ambiguous",
+                OutboxWriteError::GitHub(error)
+                    if error.is_rate_limited() && write.lifecycle != "uncertain" =>
+                {
+                    "pending"
+                }
+                OutboxWriteError::GitHub(error) if error.is_unavailable() => {
+                    if mutation_possible {
+                        "uncertain"
+                    } else {
+                        "pending"
+                    }
+                }
                 OutboxWriteError::GitHub(_) => "rejected",
             };
             if let Err(store_error) = store.finish_github_write(
-                write.intent_id,
+                write.clone(),
                 lifecycle,
                 None,
                 None,
@@ -139,6 +179,7 @@ pub(crate) async fn recover_uncertain_comment(
         .filter(|comment| {
             comment.body.as_deref() == Some(write.content.as_str())
                 && comment.created_at >= write.created_at
+                && comment.created_at <= write.recovery_until
                 && comment
                     .user
                     .as_ref()
@@ -198,6 +239,8 @@ pub(crate) fn bail_unknown_write(operation: &str) -> Result<AppliedWrite, Outbox
 pub(crate) async fn outbox_worker(
     store: Arc<StoreActor>,
     github: Arc<HashMap<String, Arc<GitHubClient>>>,
+    config: Config,
+    owner: RuntimeLease,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -205,7 +248,7 @@ pub(crate) async fn outbox_worker(
     loop {
         tokio::select! {
             _ = shutdown.changed() => return,
-            _ = tick.tick() => drain_one_write(&store, &github).await,
+            _ = tick.tick() => drain_one_write(&store, &github, &config, &owner).await,
         }
     }
 }

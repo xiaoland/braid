@@ -37,6 +37,11 @@ pub struct Budget {
 }
 
 impl Budget {
+    pub fn retry_after(&self, now: u64) -> u64 {
+        self.until
+            .max(if self.remaining == Some(0) { self.reset.unwrap_or(now) } else { now })
+            .saturating_sub(now)
+    }
     /// # Errors
     /// Returns the reason admission is delayed, without waiting or issuing a request.
     pub fn admit(&mut self, now: u64, background: bool) -> Result<(), String> {

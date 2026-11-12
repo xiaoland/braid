@@ -234,6 +234,8 @@ async fn serve_github_managed(
     workers.spawn(worker_result(outbox_worker(
         Arc::clone(&store),
         Arc::clone(&github_clients),
+        config.clone(),
+        lease.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
         shutdown_receiver.clone(),
     )));
     workers.spawn(worker_result(reconciliation_worker(
@@ -432,7 +434,8 @@ async fn serve_github_managed(
         if status.pending_writes == 0 && status.uncertain_writes == 0 {
             break;
         }
-        drain_one_write(&store, &github_clients).await;
+        let owner = lease.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        drain_one_write(&store, &github_clients, &config, &owner).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let _ = tokio::time::timeout(Duration::from_secs(5), ingress).await;
