@@ -372,15 +372,16 @@ impl Execution {
         .map_err(|_| ProviderError::Timeout {
             method: format!("Pi owned cleanup execution {}", self.id),
         })??;
+        crate::telemetry::emit_provider_cleanup(&self.id, &output.stdout, &output.stderr);
         let receipt: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
             protocol(format!(
-                "Pi owned cleanup receipt invalid: {error}; exit={}; stdout={}; stderr={}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                "Pi owned cleanup receipt invalid: {error}; execution={}; stage=decode; exit={}; stdout_bytes={}; stderr_bytes={}",
+                self.id, output.status, output.stdout.len(), output.stderr.len()
             ))
         })?;
-        tracing::info!(name="braid.provider.execution", provider.kind="pi", provider.execution.id=%self.id, receipt=%receipt, process.exit_status=%output.status, stderr=%String::from_utf8_lossy(&output.stderr), "Pi offline owned execution cleanup");
+        tracing::info!(name="braid.provider.execution", provider.kind="pi", provider.execution.id=%self.id,
+            process.exit_status=%output.status, stdout.bytes=output.stdout.len(), stderr.bytes=output.stderr.len(),
+            "Pi offline owned execution cleanup");
         if !output.status.success()
             || receipt["status"] != "stopped"
             || receipt["execution_id"] != self.id
@@ -388,9 +389,11 @@ impl Execution {
             || receipt["coverage"] != "registered-process-groups-and-inherited-execution-markers"
         {
             return Err(ProviderError::Unknown(format!(
-                "Pi owned execution stop unproved: {receipt}; exit={}; stderr={}",
+                "Pi owned execution stop unproved: execution={}; stage=validate_receipt; exit={}; stdout_bytes={}; stderr_bytes={}",
+                self.id,
                 output.status,
-                String::from_utf8_lossy(&output.stderr)
+                output.stdout.len(),
+                output.stderr.len()
             )));
         }
         Ok(())

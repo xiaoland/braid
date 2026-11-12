@@ -858,7 +858,6 @@ fn spawn_pi_stderr(
                 "stderr",
                 &line,
             );
-            tracing::debug!(provider = "pi", output = %line, "provider diagnostic");
         }
     })
 }

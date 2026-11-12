@@ -78,6 +78,13 @@ revision 前提，采纳前应重新核对当前候选。
 不是保密措施；Collector 数据及原始批次只应交给该实例授权操作者。Console 没有
 自动删除历史数据，需由操作者停止服务后管理数据库备份与保留范围。
 
+采样命中的完整 provider/GitHub/credential evidence 只通过专用 target 进入 OTLP
+logs，不写普通 stderr/journal，也不复制为 trace event。普通日志保留生命周期与
+关联信息，payload 覆盖用指标计数，不逐 chunk 输出摘要。配置外部 LGTM、按
+trace/session 回读、探针结果边界和销毁临时后端的方法见
+[部署观测指南](../40-deployment/README.md#opentelemetry)。Console Collector
+和外部 LGTM 是可选接收端，不要把端口可达或 SDK export success 当作持续存储证明。
+
 页面以文本呈现不可信内容，不执行记录中的 HTML。HTTP 接口校验 loopback Host
 和写操作 Origin，浏览器不能提供任意 shell 命令、PID 或文件根目录。这些措施
 防止网页误驱动本机接口，不把拥有本机账户权限的进程视为隔离的对手。

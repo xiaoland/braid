@@ -18,10 +18,18 @@ use serde::Serialize;
 use thiserror::Error;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::{
-    EnvFilter, Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _,
+    EnvFilter, Layer as _, filter::FilterExt as _, layer::SubscriberExt as _,
+    util::SubscriberInitExt as _,
 };
 
 use crate::config::{LogFormat, TelemetryConfig};
+
+#[path = "telemetry/export.rs"]
+mod export;
+use export::{ExportObservation, ObservedExporter};
+
+// Full evidence is OTLP-log-only, never a span attribute or ordinary diagnostic.
+const EVIDENCE_TARGET: &str = "braid::evidence";
 
 #[derive(Debug, Error)]
 pub enum TelemetryError {
@@ -29,8 +37,6 @@ pub enum TelemetryError {
     Exporter(String),
     #[error("cannot install telemetry subscriber: {0}")]
     Subscriber(String),
-    #[error("cannot flush {signal} telemetry: {message}")]
-    Flush { signal: &'static str, message: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -48,6 +54,9 @@ pub struct ProbeResult {
     pub sampled: bool,
     pub payload_emitted: bool,
     pub exporter: ExporterHealth,
+    pub trace_id: String,
+    pub signals: Vec<ExportObservation>,
+    pub flush_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -434,6 +443,7 @@ pub fn emit_provider_payload(
     let _entered = span.enter();
     if sampled {
         tracing::info!(
+            target: EVIDENCE_TARGET,
             name = "braid.provider.payload",
             provider.kind = provider,
             braid.runtime.generation = generation.as_deref().unwrap_or(""),
@@ -460,6 +470,30 @@ pub fn emit_provider_payload(
     sampled
 }
 
+/// Cleanup has an execution identity, not a fabricated provider session/turn.
+pub fn emit_provider_cleanup(execution_id: &str, stdout: &[u8], stderr: &[u8]) {
+    let span = tracing::info_span!(
+        "braid.provider.cleanup",
+        provider.kind = "pi",
+        provider.execution.id = execution_id
+    );
+    if !span.context().span().is_recording() {
+        return;
+    }
+    let _entered = span.enter();
+    for (stream, payload) in [("cleanup.stdout", stdout), ("cleanup.stderr", stderr)] {
+        let (encoding, transcript) = match std::str::from_utf8(payload) {
+            Ok(text) => ("utf-8", std::borrow::Cow::Borrowed(text)),
+            Err(_) => ("hex", std::borrow::Cow::Owned(hex::encode(payload))),
+        };
+        tracing::info!(target: EVIDENCE_TARGET,
+            name = "braid.provider.payload", provider.kind = "pi",
+            provider.execution.id = execution_id, provider.stream = stream,
+            provider.encoding = encoding, provider.transcript = %transcript,
+            "sampled complete provider cleanup evidence");
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PayloadEvidence<'a> {
     pub github_body: &'a str,
@@ -475,6 +509,7 @@ pub struct TelemetryGuard {
     meter_provider: SdkMeterProvider,
     logger_provider: SdkLoggerProvider,
     health: ExporterHealth,
+    exports: Vec<export::ExportState>,
 }
 
 impl TelemetryGuard {
@@ -483,6 +518,8 @@ impl TelemetryGuard {
         let trace_endpoint = format!("{endpoint}/v1/traces");
         let metric_endpoint = format!("{endpoint}/v1/metrics");
         let log_endpoint = format!("{endpoint}/v1/logs");
+        let exports = ["traces", "metrics", "logs"]
+            .map(|signal| export::ExportState::new(&format!("{endpoint}/v1/{signal}"), signal));
         let timeout = Duration::from_secs(config.export_timeout_seconds);
         let resource = Resource::builder()
             .with_service_name(config.service_name.clone())
@@ -502,7 +539,7 @@ impl TelemetryGuard {
             .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
                 config.effective_sample_ratio(),
             ))))
-            .with_batch_exporter(span_exporter)
+            .with_batch_exporter(ObservedExporter::new(span_exporter, exports[0].clone()))
             .build();
 
         let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
@@ -514,7 +551,7 @@ impl TelemetryGuard {
             .map_err(|error| TelemetryError::Exporter(error.to_string()))?;
         let meter_provider = SdkMeterProvider::builder()
             .with_resource(resource.clone())
-            .with_periodic_exporter(metric_exporter)
+            .with_periodic_exporter(ObservedExporter::new(metric_exporter, exports[1].clone()))
             .build();
         install_runtime_metrics(&meter_provider);
 
@@ -527,17 +564,22 @@ impl TelemetryGuard {
             .map_err(|error| TelemetryError::Exporter(error.to_string()))?;
         let logger_provider = SdkLoggerProvider::builder()
             .with_resource(resource)
-            .with_batch_exporter(log_exporter)
+            .with_batch_exporter(ObservedExporter::new(log_exporter, exports[2].clone()))
             .build();
 
         let tracer = opentelemetry::trace::TracerProvider::tracer(&tracer_provider, "braid");
-        let trace_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let trace_layer = tracing_opentelemetry::layer().with_tracer(tracer).with_filter(
+            tracing_subscriber::filter::filter_fn(|metadata| metadata.target() != EVIDENCE_TARGET),
+        );
         let log_filter = EnvFilter::new("info")
             .add_directive("opentelemetry=off".parse().expect("valid filter"))
             .add_directive("reqwest=off".parse().expect("valid filter"));
         let log_layer = OpenTelemetryTracingBridge::new(&logger_provider).with_filter(log_filter);
-        let fmt_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let fmt_filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info"))
+            .and(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.target() != EVIDENCE_TARGET
+            }));
         let fmt_layer = match config.log_format {
             // Logs are diagnostics and belong on stderr; stdout is reserved
             // for CLI results (e.g. `braid telemetry probe --json`).
@@ -547,7 +589,8 @@ impl TelemetryGuard {
                 .boxed(),
             LogFormat::Json => tracing_subscriber::fmt::layer()
                 .json()
-                .with_current_span(true)
+                .with_current_span(false)
+                .with_span_list(false)
                 .with_writer(std::io::stderr)
                 .with_filter(fmt_filter)
                 .boxed(),
@@ -567,25 +610,42 @@ impl TelemetryGuard {
             incident_mode: config.incident_mode,
             initialized: true,
         };
-        Ok(Self { tracer_provider, meter_provider, logger_provider, health })
+        Ok(Self {
+            tracer_provider,
+            meter_provider,
+            logger_provider,
+            health,
+            exports: exports.into(),
+        })
     }
 
     pub fn health(&self) -> &ExporterHealth {
         &self.health
     }
 
+    fn flush_and_shutdown(&self) -> Vec<String> {
+        // Attempt every signal even when one fails. Export failure is not a runtime gate.
+        let results = [
+            ("traces", self.tracer_provider.shutdown()),
+            ("logs", self.logger_provider.shutdown()),
+            ("metrics", self.meter_provider.shutdown()),
+        ];
+        results
+            .into_iter()
+            .filter_map(|(signal, result)| result.err().map(|error| format!("{signal}: {error}")))
+            .collect()
+    }
+
+    // Preserve the caller-facing fallible guard API; optional export errors are diagnostics.
+    #[allow(clippy::unnecessary_wraps)]
     pub fn shutdown(self) -> Result<(), TelemetryError> {
-        self.tracer_provider.shutdown().map_err(|error| TelemetryError::Flush {
-            signal: "trace",
-            message: error.to_string(),
-        })?;
-        self.logger_provider
-            .shutdown()
-            .map_err(|error| TelemetryError::Flush { signal: "log", message: error.to_string() })?;
-        self.meter_provider.shutdown().map_err(|error| TelemetryError::Flush {
-            signal: "metric",
-            message: error.to_string(),
-        })?;
+        let errors = self.flush_and_shutdown();
+        if !errors.is_empty() {
+            eprintln!(
+                "OTLP stage=shutdown failures={} (optional telemetry; runtime unaffected)",
+                errors.len()
+            );
+        }
         Ok(())
     }
 }
@@ -596,6 +656,7 @@ pub fn emit_payload_event(evidence: &PayloadEvidence<'_>) -> bool {
         return false;
     }
     tracing::info!(
+        target: EVIDENCE_TARGET,
         name = "braid.payload",
         github.comment.body = evidence.github_body,
         github.comment.summary = evidence.github_summary,
@@ -610,7 +671,8 @@ pub fn emit_payload_event(evidence: &PayloadEvidence<'_>) -> bool {
 
 pub fn run_probe(config: &TelemetryConfig, marker: &str) -> Result<ProbeResult, TelemetryError> {
     let telemetry = TelemetryGuard::install(config, "probe")?;
-    let root = tracing::info_span!("braid.telemetry.probe", marker);
+    let root = tracing::info_span!("braid.telemetry.probe");
+    let trace_id = root.context().span().span_context().trace_id().to_string();
     let sampled = root.context().span().is_recording();
     let payload_emitted = {
         let _entered = root.enter();
@@ -631,8 +693,14 @@ pub fn run_probe(config: &TelemetryConfig, marker: &str) -> Result<ProbeResult, 
         .with_description("Public telemetry probe invocations")
         .build()
         .add(1, &[KeyValue::new("sampled", sampled)]);
-    let result = ProbeResult { sampled, payload_emitted, exporter: telemetry.health().clone() };
     drop(root);
-    telemetry.shutdown()?;
-    Ok(result)
+    let flush_errors = telemetry.flush_and_shutdown();
+    Ok(ProbeResult {
+        sampled,
+        payload_emitted,
+        trace_id,
+        exporter: telemetry.health().clone(),
+        signals: telemetry.exports.iter().map(export::ExportState::snapshot).collect(),
+        flush_errors,
+    })
 }

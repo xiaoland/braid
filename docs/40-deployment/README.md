@@ -18,7 +18,7 @@ Runtime prerequisites remain explicit:
 - optional OTLP endpoint; full campaign acceptance requires one.
 
 Release artifacts include `braid`, `LICENSE`, `README`, default config example,
-OTel Collector example for optional tail sampling, SHA-256 checksums, and
+OTel Collector example for a queryable OTLP backend, SHA-256 checksums, and
 release notes generated from `CHANGELOG.md` under SemVer.
 
 Pi 可使用外部基础 CLI 或 [锁定原生材料](../../native/pi/README.md)。需要
@@ -121,16 +121,104 @@ evidence—including GitHub bodies/summaries, raw webhook, provider transcript,
 credentials, API results, and local paths—is attached only to recording spans
 as log/event bodies rather than high-cardinality metric labels.
 
-Sampling controls volume, not confidentiality. An OTLP backend receives the
-same sensitive material as the runtime and is configured/retained accordingly.
-The portable binary does not promise outcome-aware tail sampling. Operators who
-need “all errors plus 10% normal” route 100% from Braid to an OpenTelemetry
-Collector tail-sampling processor; the Collector remains optional external
-infrastructure.
+Full sampled payload events use the dedicated `braid::evidence` target and go
+only to OTLP logs. They are not copied into trace events or ordinary Text/JSON
+stderr/journal. JSON formatting does not inherit span fields; evidence must
+never be placed in ordinary span attributes. Provider chunks do not generate
+per-chunk ordinary summary logs: lifecycle/session diagnostics and the low-cardinality
+payload sampling/identity counters provide coverage without journal amplification.
 
-The selected Rust SDK behavior was compiled and measured on 2026-08-13:
-parent-based 10% sampling exported 945 of 10,000 independent traces, and every
-retained span preserved all five controlled full-payload attributes.
+Sampling controls volume, not confidentiality. An OTLP backend receives the
+same sensitive material as the runtime, including credentials and complete tools'
+output, without truncation. Backend access, backups, retention and destruction
+must be authorized for that data. Do not replace evidence with incident-only
+logging or a debug exporter. The default Collector example forwards all three
+signals to a queryable LGTM-compatible OTLP backend and does **not** sample
+again. Default Braid `0.10` therefore remains 10%, not 1%. Use
+`sample_ratio = 1.0` during a controlled dogfood/acceptance window. Optional tail
+sampling requires a deliberately different policy with Braid at 100%; a
+trace-only tail sampler does not automatically sample correlated logs.
+
+### Disposable loopback verification backend
+
+From a checkout, with a **local** Docker daemon and Compose:
+
+```sh
+docker compose -p braid-observability -f deploy/compose.observability.yaml config --quiet
+docker compose -p braid-observability -f deploy/compose.observability.yaml up -d
+```
+
+The version-pinned LGTM container stores logs in Loki, traces in Tempo, and
+metrics in Prometheus. The separate Collector uses
+`deploy/otel-collector.example.yaml`, not stdout/debug export. Set the instance:
+
+```toml
+[telemetry]
+endpoint = "http://127.0.0.1:14318"
+sample_ratio = 1.0
+incident_mode = false
+```
+
+Do not overwrite other existing telemetry keys. Run:
+
+```sh
+braid telemetry probe --config /path/to/config.toml --marker DOGFOOD2_CONTROLLED_PROBE --json
+curl -fsS http://127.0.0.1:18888/metrics | grep -E 'otelcol_(receiver|exporter)_.*(accepted|refused|sent|failed)'
+```
+
+`probe` reports the trace ID plus per-signal endpoint and SDK export call
+success/failure counts after flushing. `payload_emitted` means submitted to the
+logging layer, not receipt. `successful_batches` means the SDK exporter returned
+success, not a durable backend acknowledgement. Partial rejection, queue drops,
+retry counts and HTTP/connection sub-stages are not exposed by this SDK boundary;
+`queue_dropped_records: null` means unknown, **not zero**. Failure diagnostics
+state endpoint/signal/stage and records in failed calls without recursively
+exporting themselves or printing remote response bodies. A metrics record here
+counts one ResourceMetrics envelope, not individual datapoints. All signals are
+flushed even if one fails; optional OTLP failure does not fail business work.
+`doctor` connectivity and one successful probe do not prove sustained delivery.
+Monitor Collector receiver refusal/export failure and backend query results
+throughout a real turn.
+
+Open **http://127.0.0.1:3300**, Grafana login `admin` / `admin` (local test only),
+then Explore:
+
+1. Loki: `{service_name="braid"} | trace_id="<probe trace_id>"`.
+   If the configured service name differs, use it instead. Structured metadata
+   includes `trace_id` and normalized OTLP attribute names. To find a session,
+   use `{service_name="braid"} | braid_provider_session_id="<native-session-id>"`.
+   Open the matching record and inspect `provider_transcript` / `credential` /
+   `github_webhook_payload`; their complete values live in log attributes,
+   not the short message body. Record the trace ID from the session log.
+2. Tempo: select trace-ID query and paste that ID. Verify root/child spans
+   and session/turn association; payloads intentionally are not span events.
+3. Prometheus: query `braid_telemetry_probes_total` after a probe, or
+   `braid_provider_payloads_total` during a turn. Metrics are not sampled.
+
+Only host loopback ports 14318 (ingest), 18888 (Collector internal metrics),
+and 3300 (Grafana UI) are exposed; backend ports stay on the private Compose
+network. **Do not expose these ports through tunnels or bind to public IPs.**
+Local users/Docker administrators can read evidence; this template has no
+multi-user security boundary. The images and writable container layers are
+for a short, supervised local check, not a retention-managed production store.
+Loki has a 24h retention policy (asynchronous deletion), plus explicit 64MB
+structured-metadata and 16MB body limits with truncation disabled. Oversized
+records are rejected, not partially retained; monitor rejected records. There
+are no host data mounts or configured persistent volumes. Stop and destroy
+all evidence after the window:
+
+```sh
+docker compose -p braid-observability -f deploy/compose.observability.yaml down -v
+```
+
+A mere `stop` retains sensitive writable layers. For durable deployment, use an
+operator-controlled LGTM-compatible OTLP backend with explicit authenticated
+access, retention/deletion, storage capacity, backup policy and TLS for any
+non-loopback hop; change `otlphttp/lgtm.endpoint` accordingly. Logs must accept
+complete large attributes without truncation: validate by reading a long tool
+result back before trusting a backend's limits. Remote Docker contexts require
+host-local files and deliberate port access; do not mistake their daemon's
+loopback for the CLI machine's loopback.
 
 ## Startup and Supervision
 

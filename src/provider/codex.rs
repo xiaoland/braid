@@ -369,7 +369,6 @@ fn spawn_codex_stderr(stderr: tokio::process::ChildStderr) {
         while let Ok(Some(line)) = lines.next_line().await {
             // Shared app-server stderr carries no protocol thread identity.
             telemetry::emit_provider_payload("codex", "", None, "stderr", &line);
-            tracing::debug!(provider = "codex", output = %line, "provider diagnostic");
         }
     });
 }

@@ -1,48 +1,40 @@
-# Example OpenTelemetry Collector configuration for Braid.
-#
-# This is optional external infrastructure, not a required part of Braid. It
-# demonstrates outcome-aware tail sampling: keep all error traces and 10% of
-# successful traces. The portable Braid binary exports 100% when
-# telemetry.sample_ratio=1.0; use this Collector to reduce backend volume.
-# See docs/40-deployment/README.md for operator guidance.
-#
-# Run Braid with telemetry.sample_ratio=1.0 when using this optional
-# outcome-aware Collector policy. The portable Braid binary does not require it.
+# Run with compose.observability.yaml; private container network only.
+# Braid -> Collector -> queryable LGTM. No second sampling decision.
+# Outside Compose, replace lgtm with an explicitly authorized OTLP backend,
+# bind receivers to loopback, and configure TLS/auth for non-loopback transport.
 receivers:
   otlp:
     protocols:
       http:
-        endpoint: 127.0.0.1:4318
+        endpoint: 0.0.0.0:4318
 
 processors:
   batch: {}
-  tail_sampling:
-    decision_wait: 10s
-    policies:
-      - name: retain-errors
-        type: status_code
-        status_code:
-          status_codes: [ERROR]
-      - name: retain-ten-percent
-        type: probabilistic
-        probabilistic:
-          sampling_percentage: 10
 
 exporters:
-  debug:
-    verbosity: basic
+  otlphttp/lgtm:
+    endpoint: http://lgtm:4318
+    # Logs contain complete sensitive evidence. Never use a debug exporter.
 
 service:
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [tail_sampling, batch]
-      exporters: [debug]
+      processors: [batch]
+      exporters: [otlphttp/lgtm]
     logs:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug]
+      exporters: [otlphttp/lgtm]
     metrics:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug]
+      exporters: [otlphttp/lgtm]
