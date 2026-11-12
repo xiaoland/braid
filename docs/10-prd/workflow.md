@@ -63,5 +63,9 @@ Use the source-bound `braid gh pr read` / `issue read --output PATH` snapshot an
 design and PR implementation scope, verification and risks in their respective
 bodies. A PR Agent correcting its current directly associated open Issue remains
 publicly a PR Implementation Agent. Confirm the returned receipt is applied;
-queued design is not yet published. This maintenance action does not schedule
-another Group or alter associations.
+queued design is not yet published. This maintenance action does not create,
+activate or schedule another Group. Authorized body text can change GitHub-native associations; only
+a subsequent canonical direct-edge confirmation, never submitted body text,
+authorizes maintenance of a newly associated open Issue under the existing
+source/Context fences. There is no dedicated association, close/merge/ready or
+handoff operation added by body maintenance.

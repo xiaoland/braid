@@ -410,8 +410,28 @@ request comment's Issue.
 Before body mutation the executor reads a canonical snapshot, rejects a changed
 digest as `conflict`, revalidates target state/association/installation rights,
 reads again, and checks the source/owner fence immediately before PATCH. It
-preserves ensure markers and closing-reference lines when rendering source
-attribution once. PATCH's returned title/body must match; an unconfirmed send
+preserves recognized existing ensure-request metadata and explicit closing-source
+blocks (including ATX/Setext headings) when rendering source attribution once.
+Complete supported top-level paragraphs/headings are prefixed before replacement
+Markdown, outside new unclosed fences/comments. Context-dependent existing sources
+that cannot be reliably preserved are refused for body replacement; title-only
+edits retain them unchanged. Neither ordinary closing words nor new code, lists
+or links are forbidden. This is bounded preservation of known sources, not an
+emulation of GitHub's private parser or a guarantee that relationship sets cannot
+change.
+
+An authorized body may add native closing text. `braid gh` is an identity surface,
+not a Markdown semantic sandbox, and adds no dedicated relationship operation.
+New body text never supplies authorization to edit a different Issue: execution
+queries current GitHub canonical direct edges. A GitHub-confirmed new edge can
+expand the PR Agent's maintainable open Issue set under existing source/Context
+fences. Plain references and closing words alone grant no authority or Group
+activation/scheduling. Canonical graph reconciliation remains independent of
+Agent-origin wake suppression; explicit handoff constraints remain separate.
+No write-then-rollback is used to simulate CAS. An applied edit confirms content,
+not relationship-set equality.
+
+PATCH's returned title/body must match; an unconfirmed send
 stays uncertain and is read back before retry. Exact resulting content confirms
 applied even if authority has since expired; any different version is a conflict,
 not proof of success. This is optimistic conflict checking, not atomic GitHub CAS;

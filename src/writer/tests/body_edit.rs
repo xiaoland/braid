@@ -5,6 +5,9 @@ struct BodyRemote {
     snapshot: crate::github::BodySnapshot,
     writes: usize,
     associated: bool,
+    associated_999: bool,
+    issue_999: crate::github::BodySnapshot,
+    writes_999: usize,
     limited: bool,
     mutation_limited: bool,
     lose_response: bool,
@@ -13,7 +16,8 @@ impl BodyRemote {
     fn new(pr: bool) -> Self {
         Self {
             snapshot: serde_json::from_value(json!({"id":1,"node_id":"item","number":1,"title":"Canonical","body":"Closes #7\n\nImplementation request: https://github.com/owner/repository/issues/comments/7","state":"open","updated_at":"version-1","pull_request":if pr {Some(json!({"url":"pr"}))} else {None}})).unwrap(),
-            writes: 0, associated: true, limited: false, mutation_limited: false, lose_response: false,
+            writes: 0, associated: true, associated_999: false,
+            issue_999: serde_json::from_value(json!({"id":999,"node_id":"issue-999","number":999,"title":"Controlled Issue","body":"Original design","state":"open","updated_at":"version-1"})).unwrap(), writes_999: 0, limited: false, mutation_limited: false, lose_response: false,
         }
     }
 }
@@ -23,6 +27,8 @@ async fn body_server(
     let read = remote.clone();
     let patch = remote.clone();
     let association = remote.clone();
+    let issue_read = remote.clone();
+    let issue_patch = remote.clone();
     let router = Router::new()
         .route("/repos/owner/repository/issues/1", get(move || { let remote = read.clone(); async move {
             use axum::response::IntoResponse as _;
@@ -40,8 +46,25 @@ async fn body_server(
             if remote.lose_response { return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({"message":"lost acknowledgement"}))).into_response(); }
             Json(&remote.snapshot).into_response()
         }}))
+        .route("/repos/owner/repository/issues/999", get(move || { let remote=issue_read.clone(); async move {
+            let mut item=serde_json::to_value(&remote.lock().unwrap().issue_999).unwrap();
+            item["number"]=json!(999);
+            item["html_url"]=json!("https://github.com/owner/repository/issues/999");
+            Json(item)
+        }}).patch(move |Json(request): Json<Value>| {let remote=issue_patch.clone(); async move {
+            let mut remote=remote.lock().unwrap(); remote.writes_999+=1;
+            remote.issue_999.title=request["title"].as_str().unwrap().into();
+            remote.issue_999.body=Some(request["body"].as_str().unwrap().into());
+            remote.issue_999.updated_at="version-2".into();
+            Json(remote.issue_999.clone())
+        }}))
         .route("/repos/owner/repository/issues/9", get(|| async {Json(json!({"id":9,"node_id":"source-pr","number":9,"title":"Source PR","html_url":"pr","state":"open","pull_request":{}}))}))
-        .route("/graphql", post(move || { let remote=association.clone(); async move {Json(json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":if remote.lock().unwrap().associated {vec![json!({"number":1,"repository":{"nameWithOwner":"owner/repository"}})]}else{vec![]},"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}))} }));
+        .route("/graphql", post(move || { let remote=association.clone(); async move {
+            let state=remote.lock().unwrap(); let mut nodes=Vec::new();
+            if state.associated {nodes.push(json!({"number":1,"repository":{"nameWithOwner":"owner/repository"}}));}
+            if state.associated_999 {nodes.push(json!({"number":999,"repository":{"nameWithOwner":"owner/repository"}}));}
+            Json(json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}))
+        }}));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
@@ -321,46 +344,117 @@ async fn repeated_snapshot_body_edit_does_not_duplicate_attribution_or_protected
 }
 
 #[tokio::test]
-async fn own_pr_new_closing_targets_in_any_maintenance_block_are_rejected_without_patch() {
-    let fixture = Fixture::new(true);
-    pr_source(&fixture, true);
-    let remote = Arc::new(Mutex::new(BodyRemote::new(true)));
-    let (github, task) = body_server(remote.clone()).await;
-    let target: WorkItemLocator = "owner/repository#1".parse().unwrap();
-    let snapshot = edit::read_snapshot(&github, &target).await.unwrap();
+async fn ordinary_fixed_resolved_prose_code_lists_links_and_new_closing_text_are_applied() {
     for body in [
+        "Fixed pagination bug",
+        "Resolved review feedback",
+        "```rust\n// Fixed pagination bug\nlet resolved = true;\n```",
+        "- Fixed pagination bug\n- Resolved review feedback",
+        "[Fixed pagination bug](https://example.com/fixed) and [Resolved review feedback](https://example.com/resolved)",
         "New scope\n\nCloses #999",
-        "Closes #7\n\nCloses #999",
-        "CLOSES: owner/other#999",
-        "Fixed https://github.com/owner/other/issues/999",
         "resolves [#999](https://github.com/owner/repository/issues/999)",
-        "[Closes #999](https://github.com/owner/repository/issues/999)",
-        "Cl&#111;ses #999",
-        "Cl**os**es #999",
-        "Closes \\#999",
-        "## Closed #999",
-        "Fix #999\n===",
-        "- Resolves #999",
-        "Implementation request: replacement",
     ] {
-        let result = edit(
+        let fixture = Fixture::new(true);
+        pr_source(&fixture, true);
+        let remote = Arc::new(Mutex::new(BodyRemote::new(true)));
+        let (github, task) = body_server(remote.clone()).await;
+        let target: WorkItemLocator = "owner/repository#1".parse().unwrap();
+        // Ordinary words in the existing body are not frozen either.
+        remote
+            .lock()
+            .unwrap()
+            .snapshot
+            .body
+            .as_mut()
+            .unwrap()
+            .push_str("\n\nFixed previous bug\n\n- Resolved previous feedback\n\n```rust\n// Fixed previous bug\n```\n\nFixed [previous pagination bug](https://example.com/fixed)");
+        let receipt = edit(
             &fixture.config,
             &fixture.store,
             EditRequest {
                 invocation: fixture.invocation(),
                 target: target.clone(),
                 profile_id: "issue-codex".into(),
-                snapshot: snapshot.clone(),
+                snapshot: edit::read_snapshot(&github, &target).await.unwrap(),
                 title: None,
                 body: Some(body.into()),
-                request_id: "forbidden".into(),
+                request_id: "ordinary".into(),
             },
-        );
-        assert!(result.is_err(), "accepted {body:?}");
+        )
+        .unwrap();
+        fixture.drain(github).await;
+        let result = fixture.receipt(&receipt.request_id);
+        assert_eq!(result.lifecycle, "applied", "{body}: {:?}", result.last_error);
+        let state = remote.lock().unwrap();
+        assert_eq!(state.writes, 1);
+        let rendered = state.snapshot.body.as_ref().unwrap();
+        assert!(rendered.contains(body));
+        assert!(rendered.contains("Closes #7"));
+        assert!(rendered.contains("Implementation request:"));
+        assert!(!rendered.contains("previous"));
+        task.abort();
     }
-    fixture.drain(github).await;
-    assert_eq!(remote.lock().unwrap().writes, 0);
-    task.abort();
+}
+
+#[tokio::test]
+async fn new_pr_body_references_authorize_issue_edits_only_after_canonical_confirmation() {
+    for body in ["Closes #999", "See #999; closing work will follow"] {
+        let fixture = Fixture::new(true);
+        pr_source(&fixture, true);
+        let remote = Arc::new(Mutex::new(BodyRemote::new(true)));
+        let (github, task) = body_server(remote.clone()).await;
+        let own: WorkItemLocator = "owner/repository#1".parse().unwrap();
+        let receipt = edit(
+            &fixture.config,
+            &fixture.store,
+            EditRequest {
+                invocation: fixture.invocation(),
+                target: own.clone(),
+                profile_id: "issue-codex".into(),
+                snapshot: edit::read_snapshot(&github, &own).await.unwrap(),
+                title: None,
+                body: Some(body.into()),
+                request_id: "new-source".into(),
+            },
+        )
+        .unwrap();
+        fixture.drain(github.clone()).await;
+        assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
+        assert_eq!(remote.lock().unwrap().writes, 1);
+        let issue: WorkItemLocator = "owner/repository#999".parse().unwrap();
+        for confirmed in [false, true] {
+            remote.lock().unwrap().associated_999 = confirmed;
+            let receipt = edit(
+                &fixture.config,
+                &fixture.store,
+                EditRequest {
+                    invocation: fixture.invocation(),
+                    target: issue.clone(),
+                    profile_id: "issue-codex".into(),
+                    snapshot: edit::read_snapshot(&github, &issue).await.unwrap(),
+                    title: None,
+                    body: Some("Corrected design".into()),
+                    request_id: format!("issue-{confirmed}"),
+                },
+            )
+            .unwrap();
+            fixture.drain(github.clone()).await;
+            let result = fixture.receipt(&receipt.request_id);
+            assert_eq!(
+                result.lifecycle,
+                if confirmed { "applied" } else { "rejected" },
+                "{:?}",
+                result.last_error
+            );
+            assert_eq!(remote.lock().unwrap().writes_999, usize::from(confirmed));
+        }
+        let assignments: i64 = fixture
+            .db()
+            .query_row("SELECT count(*) FROM assignments", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(assignments, 1, "body edits never activate another Group");
+        task.abort();
+    }
 }
 
 #[tokio::test]
@@ -413,13 +507,13 @@ async fn heading_closing_and_ensure_blocks_survive_fences_comments_and_repeated_
 }
 
 #[tokio::test]
-async fn executor_rejects_previously_accepted_relationship_changes_before_mutation() {
+async fn executor_rejects_missing_existing_request_source_before_mutation() {
     let fixture = Fixture::new(true);
     pr_source(&fixture, true);
     let remote = Arc::new(Mutex::new(BodyRemote::new(true)));
     let (github, task) = body_server(remote.clone()).await;
-    // Model an immutable intent accepted by the previous renderer, not a new
-    // queue or a production payload rewrite. Execution must also fail closed.
+    // An immutable intent must retain existing sources at execution too,
+    // independently of allowing newly added native closing text.
     let mut receipt = accept(&fixture, &github).await;
     let mut payload: Value = serde_json::from_str(&receipt.payload).unwrap();
     payload["body"] = json!("Closes #7\n\nCloses #999");
@@ -438,7 +532,7 @@ async fn context_dependent_protected_blocks_fail_closed_but_title_only_is_allowe
     for protected in [
         "Closes [#7](https://github.com/owner/repository/issues/7)",
         "Closes [target][issue]\n\n[issue]: https://github.com/owner/repository/issues/7",
-        "Closes [unresolved][issue]",
+        "Closes [#7][issue]",
         "> Closes #7",
         "- Implementation request: original",
         "<!-- Closes #7 -->",

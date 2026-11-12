@@ -125,11 +125,10 @@ fn render_maintained_body(
     Ok(rendered)
 }
 
-/// This is a conservative maintenance boundary, not GitHub's closing parser.
-/// Freeze every block containing a closing keyword (even without a target) or
-/// ensure marker. New prose cannot introduce such a block. Only self-contained
-/// top-level paragraphs/headings can be moved safely; links/reference definitions,
-/// HTML and nested blocks need a different editing surface, not this API.
+/// Preserve recognized existing sources, not a predicted GitHub relationship set.
+/// Only self-contained top-level paragraphs/headings can be moved safely;
+/// context-dependent existing sources are refused rather than silently discarded.
+/// This detector is deliberately not GitHub's private closing-reference parser.
 fn protected_body_sections(body: &str) -> Result<Vec<String>> {
     use comrak::{Arena, Options, nodes::NodeValue, parse_document};
     let arena = Arena::new();
@@ -143,8 +142,8 @@ fn protected_body_sections(body: &str) -> Result<Vec<String>> {
         let end = data.sourcepos.end.line;
         let Some(block_lines) = lines.get(start..end) else { continue };
         let section = block_lines.join("\n");
-        // Also examine decoded inline text: entities, escapes, emphasis and link
-        // labels must not disguise keywords in newly supplied Markdown.
+        // Decoded inline text also identifies existing sources with emphasis,
+        // escapes or entities. Replacement Markdown is not screened for keywords.
         let mut text = String::new();
         for descendant in node.descendants() {
             match &descendant.data.borrow().value {
@@ -154,7 +153,7 @@ fn protected_body_sections(body: &str) -> Result<Vec<String>> {
                 _ => {}
             }
         }
-        if !maintenance_sensitive(&section) && !maintenance_sensitive(&text) {
+        if !recognized_body_source(&section) && !recognized_body_source(&text) {
             continue;
         }
         // Brackets include unresolved reference links, whose meaning could be
@@ -170,44 +169,66 @@ fn protected_body_sections(body: &str) -> Result<Vec<String>> {
         covered[start..end].fill(true);
         protected.push(section);
     }
-    // Reference definitions may not have AST nodes. Fail closed rather than
-    // dropping a keyword/marker in source not represented by a supported block.
+    // Reference definitions may not have AST nodes. Refuse a recognized existing
+    // source not represented by a supported block rather than dropping it.
     let remainder = lines
         .iter()
         .zip(covered)
         .filter_map(|(line, covered)| (!covered).then_some(*line))
         .collect::<Vec<_>>()
         .join("\n");
-    if maintenance_sensitive(&remainder) {
+    if recognized_body_source(&remainder) {
         bail!("body maintenance cannot change context-dependent closing or request blocks");
     }
     Ok(protected)
 }
 
-fn maintenance_sensitive(text: &str) -> bool {
+fn recognized_body_source(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("implementation request:")
-        || lower.split(|c: char| !c.is_ascii_alphabetic()).any(|token| {
-            matches!(
-                token,
-                "close"
-                    | "closes"
-                    | "closed"
-                    | "fix"
-                    | "fixes"
-                    | "fixed"
-                    | "resolve"
-                    | "resolves"
-                    | "resolved"
-            )
-        })
+    if lower.contains("implementation request:") {
+        return true;
+    }
+    let words = lower.split_whitespace().collect::<Vec<_>>();
+    words.windows(2).any(|pair| {
+        let keyword = pair[0].trim_matches(|c: char| !c.is_ascii_alphabetic());
+        let target = pair[1].trim_start_matches(['[', '(', '<', '\\']);
+        matches!(
+            keyword,
+            "close"
+                | "closes"
+                | "closed"
+                | "fix"
+                | "fixes"
+                | "fixed"
+                | "resolve"
+                | "resolves"
+                | "resolved"
+        ) && (target
+            .split_once('#')
+            .is_some_and(|(_, number)| number.starts_with(|c: char| c.is_ascii_digit()))
+            || (pair[1].starts_with('[')
+                && lower.contains("github.com/")
+                && lower.contains("/issues/"))
+            || ((target.starts_with("https://github.com/")
+                || target.starts_with("http://github.com/"))
+                && target.contains("/issues/")))
+    })
 }
 
 fn validate_maintained_body(old_body: &str, body: &str) -> Result<()> {
-    if body != old_body && protected_body_sections(old_body)? != protected_body_sections(body)? {
-        bail!(
-            "body maintenance cannot add, remove or change closing-keyword or implementation-request blocks"
-        );
+    if body == old_body {
+        return Ok(());
+    }
+    let prefix = protected_body_sections(old_body)?.join("\n\n");
+    // A complete prefix outside replacement fences/comments preserves the known
+    // sources. New native closing text is allowed; only GitHub can confirm edges.
+    let content = if body.starts_with("> **Braid Agent ·") {
+        body.split_once("\n\n").map_or("", |(_, rest)| rest)
+    } else {
+        body
+    };
+    if !content.starts_with(&prefix) {
+        bail!("body maintenance must retain recognized existing closing and request sources");
     }
     Ok(())
 }

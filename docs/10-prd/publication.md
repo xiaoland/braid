@@ -75,8 +75,8 @@ Issue Agents maintain their own open Issue. PR Implementation Agents maintain
 their own open PR title/body and may correct the design of its currently native,
 directly associated open Issues. The latter still carries PR Implementation
 Agent attribution. Relevant direct cross-surface comments remain allowed; this
-does not authorize unrelated targets, relationship editing, close/merge/ready,
-or scheduling another Group.
+does not authorize unrelated targets or add dedicated relationship,
+close/merge/ready, or Group-scheduling commands.
 
 Read a canonical snapshot, inspect it, then submit an offline-durable edit:
 
@@ -91,25 +91,35 @@ braid gh pr edit owner/repository#123 --profile pr-codex \
 The snapshot carries the canonical version/digest; callers need not guess one.
 Title and body are optional independently; empty supplied values and oversized
 UTF-8 bytes are rejected. Title-only edits retain the body. Body edits add exactly
-one source attribution and retain complete ensure-request and closing-keyword
-Markdown blocks, including ATX and Setext headings. This is deliberately a
-conservative maintenance boundary, not a reproduction of GitHub's private
-closing-reference parser: existing blocks containing any closing keyword
-(`close/closes/closed`, `fix/fixes/fixed`, `resolve/resolves/resolved`, ignoring
-case) or `Implementation request:` are frozen. Replacement prose cannot add
-such blocks, even when the keyword is ordinary prose rather than a relationship.
-Supported frozen blocks are self-contained top-level paragraphs and headings;
-blocks with square brackets (including Markdown/reference links), HTML angle
-brackets, or nested/list/code-block context are refused rather than moved or
-silently discarded. Title-only edits can retain these unsupported bodies
-unchanged. Raw source and decoded Markdown text are checked, and the final
-rendered body is checked again before PATCH. This API cannot add or retarget
-native closing relationships; use a separate authorized GitHub editing surface
-when relationship or context-dependent Markdown changes are intended. The executor
+one source attribution and retain recognized existing ensure-request metadata and
+explicit closing-source Markdown blocks, including ATX and Setext headings.
+Protection is of existing data, not words: ordinary “Fixed pagination bug”,
+“Resolved review feedback”, code, lists and links are valid replacement content.
+Recognized existing sources are preserved as complete original blocks, prefixed
+before replacement content so unclosed new fences/comments cannot hide them.
+Self-contained top-level paragraphs and headings are supported; an existing
+source with links/reference dependencies, HTML or nested/list/code-block context
+is explicitly refused when it cannot be safely preserved. Title-only edits can
+retain such a body unchanged. This is a bounded source-preservation safeguard,
+not a reproduction of GitHub's private parser or proof that arbitrary Markdown
+has an unchanged relationship set.
+
+`braid gh` provides identity and attribution, not a Markdown semantic permission
+sandbox. An authorized body edit may explicitly add GitHub-native closing text.
+This revises the earlier, undelivered keyword freeze and no-relationship-change
+restriction. Only GitHub's canonical native direct associations authorize later
+cross-surface maintenance: new body text is never itself permission to edit
+another Issue. Once GitHub confirms a new edge, that Issue can enter the PR
+Agent's maintainable set under the same open-state, source and Context fences.
+Ordinary references or closing words alone grant nothing. Body maintenance does
+not create, activate or schedule another Group; explicit handoff's direct-edge,
+active-target and generation requirements remain separate. The executor
 revalidates target state, association and source before mutation and compares the
 canonical snapshot again after validation. An external
 edit produces a `conflict` receipt, never a blind overwrite. GitHub does not offer
 atomic compare-and-swap here: a concurrent edit in the final read/PATCH interval
-remains possible. After an uncertain send, exact remote title/body is reconciled
+remains possible; Braid does not simulate CAS with a write-then-rollback.
+An `applied` body receipt confirms content, not an invariant relationship set.
+After an uncertain send, exact remote title/body is reconciled
 before retry; different external content is conflict, not claimed success. No
 second execution queue or schema authority is introduced.
