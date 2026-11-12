@@ -5,6 +5,36 @@ Versioning once release artifacts are published.
 
 ## [Unreleased]
 
+### Added
+
+- `braid gh status` 可按公开 request ID 查询发布回执。CLI 本地接收与唯一 outbox
+  执行义务原子落库；前置读取限流、CLI 退出及服务重启后仍能继续收敛，结果不确定时
+  先核对远端，避免重复评论或 PR。
+- `braid gh pr|issue read/edit` 通过 canonical snapshot 维护标题和正文；PR Agent
+  可修正当前直接关联的开放 Issue，仍保留 PR 角色归因。编辑检查已读版本并保护已识别
+  的 ensure/closing 来源；不声称 GitHub 支持原子 CAS 或关系集合恒定。
+- `braid gh pr handoff` 显式交付 Issue 新设计到已有关联 PR 的下一安全边界，按稳定
+  request ID 去重并绑定目标 generation；不创建 Group、不打断当前 turn，也不从
+  App 评论或 `@braid` 推断交接。已失效的交接输入不再阻塞同批合法输入或 Finalization。
+
+### Changed
+
+- Agent 的 `braid gh` 写命令必须携带当前 runtime 输入提供的 `--source-turn`；
+  `--profile` 不能替换 source 身份。人工调用使用显式 `--operator`，且不能在已登记
+  Agent worktree 内降级为人工身份。旧脚本需按新 help 更新。
+- 完整采样证据仅进入专用 OTLP logs，不再复制到普通 Text/JSON journal 或 trace
+  events。启用 payload 留存的后端必须接收 logs，并明确访问、保留和销毁策略。
+  新增仅供短期 loopback 验证的 Collector→LGTM 模板，无默认二次抽样；SDK 导出统计
+  不等于持久存储确认，未知丢弃数不显示为零。
+- GraphQL 增加 operation、前后台、配额窗口和真实返回 cost 归因；REST/App-token
+  不在该统计覆盖内。完整 Context 首屏静态合并后，无项目、关联或线程的单页 mock
+  HTTP 账单由 Issue 13→5、PR 10→5；保留分页和前后 marker，不推断线上 points 同降。
+- `status` 分开显示原始 runnable 数、durable 领取资格及当前/历史代；物理 provider
+  可用性仍明确未知，不因对象 closed/merged 就删除可能合法的 Finalization。
+- Harness schema 升至 **10**；配置 schema 保持 3。升级前须停止旧 runtime 并执行
+  带备份的迁移。旧 schema 8 binary 不能打开升级后的账本；回滚需停止新 runtime，
+  将升级前备份恢复到独立 runtime 目录，不支持 down migration。
+
 ### Fixed
 
 - GitHub 巡检不再每分钟完整重读所有历史 Work Item：OPEN 或仍有存活 Assignment

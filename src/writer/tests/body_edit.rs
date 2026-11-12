@@ -22,6 +22,53 @@ impl BodyRemote {
         }
     }
 }
+fn combined_first_pages(
+    request: &Value,
+    state: &BodyRemote,
+    issue: &Value,
+    pr: &Value,
+) -> Option<Value> {
+    let query = request["query"].as_str()?;
+    let (root, fields, edge, reference) = if query.contains("query PrFirstPages") {
+        (
+            "pullRequest",
+            &["assignees", "labels", "comments", "reviews", "threads"][..],
+            "associated_issue_refs",
+            issue,
+        )
+    } else if query.contains("query IssueFirstPages") {
+        (
+            "issue",
+            &[
+                "assignees",
+                "labels",
+                "linked_branches",
+                "sub_issues",
+                "blocked_by",
+                "blocking",
+                "comments",
+                "duplicate_events",
+            ][..],
+            "associated_prs",
+            pr,
+        )
+    } else {
+        return None;
+    };
+    let empty = json!({"nodes":[], "pageInfo":{"hasNextPage":false,"endCursor":null}});
+    let mut object = serde_json::Map::new();
+    for field in fields {
+        object.insert((*field).into(), empty.clone());
+    }
+    if request["variables"]["projects"].as_bool() == Some(true) {
+        object.insert("project_items".into(), empty);
+    }
+    object.insert(edge.into(), json!({"nodes":if state.associated {vec![reference]} else {Vec::new()},"pageInfo":{"hasNextPage":false,"endCursor":null}}));
+    Some(json!({"data":{"repository":{root:object}}}))
+}
+
+// Keep edit and full-Context routes in one fixture with shared scenario state.
+#[allow(clippy::too_many_lines)]
 pub(super) async fn body_server(
     remote: Arc<Mutex<BodyRemote>>,
 ) -> (Arc<GitHubClient>, tokio::task::JoinHandle<()>) {
@@ -68,6 +115,9 @@ pub(super) async fn body_server(
             let repository=json!({"id":"repo","nameWithOwner":"owner/repository"});
             let issue_ref=json!({"id":"item","number":1,"title":"Canonical","state":state.snapshot.state.to_uppercase(),"repository":repository});
             let pr_ref=json!({"id":"pr","number":9,"title":"Existing PR","state":if state.pr_closed {"CLOSED"} else {"OPEN"},"repository":repository});
+            if let Some(first_pages) = combined_first_pages(&request, &state, &issue_ref, &pr_ref) {
+                return Ok(Json(first_pages));
+            }
             let mut nodes=Vec::new();
             if query.contains("items:") {
                 if query.contains("closingIssuesReferences") && state.associated {nodes.push(issue_ref);}
