@@ -85,7 +85,10 @@ impl Budget {
         let resource =
             headers.get("x-ratelimit-resource").and_then(|v| v.to_str().ok()).map(str::to_owned);
         // Missing or changed windows/resources do not establish comparable counters.
-        let comparable = reset.is_some() && reset == self.reset && resource == self.resource;
+        let comparable = reset.is_some()
+            && reset == self.reset
+            && resource.is_some()
+            && resource == self.resource;
         let delta = comparable
             .then(|| used.zip(self.used).and_then(|(new, old)| new.checked_sub(old)))
             .flatten();
@@ -142,6 +145,7 @@ mod tests {
         let mut budget = Budget::default();
         let mut headers = HeaderMap::new();
         headers.insert("x-ratelimit-used", "4900".parse().unwrap());
+        headers.insert("x-ratelimit-resource", "graphql".parse().unwrap());
         headers.insert("x-ratelimit-remaining", "100".parse().unwrap());
         headers.insert("x-ratelimit-reset", "500".parse().unwrap());
         assert_eq!(budget.observe(&headers), None);
@@ -199,6 +203,18 @@ mod tests {
 #[cfg(test)]
 mod window_tests {
     use super::*;
+
+    #[test]
+    fn used_delta_is_unknown_when_consecutive_responses_lack_resource() {
+        let mut budget = Budget::default();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-used", "10".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "500".parse().unwrap());
+        assert_eq!(budget.observe(&headers), None);
+        headers.insert("x-ratelimit-used", "12".parse().unwrap());
+        assert_eq!(budget.observe(&headers), None);
+    }
+
     #[test]
     fn used_delta_is_unknown_across_windows_and_resources() {
         let mut budget = Budget::default();
