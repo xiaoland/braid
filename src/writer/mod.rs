@@ -149,15 +149,6 @@ pub(crate) async fn execute(
     if receipt.operation == "comment_create" {
         let target: WorkItemLocator = receipt.target.parse()?;
         let item = github.issue_or_pull_request(target.number).await?;
-        if receipt.source.as_ref().is_some_and(|source| {
-            source.role
-                != if item.kind() == "issue" { "issue_agent" } else { "pr_implementation_agent" }
-        }) {
-            return Err(GitHubError::GraphQl(
-                "publication target role does not match source assignment".into(),
-            )
-            .into());
-        }
         if receipt.role == "pending_validation" {
             let AcceptedRequest::Comment { profile, body } = serde_json::from_str(&receipt.payload)
                 .map_err(|e| GitHubError::GraphQl(e.to_string()))?

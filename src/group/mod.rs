@@ -7,6 +7,7 @@ pub(crate) mod pr_agent;
 pub(crate) mod provider;
 mod session_manager;
 
+pub(crate) mod turn_start;
 mod worker;
 use session_manager::SessionManager;
 pub(crate) use worker::{GroupKind, GroupSpec, agent_group_worker, agent_group_worker_backend};

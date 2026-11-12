@@ -580,22 +580,21 @@ impl GroupDriver<'_> {
         // Subscribe before sending so the `TurnStarted` event — the single
         // authority for provider turn identity — cannot be missed.
         let mut events = session.events();
-        match session.send_user_msg(reference, false).await {
-            Ok(SendResult::Started) => {}
-            Ok(SendResult::Deferred) => {
+        let provider_turn_id = match super::turn_start::send_and_observe(
+            store,
+            &claim.turn_id,
+            &claim.provider_session_id,
+            session.as_ref(),
+            &mut events,
+            reference,
+        )
+        .await
+        {
+            Ok(Some(provider_turn_id)) => provider_turn_id,
+            Ok(None) => {
                 if let Err(error) = store.defer_turn_claim(claim.turn_id.clone()) {
                     tracing::error!(%error, "cannot restore unsent turn claim");
                 }
-                return None;
-            }
-            Ok(SendResult::Acknowledged) => {
-                tracing::error!(turn = %claim.turn_id, "AgentSession did not start a turn");
-                let _ = store.mark_turn_terminal(claim.turn_id.clone(), "failed".into());
-                self.publish_turn_error(
-                    &claim,
-                    "failed",
-                    "AgentSession acknowledged a start request without creating a turn",
-                );
                 return None;
             }
             Err(error) => {
@@ -621,46 +620,7 @@ impl GroupDriver<'_> {
                 tracing::error!(%error, "cannot send user message through AgentSession");
                 return None;
             }
-        }
-        // The adapter emits exactly one `TurnStarted` before `Started` returns, so
-        // this receive cannot hang on a healthy adapter.
-        let provider_turn_id = match events.recv().await {
-            Ok(crate::agent_session::SessionEvent::TurnStarted { provider_turn_id }) => {
-                provider_turn_id
-            }
-            other => {
-                tracing::error!(?other, turn = %claim.turn_id, "AgentSession stream did not begin with TurnStarted");
-                let _ = store.mark_turn_terminal(claim.turn_id.clone(), "unknown".into());
-                self.publish_turn_error(
-                    &claim,
-                    "unknown",
-                    &format!("AgentSession did not expose the accepted start identity: {other:?}"),
-                );
-                let _ = sessions.remove(&claim.provider_session_id).await;
-                return None;
-            }
         };
-        crate::telemetry::bind_provider_turn(&claim.provider_session_id, &provider_turn_id);
-        if let Err(error) = store.mark_turn_started(claim.turn_id.clone(), provider_turn_id.clone())
-        {
-            tracing::error!(%error, "cannot record provider turn start");
-            self.publish_turn_error(
-                &claim,
-                "unknown",
-                &format!(
-                    "accepted provider turn {provider_turn_id} could not be recorded: {error}"
-                ),
-            );
-            let _ = store.mark_turn_terminal(claim.turn_id.clone(), "unknown".into());
-            if let Err(stop_error) = sessions.remove(&claim.provider_session_id).await {
-                self.publish_turn_error(
-                    &claim,
-                    "unknown",
-                    &format!("{error}; old execution stop failed: {stop_error}"),
-                );
-            }
-            return None;
-        }
         if claim.trusted_mention
             && let Err(error) = store.enqueue_turn_reaction(claim.turn_id.clone(), "rocket".into())
         {

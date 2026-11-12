@@ -84,8 +84,16 @@ impl Drop for Fixture {
 }
 
 #[derive(Default)]
+enum TargetKind {
+    #[default]
+    Issue,
+    PullRequest,
+}
+
+#[derive(Default)]
 struct Remote {
     create_pr: bool,
+    target_kind: TargetKind,
     pr_created: bool,
     head_created: bool,
     comments: Vec<Value>,
@@ -104,7 +112,9 @@ async fn server(
         .route("/repos/owner/repository/issues/1", get(move || { let remote=target.clone(); async move {
             use axum::response::IntoResponse as _;
             if remote.lock().unwrap().limit.is_some() { return (axum::http::StatusCode::TOO_MANY_REQUESTS, [("retry-after","120")], Json(json!({"message":"rate limit"}))).into_response(); }
-            Json(json!({"id":1,"node_id":"item","number":1,"title":"Issue","state":"open","html_url":"https://github.com/owner/repository/issues/1"})).into_response()
+            let mut item = json!({"id":1,"node_id":"item","number":1,"title":"Issue","state":"open","html_url":"https://github.com/owner/repository/issues/1"});
+            if matches!(remote.lock().unwrap().target_kind, TargetKind::PullRequest) { item["pull_request"] = json!({"url":"pr"}); }
+            Json(item).into_response()
         }}))
         .route("/repos/owner/repository/issues/1/comments", get(move || { let remote=listing.clone(); async move { Json(remote.lock().unwrap().comments.clone()) } }).post(move |Json(body): Json<Value>| { let remote=writing.clone(); async move {
             let mut remote=remote.lock().unwrap(); remote.writes+=1;
@@ -313,3 +323,57 @@ async fn initial_ensure_bootstrap_pr_association_and_restart_do_not_duplicate_mu
     assert_eq!(remote.lock().unwrap().writes, 3);
     task.abort();
 }
+
+#[tokio::test]
+async fn dual_tag_profile_can_publish_across_both_surfaces_without_weakening_source_fences() {
+    for target_pr in [true, false] {
+        for fence in ["valid", "invalidated", "profile_changed"] {
+            let mut fixture = Fixture::new(true);
+            fixture
+                .config
+                .profiles
+                .iter_mut()
+                .find(|p| p.id == "issue-codex")
+                .unwrap()
+                .tags
+                .push("pr".into());
+            if !target_pr {
+                fixture
+                    .db()
+                    .execute("UPDATE agent_instances SET role='pr_implementation_agent'", [])
+                    .unwrap();
+            }
+            assert!(source(&fixture.config, Some("pr-codex")).is_err());
+            let receipt = fixture.comment();
+            match fence {
+                "invalidated" => {
+                    fixture
+                        .db()
+                        .execute("UPDATE provider_sessions SET lifecycle='reset_pending'", [])
+                        .unwrap();
+                }
+                "profile_changed" => {
+                    fixture.db().execute_batch("INSERT INTO profiles SELECT 'pr-codex', revision, effective_digest, provider_kind, tags FROM profiles WHERE profile_id='issue-codex'; UPDATE agent_instances SET profile_id='pr-codex';").unwrap();
+                }
+                _ => {}
+            }
+            let remote = Arc::new(Mutex::new(Remote {
+                target_kind: if target_pr { TargetKind::PullRequest } else { TargetKind::Issue },
+                ..Remote::default()
+            }));
+            let (github, task) = server(remote.clone(), true).await;
+            fixture.drain(github).await;
+            let result = fixture.receipt(&receipt.request_id);
+            assert_eq!(
+                result.lifecycle,
+                if fence == "valid" { "applied" } else { "rejected" },
+                "{:?}",
+                result.last_error
+            );
+            assert_eq!(remote.lock().unwrap().writes, usize::from(fence == "valid"));
+            task.abort();
+        }
+    }
+}
+
+mod turn_start;

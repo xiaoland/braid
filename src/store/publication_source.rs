@@ -25,7 +25,10 @@ pub fn resolve(
 ) -> Result<Option<PublicationSource>, StoreError> {
     let connection = open_read_only(database)?;
     let cwd = cwd.canonicalize().map_err(|e| StoreError::InvalidData(e.to_string()))?;
-    let mut statement = connection.prepare("SELECT w.path,a.agent_id,g.assignment_id,g.generation,a.profile_id,a.profile_revision,s.session_id,t.turn_id,t.context_revision,a.role FROM worktrees w JOIN agent_instances a ON a.agent_id=w.agent_id JOIN assignments g ON g.assignment_id=a.assignment_id JOIN provider_sessions s ON s.agent_id=a.agent_id JOIN turns t ON t.session_id=s.session_id ORDER BY t.started_at DESC")?;
+    // Prefer the current claimed turn even before native start is observed:
+    // validate must reject an unobserved start, never borrow an older completed
+    // turn's identity. Row insertion order breaks ties without nullable clocks.
+    let mut statement = connection.prepare("SELECT w.path,a.agent_id,g.assignment_id,g.generation,a.profile_id,a.profile_revision,s.session_id,t.turn_id,t.context_revision,a.role FROM worktrees w JOIN agent_instances a ON a.agent_id=w.agent_id JOIN assignments g ON g.assignment_id=a.assignment_id JOIN provider_sessions s ON s.agent_id=a.agent_id JOIN turns t ON t.session_id=s.session_id ORDER BY g.generation DESC, s.rowid DESC, CASE t.lifecycle WHEN 'starting' THEN 0 WHEN 'running' THEN 0 ELSE 1 END, t.rowid DESC")?;
     let candidates = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
