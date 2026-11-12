@@ -175,6 +175,9 @@ pub(crate) fn render_event_references(config: &Config, claim: &TurnClaim) -> Str
     if !config.is_builtin() {
         writeln!(output, "\nPublication identity: pass `--source-turn {}` to every `braid gh` mutation. This turn reference is verified against your durable assignment/session/context and actual cwd; never use --operator. --profile is an assertion, not identity selection. For body maintenance: `braid gh pr read OWNER/REPO#N --output /tmp/body-snapshot.json` (or `issue read`), inspect that snapshot, then `braid gh pr edit OWNER/REPO#N --snapshot /tmp/body-snapshot.json --body-file /tmp/body.md --profile PROFILE --source-turn {} --request-id STABLE_TOKEN`. Use `braid gh status` receipts to confirm applied before relying on publication. Edits preserve request markers/closing references, reject changed canonical versions, and cannot atomically CAS GitHub. PR source may correct its currently directly associated OPEN Issues, always under PR attribution.", claim.turn_id, claim.turn_id).expect("String write");
     }
+    if !config.is_builtin() && claim.work_item_kind == "issue" {
+        writeln!(output, "\nFor explicit follow-up to an existing directly associated OPEN PR with an active assignment: confirm Issue body edit receipt applied, then `braid gh pr handoff OWNER/REPO#N --request-id STABLE_KEY --source-turn {}`. Queued/uncertain design is not published. Handoff uses ordinary debounce and only confirms durable batch delivery, not implementation completion; comments/@braid are not an implicit handoff.", claim.turn_id).expect("String write");
+    }
     for reference in &claim.references {
         output.push_str("- ");
         output.push_str(reference);

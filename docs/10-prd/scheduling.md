@@ -27,3 +27,16 @@ Trusted Braid Mention has turn-lifecycle reactions on that same comment:
 Ordinary debounced turns never receive active or terminal reactions. Their
 operational failures use one mutable Operational Status Comment instead, so
 the normal collaboration model does not look like a request/response pipeline.
+
+Explicit Issue→existing PR handoff is one internal ordinary Wake reference, not
+a mention, activation, steer or interrupt. It merges pending/runnable batches
+under the usual quiet/count policy. A running target receives it in a subsequent
+batch, never a parallel turn. Before that batch's provider input, Braid freshly
+materializes complete canonical PR Context including directly associated OPEN
+Issue bodies/discussion. Read failures defer the unsent claim; no cached/partial
+Context is substituted, and no 60-second reconciliation poll is required.
+OriginEcho suppression and trusted mention rules remain unchanged: an App
+comment containing `@braid` does not implicitly hand off anything.
+A batch that includes a handoff cannot be forwarded as an in-turn urgent steer,
+even if it also contains a trusted mention: that combined input waits for the
+next safe turn boundary and retains its existing runnable/urgent status.

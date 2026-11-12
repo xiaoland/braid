@@ -3,6 +3,7 @@ use super::*;
 
 pub fn gh(command: GhCommand) -> Result<()> {
     match command {
+        GhCommand::Pr { command: GhPrCommand::Handoff(arguments) } => gh_handoff(arguments),
         GhCommand::Pr { command: GhPrCommand::Read(arguments) }
         | GhCommand::Issue { command: GhBodyCommand::Read(arguments) } => {
             let config = helpers::load(&arguments.source.resolve_config_path()?)?;
@@ -149,4 +150,19 @@ fn print_gh_receipt(
         }
     }
     Ok(())
+}
+
+fn gh_handoff(arguments: GhPrHandoff) -> Result<()> {
+    let config = helpers::load(&arguments.source.resolve_config_path()?)?;
+    let actor = helpers::store(&config)?;
+    let receipt = writer::handoff(
+        &config,
+        &actor,
+        &writer::HandoffRequest {
+            invocation: writer::Invocation::Agent(arguments.source_turn),
+            target: arguments.target.parse()?,
+            request_id: arguments.request_id,
+        },
+    )?;
+    print_gh_receipt(&receipt, arguments.json, &actor)
 }

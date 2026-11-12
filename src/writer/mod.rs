@@ -16,7 +16,9 @@ use crate::{
 
 mod comment;
 mod edit;
+mod handoff;
 pub use edit::{EditRequest, edit, read_for_edit};
+pub use handoff::{HandoffRequest, handoff};
 mod ensure;
 pub(crate) mod helpers;
 mod prepare;
@@ -143,6 +145,7 @@ pub fn ensure_pull_request(
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub(crate) enum AcceptedRequest {
+    Handoff { quiet_seconds: u64, event_threshold: u32 },
     Comment { profile: Profile, body: String },
     Edit { profile: Profile, expected: String, title: String, body: String },
     Ensure { comment_id: u64, head: Option<String>, profile: Profile },
@@ -164,6 +167,9 @@ pub(crate) async fn execute(
     receipt.recovery_until = Some(write.recovery_until.clone());
     receipt.execution_owner = Some(write.owner.clone());
     receipt.attempts = u64::from(write.lifecycle == "uncertain");
+    if receipt.operation == "pr_handoff" {
+        return handoff::execute(config, github, &receipt).await;
+    }
     if receipt.operation == "body_edit" {
         return edit::execute(config, github, &receipt, mutation_possible).await;
     }

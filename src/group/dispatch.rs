@@ -524,7 +524,24 @@ impl GroupDriver<'_> {
                 return None;
             }
         }?;
-        let reference = render_event_references(self.config, &claim);
+        let mut reference = render_event_references(self.config, &claim);
+        // A handoff never interrupts the current turn. Once its ordinary batch
+        // is claimed, rebuild complete canonical PR + associated Issue Context
+        // before sending anything to the provider, not on a later poll tick.
+        let refresh = super::handoff::append_current_context(
+            self.config.runtime.database(),
+            self.collaboration,
+            store,
+            profile,
+            &claim,
+            &mut reference,
+        )
+        .await;
+        if let Err(error) = refresh {
+            tracing::warn!(%error, turn = %claim.turn_id, "handoff Context refresh deferred; no provider turn started");
+            let _ = store.defer_turn_claim(claim.turn_id.clone());
+            return None;
+        }
         if let Err(error) = crate::telemetry::register_session_from_store(
             self.config.runtime.database(),
             &claim.provider_session_id,

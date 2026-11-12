@@ -121,6 +121,15 @@ pub(super) fn finish_github_write(
     } else {
         now_rfc3339()
     };
+    // A fence may change after remote validation. Reject in this same short
+    // transaction instead of leaving the executor's attempt stuck in sending.
+    let delivery_error = if lifecycle == "applied" && operation == "agent_write" {
+        super::handoff::settle(&transaction, write)?
+    } else {
+        None
+    };
+    let lifecycle = if delivery_error.is_some() { "rejected" } else { lifecycle };
+    let error = delivery_error.as_deref().or(error);
     let updated = transaction.execute(
         "UPDATE github_write_outbox SET lifecycle=?2,remote_database_id=?3,last_error=?4,
            next_attempt_at=?5,updated_at=?6 WHERE intent_id=?1 AND lifecycle='sending'",

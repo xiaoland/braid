@@ -21,6 +21,7 @@ mod builtin;
 mod runs;
 pub use runs::RunCommand;
 mod gh_writes;
+pub(crate) mod handoff;
 mod write_execution;
 use write_execution::{claim_github_write, finish_github_write, recover_writes};
 pub mod publication_source;
@@ -35,7 +36,7 @@ use gh_writes::{
     prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 9;
+pub const DATABASE_SCHEMA_VERSION: u32 = 10;
 
 const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
 const EVENT_KINDS_SQL: &str = include_str!("../../migrations/0002_event_kinds.sql");
@@ -76,6 +77,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 9,
         name: "durable_publication",
         sql: include_str!("../../migrations/0009_durable_publication.sql"),
+    },
+    Migration {
+        version: 10,
+        name: "pr_handoff",
+        sql: include_str!("../../migrations/0010_pr_handoff.sql"),
     },
 ];
 
@@ -4847,7 +4853,27 @@ fn defer_turn_claim(database: &Path, turn_id: &str) -> Result<(), StoreError> {
         [turn_id], |row| Ok((row.get(0)?,row.get(1)?)),
     )?;
     transaction.execute("DELETE FROM turns WHERE turn_id=?1", [turn_id])?;
-    transaction.execute("UPDATE wake_batches SET lifecycle='runnable',updated_at=?2 WHERE batch_id=?1 AND lifecycle='consumed'", params![batch, now_rfc3339()])?;
+    // A handoff may arrive while canonical refresh awaits the network. Preserve
+    // both unsent inputs if a subsequent batch was opened before this defer.
+    let next: Option<String> = transaction.query_row(
+        "SELECT batch_id FROM wake_batches WHERE work_item_node_id=(SELECT work_item_node_id FROM wake_batches WHERE batch_id=?1) AND lifecycle IN ('pending','runnable')",
+        [&batch], |row| row.get(0),
+    ).optional()?;
+    if let Some(next) = next {
+        let offset: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(ordinal)+1,0) FROM wake_batch_events WHERE batch_id=?1",
+            [&next],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE wake_batch_events SET batch_id=?2,ordinal=ordinal+?3 WHERE batch_id=?1",
+            params![batch, next, offset],
+        )?;
+        transaction.execute("UPDATE wake_batches SET lifecycle='runnable',event_count=(SELECT COUNT(*) FROM wake_batch_events WHERE batch_id=?1),urgent=MAX(urgent,(SELECT urgent FROM wake_batches WHERE batch_id=?2)),updated_at=?3 WHERE batch_id=?1", params![next, batch, now_rfc3339()])?;
+        transaction.execute("UPDATE wake_batches SET event_count=0 WHERE batch_id=?1", [&batch])?;
+    } else {
+        transaction.execute("UPDATE wake_batches SET lifecycle='runnable',updated_at=?2 WHERE batch_id=?1 AND lifecycle='consumed'", params![batch, now_rfc3339()])?;
+    }
     transaction.execute(
         "UPDATE provider_sessions SET lifecycle='idle' WHERE session_id=?1 AND lifecycle='running'",
         [session],
@@ -5070,6 +5096,9 @@ fn claim_urgent_steer(database: &Path, turn_id: &str) -> Result<Option<TurnClaim
              JOIN wake_batches b ON b.work_item_node_id=w.node_id
              WHERE t.turn_id=?1 AND t.lifecycle='running'
                AND b.lifecycle='runnable' AND b.urgent=1
+               AND NOT EXISTS (
+                 SELECT 1 FROM wake_batch_events be JOIN pr_handoffs h ON h.event_id=be.event_id
+                 WHERE be.batch_id=b.batch_id)
              ORDER BY b.created_at,b.batch_id LIMIT 1",
             [turn_id],
             |row| {

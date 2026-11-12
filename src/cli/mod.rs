@@ -209,6 +209,7 @@ enum GhCommentCommand {
 #[derive(Debug, Subcommand)]
 enum GhPrCommand {
     Ensure(GhPrEnsure),
+    Handoff(GhPrHandoff),
     Read(GhBodyRead),
     Edit(GhBodyEdit),
 }
@@ -233,6 +234,19 @@ impl GhInvocation {
     fn resolve(self) -> writer::Invocation {
         self.source_turn.map_or(writer::Invocation::Operator, writer::Invocation::Agent)
     }
+}
+
+#[derive(Debug, Args)]
+struct GhPrHandoff {
+    target: String,
+    #[command(flatten)]
+    source: ConfigSource,
+    #[arg(long)]
+    source_turn: String,
+    #[arg(long)]
+    request_id: String,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]

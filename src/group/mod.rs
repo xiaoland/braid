@@ -2,6 +2,7 @@
 //! queue decisions through neutral session handles; adapters own physical resources.
 
 pub(crate) mod dispatch;
+pub(crate) mod handoff;
 pub(crate) mod issue_agent;
 pub(crate) mod pr_agent;
 pub(crate) mod provider;

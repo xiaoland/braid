@@ -436,3 +436,27 @@ stays uncertain and is read back before retry. Exact resulting content confirms
 applied even if authority has since expired; any different version is a conflict,
 not proof of success. This is optimistic conflict checking, not atomic GitHub CAS;
 the final read/PATCH interval remains a documented concurrency limitation.
+
+### Explicit existing-generation PR handoff
+
+`writer::handoff` reuses source-bound `Invocation`, `AcceptedRequest`, and the
+single `github_write_outbox`. Schema 10 `pr_handoffs` binds each accepted intent
+to the current active target assignment and records its unique dedicated Wake
+reference. Operator/PR sources, inactive/blocked/missing targets, finalizing
+assignments and non-OPEN sources/targets are refused. Queued/uncertain Issue
+body edits must be resolved before acceptance/delivery; no workflow DAG is added.
+The existing GitHub reads recheck OPEN state and native `closingIssuesReferences`
+within the connected repository installation, never comments or request Markdown.
+All network awaits are outside SQLite transactions.
+
+In the outbox attempt settlement transaction, Braid rechecks the source fence,
+current target assignment and scheduling eligibility; inserts the ordinary
+`wake/pr_handoff` event once; merges its batch with normal quiet/count; and commits
+the receipt/outbox state. A stale fence rejects without partially delivering a
+Wake. At dispatch, an ordinary claimed handoff batch freshly materializes and
+renders the full canonical PR/associated Issue Context before provider send.
+Failure defers the unsent claim. This appends current working data to the existing
+session, not a Context reset, urgent steer or parallel turn; it does not advance
+the session's replacement fence. The boundary rechecks the bound target and
+requires each handoff source still appear as an OPEN directly associated Issue.
+No transport, pagination, canonical query or OriginEcho rule changes are involved.

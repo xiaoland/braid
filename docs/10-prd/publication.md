@@ -123,3 +123,17 @@ An `applied` body receipt confirms content, not an invariant relationship set.
 After an uncertain send, exact remote title/body is reconciled
 before retry; different external content is conflict, not claimed success. No
 second execution queue or schema authority is introduced.
+
+### Handoff receipts
+
+`pr handoff TARGET --request-id KEY --source-turn TURN` is Agent-only. Acceptance
+is local and durable in the same intent/outbox used for publication. The key is
+namespaced by source assignment/generation and binds the first explicit target's
+current assignment. Same-key retries return the same receipt; changing target or
+request content conflicts. Replacement target generations are never substituted.
+An unresolved (`queued`/`sending`/`uncertain`/`ambiguous`) Issue body edit is a clear
+refusal boundary: confirm publication first rather than assuming queued design
+was published. `braid gh status REQUEST_ID` checks delivery. Handoff `applied`
+means only that a Wake was durably delivered to the PR batch, not that design
+implementation or acceptance has completed. Preflight rate limits keep the
+request pending without creating runnable work.

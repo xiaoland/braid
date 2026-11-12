@@ -1,27 +1,28 @@
 use super::*;
 
 #[allow(clippy::struct_excessive_bools)]
-struct BodyRemote {
-    snapshot: crate::github::BodySnapshot,
+pub(super) struct BodyRemote {
+    pub(super) snapshot: crate::github::BodySnapshot,
     writes: usize,
-    associated: bool,
+    pub(super) associated: bool,
     associated_999: bool,
     issue_999: crate::github::BodySnapshot,
     writes_999: usize,
-    limited: bool,
+    pub(super) limited: bool,
+    pub(super) pr_closed: bool,
     mutation_limited: bool,
-    lose_response: bool,
+    pub(super) lose_response: bool,
 }
 impl BodyRemote {
-    fn new(pr: bool) -> Self {
+    pub(super) fn new(pr: bool) -> Self {
         Self {
             snapshot: serde_json::from_value(json!({"id":1,"node_id":"item","number":1,"title":"Canonical","body":"Closes #7\n\nImplementation request: https://github.com/owner/repository/issues/comments/7","state":"open","updated_at":"version-1","pull_request":if pr {Some(json!({"url":"pr"}))} else {None}})).unwrap(),
-            writes: 0, associated: true, associated_999: false,
+            writes: 0, pr_closed: false, associated: true, associated_999: false,
             issue_999: serde_json::from_value(json!({"id":999,"node_id":"issue-999","number":999,"title":"Controlled Issue","body":"Original design","state":"open","updated_at":"version-1"})).unwrap(), writes_999: 0, limited: false, mutation_limited: false, lose_response: false,
         }
     }
 }
-async fn body_server(
+pub(super) async fn body_server(
     remote: Arc<Mutex<BodyRemote>>,
 ) -> (Arc<GitHubClient>, tokio::task::JoinHandle<()>) {
     let read = remote.clone();
@@ -29,6 +30,7 @@ async fn body_server(
     let association = remote.clone();
     let issue_read = remote.clone();
     let issue_patch = remote.clone();
+    let pr_read = remote.clone();
     let router = Router::new()
         .route("/repos/owner/repository/issues/1", get(move || { let remote = read.clone(); async move {
             use axum::response::IntoResponse as _;
@@ -58,9 +60,30 @@ async fn body_server(
             remote.issue_999.updated_at="version-2".into();
             Json(remote.issue_999.clone())
         }}))
-        .route("/repos/owner/repository/issues/9", get(|| async {Json(json!({"id":9,"node_id":"source-pr","number":9,"title":"Source PR","html_url":"pr","state":"open","pull_request":{}}))}))
-        .route("/graphql", post(move || { let remote=association.clone(); async move {
-            let state=remote.lock().unwrap(); let mut nodes=Vec::new();
+        .route("/repos/owner/repository/issues/9", get(move || { let remote=pr_read.clone(); async move {Json(json!({"id":9,"node_id":"pr","number":9,"title":"Source PR","html_url":"pr","state":if remote.lock().unwrap().pr_closed {"closed"} else {"open"},"pull_request":{}}))}}))
+        .route("/graphql", post(move |Json(request): Json<Value>| { let remote=association.clone(); async move {
+            let state=remote.lock().unwrap();
+            let query=request["query"].as_str().unwrap();
+            let repository=json!({"id":"repo","nameWithOwner":"owner/repository"});
+            let issue_ref=json!({"id":"item","number":1,"title":"Canonical","state":"OPEN","repository":repository});
+            let pr_ref=json!({"id":"pr","number":9,"title":"Existing PR","state":"OPEN","repository":repository});
+            let mut nodes=Vec::new();
+            if query.contains("items:") {
+                if query.contains("closingIssuesReferences") && state.associated {nodes.push(issue_ref);}
+                if query.contains("closedByPullRequestsReferences") && state.associated {nodes.push(pr_ref);}
+                let connection=json!({"items":{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}});
+                let root=if query.contains("pullRequest(number:") {"pullRequest"} else {"issue"};
+                return Json(json!({"data":{"repository":{root:connection}}}));
+            }
+            if query.contains("fullDatabaseId") {
+                let core=if query.contains("pullRequest(number:") {
+                    json!({"id":"pr","fullDatabaseId":"9","number":9,"title":"Existing PR","body":"Closes #1","state":"OPEN","isDraft":false,"merged":false,"updatedAt":"pr-v1","baseRefName":"main","headRefName":"work","headRepository":repository})
+                } else {
+                    json!({"id":"item","fullDatabaseId":"1","number":1,"title":state.snapshot.title,"body":state.snapshot.body,"state":"OPEN","updatedAt":state.snapshot.updated_at})
+                };
+                let root=if query.contains("pullRequest(number:") {"pullRequest"} else {"issue"};
+                return Json(json!({"data":{"repository":{"id":"repo","nameWithOwner":"owner/repository",root:core}}}));
+            }
             if state.associated {nodes.push(json!({"number":1,"repository":{"nameWithOwner":"owner/repository"}}));}
             if state.associated_999 {nodes.push(json!({"number":999,"repository":{"nameWithOwner":"owner/repository"}}));}
             Json(json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}))
@@ -98,14 +121,14 @@ async fn body_server(
         task,
     )
 }
-fn pr_source(fixture: &Fixture, own_pr: bool) {
+pub(super) fn pr_source(fixture: &Fixture, own_pr: bool) {
     fixture.db().execute("UPDATE agent_instances SET role='pr_implementation_agent'", []).unwrap();
     fixture
         .db()
         .execute("UPDATE work_items SET kind='pr',number=?1", [if own_pr { 1 } else { 9 }])
         .unwrap();
 }
-async fn accept(fixture: &Fixture, github: &GitHubClient) -> GhWriteReceipt {
+pub(super) async fn accept(fixture: &Fixture, github: &GitHubClient) -> GhWriteReceipt {
     let target: WorkItemLocator = "owner/repository#1".parse().unwrap();
     let snapshot = edit::read_snapshot(github, &target).await.unwrap();
     edit(

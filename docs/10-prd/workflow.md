@@ -69,3 +69,14 @@ a subsequent canonical direct-edge confirmation, never submitted body text,
 authorizes maintenance of a newly associated open Issue under the existing
 source/Context fences. There is no dedicated association, close/merge/ready or
 handoff operation added by body maintenance.
+
+### Explicit follow-up to an existing PR
+
+After confirming the Issue design edit receipt is `applied`, its bound Issue
+Agent can request `braid gh pr handoff OWNER/REPO#N --request-id STABLE_KEY
+--source-turn TURN`. The source Issue must be OPEN; the same-repository PR must
+be OPEN/unmerged, GitHub-confirmed directly associated, and already have a current
+active schedulable PR assignment. This never creates or reactivates a Group,
+unblocks it, reopens it, or enters finalization. Submitted closing text and plain
+references are not evidence of a native edge. The Issue body remains the design
+source; handoff does not copy a second design authority.

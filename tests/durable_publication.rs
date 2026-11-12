@@ -81,8 +81,27 @@ fn settle_operational_status(
 ) -> Result<(), StoreError> {
     Ok(())
 }
+// Handoff scheduling has production actor/HTTP coverage in writer::tests;
+// this harness only exercises publication ledger/execution mechanics.
+#[derive(Clone, Copy)]
+struct SchedulerPolicy {
+    quiet_seconds: u64,
+    event_threshold: u32,
+}
+fn schedule_event(
+    _: &rusqlite::Transaction<'_>,
+    _: &str,
+    _: &str,
+    _: SchedulerPolicy,
+    _: bool,
+    _: &str,
+) -> Result<(String, String), StoreError> {
+    unreachable!("handoff is tested through the production StoreActor")
+}
 #[path = "../src/store/gh_writes.rs"]
 mod gh_writes;
+#[path = "../src/store/handoff.rs"]
+mod handoff;
 #[path = "../src/store/publication_source.rs"]
 mod publication_source;
 #[path = "../src/store/write_execution.rs"]

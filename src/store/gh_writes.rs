@@ -132,6 +132,9 @@ pub(super) fn prepare_gh_write(
                     .map_err(|e| StoreError::InvalidData(e.to_string()))?,
             ],
         )?;
+        if write.operation == "pr_handoff" {
+            super::handoff::bind(&transaction, &intent_id, write)?;
+        }
         intent_id
     };
     enqueue(&transaction, &intent_id)?;
@@ -237,7 +240,7 @@ fn validate_gh_write(write: &NewGhWriteIntent) -> Result<(), StoreError> {
         || write.role.is_empty()
         || write.payload.is_empty()
         || write.request_digest.len() != 64
-        || !matches!(write.operation, "comment_create" | "pr_ensure" | "body_edit")
+        || !matches!(write.operation, "comment_create" | "pr_ensure" | "body_edit" | "pr_handoff")
     {
         return Err(StoreError::InvalidData("invalid braid gh write intent".into()));
     }
@@ -253,7 +256,7 @@ pub(super) fn gh_write_receipt(
     gh_write_receipt_on(&connection, intent_id)
 }
 
-fn gh_write_receipt_on(
+pub(super) fn gh_write_receipt_on(
     connection: &Connection,
     intent_id: &str,
 ) -> Result<Option<GhWriteReceipt>, StoreError> {
