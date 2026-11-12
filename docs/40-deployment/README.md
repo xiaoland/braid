@@ -248,6 +248,9 @@ mv loki.tmp loki.observability.yaml
 # Generate once, never print or commit. Grafana reads via __FILE, not environment value.
 test -e grafana-admin-password || openssl rand -hex 32 > grafana-admin-password
 chmod 600 grafana-admin-password
+# The Collector runs as a non-root container UID; bind-mounted config must be readable.
+# The enclosing managed directory remains 0700; these templates contain no secrets.
+chmod 644 otel-collector.example.yaml loki.observability.yaml start-dogfood-lgtm.sh
 # Use this same project + both files for every lifecycle command.
 docker compose -p braid-dogfood2 -f compose.observability.yaml \
   -f compose.observability.dogfood.yaml config --quiet
