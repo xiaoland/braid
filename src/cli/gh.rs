@@ -6,8 +6,8 @@ pub async fn github(command: GitHubCommand) -> Result<()> {
         GitHubCommand::Probe(arguments) => github_probe(arguments).await,
         GitHubCommand::Webhook(arguments) => {
             let config = helpers::load(&arguments.resolve_config_path()?)?;
-            let repository = config.github.repository.parse::<RepositoryName>()?;
-            let client = GitHubClient::connect(&config.github, &repository).await?;
+            let repository = config.repository().parse::<RepositoryName>()?;
+            let client = GitHubClient::connect(config.github()?, &repository).await?;
             let webhook = client.app_webhook_config().await?;
             if arguments.json {
                 helpers::print_json(&webhook)?;
@@ -20,8 +20,8 @@ pub async fn github(command: GitHubCommand) -> Result<()> {
         }
         GitHubCommand::Deliveries(arguments) => {
             let config = helpers::load(&arguments.resolve_config_path()?)?;
-            let repository = config.github.repository.parse::<RepositoryName>()?;
-            let client = GitHubClient::connect(&config.github, &repository).await?;
+            let repository = config.repository().parse::<RepositoryName>()?;
+            let client = GitHubClient::connect(config.github()?, &repository).await?;
             let deliveries = client.app_deliveries().await?;
             if arguments.json {
                 helpers::print_json(&deliveries)?;
@@ -42,8 +42,8 @@ pub async fn github(command: GitHubCommand) -> Result<()> {
         GitHubCommand::Redeliver(arguments) => {
             let config_path = arguments.source.resolve_config_path()?;
             let config = helpers::load(&config_path)?;
-            let repository = config.github.repository.parse::<RepositoryName>()?;
-            let client = GitHubClient::connect(&config.github, &repository).await?;
+            let repository = config.repository().parse::<RepositoryName>()?;
+            let client = GitHubClient::connect(config.github()?, &repository).await?;
             client.redeliver(arguments.delivery_id).await?;
             println!("redelivery requested: {}", arguments.delivery_id);
             Ok(())
@@ -55,8 +55,9 @@ async fn github_probe(arguments: GitHubProbe) -> Result<()> {
     let config_path = arguments.source.resolve_config_path()?;
     let config = helpers::load(&config_path)?;
     let repository = arguments.repository.parse::<RepositoryName>()?;
-    let client =
-        GitHubClient::connect(&config.github, &repository).await.context("GitHub probe failed")?;
+    let client = GitHubClient::connect(config.github()?, &repository)
+        .await
+        .context("GitHub probe failed")?;
     if arguments.json {
         helpers::print_json(client.identity())?;
     } else {

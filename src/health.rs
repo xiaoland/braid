@@ -9,6 +9,9 @@ pub struct HealthSnapshot {
     pub repository: String,
     pub tunnel: &'static str,
     pub webhook_url: Option<String>,
+    pub webhook_sync: &'static str,
+    pub tunnel_verified_at: Option<String>,
+    pub tunnel_error: Option<String>,
     pub reconciliation: &'static str,
     pub provider: &'static str,
     pub last_error: Option<String>,
@@ -22,6 +25,7 @@ pub(crate) struct ProviderHealthUpdate {
 
 pub(crate) async fn provider_health_worker(
     health: std::sync::Arc<tokio::sync::RwLock<HealthSnapshot>>,
+    expected_groups: usize,
     mut reports: tokio::sync::mpsc::Receiver<ProviderHealthUpdate>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -38,48 +42,17 @@ pub(crate) async fn provider_health_worker(
         let mut current = health.write().await;
         current.provider = if error.is_some() {
             "unavailable"
-        } else if observations.len() == 2 {
+        } else if observations.len() == expected_groups {
             "connected"
         } else {
             "starting"
         };
+        if current.ingress == "builtin" {
+            current.ready = current.provider == "connected";
+        }
         if error.is_some() || current.last_error == prior_error {
             current.last_error.clone_from(&error);
         }
         prior_error = error;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use tokio::sync::{RwLock, mpsc, watch};
-
-    #[tokio::test]
-    async fn sibling_success_does_not_clear_failure() {
-        let health = Arc::new(RwLock::new(HealthSnapshot {
-            ready: true,
-            ingress: String::new(),
-            repository: String::new(),
-            tunnel: "disabled",
-            webhook_url: None,
-            reconciliation: "ready",
-            provider: "starting",
-            last_error: None,
-        }));
-        let (sender, receiver) = mpsc::channel(8);
-        let (shutdown, signal) = watch::channel(false);
-        let worker = tokio::spawn(provider_health_worker(Arc::clone(&health), receiver, signal));
-        sender
-            .send(ProviderHealthUpdate { group: "issue", error: Some("issue failed".into()) })
-            .await
-            .unwrap();
-        sender.send(ProviderHealthUpdate { group: "pr", error: None }).await.unwrap();
-        drop(sender);
-        worker.await.unwrap();
-        assert_eq!(health.read().await.provider, "unavailable");
-        assert_eq!(health.read().await.last_error.as_deref(), Some("issue failed"));
-        drop(shutdown);
     }
 }

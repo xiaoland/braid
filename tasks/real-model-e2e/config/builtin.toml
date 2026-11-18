@@ -1,0 +1,87 @@
+schema_version = 3
+
+[instance]
+key = "real-e2e-builtin-minimax"
+
+[runtime]
+root = "/Volumes/WorkSSD/Development/braid-e2e/builtin/state"
+database = "/Volumes/WorkSSD/Development/braid-e2e/builtin/state/braid.sqlite3"
+backups = "/Volumes/WorkSSD/Development/braid-e2e/builtin/state/backups"
+worktrees = "/Volumes/WorkSSD/Development/braid-e2e/builtin/worktrees"
+auto_migrate = false
+
+[builtin]
+repository = "braid-poc-test"
+endpoint = "http://127.0.0.1:18282/"
+
+[scheduler]
+quiet_seconds = 30
+event_threshold = 8
+reconciliation_seconds = 60
+
+[[runtimes]]
+adapter_type = "pi"
+version = "1.0.2"
+executable = "/Users/lanzhijiang/Library/pnpm/bin/pi"
+home = "/Volumes/WorkSSD/Development/braid-e2e/builtin/provider/pi"
+
+[[llm_providers]]
+id = "minimax"
+protocol = "openai-compatible"
+api_key_environment = "MINIMAX_API_KEY"
+
+[[llm_providers.models]]
+model_id = "MiniMax-M3"
+input_cost = 2.10
+output_cost = 8.40
+cache_input_cost = 0.42
+
+[tools]
+git = "/usr/bin/git"
+gh = "/opt/homebrew/bin/gh"
+wrangler = "/Volumes/WorkSSD/Development/braid-e2e/wrangler/node_modules/wrangler/bin/wrangler.js"
+
+[server]
+ingress = "127.0.0.1:18280"
+health = "127.0.0.1:18281"
+
+[telemetry]
+endpoint = "http://127.0.0.1:14318/"
+sample_ratio = 1.0
+incident_mode = true
+export_timeout_seconds = 5
+service_name = "braid-real-e2e-builtin"
+log_format = "text"
+
+[[profiles]]
+id = "issue-minimax"
+display_name = "MiniMax Issue Agent"
+tags = ["issue"]
+adapter_type = "pi"
+adapter_version = "1.0.2"
+provider = "minimax"
+model = "MiniMax-M3"
+reasoning = "medium"
+user_instructions = "你只负责需求设计、实施请求和 Issue 工作记忆，不编写或修改业务实现。业务范围仅 e2e-notes/20261011-minimax-peer-upstreams/。需求明确后自行创建关联 PR 交给 PR Agent，发布简洁证据。当前上游为 Braid 内建平台：在专属工作树建立仅空提交的候选分支（git commit --allow-empty），然后 braid object --config \"$BRAID_CONFIG_PATH\" pr --title ... --head <候选分支> --base main --issue <当前Issue编号> 创建关联 PR。PR 将由正常操作者指派 pr-minimax，不要自行实现业务，也不要自行合并。"
+workspace = "/Volumes/WorkSSD/Development/braid-e2e/source/builtin"
+status_surfaces = ["issue"]
+github_context_soft_ratio = 0.80
+github_context_hard_bytes = 524288
+
+[[profiles]]
+id = "pr-minimax"
+display_name = "MiniMax PR Agent"
+tags = ["pr", "implementation"]
+adapter_type = "pi"
+adapter_version = "1.0.2"
+provider = "minimax"
+model = "MiniMax-M3"
+reasoning = "medium"
+user_instructions = "只在专属工作树依据当前关联 Issue 与 PR 工作记忆实现业务，范围仅 e2e-notes/20261011-minimax-peer-upstreams/。实际调用生成应用而不添加测试文件，提交真实 diff 并发布简洁应用操作证据。交付真实 Git commit 后自行 braid object --config \"$BRAID_CONFIG_PATH\" publish <当前PR编号> 冻结候选OID。不要自行合并。"
+workspace = "/Volumes/WorkSSD/Development/braid-e2e/source/builtin"
+status_surfaces = ["pr"]
+github_context_soft_ratio = 0.80
+github_context_hard_bytes = 524288
+
+[profile_selection]
+default_pr_profile = "pr-minimax"

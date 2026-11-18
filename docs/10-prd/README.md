@@ -1,17 +1,17 @@
 # Product Truth
 
-Braid turns a GitHub Issue or pull request into the durable working memory of a
-local Coding Agent. GitHub holds the current collaboration state; provider
+Braid turns an Issue or pull request into the durable working memory of a
+local Coding Agent. GitHub or the built-in collaboration platform holds current collaboration state; provider
 sessions are replaceable execution contexts built from that state.
 
 The project vocabulary is owned by [`glossary.md`](glossary.md).
 This document owns product purpose, promises, workflows, and exclusions. The
 cross-unit realization is owned by [`../20-product-tdd/`](../20-product-tdd/),
-and only the real campaign in [`acceptance.md`](acceptance.md) accepts them.
+and the real operation criteria in [`acceptance.md`](acceptance.md) determine acceptance.
 
 This directory owns product purpose, promises, workflows, and exclusions.
 The cross-unit realization is owned by [`../20-product-tdd/`](../20-product-tdd/),
-and only the real campaign in [`acceptance.md`](acceptance.md) accepts them.
+and the real operation criteria in [`acceptance.md`](acceptance.md) determine acceptance.
 
 - [`glossary.md`](glossary.md) — project vocabulary.
 - [`purpose.md`](purpose.md) — why Braid exists and the pressure it relieves.

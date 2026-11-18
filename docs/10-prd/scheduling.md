@@ -10,10 +10,21 @@ Replacing or removing a fact already present in a Work Item's Context is Hard
 Invalidation. Braid fences the stale Context Revision immediately. If a turn is
 active, it requests safe interruption, discards later stale Agent output, starts
 a fresh physical Provider Session with current Context, and continues once
-with the invalidation reference. If idle, it replaces Context without starting
-a turn. Rapid Cross-surface edits to an open Associated Issue description wait
-for debounce before interrupting a PR turn. Other Associated Issue changes mark
-the dependency dirty and are incorporated before the next PR turn.
+with the invalidation reference. Context freshness and attention are independent:
+a relevant external revision both invalidates old memory and leaves durable work
+for the still-active responsibility. If idle, replacement preserves one ordinary
+debounced batch; if running, replacement and pending input coalesce into one
+continuation, not a second parallel turn. No second Human mention is required.
+Rapid Cross-surface edits to an open Associated Issue description wait for
+debounce before interrupting a PR turn and remain input for an idle active PR
+Agent too. Other Associated Issue changes mark the dependency dirty and are
+incorporated before the next PR turn.
+
+Timestamp-only and HTML-comment-only changes carry no new semantic input.
+Repeated observations/redeliveries of the same change do not schedule another
+turn. Closed, sleeping, dormant or retired responsibilities are not activated by
+ordinary revisions. An unavailable executor or Context must leave an observable
+pending/blocked obligation, not pretend that memory replacement handled it.
 
 Every newly ingested external comment receives Braid's `eyes` reaction. Only a
 Trusted Braid Mention has turn-lifecycle reactions on that same comment:
@@ -27,3 +38,16 @@ Trusted Braid Mention has turn-lifecycle reactions on that same comment:
 Ordinary debounced turns never receive active or terminal reactions. Their
 operational failures use one mutable Operational Status Comment instead, so
 the normal collaboration model does not look like a request/response pipeline.
+
+Explicit Issue→existing PR handoff is one internal ordinary Wake reference, not
+a mention, activation, steer or interrupt. It merges pending/runnable batches
+under the usual quiet/count policy. A running target receives it in a subsequent
+batch, never a parallel turn. Before that batch's provider input, Braid freshly
+materializes complete canonical PR Context including directly associated OPEN
+Issue bodies/discussion. Read failures defer the unsent claim; no cached/partial
+Context is substituted, and no 60-second reconciliation poll is required.
+OriginEcho suppression and trusted mention rules remain unchanged: an App
+comment containing `@braid` does not implicitly hand off anything.
+A batch that includes a handoff cannot be forwarded as an in-turn urgent steer,
+even if it also contains a trusted mention: that combined input waits for the
+next safe turn boundary and retains its existing runnable/urgent status.

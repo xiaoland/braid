@@ -1,63 +1,27 @@
-use std::{collections::BTreeMap, fmt, fs, str::FromStr};
+#[path = "github/body.rs"]
+mod body;
+#[allow(unused_imports)]
+pub use body::BodySnapshot;
+use std::{collections::BTreeMap, fmt, fs, str::FromStr, sync::Arc, time::Duration};
+
+#[path = "github/error.rs"]
+mod error;
+#[path = "github/graphql.rs"]
+mod graphql;
+#[path = "github/rate_limit.rs"]
+mod rate_limit;
+#[path = "github/write_rest.rs"]
+mod write_rest;
+pub use error::GitHubError;
+use error::bounded;
+pub use rate_limit::RateLimits;
 
 use axum::http::StatusCode;
 use jsonwebtoken::EncodingKey;
 use octocrab::Octocrab;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use thiserror::Error;
 
 use crate::config::GitHubConfig;
-
-#[derive(Debug, Error)]
-pub enum GitHubError {
-    #[error("invalid GitHub repository {0:?}; expected owner/name")]
-    InvalidRepository(String),
-    #[error("invalid GitHub work item {0:?}; expected owner/name#number")]
-    InvalidWorkItem(String),
-    #[error("cannot read GitHub App private key: {0}")]
-    PrivateKey(#[from] std::io::Error),
-    #[error("GitHub App private key is not a usable RSA PEM: {0}")]
-    InvalidPrivateKey(jsonwebtoken::errors::Error),
-    #[error("cannot build GitHub client: {0}")]
-    Client(String),
-    #[error("GitHub returned {status}: {body}")]
-    Http { status: StatusCode, body: String },
-    #[error("GitHub GraphQL returned errors: {0}")]
-    GraphQl(String),
-    #[error("GitHub GraphQL returned no data")]
-    MissingData,
-    #[error("GitHub state has not converged yet: {0}")]
-    ConvergencePending(String),
-    #[error("credential resolved App {actual}, expected {expected}")]
-    WrongApp { actual: u64, expected: u64 },
-    #[error("GitHub App installation lacks required permissions: {0}")]
-    InsufficientPermissions(String),
-    #[error("GitHub client error: {0}")]
-    Octocrab(String),
-}
-
-impl From<octocrab::Error> for GitHubError {
-    fn from(error: octocrab::Error) -> Self {
-        match error {
-            octocrab::Error::GitHub { source, .. } => Self::Http {
-                status: source.status_code,
-                body: bounded(&source.message, 1024).to_owned(),
-            },
-            _ => Self::Octocrab(error.to_string()),
-        }
-    }
-}
-
-impl GitHubError {
-    pub fn is_unavailable(&self) -> bool {
-        matches!(self, Self::Octocrab(_) | Self::ConvergencePending(_))
-            || matches!(self, Self::Http { status, .. } if status.is_server_error())
-    }
-
-    pub fn is_conflict(&self) -> bool {
-        matches!(self, Self::Http { status, .. } if *status == StatusCode::UNPROCESSABLE_ENTITY || *status == StatusCode::CONFLICT)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct RepositoryName {
@@ -66,14 +30,21 @@ pub struct RepositoryName {
 }
 
 impl RepositoryName {
+    pub(crate) fn local(name: &str) -> Self {
+        Self { owner: String::new(), name: name.to_owned() }
+    }
     pub fn name_with_owner(&self) -> String {
-        format!("{}/{}", self.owner, self.name)
+        if self.owner.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}/{}", self.owner, self.name)
+        }
     }
 }
 
 impl fmt::Display for RepositoryName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}/{}", self.owner, self.name)
+        formatter.write_str(&self.name_with_owner())
     }
 }
 
@@ -142,12 +113,15 @@ pub struct GitHubIdentity {
     pub permissions: BTreeMap<String, String>,
 }
 
+#[derive(Clone)]
 pub struct GitHubClient {
-    app: Octocrab,
-    installation: Octocrab,
+    app: Arc<Octocrab>,
+    installation: Arc<Octocrab>,
     config: GitHubConfig,
     identity: GitHubIdentity,
     projects_v2_enabled: bool,
+    rate_limits: Arc<RateLimits>,
+    background: bool,
 }
 
 impl GitHubClient {
@@ -155,35 +129,62 @@ impl GitHubClient {
         config: &GitHubConfig,
         repository: &RepositoryName,
     ) -> Result<Self, GitHubError> {
+        Self::connect_shared(config, repository, Arc::new(RateLimits::default())).await
+    }
+
+    pub async fn connect_shared(
+        config: &GitHubConfig,
+        repository: &RepositoryName,
+        rate_limits: Arc<RateLimits>,
+    ) -> Result<Self, GitHubError> {
         let pem = fs::read(&config.private_key_file)?;
         let key = EncodingKey::from_rsa_pem(&pem).map_err(GitHubError::InvalidPrivateKey)?;
-        let app = Octocrab::builder()
-            .app(octocrab::models::AppId(config.app_id), key)
-            .build()
-            .map_err(|error| GitHubError::Client(error.to_string()))?;
-        let app_info = app.current().app().await?;
+        let app = Arc::new(
+            Octocrab::builder()
+                .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+                .app(octocrab::models::AppId(config.app_id), key)
+                .build()
+                .map_err(|error| GitHubError::Client(error.to_string()))?,
+        );
+        let app_info = github_step("GET /app", app.current().app()).await?;
         let app_id = app_info.id.into_inner();
         if app_id != config.app_id {
             return Err(GitHubError::WrongApp { actual: app_id, expected: config.app_id });
         }
-        let installation =
-            app.apps().get_repository_installation(&repository.owner, &repository.name).await?;
+        let installation = github_step(
+            "GET repository installation",
+            app.apps().get_repository_installation(&repository.owner, &repository.name),
+        )
+        .await?;
         // Keep the raw id for the auto-refreshing installation client; a
         // fixed personal_token client would die permanently when the token
         // expires after one hour.
         let installation_raw_id = installation.id;
         let installation_id = installation_raw_id.into_inner();
-        let access: AccessTokenResponse = app
-            .post(&format!("/app/installations/{installation_id}/access_tokens"), None::<&()>)
-            .await?;
-        let installation_client = app
-            .installation(installation_raw_id)
-            .map_err(|error| GitHubError::Client(error.to_string()))?;
-        let repository_info = repository_identity(&installation_client, repository).await?;
-        let actor = viewer_identity(&installation_client).await?;
+        let access: AccessTokenResponse = github_step(
+            "POST installation access token",
+            app.post(&format!("/app/installations/{installation_id}/access_tokens"), None::<&()>),
+        )
+        .await?;
+        let installation_client = Arc::new(
+            app.installation(installation_raw_id)
+                .map_err(|error| GitHubError::Client(error.to_string()))?,
+        );
+        let repository_info = github_step(
+            "repository identity",
+            repository_identity(&installation_client, repository, &rate_limits, installation_id),
+        )
+        .await?;
+        let actor = github_step(
+            "viewer identity",
+            viewer_identity(&installation_client, &rate_limits, installation_id),
+        )
+        .await?;
         validate_read_permissions(&access.permissions, config.projects_v2_enabled)?;
         Ok(Self {
             app,
+            rate_limits,
+            background: false,
             installation: installation_client,
             config: config.clone(),
             projects_v2_enabled: config.projects_v2_enabled,
@@ -210,26 +211,80 @@ impl GitHubClient {
     }
 
     pub async fn for_repository(&self, repository: &RepositoryName) -> Result<Self, GitHubError> {
-        Self::connect(&self.config, repository).await
+        if self.identity.repository == repository.name_with_owner() {
+            return Ok(self.clone());
+        }
+        let installation = github_step(
+            "GET associated repository installation",
+            self.app.apps().get_repository_installation(&repository.owner, &repository.name),
+        )
+        .await?;
+        if installation.id.into_inner() != self.identity.installation_id {
+            let mut client =
+                Self::connect_shared(&self.config, repository, Arc::clone(&self.rate_limits))
+                    .await?;
+            client.background = self.background;
+            return Ok(client);
+        }
+        // Reuse the installation's auto-refreshing credential and admission owner.
+        let mut client = self.clone();
+        let data: RepositoryIdentityData = client.graphql(
+            "query RepositoryIdentity($owner:String!,$name:String!){rateLimit{cost} repository(owner:$owner,name:$name){id nameWithOwner}}",
+            &serde_json::json!({"owner":repository.owner,"name":repository.name}),
+        ).await?;
+        let identity = data.repository.ok_or(GitHubError::MissingData)?;
+        client.identity.repository = identity.name_with_owner;
+        client.identity.repository_node_id = identity.id;
+        Ok(client)
     }
 
+    #[tracing::instrument(skip_all, fields(repository = %self.identity.repository))]
     pub async fn graphql<V, T>(&self, query: &str, variables: &V) -> Result<T, GitHubError>
     where
         V: Serialize + ?Sized,
         T: DeserializeOwned,
     {
-        let envelope: GraphQlEnvelope<T> =
-            self.installation.post("/graphql", Some(&GraphQlRequest { query, variables })).await?;
-        if !envelope.errors.is_empty() {
-            let messages = envelope
-                .errors
-                .into_iter()
-                .map(|error| error.message)
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(GitHubError::GraphQl(bounded(&messages, 2048).to_owned()));
-        }
-        envelope.data.ok_or(GitHubError::MissingData)
+        graphql::request(
+            &self.installation,
+            &self.rate_limits,
+            self.identity.installation_id,
+            self.background,
+            query,
+            variables,
+        )
+        .await
+    }
+
+    pub async fn write_retry_after(&self) -> u64 {
+        self.rate_limits
+            .installation(self.identity.installation_id)
+            .lock()
+            .await
+            .retry_after(rate_limit::now())
+    }
+
+    pub async fn pull_request(&self, number: u64) -> Result<PullRequest, GitHubError> {
+        self.write_rest(
+            "GET",
+            &format!("/repos/{}/pulls/{number}", self.identity.repository),
+            None::<&()>,
+        )
+        .await
+    }
+
+    pub async fn reconciliation_delay(&self) -> Option<String> {
+        self.rate_limits
+            .installation(self.identity.installation_id)
+            .lock()
+            .await
+            .check(rate_limit::now(), true)
+            .err()
+    }
+
+    pub fn background(&self) -> Self {
+        let mut client = self.clone();
+        client.background = true;
+        client
     }
 
     pub async fn repository_permission(&self, login: &str) -> Result<String, GitHubError> {
@@ -258,7 +313,7 @@ impl GitHubClient {
             }
         };
         let reaction: ReactionResponse =
-            self.installation.post(&path, Some(&ReactionRequest { content })).await?;
+            self.write_rest("POST", &path, Some(&ReactionRequest { content })).await?;
         Ok(reaction.id)
     }
 
@@ -289,13 +344,12 @@ impl GitHubClient {
         issue_number: u64,
         body: &str,
     ) -> Result<CreatedIssueComment, GitHubError> {
-        self.installation
-            .post(
-                &format!("/repos/{}/issues/{issue_number}/comments", self.identity.repository),
-                Some(&IssueCommentRequest { body }),
-            )
-            .await
-            .map_err(GitHubError::from)
+        self.write_rest(
+            "POST",
+            &format!("/repos/{}/issues/{issue_number}/comments", self.identity.repository),
+            Some(&IssueCommentRequest { body }),
+        )
+        .await
     }
 
     pub async fn issue_comments(
@@ -304,12 +358,14 @@ impl GitHubClient {
     ) -> Result<Vec<IssueComment>, GitHubError> {
         let mut comments = Vec::new();
         for page in 1_u16..=100 {
-            let params = PaginationParams { per_page: 100, page };
             let page_comments: Vec<IssueComment> = self
-                .installation
-                .get(
-                    &format!("/repos/{}/issues/{issue_number}/comments", self.identity.repository),
-                    Some(&params),
+                .write_rest(
+                    "GET",
+                    &format!(
+                        "/repos/{}/issues/{issue_number}/comments?per_page=100&page={page}",
+                        self.identity.repository
+                    ),
+                    None::<&()>,
                 )
                 .await?;
             let complete = page_comments.len() < 100;
@@ -328,23 +384,21 @@ impl GitHubClient {
         comment_id: &str,
         body: &str,
     ) -> Result<CreatedIssueComment, GitHubError> {
-        self.installation
-            .patch(
-                &format!("/repos/{}/issues/comments/{comment_id}", self.identity.repository),
-                Some(&IssueCommentRequest { body }),
-            )
-            .await
-            .map_err(GitHubError::from)
+        self.write_rest(
+            "PATCH",
+            &format!("/repos/{}/issues/comments/{comment_id}", self.identity.repository),
+            Some(&IssueCommentRequest { body }),
+        )
+        .await
     }
 
     pub async fn issue_comment(&self, comment_id: u64) -> Result<IssueComment, GitHubError> {
-        self.installation
-            .get(
-                &format!("/repos/{}/issues/comments/{comment_id}", self.identity.repository),
-                None::<&()>,
-            )
-            .await
-            .map_err(GitHubError::from)
+        self.write_rest(
+            "GET",
+            &format!("/repos/{}/issues/comments/{comment_id}", self.identity.repository),
+            None::<&()>,
+        )
+        .await
     }
 
     pub fn require_write_permissions(&self, permissions: &[&str]) -> Result<(), GitHubError> {
@@ -372,33 +426,41 @@ impl GitHubClient {
         &self,
         number: u64,
     ) -> Result<IssueOrPullRequest, GitHubError> {
-        self.installation
-            .get(&format!("/repos/{}/issues/{number}", self.identity.repository), None::<&()>)
-            .await
-            .map_err(GitHubError::from)
-    }
-
-    pub async fn repository_details(&self) -> Result<RepositoryDetails, GitHubError> {
-        self.installation
-            .get(&format!("/repos/{}", self.identity.repository), None::<&()>)
-            .await
-            .map_err(GitHubError::from)
-    }
-
-    pub async fn git_reference(&self, name: &str) -> Result<Option<GitReference>, GitHubError> {
-        let encoded = encode_path(name);
-        octocrab_get_optional(
-            &self.installation,
-            &format!("/repos/{}/git/ref/heads/{encoded}", self.identity.repository),
+        self.write_rest(
+            "GET",
+            &format!("/repos/{}/issues/{number}", self.identity.repository),
+            None::<&()>,
         )
         .await
     }
 
-    pub async fn git_commit(&self, sha: &str) -> Result<GitCommit, GitHubError> {
-        self.installation
-            .get(&format!("/repos/{}/git/commits/{sha}", self.identity.repository), None::<&()>)
+    pub async fn repository_details(&self) -> Result<RepositoryDetails, GitHubError> {
+        self.write_rest("GET", &format!("/repos/{}", self.identity.repository), None::<&()>).await
+    }
+
+    pub async fn git_reference(&self, name: &str) -> Result<Option<GitReference>, GitHubError> {
+        let encoded = encode_path(name);
+        match self
+            .write_rest(
+                "GET",
+                &format!("/repos/{}/git/ref/heads/{encoded}", self.identity.repository),
+                None::<&()>,
+            )
             .await
-            .map_err(GitHubError::from)
+        {
+            Ok(reference) => Ok(Some(reference)),
+            Err(GitHubError::Http { status, .. }) if status == StatusCode::NOT_FOUND => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn git_commit(&self, sha: &str) -> Result<GitCommit, GitHubError> {
+        self.write_rest(
+            "GET",
+            &format!("/repos/{}/git/commits/{sha}", self.identity.repository),
+            None::<&()>,
+        )
+        .await
     }
 
     pub async fn create_git_commit(
@@ -410,19 +472,18 @@ impl GitHubClient {
     ) -> Result<GitCommit, GitHubError> {
         let actor = format!("{}[bot]", self.identity.app_slug);
         let email = format!("{}+{}@users.noreply.github.com", self.identity.app_id, actor);
-        self.installation
-            .post(
-                &format!("/repos/{}/git/commits", self.identity.repository),
-                Some(&CreateGitCommit {
-                    message,
-                    tree,
-                    parents: [parent],
-                    author: GitSignature { name: &actor, email: &email, date: authored_at },
-                    committer: GitSignature { name: &actor, email: &email, date: authored_at },
-                }),
-            )
-            .await
-            .map_err(GitHubError::from)
+        self.write_rest(
+            "POST",
+            &format!("/repos/{}/git/commits", self.identity.repository),
+            Some(&CreateGitCommit {
+                message,
+                tree,
+                parents: [parent],
+                author: GitSignature { name: &actor, email: &email, date: authored_at },
+                committer: GitSignature { name: &actor, email: &email, date: authored_at },
+            }),
+        )
+        .await
     }
 
     pub async fn create_git_reference(
@@ -431,13 +492,12 @@ impl GitHubClient {
         sha: &str,
     ) -> Result<GitReference, GitHubError> {
         let reference = format!("refs/heads/{name}");
-        self.installation
-            .post(
-                &format!("/repos/{}/git/refs", self.identity.repository),
-                Some(&CreateGitReference { reference: &reference, sha }),
-            )
-            .await
-            .map_err(GitHubError::from)
+        self.write_rest(
+            "POST",
+            &format!("/repos/{}/git/refs", self.identity.repository),
+            Some(&CreateGitReference { reference: &reference, sha }),
+        )
+        .await
     }
 
     pub async fn update_git_reference(
@@ -446,31 +506,32 @@ impl GitHubClient {
         sha: &str,
     ) -> Result<GitReference, GitHubError> {
         let encoded = encode_path(name);
-        self.installation
-            .patch(
-                &format!("/repos/{}/git/refs/heads/{encoded}", self.identity.repository),
-                Some(&UpdateGitReference { sha, force: false }),
-            )
-            .await
-            .map_err(GitHubError::from)
+        self.write_rest(
+            "PATCH",
+            &format!("/repos/{}/git/refs/heads/{encoded}", self.identity.repository),
+            Some(&UpdateGitReference { sha, force: false }),
+        )
+        .await
     }
 
-    pub async fn open_pull_requests_for_head(
+    pub async fn pull_requests_for_head(
         &self,
         head: &str,
         base: &str,
     ) -> Result<Vec<PullRequest>, GitHubError> {
         let owner = self.identity.repository.split_once('/').map_or("", |(owner, _)| owner);
-        let params = PullRequestsParams {
-            state: "open",
-            head: format!("{owner}:{head}"),
-            base,
-            per_page: 100,
-        };
-        self.installation
-            .get(&format!("/repos/{}/pulls", self.identity.repository), Some(&params))
-            .await
-            .map_err(GitHubError::from)
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("state", "all")
+            .append_pair("head", &format!("{owner}:{head}"))
+            .append_pair("base", base)
+            .append_pair("per_page", "100")
+            .finish();
+        self.write_rest(
+            "GET",
+            &format!("/repos/{}/pulls?{query}", self.identity.repository),
+            None::<&()>,
+        )
+        .await
     }
 
     pub async fn create_draft_pull_request(
@@ -480,13 +541,12 @@ impl GitHubClient {
         head: &str,
         base: &str,
     ) -> Result<PullRequest, GitHubError> {
-        self.installation
-            .post(
-                &format!("/repos/{}/pulls", self.identity.repository),
-                Some(&CreatePullRequest { title, body, head, base, draft: true }),
-            )
-            .await
-            .map_err(GitHubError::from)
+        self.write_rest(
+            "POST",
+            &format!("/repos/{}/pulls", self.identity.repository),
+            Some(&CreatePullRequest { title, body, head, base, draft: true }),
+        )
+        .await
     }
 
     pub async fn pull_request_closing_issues(
@@ -585,24 +645,6 @@ impl GitHubClient {
     }
 }
 
-#[derive(Serialize)]
-struct GraphQlRequest<'a, V: ?Sized> {
-    query: &'a str,
-    variables: &'a V,
-}
-
-#[derive(Deserialize)]
-struct GraphQlEnvelope<T> {
-    data: Option<T>,
-    #[serde(default)]
-    errors: Vec<GraphQlError>,
-}
-
-#[derive(Deserialize)]
-struct GraphQlError {
-    message: String,
-}
-
 #[derive(Deserialize)]
 struct AccessTokenResponse {
     expires_at: String,
@@ -640,21 +682,7 @@ struct PermissionResponse {
 }
 
 #[derive(Serialize)]
-struct PaginationParams {
-    per_page: u8,
-    page: u16,
-}
-
-#[derive(Serialize)]
 struct AppDeliveriesParams {
-    per_page: u8,
-}
-
-#[derive(Serialize)]
-struct PullRequestsParams<'a> {
-    state: &'a str,
-    head: String,
-    base: &'a str,
     per_page: u8,
 }
 
@@ -885,55 +913,32 @@ struct AppWebhookUpdate<'a> {
 async fn repository_identity(
     client: &Octocrab,
     repository: &RepositoryName,
+    rate_limits: &RateLimits,
+    installation_id: u64,
 ) -> Result<RepositoryIdentityNode, GitHubError> {
-    let envelope: GraphQlEnvelope<RepositoryIdentityData> = client
-        .post(
-            "/graphql",
-            Some(&serde_json::json!({
-                "query": "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id nameWithOwner}}",
-                "variables": {"owner": repository.owner, "name": repository.name}
-            })),
-        )
-        .await?;
-    if !envelope.errors.is_empty() {
-        return Err(GitHubError::GraphQl(
-            envelope.errors.into_iter().map(|error| error.message).collect::<Vec<_>>().join("; "),
-        ));
-    }
-    envelope.data.and_then(|data| data.repository).ok_or(GitHubError::MissingData)
+    let data: RepositoryIdentityData = graphql::request(
+        client, rate_limits, installation_id, false,
+        "query RepositoryIdentity($owner:String!,$name:String!){rateLimit{cost} repository(owner:$owner,name:$name){id nameWithOwner}}",
+        &serde_json::json!({"owner":repository.owner,"name":repository.name}),
+    ).await?;
+    data.repository.ok_or(GitHubError::MissingData)
 }
 
-async fn viewer_identity(client: &Octocrab) -> Result<ViewerIdentity, GitHubError> {
-    let envelope: GraphQlEnvelope<ViewerIdentityData> = client
-        .post(
-            "/graphql",
-            Some(&serde_json::json!({
-                "query": "query{viewer{id login}}",
-                "variables": {}
-            })),
-        )
-        .await?;
-    if !envelope.errors.is_empty() {
-        return Err(GitHubError::GraphQl(
-            envelope.errors.into_iter().map(|error| error.message).collect::<Vec<_>>().join("; "),
-        ));
-    }
-    Ok(envelope.data.ok_or(GitHubError::MissingData)?.viewer)
-}
-
-async fn octocrab_get_optional<T: DeserializeOwned>(
+async fn viewer_identity(
     client: &Octocrab,
-    route: impl AsRef<str>,
-) -> Result<Option<T>, GitHubError> {
-    match client.get::<T, _, _>(route.as_ref(), None::<&()>).await {
-        Ok(value) => Ok(Some(value)),
-        Err(octocrab::Error::GitHub { source, .. })
-            if source.status_code == StatusCode::NOT_FOUND =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error.into()),
-    }
+    rate_limits: &RateLimits,
+    installation_id: u64,
+) -> Result<ViewerIdentity, GitHubError> {
+    let data: ViewerIdentityData = graphql::request(
+        client,
+        rate_limits,
+        installation_id,
+        false,
+        "query ViewerIdentity{rateLimit{cost} viewer{id login}}",
+        &(),
+    )
+    .await?;
+    Ok(data.viewer)
 }
 
 async fn octocrab_delete(client: &Octocrab, route: impl AsRef<str>) -> Result<(), GitHubError> {
@@ -951,17 +956,6 @@ async fn octocrab_delete(client: &Octocrab, route: impl AsRef<str>) -> Result<()
 
 fn encode_path(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
-}
-
-fn bounded(value: &str, bytes: usize) -> &str {
-    if value.len() <= bytes {
-        return value;
-    }
-    let mut end = bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
 }
 
 fn validate_read_permissions(
@@ -990,3 +984,24 @@ fn validate_read_permissions(
         Err(GitHubError::InsufficientPermissions(missing.join(", ")))
     }
 }
+
+const GITHUB_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound one GitHub API step so an unavailable network fails with operation
+/// context instead of hanging until the OS TCP timeout.
+async fn github_step<T, E>(
+    operation: &str,
+    future: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, GitHubError>
+where
+    E: Into<GitHubError>,
+{
+    tokio::time::timeout(GITHUB_STEP_TIMEOUT, future)
+        .await
+        .map_err(|_| GitHubError::Timeout { operation: operation.to_owned() })?
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+#[path = "../tests/support/publication_github.rs"]
+mod publication_github;

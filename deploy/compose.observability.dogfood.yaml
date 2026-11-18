@@ -1,0 +1,22 @@
+# Controlled single-host dogfood, not a multi-tenant production security boundary.
+# Apply AFTER compose.observability.yaml, from a private managed directory.
+services:
+  lgtm:
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_BASIC_ENABLED: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+    secrets: [grafana_admin_password]
+    volumes:
+      - data:/data
+      - ./start-dogfood-lgtm.sh:/otel-lgtm/start-dogfood-lgtm.sh:ro
+    command: ["bash", "/otel-lgtm/start-dogfood-lgtm.sh"]
+  collector:
+    restart: unless-stopped
+secrets:
+  grafana_admin_password:
+    file: ./grafana-admin-password
+volumes:
+  data: {}

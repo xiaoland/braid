@@ -1,0 +1,92 @@
+schema_version = 3
+
+[instance]
+key = "real-e2e-github-minimax"
+
+[runtime]
+root = "/Volumes/WorkSSD/Development/braid-e2e/github/state"
+database = "/Volumes/WorkSSD/Development/braid-e2e/github/state/braid.sqlite3"
+backups = "/Volumes/WorkSSD/Development/braid-e2e/github/state/backups"
+worktrees = "/Volumes/WorkSSD/Development/braid-e2e/github/worktrees"
+auto_migrate = false
+
+[github]
+app_id = 4780313
+repository = "xiaoland/braid-poc-test"
+handle = "braid"
+api_version = "2022-11-28"
+private_key_file = "/Users/lanzhijiang/.braid/instances/xiaoland/github-app.pem"
+webhook_secret_file = "/Users/lanzhijiang/.braid/instances/xiaoland/secrets.toml"
+projects_v2_enabled = false
+
+[scheduler]
+quiet_seconds = 30
+event_threshold = 8
+reconciliation_seconds = 60
+
+[[runtimes]]
+adapter_type = "pi"
+version = "1.0.2"
+executable = "/Users/lanzhijiang/Library/pnpm/bin/pi"
+home = "/Volumes/WorkSSD/Development/braid-e2e/github/provider/pi"
+
+[[llm_providers]]
+id = "minimax"
+protocol = "openai-compatible"
+api_key_environment = "MINIMAX_API_KEY"
+
+[[llm_providers.models]]
+model_id = "MiniMax-M3"
+input_cost = 2.10
+output_cost = 8.40
+cache_input_cost = 0.42
+
+[tools]
+git = "/usr/bin/git"
+gh = "/opt/homebrew/bin/gh"
+wrangler = "/Volumes/WorkSSD/Development/braid-e2e/wrangler/node_modules/wrangler/bin/wrangler.js"
+
+[server]
+ingress = "127.0.0.1:18180"
+health = "127.0.0.1:18181"
+
+[telemetry]
+endpoint = "http://127.0.0.1:24318/"
+sample_ratio = 1.0
+incident_mode = true
+export_timeout_seconds = 5
+service_name = "braid-real-e2e-github"
+log_format = "text"
+
+[[profiles]]
+id = "issue-minimax"
+display_name = "MiniMax Issue Agent"
+tags = ["issue"]
+adapter_type = "pi"
+adapter_version = "1.0.2"
+provider = "minimax"
+model = "MiniMax-M3"
+reasoning = "medium"
+user_instructions = "你只负责需求设计、实施请求和 Issue 工作记忆，不编写或修改业务实现。业务范围仅 e2e-notes/20261011-minimax-peer-upstreams/。需求明确后自行创建关联 PR 交给 PR Agent，发布简洁证据。当前上游为 GitHub：使用 braid gh pr ensure 建立关联 Draft PR 并交接 PR Agent。不要自行合并。 本轮环境约束：所有应用数据、验收证据、临时文件、材料和缓存仅可放在 /Volumes/WorkSSD/Development/braid-e2e/github/ 或当前WorkSSD工作目录；禁止使用 /tmp、系统盘及用户目录作为写入位置，不得仅依赖TMPDIR。"
+workspace = "/Volumes/WorkSSD/Development/braid-e2e/source/github"
+status_surfaces = ["issue"]
+github_context_soft_ratio = 0.80
+github_context_hard_bytes = 524288
+
+[[profiles]]
+id = "pr-minimax"
+display_name = "MiniMax PR Agent"
+tags = ["pr", "implementation"]
+adapter_type = "pi"
+adapter_version = "1.0.2"
+provider = "minimax"
+model = "MiniMax-M3"
+reasoning = "medium"
+user_instructions = "只在专属工作树依据当前关联 Issue 与 PR 工作记忆实现业务，范围仅 e2e-notes/20261011-minimax-peer-upstreams/。实际调用生成应用而不添加测试文件，提交真实 diff 并发布简洁应用操作证据。提交真实 diff 后自行 push 当前PR分支并更新PR工作记忆。不要自行合并。 本轮环境约束：所有应用数据、验收证据、临时文件、材料和缓存仅可放在 /Volumes/WorkSSD/Development/braid-e2e/github/ 或当前WorkSSD工作目录；禁止使用 /tmp、系统盘及用户目录作为写入位置，不得仅依赖TMPDIR。"
+workspace = "/Volumes/WorkSSD/Development/braid-e2e/source/github"
+status_surfaces = ["pr"]
+github_context_soft_ratio = 0.80
+github_context_hard_bytes = 524288
+
+[profile_selection]
+default_pr_profile = "pr-minimax"

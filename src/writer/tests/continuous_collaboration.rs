@@ -1,0 +1,444 @@
+use super::*;
+use crate::{
+    context::CanonicalObservation,
+    producer::reconcile::{self, ReconcileScope},
+    store::{CanonicalCommentSet, CanonicalObjectState, EventKind, ObservationCommit},
+};
+
+pub(crate) fn revision(delivery: &str, body: &str) -> IngressEvent {
+    IngressEvent {
+        identity: crate::store::ChangeIdentity::ObjectVersion,
+        delivery_guid: delivery.into(),
+        event_name: "issues".into(),
+        action: Some("edited".into()),
+        repository_node_id: "repo".into(),
+        repository: "owner/repository".into(),
+        work_item_node_id: Some("item".into()),
+        work_item_kind: Some("issue"),
+        work_item_number: Some(1),
+        work_item_state: Some("open".into()),
+        object_node_id: Some("item".into()),
+        object_version: Some(delivery.into()),
+        object_digest: Some(helpers::digest(body)),
+        visible_body: Some(body.into()),
+        actor_node_id: Some("human".into()),
+        actor_login: Some("human".into()),
+        kind: EventKind::Invalidate,
+        detail: Some("edited"),
+        cross_surface_invalidation: true,
+        requires_attention: true,
+        origin: "external",
+        reference: format!("Human revised Issue #1: {delivery}"),
+        mention_candidate: false,
+        reaction_target: None,
+        known: true,
+        raw_payload: Vec::new(),
+    }
+}
+
+fn state(version: &str, digest: char) -> CanonicalObjectState {
+    CanonicalObjectState {
+        metadata_digest: None,
+        node_id: "item".into(),
+        database_id: Some("1".into()),
+        object_kind: "issue".into(),
+        version: version.into(),
+        digest: digest.to_string().repeat(64),
+        lifecycle: "open".into(),
+        author_node_id: Some("human".into()),
+        author_login: Some("human".into()),
+    }
+}
+
+#[tokio::test]
+async fn another_context_read_cannot_acknowledge_a_revision_before_delivery() {
+    let old_version = "2026-01-01T00:00:01Z";
+    let revised_version = "2026-01-01T00:00:02Z";
+    let f = Fixture::new(true);
+    f.store
+        .commit_observation(ObservationCommit {
+            basis: f.store.begin_observation("item".into()).unwrap(),
+            current: vec![state(old_version, 'a')],
+            events: vec![],
+            policy: SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 },
+        })
+        .unwrap();
+    f.store
+        .reconcile_comments(CanonicalCommentSet {
+            repository_node_id: "repo".into(),
+            repository: "owner/repository".into(),
+            work_item_node_id: "item".into(),
+            work_item_kind: "issue",
+            work_item_number: 1,
+            work_item_state: "open".into(),
+            work_item_version: "2026-01-01T00:00:03Z".into(),
+            work_item_digest: "b".repeat(64),
+            object_kind: "issue_comment",
+            comments: vec![],
+        })
+        .unwrap();
+    assert_eq!(f.store.processed_objects("item".into()).unwrap()[0].version, old_version);
+    let observation = CanonicalObservation {
+        unedited_creation: false,
+        work_item_node_id: "item".into(),
+        work_item_kind: "issue",
+        work_item_number: 1,
+        work_item_state: "open".into(),
+        repository_node_id: "repo".into(),
+        repository: "owner/repository".into(),
+        object_node_id: "item".into(),
+        database_id: "1".into(),
+        object_kind: "issue",
+        version: revised_version.into(),
+        digest: "b".repeat(64),
+        lifecycle: "active",
+        author_node_id: Some("human".into()),
+        author_login: Some("human".into()),
+        body: Some("Current revised contract".into()),
+        visible_body: Some("Current revised contract".into()),
+        title: Some("Design".into()),
+        metadata_digest: None,
+    };
+    let scope = ReconcileScope {
+        work_item_node_id: "item".into(),
+        work_item_kind: "issue",
+        work_item_number: 1,
+        work_item_state: "open".into(),
+        previous_work_item_state: "open".into(),
+        repository_node_id: "repo".into(),
+        repository: "owner/repository".into(),
+    };
+    let (github, task) = server(Arc::new(Mutex::new(Remote::default())), true).await;
+    for expected_changes in [1, 0] {
+        let basis = f.store.begin_observation("item".into()).unwrap();
+        assert_eq!(
+            reconcile::reconcile_observations(
+                &f.store,
+                &github,
+                &f.config,
+                &scope,
+                basis,
+                std::slice::from_ref(&observation)
+            )
+            .unwrap(),
+            expected_changes
+        );
+    }
+    assert_eq!(f.store.runtime_status().unwrap().batches.len(), 1);
+    assert_eq!(
+        f.db()
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='invalidate' AND requires_attention=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    task.abort();
+}
+
+#[test]
+fn failed_observation_commits_neither_events_nor_frontier() {
+    let f = Fixture::new(true);
+    let result = f.store.commit_observation(ObservationCommit {
+        basis: f.store.begin_observation("item".into()).unwrap(),
+        current: vec![],
+        events: vec![revision("v2", "new")],
+        policy: SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 },
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        f.db().query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0)).unwrap(),
+        0
+    );
+    assert!(f.store.processed_objects("item".into()).unwrap().is_empty());
+    assert!(f.store.runtime_status().unwrap().batches.is_empty());
+}
+
+#[test]
+fn independent_pr_ensures_deliver_two_activations_and_retry_one_identity() {
+    let f = Fixture::new(false);
+    let policy = SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 };
+    let profile = f.config.profile("pr-codex").unwrap();
+    let owner =
+        f.store.acquire_runtime_lease("runtime".into(), "activation-test".into(), 3600).unwrap();
+    for number in [9, 10] {
+        let payload = serde_json::to_string(&AcceptedRequest::Ensure {
+            comment_id: number,
+            head: Some(format!("head-{number}")),
+            profile: profile.clone(),
+        })
+        .unwrap();
+        let plan = f
+            .store
+            .prepare_implementation_request(NewImplementationRequest {
+                root_intent_id: None,
+                write: NewGhWriteIntent {
+                    request_key: format!("ensure-{number}"),
+                    operation: "pr_ensure",
+                    repository: "owner/repository".into(),
+                    target: format!("https://github.com/owner/repository/issues/comments/{number}"),
+                    profile_id: profile.id.clone(),
+                    role: "Operator".into(),
+                    request_digest: helpers::digest(&payload),
+                    payload,
+                    source: None,
+                },
+                comment_database_id: number,
+                comment_node_id: format!("comment-{number}"),
+                issue_node_id: "item".into(),
+                issue_number: 1,
+                issue_title: "Design".into(),
+                base_ref: "main".into(),
+                head_ref: format!("head-{number}"),
+                pr_profile_id: profile.id.clone(),
+            })
+            .unwrap();
+        f.store
+            .record_implementation_progress(
+                plan.write.intent_id.clone(),
+                ImplementationProgress {
+                    stage: "activation_pending",
+                    bootstrap_commit_sha: None,
+                    pull_request_database_id: Some(number),
+                    pull_request_node_id: Some(format!("pr-{number}")),
+                    pull_request_number: Some(number),
+                },
+            )
+            .unwrap();
+        for _ in 0..2 {
+            f.store
+                .accept_pr_activation(crate::store::PrActivation {
+                    intent_id: plan.write.intent_id.clone(),
+                    repository_node: "repo".into(),
+                    pr_node: format!("pr-{number}"),
+                    pr_number: number,
+                    policy,
+                    owner: owner.clone(),
+                    issue_basis: f.store.begin_observation("item".into()).unwrap(),
+                    target_basis: f.store.begin_observation(format!("pr-{number}")).unwrap(),
+                })
+                .unwrap();
+        }
+        assert!(
+            f.store
+                .implementation_request_receipt(plan.write.intent_id)
+                .unwrap()
+                .unwrap()
+                .activation_delivered
+        );
+    }
+    let candidates =
+        f.store.assignment_candidates("owner/repository".into(), "pr".into(), 10).unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(
+        f.db()
+            .query_row("SELECT count(*) FROM events WHERE detail='pr_ensure'", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn human_edit_of_a_braid_authored_body_is_not_an_echo_or_an_urgent_mention() {
+    use crate::webhook::{self, ActorPolicy, WebhookHeaders};
+    use hmac::{Hmac, KeyInit as _, Mac as _};
+    let body=serde_json::to_vec(&json!({"action":"edited","sender":{"login":"human","node_id":"human"},"repository":{"node_id":"repo","full_name":"owner/repository"},"issue":{"node_id":"item","number":1,"title":"Design","state":"open","body":"> **Braid Agent · Braid**\n> Issue Agent\n\nRevised requirements","updated_at":"v2"},"changes":{"body":{"from":"old requirements"}}})).unwrap();
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"secret").unwrap();
+    mac.update(&body);
+    let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let event = webhook::parse_verified(
+        WebhookHeaders {
+            signature: Some(&signature),
+            delivery: Some("revision"),
+            event: Some("issues"),
+        },
+        &body,
+        b"secret",
+        &["owner/repository".into()],
+        "braid",
+        ActorPolicy { app_node_id: "app", app_login: "braid[bot]", agent_node_ids: &[] },
+    )
+    .unwrap();
+    assert_eq!(event.kind, EventKind::Invalidate);
+    assert!(event.requires_attention);
+    assert!(!event.mention_candidate);
+    assert_eq!(event.origin, "external");
+}
+
+#[test]
+fn interrupted_revision_coalesces_attention_into_one_continuation() {
+    let f = Fixture::new(true);
+    f.db().execute_batch("UPDATE turns SET lifecycle='running',provider_turn_id='old-native' WHERE turn_id='turn'; UPDATE provider_sessions SET lifecycle='running' WHERE session_id='session'").unwrap();
+    let policy = SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 };
+    f.store.ingest_event(revision("v2", "Current design"), policy).unwrap();
+    let reset = f
+        .store
+        .begin_context_reset(Some("turn".into()), "issue".into(), "issue-codex".into())
+        .unwrap()
+        .unwrap();
+    assert!(reset.continuation);
+    f.store
+        .mark_context_reset_turn_terminal(
+            reset.reset_id.clone(),
+            "turn".into(),
+            "interrupted".into(),
+        )
+        .unwrap();
+    f.store
+        .complete_context_reset(
+            reset.reset_id,
+            "fresh-provider".into(),
+            "new-context".into(),
+            "instructions".into(),
+        )
+        .unwrap();
+    f.store.ingest_event(revision("v2", "Current design"), policy).unwrap();
+    assert_eq!(f.store.runtime_status().unwrap().batches.len(), 1);
+    let claim = f
+        .store
+        .claim_runnable_turn("issue".into(), "issue-codex".into(), vec!["fresh-provider".into()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.references.len(), 1);
+    assert_eq!(claim.trigger_kind, "wake_batch");
+    assert!(
+        f.store
+            .claim_runnable_turn(
+                "issue".into(),
+                "issue-codex".into(),
+                vec!["fresh-provider".into()]
+            )
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn an_additive_projection_does_not_replace_the_session_publication_fence() {
+    let f = Fixture::new(true);
+    f.db()
+        .execute("UPDATE work_items SET context_revision='latest-projected-comments'", [])
+        .unwrap();
+    let mut input = revision("new-comment", "comment");
+    input.kind = EventKind::Wake;
+    input.cross_surface_invalidation = false;
+    f.store.ingest_event(input, SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 }).unwrap();
+    let claim = f
+        .store
+        .claim_runnable_turn("issue".into(), "issue-codex".into(), vec!["provider".into()])
+        .unwrap()
+        .unwrap();
+    f.store.mark_turn_started(claim.turn_id.clone(), "native-next".into()).unwrap();
+    let source =
+        resolve_source(&f.config, None, &Invocation::Agent(claim.turn_id)).unwrap().unwrap();
+    assert_eq!(source.context_revision, "context");
+}
+
+#[tokio::test]
+async fn a_published_version_is_not_an_echo_after_a_human_changes_its_content() {
+    let f = Fixture::new(true);
+    let remote = Arc::new(Mutex::new(body_edit::BodyRemote::new(false)));
+    let (github, http) = body_edit::body_server(remote.clone()).await;
+    let edit = body_edit::accept(&f, &github).await;
+    f.drain(github.clone()).await;
+    assert_eq!(f.receipt(&edit.request_id).lifecycle, "applied");
+    let snapshot = remote.lock().unwrap().snapshot.clone();
+    let mut observed = CanonicalObservation {
+        unedited_creation: false,
+        work_item_node_id: "item".into(),
+        work_item_kind: "issue",
+        work_item_number: 1,
+        work_item_state: "open".into(),
+        repository_node_id: "repo".into(),
+        repository: "owner/repository".into(),
+        object_node_id: snapshot.node_id,
+        database_id: "1".into(),
+        object_kind: "issue",
+        version: snapshot.updated_at,
+        digest: "a".repeat(64),
+        lifecycle: "active",
+        author_node_id: Some("app".into()),
+        author_login: Some("braid[bot]".into()),
+        body: snapshot.body,
+        visible_body: None,
+        title: Some(snapshot.title),
+        metadata_digest: None,
+    };
+    assert!(
+        !reconcile::observation_is_external(&f.store, &observed, "edited", "app", &f.config)
+            .unwrap()
+    );
+    let published_body = observed.body.clone();
+    observed.body =
+        Some(format!("{}\n\nHuman changed the current contract", observed.body.unwrap()));
+    // Even an equal coarse timestamp is not evidence that the new content is ours.
+    assert!(
+        reconcile::observation_is_external(&f.store, &observed, "edited", "app", &f.config)
+            .unwrap()
+    );
+    // An exact body publication does not prove unrelated metadata was ours.
+    observed.body = published_body;
+    let mut prior = state(&observed.version, 'a');
+    prior.metadata_digest = Some("c".repeat(64));
+    f.store
+        .commit_observation(ObservationCommit {
+            basis: f.store.begin_observation("item".into()).unwrap(),
+            current: vec![prior],
+            events: vec![],
+            policy: SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 },
+        })
+        .unwrap();
+    observed.metadata_digest = Some("d".repeat(64));
+    let basis = f.store.begin_observation("item".into()).unwrap();
+    let scope = ReconcileScope {
+        work_item_node_id: "item".into(),
+        work_item_kind: "issue",
+        work_item_number: 1,
+        work_item_state: "open".into(),
+        previous_work_item_state: "open".into(),
+        repository_node_id: "repo".into(),
+        repository: "owner/repository".into(),
+    };
+    assert_eq!(
+        reconcile::reconcile_observations(&f.store, &github, &f.config, &scope, basis, &[observed])
+            .unwrap(),
+        1
+    );
+    assert_eq!(f.db().query_row("SELECT count(*) FROM events WHERE kind='invalidate' AND origin='reconciliation' AND requires_attention=1",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    http.abort();
+}
+
+#[tokio::test]
+async fn native_association_changes_are_visible_without_a_root_version_change() {
+    let remote = Arc::new(Mutex::new(body_edit::BodyRemote::new(false)));
+    let (github, http) = body_edit::body_server(remote.clone()).await;
+    let locator = "owner/repository#9".parse().unwrap();
+    let before = crate::context::CanonicalContext::PullRequest(
+        crate::context::materialize_pull_request(&github, &locator, 100).await.unwrap(),
+    );
+    remote.lock().unwrap().associated = false;
+    let after = crate::context::CanonicalContext::PullRequest(
+        crate::context::materialize_pull_request(&github, &locator, 100).await.unwrap(),
+    );
+    let before = crate::context::canonical_observations(&before).remove(0);
+    let after = crate::context::canonical_observations(&after).remove(0);
+    assert_eq!(before.version, after.version);
+    assert_eq!(before.body, after.body);
+    assert_ne!(before.metadata_digest, after.metadata_digest);
+    let prior = CanonicalObjectState {
+        node_id: before.object_node_id,
+        database_id: Some(before.database_id),
+        object_kind: "pr".into(),
+        version: before.version,
+        digest: before.digest,
+        lifecycle: "open".into(),
+        author_node_id: None,
+        author_login: None,
+        metadata_digest: before.metadata_digest,
+    };
+    assert!(!reconcile::observation_unchanged(&prior, &after));
+    http.abort();
+}

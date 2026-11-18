@@ -16,6 +16,14 @@ pub async fn telemetry_probe(arguments: TelemetryProbe) -> Result<()> {
         println!("sampled: {}", result.sampled);
         println!("payload emitted: {}", result.payload_emitted);
         println!("OTLP endpoint: {}", result.exporter.endpoint);
+        println!("trace ID: {}", result.trace_id);
+        for signal in &result.signals {
+            println!(
+                "{} {}: SDK batches successful={}, failed={} (not a persistence acknowledgement)",
+                signal.signal, signal.endpoint, signal.successful_batches, signal.failed_batches
+            );
+        }
+        println!("Verify logs/traces/metrics in the backend; see docs/40-deployment/README.md.");
     }
     Ok(())
 }

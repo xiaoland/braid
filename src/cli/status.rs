@@ -13,7 +13,7 @@ pub fn status(arguments: &ConfigPath) -> Result<()> {
         binary_version: env!("CARGO_PKG_VERSION"),
         config_schema: config.schema_version,
         instance_key: &config.instance.key,
-        repository: &config.github.repository,
+        repository: config.repositories().join(", "),
         default_pr_profile: &config.profile_selection.default_pr_profile,
         database,
         telemetry_endpoint: config.telemetry.endpoint.to_string(),
@@ -26,7 +26,7 @@ pub fn status(arguments: &ConfigPath) -> Result<()> {
     } else {
         println!("braid {}", status.binary_version);
         println!("instance: {}", status.instance_key);
-        println!("repository: {}", status.repository);
+        println!("repositories: {}", status.repository);
         println!(
             "database schema: {}/{} ({} pending)",
             status.database.schema_version,
@@ -46,6 +46,36 @@ pub fn status(arguments: &ConfigPath) -> Result<()> {
                 transport.uncertain_writes,
                 transport.context_resets.len()
             );
+            println!(
+                "scheduler: durable-eligible={} (provider availability unknown; runnable is a raw lifecycle count)",
+                transport.durable_eligible_batches
+            );
+            for batch in &transport.batches {
+                println!(
+                    "  {}#{} {}: {}",
+                    batch.repository,
+                    batch.work_item_number,
+                    batch.lifecycle,
+                    batch
+                        .scheduler
+                        .ineligible_reason
+                        .unwrap_or("durable_eligible_provider_unknown")
+                );
+                if let Some(error) = &batch.input_error {
+                    println!("    waiting for complete input: {error}");
+                }
+            }
+            for group in &transport.agent_groups {
+                println!(
+                    "  {}#{} generation={} {} assignment={} session={}",
+                    group.work_item_kind,
+                    group.work_item_number,
+                    group.assignment_generation,
+                    if group.current_generation { "current" } else { "historical" },
+                    group.assignment_lifecycle,
+                    group.session_lifecycle.as_deref().unwrap_or("none")
+                );
+            }
         }
     }
     Ok(())

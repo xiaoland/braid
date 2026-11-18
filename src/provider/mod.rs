@@ -20,7 +20,7 @@ pub use tokio::{
 
 pub(crate) use crate::{
     config::{CodexConfig, PiConfig, Profile},
-    telemetry::{self, PayloadEvidence},
+    telemetry,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -36,13 +36,16 @@ pub enum ProviderError {
     Disconnected,
     #[error("provider protocol error: {0}")]
     Protocol(String),
+    #[error("provider deferred input: {0}")]
+    Deferred(String),
+    #[error("provider input reception is unknown: {0}")]
+    Unknown(String),
 }
 
 #[derive(Debug, Clone)]
 pub enum ProviderNotification {
     TurnStarted { thread_id: String, turn_id: String },
     TurnCompleted { thread_id: String, turn_id: String, status: String, error: Option<String> },
-    Activity { method: String, thread_id: Option<String>, turn_id: Option<String> },
     Disconnected,
 }
 
@@ -66,6 +69,22 @@ pub trait AgentProvider: Send + Sync {
     /// connection-scoped fact observed inside the adapter. Adapter session
     /// handles expose their own latched availability to core consumers.
     async fn closed(&self);
+
+    /// Release this session only after its execution is known to be idle.
+    /// Shared providers cannot infer a stopped turn from a lost connection.
+    async fn close_session(
+        &self,
+        _thread_id: &str,
+        confirmed_idle: bool,
+    ) -> Result<(), ProviderError> {
+        if confirmed_idle {
+            Ok(())
+        } else {
+            Err(ProviderError::Protocol(
+                "old execution has no confirmed terminal; replacement is blocked".into(),
+            ))
+        }
+    }
 
     async fn start_session(
         &self,
@@ -104,6 +123,7 @@ pub trait AgentProvider: Send + Sync {
 
 mod codex;
 mod pi;
+mod pi_context;
 mod session;
 mod util;
 

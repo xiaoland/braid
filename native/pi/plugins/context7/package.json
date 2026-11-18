@@ -1,0 +1,8 @@
+{
+  "name": "@braid/pi-runtime-context7",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@upstash/context7-pi": "0.1.2"
+  }
+}

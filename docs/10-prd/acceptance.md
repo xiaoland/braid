@@ -1,14 +1,8 @@
 # End-to-End Acceptance
 
-This document is the PRD acceptance oracle. It defines what "done" means for
-Braid: real GitHub Work Items, the packaged Rust binary, a real public webhook
-path, a real Codex app-server, and observable Agent behavior. Unit/component/
-fake transport checks may diagnose code but do not satisfy this contract.
-
-Braid is accepted only through real GitHub Work Items, the packaged Rust
-binary, a real public webhook path, a real Codex app-server, and observable
-Agent behavior. Unit/component/fake transport checks may diagnose code but do
-not satisfy this contract.
+本文件持有真实产品验收判据。GitHub 后端的下述 campaign 要求真实工作项、
+发行 binary、公网 webhook、原生执行器及可观察 Agent 行为；内建平台的入口与
+判别事实见末尾内建空间章节。编译和机械对象操作各自只支持它们实际覆盖的结论。
 
 ## Boundary and Fixture
 
@@ -32,9 +26,8 @@ control, provider executable, Git, installed artifact, and OTLP export. SQLite
 inspection, internal Rust APIs, fake providers/GitHub, and hand-injected inbox
 events are never pass oracles.
 
-Acceptance helpers under [`../../scripts/tests/`](../../scripts/tests/) remain
-operator scripts until the workflow stabilizes. GitHub objects and Human
-verdicts are the product oracle.
+验收按本页描述操作真实产品并保留原始证据，不维护或运行自动测试、模拟、包 smoke
+或换名后的自检入口。GitHub 对象和人工判断仍是产品验收依据。
 
 ## Campaign Setup
 
@@ -108,8 +101,13 @@ Codex thread, and inject current complete Context. The replacement must contain
 new description/comment bodies, only metadata for the minimized/deleted
 comments, and no stale body or provider transcript.
 
-Repeat equivalent lifecycle on an idle group. Context/session is replaced but
-no turn starts until a Wake Event. Unminimizing the comment restores its body and
+Repeat equivalent lifecycle on an idle active group without posting another
+comment or mention. Context/session replacement must preserve one ordinary
+pending input, and after debounce the Agent must handle the revised agreement.
+Its observable behavior must use the new description, not the superseded
+requirement; it may discuss, revise, clarify or explicitly wait. Repeat delivery
+and restart while waiting: neither may silently settle the input or add a second
+turn for the same revision. Unminimizing the comment restores its body and
 creates a Wake Event. Older-after-newer webhook redelivery must not regress the
 projection or create a duplicate turn.
 
@@ -121,8 +119,10 @@ Draft PR, native association, ActivationIntent, PR Agent generation, PR Profile,
 and dedicated worktree must result. When the selected branch initially equals
 base, the PR contains exactly one Braid App bootstrap commit whose tree equals
 its parent and whose message identifies the request comment; it changes no
-file. A second distinct request comment may create a second PR; 1:N and N:1
-associations must not be rejected.
+file. A second distinct request comment must independently deliver activation to its
+own PR and start that authorized PR Agent; 1:N and N:1 associations must not be
+rejected. An applied ensure receipt must report durable activation delivery,
+separately from provider readiness/completion. PR existence alone is not pass.
 
 The PR Agent's initial Context must contain all current directly Associated
 Issues followed by the PR section. Open Issues are complete; a closed Issue is
@@ -138,6 +138,14 @@ and must refresh Context before that turn, but must not interrupt the active PR
 turn. Close the Issue: its description/comments disappear from future PR
 Context while reference/state remain. Reopen restores full Context.
 
+在受控旧版 fixture 上重现“PR 已创建、激活未送达”的历史缺口，再升级：使用旧版
+对同仓库第二个不同 Implementation Request 创建 PR，以公开 receipt/status 记录缺失，
+不用 SQL 制造状态。升级前先修订 Issue、更换原 Source Context；新版仍应安全补交
+固定 PR 的原实现职责，不重推分支、不建重复 PR，首个 PR turn 必须读取当前设计与
+已接收的 review。另测源或目标关闭、关联移除、目标已有 blocked/retired 历史，均
+不能因恢复而自动解阻或新增 generation。后续评论复用同一受管 head 时，回执应沿用
+原 implementation request；不同 head 的独立请求仍支持多个 PR。
+
 ### 5. Origin and Working-Memory Maintenance
 
 Use `braid gh` from each Agent to update its description/body and create one
@@ -150,6 +158,11 @@ configured stable GitHub actor. Braid must not block it, and the exact actor
 match suppresses self-wake/reset. Repeat under an unconfigured/shared Human
 identity: it remains allowed but is processed as a normal external change and
 may wake/invalidate. This is the explicit autonomy/attribution tradeoff.
+
+Have the Human revise an Agent-maintained description while preserving its old
+Braid attribution block. It must still be handled as a Human revision. Repeat
+with webhook delivery unavailable so canonical reconciliation observes it;
+original authorship and displayed attribution must not suppress the newer input.
 
 ### 6. Close, Merge, Reopen, and Finalization
 
@@ -176,12 +189,26 @@ Exercise duplicate delivery, temporary tunnel loss, 60-second reconciliation,
 and an out-of-order edit. GitHub state must converge without duplicate logical
 turns, reactions, status comments, or `pr ensure` PRs.
 
+While the Issue Agent is idle, lose a body-edit webhook and let another complete
+Context read (including an associated PR read) see the new description first.
+Periodic reconciliation must still deliver the changed agreement to the Issue
+Agent without an extra mention. Repeat with only a timestamp or hidden HTML
+comment changed: no new work is required. Recover the Tunnel without restarting
+Agent execution: the public signed ingress and the App's registered URL must
+agree before reporting connected; failures must be visibly degraded.
+
 Restart Braid while debouncing, while a reaction/status write is uncertain, and
 while a provider turn is active. Repository owner lease, batches, outbox, and
 same compatible physical thread must converge without parallel turns. Disconnect
 app-server without terminal evidence: Braid keeps the turn unknown, preserves
 the trusted mention's `rocket`, and updates Operational Status rather than
 claiming success/failure.
+
+在可复用旧版 fixture 中发布一条真实 Operational Status，观察其 webhook 被接收后
+读取完整 Context。该 comment 可以不进入 Agent Context，但不能因此被认成 GitHub
+已删除。升级后，旧错误 tombstone 对应的评论仍在 canonical API 中可见时，对账应
+自行恢复且 status 本身不产生业务 turn；不允许通过直接改库作为 pass oracle。对真正
+较新 edit、读取期间到达的 delete，保留乱序保护并以安全元数据说明冲突来源。
 
 ### 9. Telemetry, Migration, and Distribution
 
@@ -208,8 +235,14 @@ restore the pre-migration backup rather than executing a down migration.
   observable by 45 seconds absent recorded GitHub/provider outage;
 - eight-event threshold or trusted mention: provider acceptance/reaction by 15
   seconds;
-- reconciliation-only missed event: observable processing by 105 seconds with
-  a 60-second interval;
+- reconciliation-only missed event on OPEN/live-assignment Work Items: observable
+  processing by 110 seconds under normal budget with a 60-second successful
+  traversal interval (includes up to five seconds of local due-check delay);
+- closed/merged history without materializing/active/finalizing Assignments:
+  missed-event recovery is due 30 minutes after the last complete traversal,
+  plus up to five seconds of local due-check delay and processing time; quota or
+  network pressure explicitly reports degraded/delayed instead of meeting these
+  normal-budget timing targets;
 - unassignment and Cross-surface description invalidation: debounce before
   retirement/interruption.
 
@@ -223,3 +256,64 @@ assertions but cannot substitute for public product behavior.
 The golden Issue-to-PR journey must pass without corrective operator action. A
 fresh installation and fixture must pass the entire campaign three consecutive
 times before the implementation PR becomes ready.
+
+## 多 repository instance 的验收边界
+
+多仓库验收使用同一个 GitHub App、一个 webhook/tunnel 入口和两个已配置
+repository。两个 repository 使用不同的 Profile/user_instructions 与独立
+source checkout，最好包含相同 Issue 编号以证明裸 number 不成为身份。分别
+触发 trusted mention，核对：事件只进入所属 repository 的队列；Context 标题、
+正文和评论不混入另一仓库；worktree 路径按 repository 隔离；comment/reaction、
+status 和 `pr ensure` 都使用目标 repository 的 scoped client。第三个已安装但
+未配置 repository 的 signed delivery 必须在调度前拒绝。跨 repository native
+association 仍按既有 PR Context 合同由目标 PR 的 scoped client 读取；它不会把
+另一个 repository 纳入调度、Profile 绑定或共享工作图。当前 MVP 桥接仍要求
+同一 instance 的 Profiles 使用相同 adapter_type，不宣称混合 Codex/Pi 多仓库。
+
+## 内建空间的验收边界
+
+内建平台的操作验收从公开 `platform/init/object/serve` 入口进行：没有 GitHub App 配置时，
+创建、指派、讨论、关联 PR、发布与采用实际候选，重启后仍能读写并投递剩余输入。
+核对对象、队列、Git 引用和具体执行状态。机械对象操作不代替模型实际消费和
+多 Agent 协作效果；需要判断完整 Agent 工作经历时，应在获授权的真实模型任务上
+沿同一流程取证，不构造 provider 或修改私有执行状态。当前隔离操作结果归任务
+记录，不据此宣称完成下述 GitHub campaign 或完整模型验收。
+
+## Braid Console 的实际验收
+
+Braid Console 不依赖 Factory。内建平台场景使用独立真实 Git checkout，先只配置
+平台而不启动 Harness，实际创建并讨论 Issue，再接入仅传输 Harness，核对对象 revision、事件和
+命令回执；两个页面并发编辑时旧 revision 必须明确冲突且保留草稿。同一 request
+ID 取回同一结果，不重复创建；不同命令不能复用该 ID。
+
+通过页面从真实候选分支建立关联 PR，阅读实际 diff，明确发布配置 source 或
+登记 worktree 的已提交候选，再合并至未被 checkout 的 base。核对发布 OID、
+持久合并意图、base 新提交及具体失败；对象关闭和原生执行停止分别取证。
+
+由真实 OpenTelemetry SDK 向 Console 发送三信号，核对原始封包、解码属性、
+采样边界、接收与发生时间，以及原件下载。重发保留传输事实；坏 protobuf、gzip
+和超限请求保留具体状态与原因，Collector 重启后仍可按游标阅读旧记录。真实
+存储不可用返回可重试 503，不把正常遥测批次误判为坏数据。
+
+通过页面启动和停止 runtime，接受回执不能代替就绪或停止确认。runtime 已停
+时 Collector 与对象接口继续可用；未确认停止不可启动替代执行。完整 Agent
+验收还需获授权的真实 provider/session/turn 运行，编译及无模型操作不替代这一
+证明。本轮不推导新的模型、GitHub 或发布授权。
+
+平台与 Harness 边界必须通过实际操作取得反馈：平台无 Harness 时可持续读写；
+停止并更换 Harness 后同一对象、历史和事件仍存在，新消费者拥有独立 cursor；
+撤销 writer grant 后，相同 actor 和对象 revision 的迟到命令拒绝。旧 Local 数据
+显式导入保留身份及回执，原数据库保留且旧写入口不能继续使用。Console 对任一
+上游提供同一 Harness 控制合同；没有真实 GitHub 授权时只核对配置/入口，不宣称
+完成 GitHub 网络或 Agent 全链路验收。
+
+## Root 自主运行验收
+
+有限运行需要独立的真实模型资格。仅传入 description，由 root 自行形成可分工子项、
+实际指派、创建并实现 PR，消费依赖成果并形成明确交付 commit；开发 Agent 不代写业务答案。
+在同一记录中分别确认创建、启动、成果采用和终态，不以手动对象操作或编译代替自主行为。
+
+另外实际核对 root 提前关闭、静默未完成、合并冲突、停止和同 run 接续：提前关闭须保留
+未完义务且撤销旧 writer，静默不报完成，未确认停止不得替代，同一输入不重复建 root。
+普通 serve 与其对象无关的运行保持原合同；并发参数只按在途 Braid turns 判断，不冒称
+验证了原生 subagents/background 或宿主总资源上限。候选应用的实际业务验收单独保留。

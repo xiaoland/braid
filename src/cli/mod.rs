@@ -20,6 +20,7 @@ use crate::{
     writer::{self, CommentCreateRequest, PullRequestEnsureRequest},
 };
 
+mod assignment;
 mod config;
 mod context_cmd;
 mod doctor_cmd;
@@ -28,11 +29,12 @@ mod gh_cmd;
 mod helpers;
 mod migrate;
 mod profile;
+mod provider_cmd;
 mod status;
 mod telemetry_cmd;
 
 #[derive(Debug, Parser)]
-#[command(name = "braid", version, about = "GitHub working memory for local coding agents")]
+#[command(name = "braid", version, about = "Collaboration working memory for coding agents")]
 pub struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -41,6 +43,15 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Setup(SetupArguments),
+    Object(ObjectArguments),
+    /// Built-in collaboration platform, independent of the Agent Harness.
+    Platform(crate::platform::cli::PlatformArguments),
+    /// Initialize a Braid-owned collaboration space around a local Git checkout.
+    Init(crate::local::init::InitArguments),
+    Assignment {
+        #[command(subcommand)]
+        command: AssignmentCommand,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -48,6 +59,10 @@ enum Command {
     Profile {
         #[command(subcommand)]
         command: ProfileCommand,
+    },
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
     },
     Migrate {
         #[command(subcommand)]
@@ -76,6 +91,43 @@ enum Command {
         command: TunnelCommand,
     },
     Serve(ServeArguments),
+    /// Complete one root task using the built-in collaboration platform.
+    Run(RunArguments),
+    /// Local OTLP collector, browser Console, and optional managed runtime.
+    Console(crate::console::ConsoleArgs),
+}
+
+#[derive(Debug, Args)]
+struct ObjectArguments {
+    #[command(flatten)]
+    source: ConfigSource,
+    /// Reuse the original identity when recovering an uncertain object command.
+    #[arg(long, global = true)]
+    request_id: Option<String>,
+    /// Reject a mutation when the platform object has changed since this revision.
+    #[arg(long, global = true)]
+    expected_revision: Option<u64>,
+    #[command(subcommand)]
+    command: crate::local::cli::LocalCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AssignmentCommand {
+    Reactivate(AssignmentReactivate),
+}
+
+#[derive(Debug, Args)]
+struct AssignmentReactivate {
+    #[arg(value_name = "NUMBER")]
+    number: u64,
+    #[command(flatten)]
+    source: ConfigSource,
+    #[arg(long, value_name = "OWNER/REPOSITORY")]
+    repository: Option<String>,
+    #[arg(long, value_name = "issue|pr", default_value = "issue", value_parser = ["issue", "pr"])]
+    kind: String,
+    #[arg(long, value_name = "TEXT")]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -86,6 +138,11 @@ enum ConfigCommand {
 #[derive(Debug, Subcommand)]
 enum ProfileCommand {
     Inspect(ProfileInspect),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderCommand {
+    ImportAuth(provider_cmd::ProviderImportAuth),
 }
 
 #[derive(Debug, Subcommand)]
@@ -120,6 +177,7 @@ enum GitHubCommand {
 
 #[derive(Debug, Subcommand)]
 enum GhCommand {
+    Status(GhWriteStatus),
     Comment {
         #[command(subcommand)]
         command: GhCommentCommand,
@@ -128,6 +186,19 @@ enum GhCommand {
         #[command(subcommand)]
         command: GhPrCommand,
     },
+    Issue {
+        #[command(subcommand)]
+        command: GhBodyCommand,
+    },
+}
+
+#[derive(Debug, Args)]
+struct GhWriteStatus {
+    request_id: String,
+    #[command(flatten)]
+    source: ConfigSource,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,6 +209,75 @@ enum GhCommentCommand {
 #[derive(Debug, Subcommand)]
 enum GhPrCommand {
     Ensure(GhPrEnsure),
+    Handoff(GhPrHandoff),
+    Read(GhBodyRead),
+    Edit(GhBodyEdit),
+}
+
+#[derive(Debug, Subcommand)]
+enum GhBodyCommand {
+    Read(GhBodyRead),
+    Edit(GhBodyEdit),
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct GhInvocation {
+    /// Turn reference supplied by the Braid runtime prompt (verified against durable state and cwd).
+    #[arg(long)]
+    source_turn: Option<String>,
+    /// Explicit audited human entry; unavailable inside Agent runtime worktrees.
+    #[arg(long)]
+    operator: bool,
+}
+impl GhInvocation {
+    fn resolve(self) -> writer::Invocation {
+        self.source_turn.map_or(writer::Invocation::Operator, writer::Invocation::Agent)
+    }
+}
+
+#[derive(Debug, Args)]
+struct GhPrHandoff {
+    target: String,
+    #[command(flatten)]
+    source: ConfigSource,
+    #[arg(long)]
+    source_turn: String,
+    #[arg(long)]
+    request_id: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct GhBodyRead {
+    target: String,
+    #[command(flatten)]
+    source: ConfigSource,
+    /// Save the canonical snapshot for a later edit.
+    #[arg(long)]
+    output: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct GhBodyEdit {
+    target: String,
+    #[command(flatten)]
+    source: ConfigSource,
+    #[command(flatten)]
+    invocation: GhInvocation,
+    #[arg(long)]
+    profile: String,
+    #[arg(long)]
+    snapshot: PathBuf,
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long)]
+    body_file: Option<PathBuf>,
+    #[arg(long)]
+    request_id: String,
+    #[arg(long)]
+    json: bool,
 }
 
 /// Shared config source: exact `--config <PATH>` or registry lookup via
@@ -145,7 +285,7 @@ enum GhPrCommand {
 /// this struct.
 #[derive(Debug, Args)]
 struct ConfigSource {
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "BRAID_CONFIG")]
     config: Option<PathBuf>,
     #[arg(long, value_name = "KEY", env = "BRAID_INSTANCE")]
     instance: Option<String>,
@@ -245,6 +385,8 @@ struct GitHubRedeliver {
 
 #[derive(Debug, Args)]
 struct GhCommentCreate {
+    #[command(flatten)]
+    invocation: GhInvocation,
     #[arg(value_name = "OWNER/REPOSITORY#NUMBER")]
     target: String,
     #[command(flatten)]
@@ -263,10 +405,14 @@ struct GhCommentCreate {
 
 #[derive(Debug, Args)]
 struct GhPrEnsure {
+    #[command(flatten)]
+    invocation: GhInvocation,
     #[arg(long, value_name = "ISSUE_COMMENT_ID")]
     comment: u64,
     #[command(flatten)]
     source: ConfigSource,
+    #[arg(long, value_name = "OWNER/REPOSITORY")]
+    repository: Option<String>,
     #[arg(long, value_name = "BRANCH")]
     head: Option<String>,
     #[arg(long)]
@@ -277,20 +423,35 @@ struct GhPrEnsure {
 pub(crate) struct SetupArguments {
     #[arg(value_name = "OWNER/REPOSITORY")]
     pub(crate) repository: String,
-    #[arg(long, value_name = "pi|codex", default_value = "pi")]
-    pub(crate) provider: String,
-    #[arg(long, value_name = "MODEL", default_value = "deepseek-chat")]
-    pub(crate) model: String,
-    #[arg(long, value_name = "ENV", default_value = "DEEPSEEK_API_KEY")]
-    pub(crate) api_key_environment: String,
+    /// Agent runtime adapter to discover or verify. This does not select an LLM provider.
+    #[arg(long, value_name = "pi|codex", value_parser = ["pi", "codex"])]
+    pub(crate) adapter: String,
+    #[arg(long, value_name = "MODEL")]
+    pub(crate) model: Option<String>,
+    /// Optional reasoning/thinking level for runtimes that support one.
+    #[arg(long, value_name = "LEVEL")]
+    pub(crate) reasoning: Option<String>,
+    /// Pi-only LLM provider catalog id; Braid does not infer one from the adapter.
+    #[arg(long, value_name = "ID")]
+    pub(crate) llm_provider: Option<String>,
+    /// Pi-only credential kind for the selected LLM provider.
+    #[arg(long, value_name = "api_key|oauth|none", value_parser = ["api_key", "oauth", "none"])]
+    pub(crate) llm_credential_kind: Option<String>,
+    /// Pi-only Braid-schema credential file; required unless kind is `none`.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) llm_credential_file: Option<PathBuf>,
+    /// Pi-only provider endpoint rendered into models.json.
+    #[arg(long, value_name = "URL")]
+    pub(crate) llm_base_url: Option<String>,
     #[arg(long, value_name = "KEY", env = "BRAID_INSTANCE")]
     pub(crate) instance: Option<String>,
     #[arg(long, value_name = "DIR", env = "BRAID_USER_HOME", default_value = "~/.braid")]
     pub(crate) user_home: PathBuf,
-    #[arg(long, value_name = "PATH", conflicts_with = "runtime_api_url")]
+    #[arg(long, value_name = "PATH")]
     pub(crate) runtime_executable: Option<PathBuf>,
-    #[arg(long, value_name = "URL", conflicts_with = "runtime_executable")]
-    pub(crate) runtime_api_url: Option<String>,
+    /// Complete a prior `--no-browser` setup from the GitHub redirect URL.
+    #[arg(long, value_name = "URL", conflicts_with = "no_browser")]
+    pub(crate) callback_url: Option<String>,
     #[arg(
         long,
         help = "Skip opening a browser; print manifest values and manual instructions instead"
@@ -307,8 +468,25 @@ struct ServeArguments {
         help = "Expose ingress through a free Wrangler Quick Tunnel and own the App webhook while running"
     )]
     tunnel: bool,
-    #[arg(long, help = "Run GitHub transport without starting the configured Coding Agent")]
+    #[arg(long, help = "Run collaboration transport without starting the configured Coding Agent")]
     transport_only: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunArguments {
+    #[command(flatten)]
+    source: ConfigSource,
+    #[arg(long)]
+    run_id: String,
+    #[arg(long, conflicts_with = "description_file", required_unless_present = "description_file")]
+    root_issue: Option<u64>,
+    #[arg(long, conflicts_with = "root_issue", required_unless_present = "root_issue")]
+    description_file: Option<PathBuf>,
+    #[arg(long)]
+    delivery_ref: String,
+    /// Maximum simultaneously active Braid turns, including the root (not a process limit).
+    #[arg(long, default_value_t = 2)]
+    max_concurrency: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -321,6 +499,13 @@ struct ContextReport<'a> {
 
 #[derive(Debug, Serialize)]
 struct CommentWriteResult<'a> {
+    request_id: &'a str,
+    stage: Option<&'a str>,
+    activation: Option<&'static str>,
+    implementation_request: Option<&'a str>,
+    head: Option<&'a str>,
+    base: Option<&'a str>,
+    pull_request: Option<String>,
     operation: &'a str,
     state: &'a str,
     target: &'a str,
@@ -331,25 +516,11 @@ struct CommentWriteResult<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct PullRequestEnsureResult<'a> {
-    operation: &'static str,
-    state: &'a str,
-    stage: &'a str,
-    implementation_request_comment: u64,
-    issue: String,
-    base: &'a str,
-    head: &'a str,
-    profile: &'a str,
-    pull_request: Option<String>,
-    error: Option<&'a str>,
-}
-
-#[derive(Debug, Serialize)]
 struct LocalStatus<'a> {
     binary_version: &'static str,
     config_schema: u32,
     instance_key: &'a str,
-    repository: &'a str,
+    repository: String,
     default_pr_profile: &'a str,
     database: StoreStatus,
     telemetry_endpoint: String,
@@ -360,11 +531,17 @@ struct LocalStatus<'a> {
 
 pub async fn run() -> Result<()> {
     match Cli::parse().command {
+        Command::Assignment { command: AssignmentCommand::Reactivate(arguments) } => {
+            assignment::reactivate(arguments)?;
+        }
         Command::Config { command: ConfigCommand::Check(arguments) } => {
             config::config_check(&arguments)?;
         }
         Command::Profile { command: ProfileCommand::Inspect(arguments) } => {
             profile::profile_inspect(&arguments)?;
+        }
+        Command::Provider { command: ProviderCommand::ImportAuth(arguments) } => {
+            provider_cmd::import_auth(&arguments)?;
         }
         Command::Migrate { command } => migrate::migrate(command)?,
         Command::Status(arguments) => {
@@ -375,7 +552,7 @@ pub async fn run() -> Result<()> {
         }
         Command::Context { command } => Box::pin(context_cmd::context(command)).await?,
         Command::Github { command } => gh::github(command).await?,
-        Command::Gh { command } => Box::pin(gh_cmd::gh(command)).await?,
+        Command::Gh { command } => gh_cmd::gh(command)?,
         Command::Telemetry { command: TelemetryCommand::Probe(arguments) } => {
             telemetry_cmd::telemetry_probe(arguments).await?;
         }
@@ -387,6 +564,53 @@ pub async fn run() -> Result<()> {
             let config = helpers::load(&config_path)?;
             crate::runtime::serve(config, arguments.tunnel, !arguments.transport_only).await?;
         }
+        Command::Run(arguments) => {
+            let config = helpers::load(&arguments.source.resolve_config_path()?)?;
+            let request = crate::run::RunRequest {
+                run_id: arguments.run_id,
+                root_issue: arguments.root_issue,
+                description: arguments.description_file.map(fs::read_to_string).transpose()?,
+                delivery_ref: arguments.delivery_ref,
+                max_concurrency: arguments.max_concurrency,
+            };
+            request.validate(&config)?;
+            let telemetry = crate::telemetry::TelemetryGuard::install(
+                &config.telemetry,
+                config.instance_key(),
+            )?;
+            let generation = uuid::Uuid::now_v7().to_string();
+            crate::telemetry::set_runtime_generation(Some(generation));
+            let health = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::runtime::initial_health(&config, true),
+            ));
+            let (stop, shutdown) = tokio::sync::watch::channel(false);
+            let mut runtime = Box::pin(crate::run::run_managed(config, request, shutdown, health));
+            let result = tokio::select! {result=&mut runtime=>result, signal=crate::runtime::wait_for_shutdown_signal()=> {let _=stop.send(true);signal?;runtime.await}};
+            crate::telemetry::set_runtime_generation(None);
+            telemetry.shutdown()?;
+            let result = result?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            if result.state != crate::run::RunState::Completed {
+                bail!(
+                    "finite run ended as {:?}: {}",
+                    result.state,
+                    result.reason.as_deref().unwrap_or("no detail")
+                );
+            }
+        }
+        Command::Init(arguments) => crate::local::init::run(arguments).await?,
+        Command::Object(arguments) => {
+            let config = helpers::load(&arguments.source.resolve_config_path()?)?;
+            crate::local::cli::run_options(
+                arguments.command,
+                &config,
+                arguments.request_id,
+                arguments.expected_revision,
+            )
+            .await?;
+        }
+        Command::Platform(arguments) => crate::platform::cli::run(arguments).await?,
+        Command::Console(arguments) => crate::console::serve(arguments).await?,
         Command::Setup(arguments) => {
             setup::run(arguments).await?;
         }
