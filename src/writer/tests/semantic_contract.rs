@@ -45,15 +45,11 @@ fn processed(o: &context::CanonicalObservation) -> CanonicalObjectState {
 fn observe(f: &Fixture, github: &GitHubClient, current: &CanonicalContext) -> usize {
     let observations = context::canonical_observations(current);
     let root = &observations[0];
-    let prior = f
-        .store
-        .processed_objects(root.work_item_node_id.clone())
-        .unwrap()
-        .into_iter()
-        .map(|o| (o.node_id.clone(), o))
-        .collect::<BTreeMap<_, _>>();
-    let previous = prior
-        .get(&root.work_item_node_id)
+    let basis = f.store.begin_observation(root.work_item_node_id.clone()).unwrap();
+    let previous = basis
+        .objects
+        .iter()
+        .find(|o| o.node_id == root.work_item_node_id)
         .map_or(root.work_item_state.clone(), |o| o.lifecycle.clone());
     let scope = crate::producer::reconcile::ReconcileScope {
         work_item_node_id: root.work_item_node_id.clone(),
@@ -69,7 +65,7 @@ fn observe(f: &Fixture, github: &GitHubClient, current: &CanonicalContext) -> us
         github,
         &f.config,
         &scope,
-        &prior,
+        basis,
         &observations,
     )
     .unwrap()
@@ -142,8 +138,7 @@ async fn contract_hidden_comment_edit_is_not_new_work_during_reconciliation() {
     let prior = context::canonical_observations(&current).iter().map(processed).collect();
     f.store
         .commit_observation(ObservationCommit {
-            work_item_node_id: "item".into(),
-            expected: vec![],
+            basis: f.store.begin_observation("item".into()).unwrap(),
             current: prior,
             events: vec![],
             policy: policy(),
@@ -214,7 +209,8 @@ async fn contract_restoration_cycles_survive_polling_and_share_a_real_ingress_re
     thread_state(&mut current, true);
     observe(&f, &github, &current);
     f.store.ingest_event(raw_restoration("another-restoration", "pr", 9), policy()).unwrap();
-    let expected = f.store.processed_objects("pr".into()).unwrap();
+    let basis = f.store.begin_observation("pr".into()).unwrap();
+    let expected = basis.objects.clone();
     thread_state(&mut current, false);
     let CanonicalContext::PullRequest(pr) = &mut current else { unreachable!() };
     pr.review_threads[0].path = "different-file.rs".into();
@@ -223,8 +219,7 @@ async fn contract_restoration_cycles_survive_polling_and_share_a_real_ingress_re
     assert!(
         f.store
             .commit_observation(ObservationCommit {
-                work_item_node_id: "pr".into(),
-                expected: expected.clone(),
+                basis,
                 current: context::canonical_observations(&current).iter().map(processed).collect(),
                 events: vec![invalid],
                 policy: policy()

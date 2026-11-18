@@ -171,6 +171,7 @@ async fn reconcile_work_item(
     let mut changes = 0;
     let repository = work_item.repository.parse::<RepositoryName>()?;
     let locator = WorkItemLocator { repository, number: work_item.number };
+    let basis = store.begin_observation(work_item.node_id.clone())?;
     let mut canonical = if work_item.kind == "issue" {
         CanonicalContext::Issue(context::materialize_issue(github, &locator, 100).await?)
     } else if work_item.kind == "pr" {
@@ -180,23 +181,6 @@ async fn reconcile_work_item(
     } else {
         return Ok(0);
     };
-    let prior = store
-        .processed_objects(work_item.node_id.clone())?
-        .into_iter()
-        .filter(|object| {
-            matches!(
-                object.object_kind.as_str(),
-                "issue"
-                    | "pr"
-                    | "issue_comment"
-                    | "pr_comment"
-                    | "review"
-                    | "review_comment"
-                    | "review_thread"
-            )
-        })
-        .map(|object| (object.node_id.clone(), object))
-        .collect::<BTreeMap<_, _>>();
     let scope = match &canonical {
         CanonicalContext::Issue(issue) => ReconcileScope {
             work_item_node_id: issue.node_id.clone(),
@@ -218,7 +202,7 @@ async fn reconcile_work_item(
         },
     };
     let observations = context::canonical_observations(&canonical);
-    changes += reconcile_observations(store, github, config, &scope, &prior, &observations)?;
+    changes += reconcile_observations(store, github, config, &scope, basis, &observations)?;
     context::reconcile_local_state(&mut canonical, store)?;
     let profile = if work_item.kind == "pr" {
         config.pr_profile_for_repository(&work_item.repository)?
@@ -240,9 +224,16 @@ pub(crate) fn reconcile_observations(
     github: &GitHubClient,
     config: &Config,
     scope: &ReconcileScope,
-    prior: &BTreeMap<String, CanonicalObjectState>,
+    basis: crate::store::ObservationBasis,
     current: &[CanonicalObservation],
 ) -> Result<usize> {
+    let prior = basis
+        .objects
+        .iter()
+        .cloned()
+        .map(|object| (object.node_id.clone(), object))
+        .collect::<BTreeMap<_, _>>();
+    let operational = store.operational_status_comment_ids(scope.work_item_node_id.clone())?;
     let current_map = current
         .iter()
         .map(|observation| (observation.object_node_id.as_str(), observation))
@@ -272,6 +263,15 @@ pub(crate) fn reconcile_observations(
         .collect::<Vec<_>>();
     for observation in current {
         let previous = prior.get(&observation.object_node_id);
+        if operational.contains(&observation.object_node_id) {
+            if previous.is_none_or(|p| !observation_unchanged(p, observation)) {
+                let mut event =
+                    reconciled_event(observation, "observed", EventKind::Noop, true, false, config);
+                event.requires_attention = false;
+                events.push(event);
+            }
+            continue;
+        }
         // A work-item state transition (close/reopen/merge) must never be
         // skipped: the body digest often survives it, and the issue/pr
         // unchanged rule intentionally treats digest-equal as unchanged for
@@ -388,7 +388,7 @@ pub(crate) fn reconcile_observations(
             } else {
                 "issue_comment"
             },
-            version: format!("{}:deleted", previous.version),
+            version: previous.version.clone(),
             digest: previous.digest.clone(),
             lifecycle: "deleted",
             author_node_id: previous.author_node_id.clone(),
@@ -405,7 +405,11 @@ pub(crate) fn reconcile_observations(
         events.push(reconciled_event(
             &observation,
             "deleted",
-            EventKind::Invalidate,
+            if operational.contains(&previous.node_id) {
+                EventKind::Noop
+            } else {
+                EventKind::Invalidate
+            },
             true,
             false,
             config,
@@ -413,8 +417,7 @@ pub(crate) fn reconcile_observations(
     }
     store
         .commit_observation(crate::store::ObservationCommit {
-            work_item_node_id: scope.work_item_node_id.clone(),
-            expected: prior.values().cloned().collect(),
+            basis,
             current: processed,
             events,
             policy,
@@ -430,11 +433,13 @@ pub(crate) fn observation_is_external(
     config: &Config,
 ) -> Result<bool> {
     let fingerprint = observation.version_digest();
-    if store.is_agent_version(
-        observation.object_node_id.clone(),
-        observation.version.clone(),
-        fingerprint,
-    )? {
+    if matches!(action, "created" | "submitted" | "edited")
+        && store.is_agent_version(
+            observation.object_node_id.clone(),
+            observation.version.clone(),
+            fingerprint,
+        )?
+    {
         return Ok(false);
     }
     // The creator is evidence for creation only, never for a later Human edit.
@@ -481,6 +486,9 @@ pub(crate) fn reconciled_change(
     let restored = previous.is_some_and(|previous| {
         previous.lifecycle == "minimized" && observation.lifecycle == "active"
     });
+    if previous.is_some_and(|p| p.lifecycle == "deleted") && observation.lifecycle != "deleted" {
+        return ("restored", EventKind::Wake);
+    }
     match observation.object_kind {
         "issue" | "pr" | "review_thread" if previous.is_none() => ("observed", EventKind::Noop),
         "review_thread"
@@ -549,8 +557,8 @@ pub(crate) fn reconciled_event(
         "version":observation.version,
     }))
     .expect("reconciliation evidence serializes");
-    let occurrence =
-        observation.object_kind == "review_thread" || matches!(action, "minimized" | "unminimized");
+    let occurrence = observation.object_kind == "review_thread"
+        || matches!(action, "minimized" | "unminimized" | "restored" | "deleted");
     let delivery_guid = if occurrence {
         format!("reconcile-transition-{}", uuid::Uuid::now_v7())
     } else {

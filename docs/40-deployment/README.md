@@ -367,6 +367,32 @@ and stable secret, then select the events declared in the GitHub boundary
 contract. Once that hook exists, `serve --tunnel` reads its prior URL, patches
 the verified temporary URL, and restores the prior URL on graceful shutdown.
 
+### 升级现有实现请求与原生材料
+
+Schema 12 会把“已固定 PR，但 activation receipt 缺失”的旧错误 applied ensure 重新
+交给原 outbox。迁移本身不启动 Agent；服务恢复后，执行 owner 重验当前精确 PR、
+源 Issue 的 OPEN 状态、canonical 关联、Profile 与生命周期，再补交原授权。已有
+blocked/sleeping/retired/finalizing 历史不会被 ensure 自动解阻或换代。升级前应检查
+这些待恢复请求，尤其旧版本已创建却从未交接的 PR；不要把它误解为按任意关联自动
+授权新角色，也不要把 applied 当成模型已执行。
+
+Braid 二进制升级不会替换配置引用的 immutable Pi 安装。新版本源码中的环境修复
+只有在新材料实际被引用后才生效；禁止原地改动 manifest 已锁定的安装。保留旧材料
+时，可由服务显式设置正确的 `GH_CONFIG_DIR` 作为过渡，路径不能由 Agent 猜测。
+材料 identity 检查和 `pi --version` 不证明 execution-local 环境下的默认 gh/Git
+credential helper 可用；安装验收要在那个环境中验证，仅报告结果，绝不输出 token
+或 credential 的值。
+
+切换服务配置前，用候选 binary 对候选配置执行 `braid doctor --config PATH`。
+只读 Session compatibility 检查将当前有效材料与最新既有 generation 比较，并对
+可静态重建的 GitHub 工作项校验指令。Built-in 按已显式选择的 Profile 比较材料；
+有限 run 的动态协调指令仍由运行时校验，预检不猜测它。不更改 assignment、Agent、
+Session 或分支。材料/指令不匹配会明确失败；材料回退后
+仍 blocked 或执行 unknown 也不会被当成已恢复。先保持兼容配置，或明确用
+`assignment reactivate` 创建新 generation。恢复完全相同 Profile 只是复用旧 generation
+的必要条件，不是 owned execution 已停止的证明；当前不提供把旧 blocked 记录自动
+翻回 active 的通用入口，不把现场特定的 SQL 逆向操作当作受支持恢复流程。
+
 ## Health and Status
 
 Loopback `/healthz` and `braid status` expose bounded, non-semantic state:

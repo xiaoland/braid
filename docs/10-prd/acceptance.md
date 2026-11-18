@@ -138,6 +138,14 @@ and must refresh Context before that turn, but must not interrupt the active PR
 turn. Close the Issue: its description/comments disappear from future PR
 Context while reference/state remain. Reopen restores full Context.
 
+在受控旧版 fixture 上重现“PR 已创建、激活未送达”的历史缺口，再升级：使用旧版
+对同仓库第二个不同 Implementation Request 创建 PR，以公开 receipt/status 记录缺失，
+不用 SQL 制造状态。升级前先修订 Issue、更换原 Source Context；新版仍应安全补交
+固定 PR 的原实现职责，不重推分支、不建重复 PR，首个 PR turn 必须读取当前设计与
+已接收的 review。另测源或目标关闭、关联移除、目标已有 blocked/retired 历史，均
+不能因恢复而自动解阻或新增 generation。后续评论复用同一受管 head 时，回执应沿用
+原 implementation request；不同 head 的独立请求仍支持多个 PR。
+
 ### 5. Origin and Working-Memory Maintenance
 
 Use `braid gh` from each Agent to update its description/body and create one
@@ -195,6 +203,12 @@ same compatible physical thread must converge without parallel turns. Disconnect
 app-server without terminal evidence: Braid keeps the turn unknown, preserves
 the trusted mention's `rocket`, and updates Operational Status rather than
 claiming success/failure.
+
+在可复用旧版 fixture 中发布一条真实 Operational Status，观察其 webhook 被接收后
+读取完整 Context。该 comment 可以不进入 Agent Context，但不能因此被认成 GitHub
+已删除。升级后，旧错误 tombstone 对应的评论仍在 canonical API 中可见时，对账应
+自行恢复且 status 本身不产生业务 turn；不允许通过直接改库作为 pass oracle。对真正
+较新 edit、读取期间到达的 delete，保留乱序保护并以安全元数据说明冲突来源。
 
 ### 9. Telemetry, Migration, and Distribution
 

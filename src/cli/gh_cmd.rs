@@ -111,6 +111,7 @@ fn print_gh_receipt(
             operation: &receipt.operation,
             stage: plan.as_ref().map(|plan| plan.stage.as_str()),
             activation: plan.as_ref().map(|plan| activation_delivery(plan)),
+            implementation_request: plan.as_ref().map(|plan| plan.root_request_id.as_str()),
             head: plan.as_ref().map(|plan| plan.head_ref.as_str()),
             base: plan.as_ref().map(|plan| plan.base_ref.as_str()),
             pull_request: plan
@@ -140,6 +141,7 @@ fn print_gh_receipt(
         println!("Profile: {} ({})", receipt.profile_id, receipt.role);
         if let Some(plan) = &plan {
             println!("stage: {}", plan.stage);
+            println!("implementation request: {}", plan.root_request_id);
             println!(
                 "activation delivery: {} (not execution completion)",
                 activation_delivery(plan)

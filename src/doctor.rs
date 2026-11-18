@@ -1,3 +1,4 @@
+mod compatibility;
 use std::{
     collections::HashMap,
     net::{TcpStream, ToSocketAddrs},
@@ -74,6 +75,18 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
         }
     });
 
+    let candidate = config.clone();
+    checks.push(
+        match tokio::task::spawn_blocking(move || compatibility::check(&candidate)).await {
+            Ok(check) => check,
+            Err(error) => Check {
+                name: "persisted Session compatibility".into(),
+                state: CheckState::Fail,
+                detail: format!("cannot inspect retained Sessions: {error}"),
+            },
+        },
+    );
+
     match config.default_provider_config() {
         Ok(provider_config) => {
             if let Some(codex) = provider_config.codex {
@@ -109,7 +122,7 @@ pub async fn run(config: &Config, user_home: &UserHome) -> DoctorReport {
                         Ok(()) => Check {
                             name: "Pi native material".into(),
                             state: CheckState::Pass,
-                            detail: "locked file identities verified; live capabilities checked at session startup".into(),
+                            detail: format!("locked file identities verified; live capabilities checked at session startup; configured entry={} (binary upgrade does not replace this install); default gh/Git execution-environment credentials are not verified here",pi.executable.display()),
                         },
                         Err(error) => Check {
                             name: "Pi native material".into(),

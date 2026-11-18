@@ -20,8 +20,13 @@ without requiring another Human mention.
 
 An Issue Agent or Human may request implementation through a concise Issue
 comment. `braid gh pr ensure` uses that comment's GitHub ID as the
-Implementation Request key, so concurrent calls for the same request converge
-on one Draft PR. It establishes native Issue association and PR Activation. If
+creation idempotency key, so concurrent calls for the same request converge
+on one Draft PR. 创建后，原 Implementation Request 与固定的 PR 身份承担长期协作义务，
+而不是要求每条催办评论另建一个 PR。后续评论显式复用同一个受管 head 时，只有在
+原计划、源 Issue、固定 PR node、base/head、PR Profile 与 canonical 直接关联都一致
+且双方仍 OPEN 的条件下才续接原请求。不同 head 的独立请求仍允许形成 1:N。
+续接 ensure 不表示新的设计输入已被执行；已激活 PR 的后续处理沿 review Wake／显式
+handoff 交付，不隐式增加 turn。 It establishes native Issue association and PR Activation. If
 the selected remote head has no difference from base, Braid creates an
 App-authored empty bootstrap commit with the same tree, so GitHub can open the
 Draft PR before implementation changes exist. This public commit changes no
@@ -30,6 +35,12 @@ the resulting branch/worktree. An applied ensure receipt must confirm durable
 delivery of the activation to that exact PR, not merely that the PR exists.
 Activation delivery is distinct from executor readiness or implementation
 completion; any blocked handover must remain diagnosable.
+
+已固定 PR 的激活交付未完成时，恢复的是原来已授权的职责承诺。Source Context
+替换仍禁止旧输出继续远端写入，但不会让已发布 PR 的交接永远依赖旧 turn 存活。
+恢复前重验当前 OPEN 状态、精确身份、关联与 Profile；已有匹配的 active/materializing
+角色可以幂等采用，已有 blocked/sleeping/retired/finalizing 历史不能被 ensure 自动
+解阻或换代。这与“任意关联自动激活 PR”不同。
 
 PR Profile selection is deterministic: use the sole eligible `pr` Profile, or
 the configured default when several exist; otherwise leave activation visibly

@@ -128,6 +128,9 @@ impl Database {
             connection
                 .execute_batch(include_str!("../migrations/0011_collaboration_inputs.sql"))
                 .unwrap();
+            connection
+                .execute_batch(include_str!("../migrations/0012_implementation_delivery.sql"))
+                .unwrap();
         }
         Self(path)
     }
@@ -235,6 +238,7 @@ fn ensure_plan_and_progress_freeze_and_resume_without_replanning() {
     let write = intent("pr_ensure");
     let receipt = prepare_gh_write(&db.0, &write).unwrap();
     let mut plan = NewImplementationRequest {
+        root_intent_id: None,
         write,
         comment_database_id: 7,
         comment_node_id: "comment".into(),

@@ -37,13 +37,21 @@ Versioning once release artifacts are published.
   HTTP 账单由 Issue 13→5、PR 10→5；保留分页和前后 marker，不推断线上 points 同降。
 - `status` 分开显示原始 runnable 数、durable 领取资格及当前/历史代；物理 provider
   可用性仍明确未知，不因对象 closed/merged 就删除可能合法的 Finalization。
-- Harness schema 升至 **11**；配置 schema 保持 3。处理基线与普通 Context 投影分开，
+- Harness schema 升至 **12**；配置 schema 保持 3。处理基线与普通 Context 投影分开，
   完整观察的事件和基线原子提交；发生身份与版本身份分开，接单复用记录可追溯。
   升级前须停止旧 runtime 并执行带备份的迁移。旧 binary 不能打开升级后的账本；回滚需停止新 runtime，
   将升级前备份恢复到独立 runtime 目录，不支持 down migration。
 
 ### Fixed
 
+- Operational Status 的展示过滤不再被当作删除证据；完整成员集合与 Agent 投影分开。
+  本地 tombstone 不是上游 updatedAt，当前正向完整观察可安全纠正；读取前事件栅栏
+  防止提交期间的新 delete 被旧快照覆盖，冲突会说明 node、版本、状态和来源。
+- 已固定 PR 的未交付 ensure 可恢复原职责，不因旧 Source Context 替换而永久丢失；
+  任何远端写入仍受原 Source fence 约束。后续评论显式复用受管 head 时续接原请求，
+  不因新 marker 创建重复 PR；关闭、移除关联或已有撤销/阻塞历史仍严格拒绝。
+- doctor 增加只读 Session 材料/指令兼容性预检，候选配置不匹配或回退后仍 blocked
+  会明确失败，不改既有 generation，也不把文件完整性验证误称默认 gh/Git 认证已验证。
 - 普通 Context／关联 PR 读取不再提前消费 Issue 的变更；stale 判定不再依赖可被读取
   覆盖的投影。无版本的反复恢复不会撞键，隐藏 HTML／时间变化不会制造语义工作。
   Human 保留旧 Braid 署名的编辑也不再被误判为 OriginEcho。

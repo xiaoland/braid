@@ -348,7 +348,6 @@ pub fn reconcile_local_state(
                 reconcile_issue_comments(issue, store)?;
             }
             let excluded = store.operational_status_comment_ids(pull_request.node_id.clone())?;
-            pull_request.conversation.retain(|comment| !excluded.contains(&comment.node_id));
             let mut tombstones = store.reconcile_comments(comment_set(
                 &pull_request.repository_node_id,
                 &pull_request.repository,
@@ -361,6 +360,8 @@ pub fn reconcile_local_state(
                 "pr_comment",
                 &pull_request.conversation,
             ))?;
+            // Projection exclusions are not evidence of upstream deletion.
+            pull_request.conversation.retain(|comment| !excluded.contains(&comment.node_id));
             tombstones.retain(|comment| !excluded.contains(&comment.node_id));
             extend_tombstones(
                 &mut pull_request.conversation,
@@ -737,7 +738,6 @@ fn reconcile_issue_comments(
 ) -> Result<(), ContextError> {
     let work_item_digest = issue_root_digest(issue);
     let excluded = store.operational_status_comment_ids(issue.node_id.clone())?;
-    issue.comments.retain(|comment| !excluded.contains(&comment.node_id));
     let mut tombstones = store.reconcile_comments(comment_set(
         &issue.repository_node_id,
         &issue.repository,
@@ -750,6 +750,7 @@ fn reconcile_issue_comments(
         "issue_comment",
         &issue.comments,
     ))?;
+    issue.comments.retain(|comment| !excluded.contains(&comment.node_id));
     tombstones.retain(|comment| !excluded.contains(&comment.node_id));
     extend_tombstones(&mut issue.comments, tombstones, &issue.repository, issue.number);
     store.reconcile_associations(AssociationSet {

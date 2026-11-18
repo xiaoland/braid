@@ -202,6 +202,16 @@ compares its expected frontier, admits all resulting events, and commits the new
 frontier. Failure or a changed precondition commits neither. Network awaits never
 occur inside that transaction. The frontier is an acknowledgement of classified
 input, not a second current-content authority or another execution queue.
+完整观察在 API 遍历前取得 processed frontier 与已接纳事件 watermark，提交时同时
+校验；读取期间新 delete 等事件到达会拒绝整个旧快照。缺失是负向观察，不是更晚的
+上游 updatedAt；本地 tombstone 的时间不能压过 API 当前仍可见对象。正向完整观察
+可以纠正它，旧 webhook 不可直接复活 tombstone，真正较新的正向 edit 仍受保护。
+冲突报告包含 node、类型、双方版本、对象状态与证据来源，不包含正文。
+
+Context 的完整成员集合必须先维护 ledger，再作 Agent 展示过滤。Operational Status
+是受管输出；过滤它不表示删除，它的恢复也不产生业务 Wake。展示投影不能充当缺失
+推断的输入。这一约束同样适用于 Issue 与 PR conversation。
+
 Event staleness likewise uses admitted change evidence and the processed frontier,
 never a Context cache row. Root synchronize/assignment hints do not acknowledge
 body changes. Comparable upstream timestamps may reject older facts; lifecycle
@@ -231,9 +241,10 @@ creation; an edited comment's unknown current actor cannot inherit the creator's
 trusted-mention authority. Already-active responsibilities still receive ordinary
 attention for real revisions when the current action actor is unknown.
 
-Migration bootstraps a new frontier from retained observations; it cannot prove
-that old silently lost inputs were executed. Historical activation gaps remain
-visible and require explicit authorized recovery, never automatic activation.
+迁移建立新的观察边界，不能据此证明历史丢失输入已执行。Schema 12 将已接受且
+固定精确 PR、却没有 activation receipt 的错误 applied ensure 重新交给唯一 outbox。
+这是原请求的交付恢复，不根据任意 native 关联新建职责；当前 canonical 源/目标、
+Profile、生命周期与读取期间事件栅栏都必须重新验证，撤销/阻塞的角色不被自动重建。
 
 Webhook 是观察，不是完整历史。巡检在正常预算下按两档到期：OPEN Work Item，
 或仍有 materializing/active/finalizing Assignment 的条目，完整巡检成功后默认

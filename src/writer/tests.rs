@@ -104,8 +104,20 @@ enum TargetKind {
     PullRequest,
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Authority {
+    #[default]
+    Intact,
+    SourceClosed,
+    TargetClosed,
+    AssociationRemoved,
+    OtherIssue,
+}
+
 #[derive(Default)]
 struct Remote {
+    authority: Authority,
+    pr_body: Option<String>,
     create_pr: bool,
     target_kind: TargetKind,
     pr_created: bool,
@@ -121,12 +133,16 @@ async fn server(
     let listing = remote.clone();
     let writing = remote.clone();
     let target = remote.clone();
+    let continuation = remote.clone();
+    let pr_read = remote.clone();
+    let associations = remote.clone();
     let pr = json!({"id":88,"node_id":"pr","number":9,"html_url":"https://github.com/owner/repository/pull/9","draft":true,"state":"open","body":"Closes #1\n\nImplementation request: https://github.com/owner/repository/issues/comments/7","head":{"ref":"head","sha":"new"},"base":{"ref":"main","sha":"base"}});
     let router = Router::new()
         .route("/repos/owner/repository/issues/1", get(move || { let remote=target.clone(); async move {
             use axum::response::IntoResponse as _;
             if remote.lock().unwrap().limit.is_some() { return (axum::http::StatusCode::TOO_MANY_REQUESTS, [("retry-after","120")], Json(json!({"message":"rate limit"}))).into_response(); }
             let mut item = json!({"id":1,"node_id":"item","number":1,"title":"Issue","state":"open","html_url":"https://github.com/owner/repository/issues/1"});
+            if remote.lock().unwrap().authority==Authority::SourceClosed {item["state"]=json!("closed");}
             if matches!(remote.lock().unwrap().target_kind, TargetKind::PullRequest) { item["pull_request"] = json!({"url":"pr"}); }
             Json(item).into_response()
         }}))
@@ -136,6 +152,8 @@ async fn server(
             remote.comments.push(comment); Json(json!({"id":99,"node_id":"comment"}))
         }}))
         .route("/repos/owner/repository/issues/comments/7", get(|| async { Json(json!({"id":7,"node_id":"request-comment","url":"https://api.github.com/repos/owner/repository/issues/comments/7","html_url":"https://github.com/owner/repository/issues/1#issuecomment-7","issue_url":"https://api.github.com/repos/owner/repository/issues/1","body":"implement","created_at":"now","updated_at":"now"})) }))
+        .route("/repos/owner/repository/issues/comments/8",get(move||{let remote=continuation.clone();async move{let number=if remote.lock().unwrap().authority==Authority::OtherIssue {2}else{1};Json(json!({"id":8,"node_id":"followup-comment","html_url":format!("https://github.com/owner/repository/issues/{number}#issuecomment-8"),"issue_url":format!("https://api.github.com/repos/owner/repository/issues/{number}"),"body":"continue current implementation","created_at":"now","updated_at":"now"}))}}))
+        .route("/repos/owner/repository/issues/2",get(||async{Json(json!({"id":2,"node_id":"other-issue","number":2,"title":"Other issue","state":"open","html_url":"https://github.com/owner/repository/issues/2"}))}))
         .route("/repos/owner/repository", get(|| async { Json(json!({"default_branch":"main"})) }))
         .route("/repos/owner/repository/pulls", get({ let pr=pr.clone(); let remote=remote.clone(); move || { let pr=pr.clone(); let remote=remote.clone(); async move { let state=remote.lock().unwrap(); Json(if state.create_pr && !state.pr_created {json!([])} else {json!([pr])}) } }}).post({ let pr=pr.clone(); let remote=remote.clone(); move || {let pr=pr.clone(); let remote=remote.clone(); async move { let mut state=remote.lock().unwrap(); state.pr_created=true; state.writes+=1; Json(pr) }}}))
         .route("/repos/owner/repository/git/ref/heads/main",get(|| async {Json(json!({"ref":"refs/heads/main","object":{"sha":"base"}}))}))
@@ -146,8 +164,9 @@ async fn server(
         .route("/repos/owner/repository/git/commits/base",get(|| async {Json(json!({"sha":"base","tree":{"sha":"tree"}}))}))
         .route("/repos/owner/repository/git/commits",post({let remote=remote.clone(); move || {let remote=remote.clone(); async move {remote.lock().unwrap().writes+=1; Json(json!({"sha":"new","tree":{"sha":"tree"}}))}}}))
         .route("/repos/owner/repository/git/refs",post({let remote=remote.clone(); move || {let remote=remote.clone(); async move {let mut state=remote.lock().unwrap(); state.head_created=true; state.writes+=1; Json(json!({"ref":"refs/heads/head","object":{"sha":"new"}}))}}}))
-        .route("/repos/owner/repository/pulls/9", get(move || {let pr=pr.clone(); async move {Json(pr)}}))
-        .route("/graphql", post(|| async { Json(json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[{"number":1,"repository":{"nameWithOwner":"owner/repository"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}})) }));
+        .route("/repos/owner/repository/pulls/9", get(move || {let mut pr=pr.clone();let remote=pr_read.clone(); async move {let remote=remote.lock().unwrap();if remote.authority==Authority::TargetClosed{pr["state"]=json!("closed");}
+            if let Some(body)=&remote.pr_body{pr["body"]=json!(body);}Json(pr)}}))
+        .route("/graphql", post(move||{let remote=associations.clone(); async move {let nodes=if remote.lock().unwrap().authority==Authority::AssociationRemoved{json!([])}else{json!([{"number":1,"repository":{"nameWithOwner":"owner/repository"}}])};Json(json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}})) }}));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
@@ -396,6 +415,8 @@ mod body_edit;
 
 mod continuous_collaboration;
 mod handoff;
+mod implementation_recovery;
+mod observation_recovery;
 mod semantic_contract;
 
 pub(crate) async fn issue_context_server(

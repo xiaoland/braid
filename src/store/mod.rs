@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 mod observations;
 mod reconciliation;
-pub(crate) use observations::{ObservationCommit, publication_digest};
+pub(crate) use observations::{ObservationBasis, ObservationCommit, publication_digest};
 mod scheduler_status;
 pub use reconciliation::TrackedWorkItem;
 pub use scheduler_status::BatchEligibility;
@@ -25,6 +25,8 @@ mod builtin;
 mod runs;
 pub use runs::RunCommand;
 mod gh_writes;
+mod implementation_delivery;
+pub(crate) use implementation_delivery::PrActivation;
 pub(crate) mod handoff;
 mod write_execution;
 use write_execution::{claim_github_write, finish_github_write, recover_writes};
@@ -40,7 +42,7 @@ use gh_writes::{
     prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 11;
+pub const DATABASE_SCHEMA_VERSION: u32 = 12;
 
 const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
 const EVENT_KINDS_SQL: &str = include_str!("../../migrations/0002_event_kinds.sql");
@@ -92,6 +94,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "collaboration_inputs",
         sql: include_str!("../../migrations/0011_collaboration_inputs.sql"),
     },
+    Migration {
+        version: 12,
+        name: "implementation_delivery",
+        sql: include_str!("../../migrations/0012_implementation_delivery.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -122,6 +129,12 @@ pub enum StoreError {
     SchemaNotReady { found: u32, required: u32 },
     #[error("invalid durable state: {0}")]
     InvalidData(String),
+    #[error(transparent)]
+    ObservationConflict(Box<observations::ObservationConflict>),
+    #[error(
+        "events arrived during canonical traversal for {node}: {expected} -> {admitted}; reread canonical state"
+    )]
+    ObservationChanged { node: String, expected: i64, admitted: i64 },
     #[error("another Braid runtime owns {scope} until {expires_at}")]
     RuntimeBusy { scope: String, expires_at: String },
 }
@@ -873,6 +886,7 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
+    #[cfg(test)]
     pub(crate) fn processed_objects(
         &self,
         work_item: String,
@@ -880,6 +894,17 @@ impl StoreActor {
         let (reply, receiver) = mpsc::channel();
         self.sender
             .send(Command::ProcessedObjects(work_item, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub(crate) fn begin_observation(
+        &self,
+        work_item: String,
+    ) -> Result<ObservationBasis, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::BeginObservation(work_item, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -922,17 +947,22 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub(crate) fn accept_pr_activation(
+    pub(crate) fn managed_implementations(
         &self,
-        intent: String,
-        repository_node: String,
-        node: String,
-        number: u64,
-        policy: SchedulerPolicy,
-    ) -> Result<(), StoreError> {
+        repository: String,
+        head: String,
+    ) -> Result<Vec<ImplementationRequestReceipt>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::AcceptPrActivation(intent, repository_node, node, number, policy, reply))
+            .send(Command::ManagedImplementations(repository, head, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub(crate) fn accept_pr_activation(&self, activation: PrActivation) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::AcceptPrActivation(Box::new(activation), reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1497,18 +1527,18 @@ enum Command {
     RecordImplementationProgress(String, ImplementationProgress, Sender<Result<(), StoreError>>),
     DueReconciliationWorkItems(u64, Sender<Result<Vec<TrackedWorkItem>, StoreError>>),
     RecordReconciliation(String, bool, Sender<Result<(), StoreError>>),
+    #[cfg(test)]
     ProcessedObjects(String, Sender<Result<Vec<CanonicalObjectState>, StoreError>>),
+    BeginObservation(String, Sender<Result<ObservationBasis, StoreError>>),
     CommitObservation(Box<ObservationCommit>, Sender<Result<usize, StoreError>>),
     RecordPublicationVersion(String, String, String, String, Sender<Result<(), StoreError>>),
     IsAgentVersion(String, String, String, Sender<Result<bool, StoreError>>),
-    AcceptPrActivation(
+    ManagedImplementations(
         String,
         String,
-        String,
-        u64,
-        SchedulerPolicy,
-        Sender<Result<(), StoreError>>,
+        Sender<Result<Vec<ImplementationRequestReceipt>, StoreError>>,
     ),
+    AcceptPrActivation(Box<PrActivation>, Sender<Result<(), StoreError>>),
     BeginReconciliation(String, String, Sender<Result<ReconciliationRun, StoreError>>),
     FinishReconciliation(
         ReconciliationRun,
@@ -1741,11 +1771,15 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
                 });
                 let _ = reply.send(result);
             }
+            #[cfg(test)]
             Command::ProcessedObjects(work_item, reply) => {
                 let _ = reply.send(
                     open_read_only(database)
                         .and_then(|connection| observations::load(&connection, &work_item)),
                 );
+            }
+            Command::BeginObservation(work_item, reply) => {
+                let _ = reply.send(observations::begin(database, &work_item));
             }
             Command::CommitObservation(observation, reply) => {
                 let _ = reply.send(observations::commit(database, &observation));
@@ -1760,15 +1794,12 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
                     observations::is_agent_version(&connection, &node, &version, &digest)
                 }));
             }
-            Command::AcceptPrActivation(intent, repository_node, node, number, policy, reply) => {
-                let _ = reply.send(observations::accept_pr_activation(
-                    database,
-                    &intent,
-                    &repository_node,
-                    &node,
-                    number,
-                    policy,
-                ));
+            Command::ManagedImplementations(repository, head, reply) => {
+                let _ =
+                    reply.send(gh_writes::managed_implementations(database, &repository, &head));
+            }
+            Command::AcceptPrActivation(activation, reply) => {
+                let _ = reply.send(implementation_delivery::accept(database, &activation));
             }
             Command::BeginReconciliation(repository_node_id, repository_name, reply) => {
                 let _ = reply.send(begin_reconciliation(
@@ -2243,7 +2274,7 @@ fn reconcile_comments(
         if !current_ids.contains(comment.node_id.as_str()) {
             transaction.execute(
                 "UPDATE canonical_objects
-                 SET lifecycle='deleted', version=?2, observed_at=?2
+                 SET lifecycle='deleted', observed_at=?2
                  WHERE node_id=?1",
                 params![comment.node_id, observed_at],
             )?;
@@ -2304,7 +2335,7 @@ fn operational_status_comment_ids(
     let mut statement = connection.prepare(
         "SELECT remote_comment_node_id
          FROM status_comments
-         WHERE work_item_node_id=?1 AND remote_comment_node_id IS NOT NULL AND lifecycle != 'deleted'",
+         WHERE work_item_node_id=?1 AND remote_comment_node_id IS NOT NULL",
     )?;
     let rows = statement.query_map([work_item_node_id], |row| row.get::<_, String>(0))?;
     rows.collect::<Result<BTreeSet<_>, _>>().map_err(StoreError::from)
@@ -2407,6 +2438,12 @@ fn reconcile_associations(database: &Path, update: &AssociationSet) -> Result<()
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum Admission {
+    Event,
+    CanonicalObservation,
+}
+
 #[allow(clippy::too_many_lines)]
 fn ingest_event(
     database: &Path,
@@ -2422,7 +2459,7 @@ fn ingest_event(
             "observed transitions require a complete observation commit".into(),
         ));
     }
-    let result = ingest_event_on(&transaction, event, policy)?;
+    let result = ingest_event_on(&transaction, event, policy, Admission::Event)?;
     transaction.commit()?;
     Ok(result)
 }
@@ -2432,6 +2469,7 @@ fn ingest_event_on(
     transaction: &rusqlite::Transaction<'_>,
     event: &IngressEvent,
     policy: SchedulerPolicy,
+    admission: Admission,
 ) -> Result<IngestResult, StoreError> {
     let now = now_rfc3339();
     if event.identity == ChangeIdentity::ObjectVersion
@@ -2467,7 +2505,10 @@ fn ingest_event_on(
     }
 
     let object_kind = event_object_kind(event);
-    let stale = observations::event_is_stale(transaction, event, object_kind)?;
+    let stale = match admission {
+        Admission::Event => observations::event_is_stale(transaction, event, object_kind)?,
+        Admission::CanonicalObservation => false,
+    };
     transaction.execute(
         "INSERT INTO repositories(node_id,name_with_owner,observed_at)
          VALUES (?1,?2,?3)

@@ -232,7 +232,11 @@ pub(crate) async fn execute(
             return Err(GitHubError::GraphQl("frozen Profile mismatch".into()).into());
         }
         github.require_write_permissions(&["pull_requests", "contents"])?;
-        check_source(config, &receipt)?;
+        if plan.pull_request_number.is_none() {
+            check_source(config, &receipt)?;
+        } else {
+            check_execution_owner(config, &receipt)?;
+        }
         let pr =
             ensure::converge_pull_request(config, github, store, &plan, mutation_possible).await?;
         Ok(RemoteWrite { database_id: pr.id.to_string(), node_id: pr.node_id })
@@ -273,10 +277,21 @@ pub(crate) fn resolve_source(
     }
 }
 
+pub(crate) fn check_execution_owner(
+    config: &Config,
+    receipt: &GhWriteReceipt,
+) -> Result<(), GitHubError> {
+    let owner = receipt
+        .execution_owner
+        .as_ref()
+        .ok_or_else(|| GitHubError::GraphQl("publication has no runtime owner".into()))?;
+    crate::store::check_publication_owner(config.runtime.database(), owner)
+        .map_err(|e| GitHubError::GraphQl(e.to_string()))
+}
+
 pub(crate) fn check_source(config: &Config, receipt: &GhWriteReceipt) -> Result<(), GitHubError> {
-    if let Some(owner) = &receipt.execution_owner {
-        crate::store::check_publication_owner(config.runtime.database(), owner)
-            .map_err(|e| GitHubError::GraphQl(e.to_string()))?;
+    if receipt.execution_owner.is_some() {
+        check_execution_owner(config, receipt)?;
     }
     if let Some(source) = &receipt.source {
         crate::store::publication_source::check(config.runtime.database(), source)

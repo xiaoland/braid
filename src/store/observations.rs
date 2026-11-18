@@ -4,11 +4,74 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use sha2::{Digest as _, Sha256};
 use std::path::Path;
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "complete observation predates classified object {node} ({kind}): snapshot={snapshot_version} [{snapshot_lifecycle}], classified={classified_version} evidence={classified_evidence}"
+)]
+pub struct ObservationConflict {
+    pub node: String,
+    pub kind: String,
+    pub snapshot_version: String,
+    pub snapshot_lifecycle: String,
+    pub classified_version: String,
+    pub classified_evidence: String,
+}
+
+/// Captured before the API traversal, never reconstructed from its result.
+#[derive(Debug, Clone)]
+pub(crate) struct ObservationBasis {
+    work_item_node_id: String,
+    pub objects: Vec<CanonicalObjectState>,
+    admitted_events: i64,
+}
+
+pub(super) fn begin(database: &Path, work_item: &str) -> Result<ObservationBasis, StoreError> {
+    super::require_current_schema(database)?;
+    let mut connection = super::open_read_only(database)?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    let tx = connection.transaction()?;
+    let basis = ObservationBasis {
+        work_item_node_id: work_item.into(),
+        objects: load(&tx, work_item)?,
+        admitted_events: watermark(&tx, work_item)?,
+    };
+    tx.commit()?;
+    Ok(basis)
+}
+
+pub(super) fn require_current_events(
+    connection: &Connection,
+    basis: &ObservationBasis,
+    node: &str,
+) -> Result<(), StoreError> {
+    if basis.work_item_node_id != node {
+        return Err(StoreError::InvalidData("observation belongs to a different object".into()));
+    }
+    let admitted = watermark(connection, node)?;
+    if admitted != basis.admitted_events {
+        return Err(StoreError::ObservationChanged {
+            node: node.into(),
+            expected: basis.admitted_events,
+            admitted,
+        });
+    }
+    Ok(())
+}
+
+fn watermark(connection: &Connection, work_item: &str) -> Result<i64, StoreError> {
+    connection
+        .query_row(
+            "SELECT COALESCE(MAX(rowid),0) FROM events WHERE work_item_node_id=?1",
+            [work_item],
+            |r| r.get(0),
+        )
+        .map_err(Into::into)
+}
+
 /// The producer prepares classification outside `SQLite`. This compare-and-commit
 /// either persists every resulting event and the new frontier, or neither.
 pub(crate) struct ObservationCommit {
-    pub work_item_node_id: String,
-    pub expected: Vec<CanonicalObjectState>,
+    pub basis: ObservationBasis,
     pub current: Vec<CanonicalObjectState>,
     pub events: Vec<IngressEvent>,
     pub policy: SchedulerPolicy,
@@ -46,32 +109,34 @@ pub(super) fn commit(
     let mut connection = super::open_read_write(database)?;
     super::configure_connection(&connection)?;
     let tx = connection.transaction()?;
-    let mut expected = observation.expected.clone();
+    let work_item = &observation.basis.work_item_node_id;
+    let mut expected = observation.basis.objects.clone();
     expected.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-    if load(&tx, &observation.work_item_node_id)? != expected {
+    if load(&tx, work_item)? != expected {
         return Err(StoreError::InvalidData(
             "processed observation changed before commit; reread canonical state".into(),
         ));
     }
+    require_current_events(&tx, &observation.basis, work_item)?;
     for object in &observation.current {
         if let Some(at) = comparable_timestamp(&object.version, &object.object_kind)
-            && latest_classified_time(
-                &tx,
-                &observation.work_item_node_id,
-                &object.node_id,
-                &object.object_kind,
-            )?
-            .is_some_and(|known| known > at)
+            && let Some(known) =
+                latest_positive_version(&tx, work_item, &object.node_id, &object.object_kind)?
+            && known.at > at
         {
-            return Err(StoreError::InvalidData(
-                "complete observation predates an admitted object change; reread canonical state"
-                    .into(),
-            ));
+            return Err(StoreError::ObservationConflict(Box::new(ObservationConflict {
+                node: object.node_id.clone(),
+                kind: object.object_kind.clone(),
+                snapshot_version: object.version.clone(),
+                snapshot_lifecycle: object.lifecycle.clone(),
+                classified_version: known.version,
+                classified_evidence: known.source,
+            })));
         }
     }
     let mut changes = 0;
     for event in &observation.events {
-        if event.work_item_node_id.as_deref() != Some(&observation.work_item_node_id) {
+        if event.work_item_node_id.as_deref() != Some(work_item) {
             return Err(StoreError::InvalidData(
                 "observation event belongs to a different responsibility".into(),
             ));
@@ -98,21 +163,31 @@ pub(super) fn commit(
                 ));
             }
         }
-        let result = super::ingest_event_on(&tx, event, observation.policy)?;
+        let result = super::ingest_event_on(
+            &tx,
+            event,
+            observation.policy,
+            super::Admission::CanonicalObservation,
+        )?;
         changes += usize::from(result.event_id.is_some());
     }
     // Empty snapshots are not valid observations of an existing Work Item.
-    if !observation.current.iter().any(|object| object.node_id == observation.work_item_node_id) {
+    if !observation.current.iter().any(|object| object.node_id == *work_item) {
         return Err(StoreError::InvalidData("complete observation has no root".into()));
     }
-    tx.execute(
-        "DELETE FROM processed_objects WHERE work_item_node_id=?1",
-        [&observation.work_item_node_id],
-    )?;
+    tx.execute("DELETE FROM processed_objects WHERE work_item_node_id=?1", [work_item])?;
     for object in &observation.current {
-        tx.execute("INSERT INTO processed_objects(work_item_node_id,node_id,database_id,object_kind,version,digest,lifecycle,author_node_id,author_login,metadata_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![observation.work_item_node_id,object.node_id,object.database_id,object.object_kind,object.version,object.digest,object.lifecycle,object.author_node_id,object.author_login,object.metadata_digest])?;
+        tx.execute("INSERT INTO processed_objects(work_item_node_id,node_id,database_id,object_kind,version,digest,lifecycle,author_node_id,author_login,metadata_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![work_item,object.node_id,object.database_id,object.object_kind,object.version,object.digest,object.lifecycle,object.author_node_id,object.author_login,object.metadata_digest])?;
     }
     tx.commit()?;
+    for object in &observation.current {
+        if let Some(before) =
+            expected.iter().find(|old| old.node_id == object.node_id && old.lifecycle == "deleted")
+            && object.lifecycle != "deleted"
+        {
+            tracing::info!(object_node_id=%object.node_id,object_kind=%object.object_kind,previous_version=%before.version,current_version=%object.version,current_lifecycle=%object.lifecycle,"fresh canonical presence corrected an absence observation");
+        }
+    }
     Ok(changes)
 }
 
@@ -131,25 +206,48 @@ fn comparable_timestamp(version: &str, kind: &str) -> Option<time::OffsetDateTim
         .ok()
 }
 
-fn latest_classified_time(
+struct ClassifiedVersion {
+    at: time::OffsetDateTime,
+    version: String,
+    source: String,
+}
+
+fn latest_positive_version(
     connection: &Connection,
     work_item: &str,
     node: &str,
     kind: &str,
-) -> Result<Option<time::OffsetDateTime>, StoreError> {
-    let processed: Option<String> = connection
+) -> Result<Option<ClassifiedVersion>, StoreError> {
+    let processed: Option<(String,String)> = connection
         .query_row(
-            "SELECT version FROM processed_objects WHERE work_item_node_id=?1 AND node_id=?2",
+            "SELECT version,lifecycle FROM processed_objects WHERE work_item_node_id=?1 AND node_id=?2 AND lifecycle!='deleted'",
             params![work_item, node],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?,r.get(1)?)),
         )
         .optional()?;
-    let mut latest = processed.as_deref().and_then(|v| comparable_timestamp(v, kind));
+    let mut latest = processed.and_then(|(version, lifecycle)| {
+        comparable_timestamp(&version, kind).map(|at| ClassifiedVersion {
+            at,
+            version,
+            source: format!("processed/{lifecycle}"),
+        })
+    });
     let root = matches!(kind, "issue" | "pr");
-    let mut statement = connection.prepare("SELECT object_version FROM events WHERE object_node_id=?1 AND object_version IS NOT NULL AND lifecycle!='superseded' AND (?2=0 OR kind='lifecycle' OR (kind IN ('invalidate','origin_echo') AND detail='edited'))")?;
-    for version in statement.query_map(params![node, root], |r| r.get::<_, String>(0))? {
-        if let Some(at) = comparable_timestamp(&version?, kind) {
-            latest = Some(latest.map_or(at, |old| old.max(at)));
+    // Absence/deletion observations have no upstream edit clock. In particular,
+    // old projection tombstones contain local observation time, not updatedAt.
+    let mut statement = connection.prepare("SELECT object_version,kind,detail FROM events WHERE object_node_id=?1 AND object_version IS NOT NULL AND lifecycle!='superseded' AND detail IS NOT 'deleted' AND (?2=0 OR kind='lifecycle' OR (kind IN ('invalidate','origin_echo') AND detail='edited'))")?;
+    for row in statement.query_map(params![node, root], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+    })? {
+        let (version, event_kind, detail) = row?;
+        if let Some(at) = comparable_timestamp(&version, kind)
+            && latest.as_ref().is_none_or(|old| old.at < at)
+        {
+            latest = Some(ClassifiedVersion {
+                at,
+                version,
+                source: format!("event/{event_kind}/{}", detail.as_deref().unwrap_or("none")),
+            });
         }
     }
     Ok(latest)
@@ -160,11 +258,6 @@ pub(super) fn event_is_stale(
     event: &IngressEvent,
     kind: Option<&str>,
 ) -> Result<bool, StoreError> {
-    // A complete observation has a stronger, atomic precondition checked above;
-    // partial webhook hints must not acknowledge it through a mutable cache.
-    if event.delivery_guid.starts_with("reconcile-") {
-        return Ok(false);
-    }
     let (Some(kind), Some(node), Some(version), Some(work_item)) = (
         kind,
         event.object_node_id.as_deref(),
@@ -173,10 +266,15 @@ pub(super) fn event_is_stale(
     ) else {
         return Ok(false);
     };
+    if event.detail != Some("deleted") && connection.query_row("SELECT EXISTS(SELECT 1 FROM processed_objects WHERE work_item_node_id=?1 AND node_id=?2 AND lifecycle='deleted')",params![work_item,node],|r|r.get::<_,bool>(0))? {
+        // Only a fresh complete observation may restore an absent object.
+        return Ok(true);
+    }
     let Some(at) = comparable_timestamp(version, kind) else {
         return Ok(false);
     };
-    Ok(latest_classified_time(connection, work_item, node, kind)?.is_some_and(|known| known > at))
+    Ok(latest_positive_version(connection, work_item, node, kind)?
+        .is_some_and(|known| known.at > at))
 }
 
 pub(super) fn matching_latest_transition(
@@ -235,74 +333,4 @@ pub(super) fn is_agent_version(
     digest: &str,
 ) -> Result<bool, StoreError> {
     connection.query_row("SELECT EXISTS(SELECT 1 FROM publication_versions WHERE node_id=?1 AND version=?2 AND digest=?3) OR EXISTS(SELECT 1 FROM events WHERE object_node_id=?1 AND object_version=?2 AND body_digest=?3 AND origin='agent')",params![node,version,digest],|row| row.get(0)).map_err(Into::into)
-}
-
-/// PR existence and activation delivery are separate commitments. Only this
-/// domain operation can bind the ensure plan to its durable activation event.
-pub(super) fn accept_pr_activation(
-    database: &Path,
-    intent: &str,
-    repository_node: &str,
-    node: &str,
-    number: u64,
-    policy: SchedulerPolicy,
-) -> Result<(), StoreError> {
-    super::require_current_schema(database)?;
-    let mut connection = super::open_read_write(database)?;
-    super::configure_connection(&connection)?;
-    let tx = connection.transaction()?;
-    let (repository, request, comment, expected_node, expected_number, source): (String,String,i64,Option<String>,Option<i64>,Option<String>) = tx.query_row(
-        "SELECT i.repository,w.public_request_id,i.comment_database_id,i.pull_request_node_id,i.pull_request_number,w.source_binding
-         FROM implementation_requests i JOIN write_intents w ON w.intent_id=i.intent_id
-         WHERE i.intent_id=?1 AND w.operation='pr_ensure'", [intent],
-        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
-    )?;
-    if expected_node.as_deref() != Some(node)
-        || expected_number != Some(super::sqlite_u64(number, "PR number")?)
-    {
-        return Err(StoreError::InvalidData(
-            "activation target differs from frozen ensure plan".into(),
-        ));
-    }
-    if let Some(source) = source {
-        let source = serde_json::from_str(&source)
-            .map_err(|e| StoreError::InvalidData(format!("invalid activation source: {e}")))?;
-        super::publication_source::validate(&tx, &source)?;
-    }
-    let delivery = format!("braid-pr-ensure-v2-{request}");
-    let event = IngressEvent {
-        identity: super::ChangeIdentity::Occurrence,
-        delivery_guid: delivery.clone(),
-        event_name: "braid".into(),
-        action: Some("pr_ensure".into()),
-        repository_node_id: repository_node.into(),
-        repository: repository.clone(),
-        work_item_node_id: Some(node.into()),
-        work_item_kind: Some("pr"),
-        work_item_number: Some(number),
-        work_item_state: Some("open".into()),
-        object_node_id: Some(node.into()),
-        object_version: Some(request),
-        object_digest: None,
-        visible_body: None,
-        actor_node_id: None,
-        actor_login: None,
-        kind: super::EventKind::Assign,
-        detail: Some("pr_ensure"),
-        cross_surface_invalidation: false,
-        requires_attention: true,
-        origin: "braid",
-        reference: format!(
-            "Implementation Request comment {repository}#issuecomment-{comment} ensured GitHub PR {repository}#{number}."
-        ),
-        mention_candidate: false,
-        reaction_target: None,
-        known: true,
-        raw_payload: Vec::new(),
-    };
-    super::ingest_event_on(&tx, &event, policy)?;
-    let event_id: String = tx.query_row("SELECT event_id FROM events WHERE delivery_guid=?1 AND work_item_node_id=?2 AND kind='assign' AND detail='pr_ensure'",params![delivery,node],|r|r.get(0)).optional()?.ok_or_else(||StoreError::InvalidData("ensure activation was not durably accepted".into()))?;
-    tx.execute("UPDATE implementation_requests SET activation_event_id=?2,updated_at=?3 WHERE intent_id=?1",params![intent,event_id,super::now_rfc3339()])?;
-    tx.commit()?;
-    Ok(())
 }

@@ -502,6 +502,7 @@ struct CommentWriteResult<'a> {
     request_id: &'a str,
     stage: Option<&'a str>,
     activation: Option<&'static str>,
+    implementation_request: Option<&'a str>,
     head: Option<&'a str>,
     base: Option<&'a str>,
     pull_request: Option<String>,

@@ -182,7 +182,7 @@ fn record_head_ready(
         .map_err(|error| store_as_github_error(&error))
 }
 
-pub fn record_pr_activation(
+pub async fn record_pr_activation(
     config: &Config,
     github: &GitHubClient,
     store: &StoreActor,
@@ -205,18 +205,63 @@ pub fn record_pr_activation(
                 .into(),
         ));
     }
+    let issue_basis = store
+        .begin_observation(receipt.issue_node_id.clone())
+        .map_err(|e| store_as_github_error(&e))?;
+    let target_basis = store
+        .begin_observation(pull_request.node_id.clone())
+        .map_err(|e| store_as_github_error(&e))?;
+    let target = github.pull_request(pull_request.number).await?;
+    let issue = github.issue_or_pull_request(receipt.issue_number).await?;
+    if target.node_id != pull_request.node_id
+        || target.head.reference != receipt.head_ref
+        || target.base.reference != receipt.base_ref
+        || !target.state.eq_ignore_ascii_case("open")
+        || issue.node_id != receipt.issue_node_id
+        || issue.kind() != "issue"
+        || !issue.state.eq_ignore_ascii_case("open")
+    {
+        return Err(GitHubError::GraphQl(
+            "published implementation no longer has its authorized open source and target".into(),
+        ));
+    }
+    if !github
+        .pull_request_closing_issues(target.number)
+        .await?
+        .iter()
+        .any(|edge| edge.repository == *repository && edge.number == receipt.issue_number)
+    {
+        return Err(GitHubError::GraphQl(
+            "published implementation lost its canonical Issue association".into(),
+        ));
+    }
+    let owner =
+        receipt.write.execution_owner.clone().ok_or_else(|| {
+            GitHubError::GraphQl("activation delivery has no runtime owner".into())
+        })?;
     store
-        .accept_pr_activation(
-            receipt.write.intent_id.clone(),
-            github.identity().repository_node_id.clone(),
-            pull_request.node_id.clone(),
-            pull_request.number,
-            SchedulerPolicy {
+        .accept_pr_activation(crate::store::PrActivation {
+            intent_id: receipt.write.intent_id.clone(),
+            repository_node: github.identity().repository_node_id.clone(),
+            pr_node: target.node_id,
+            pr_number: target.number,
+            policy: SchedulerPolicy {
                 quiet_seconds: config.scheduler.quiet_seconds,
                 event_threshold: config.scheduler.event_threshold,
             },
-        )
-        .map_err(|error| store_as_github_error(&error))
+            owner,
+            issue_basis,
+            target_basis,
+        })
+        .map_err(|error| match error {
+            crate::store::StoreError::ObservationChanged { .. }
+            | crate::store::StoreError::Sqlite(_)
+            | crate::store::StoreError::ActorUnavailable
+            | crate::store::StoreError::ActorStopped => {
+                GitHubError::ConvergencePending(format!("activation delivery must retry: {error}"))
+            }
+            _ => store_as_github_error(&error),
+        })
 }
 
 pub struct RemoteWrite {

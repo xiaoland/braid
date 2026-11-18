@@ -35,6 +35,9 @@ async fn prepare_plan(
             issue_number
         );
     }
+    if !issue.state.eq_ignore_ascii_case("open") {
+        bail!("Implementation Request Issue is closed");
+    }
     if let Some(source) = &accepted.source {
         let (source_repository, source_kind, source_number) =
             crate::store::publication_source::work_item(config.runtime.database(), source)?;
@@ -72,8 +75,19 @@ async fn prepare_plan(
     if head_ref == base_ref {
         bail!("Implementation Request head must differ from the default branch {base_ref:?}");
     }
+    let root = managed_root(
+        store,
+        github,
+        &repository.to_string(),
+        &head_ref,
+        &base_ref,
+        &issue,
+        &profile,
+    )
+    .await?;
     store
         .prepare_implementation_request(NewImplementationRequest {
+            root_intent_id: root,
             write: NewGhWriteIntent {
                 request_key: format!("pr_ensure\0{}\0{}", repository, request.comment_id),
                 operation: "pr_ensure",
@@ -95,4 +109,75 @@ async fn prepare_plan(
             pr_profile_id: profile.id.clone(),
         })
         .map_err(Into::into)
+}
+
+async fn managed_root(
+    store: &StoreActor,
+    github: &GitHubClient,
+    repository: &str,
+    head: &str,
+    base: &str,
+    issue: &crate::github::IssueOrPullRequest,
+    profile: &Profile,
+) -> Result<Option<String>> {
+    let candidates = store.managed_implementations(repository.into(), head.into())?;
+    if candidates.len() > 100 {
+        return Err(GitHubError::Ambiguous(
+            "managed implementation head exceeds recovery bound".into(),
+        )
+        .into());
+    }
+    let mut matching = None;
+    for root in candidates {
+        if root.issue_node_id != issue.node_id || root.base_ref != base {
+            continue;
+        }
+        let Some(number) = root.pull_request_number else {
+            if matches!(root.write.lifecycle.as_str(), "pending" | "sending" | "uncertain") {
+                return Err(GitHubError::ConvergencePending(
+                    "original managed request has not fixed its published PR yet".into(),
+                )
+                .into());
+            }
+            continue;
+        };
+        let pr = github.pull_request(number).await?;
+        if !pr.state.eq_ignore_ascii_case("open") {
+            continue;
+        }
+        if root.pr_profile_id != profile.id {
+            bail!(
+                "managed implementation uses a different PR Profile; refusing implicit reassignment"
+            );
+        }
+        let AcceptedRequest::Ensure { profile: original, .. } =
+            serde_json::from_str(&root.write.payload)?
+        else {
+            bail!("managed request has no frozen PR Profile");
+        };
+        if serde_json::to_string(&original)? != serde_json::to_string(profile)? {
+            bail!("managed PR Profile changed; explicit recovery configuration is required");
+        }
+        if root.pull_request_node_id.as_deref() != Some(pr.node_id.as_str())
+            || pr.head.reference != head
+            || pr.base.reference != base
+        {
+            bail!("managed implementation PR no longer matches its frozen identity");
+        }
+        if !github
+            .pull_request_closing_issues(number)
+            .await?
+            .iter()
+            .any(|edge| edge.repository == repository && edge.number == issue.number)
+        {
+            bail!("managed implementation is no longer directly associated with this Issue");
+        }
+        if matching.replace(root.root_intent_id).is_some() {
+            return Err(GitHubError::Ambiguous(
+                "multiple open managed implementations share this head".into(),
+            )
+            .into());
+        }
+    }
+    Ok(matching)
 }

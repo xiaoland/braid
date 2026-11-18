@@ -57,8 +57,7 @@ async fn another_context_read_cannot_acknowledge_a_revision_before_delivery() {
     let f = Fixture::new(true);
     f.store
         .commit_observation(ObservationCommit {
-            work_item_node_id: "item".into(),
-            expected: vec![],
+            basis: f.store.begin_observation("item".into()).unwrap(),
             current: vec![state(old_version, 'a')],
             events: vec![],
             policy: SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 },
@@ -111,20 +110,14 @@ async fn another_context_read_cannot_acknowledge_a_revision_before_delivery() {
     };
     let (github, task) = server(Arc::new(Mutex::new(Remote::default())), true).await;
     for expected_changes in [1, 0] {
-        let prior = f
-            .store
-            .processed_objects("item".into())
-            .unwrap()
-            .into_iter()
-            .map(|o| (o.node_id.clone(), o))
-            .collect();
+        let basis = f.store.begin_observation("item".into()).unwrap();
         assert_eq!(
             reconcile::reconcile_observations(
                 &f.store,
                 &github,
                 &f.config,
                 &scope,
-                &prior,
+                basis,
                 std::slice::from_ref(&observation)
             )
             .unwrap(),
@@ -149,8 +142,7 @@ async fn another_context_read_cannot_acknowledge_a_revision_before_delivery() {
 fn failed_observation_commits_neither_events_nor_frontier() {
     let f = Fixture::new(true);
     let result = f.store.commit_observation(ObservationCommit {
-        work_item_node_id: "item".into(),
-        expected: vec![],
+        basis: f.store.begin_observation("item".into()).unwrap(),
         current: vec![],
         events: vec![revision("v2", "new")],
         policy: SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 },
@@ -169,6 +161,8 @@ fn independent_pr_ensures_deliver_two_activations_and_retry_one_identity() {
     let f = Fixture::new(false);
     let policy = SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 };
     let profile = f.config.profile("pr-codex").unwrap();
+    let owner =
+        f.store.acquire_runtime_lease("runtime".into(), "activation-test".into(), 3600).unwrap();
     for number in [9, 10] {
         let payload = serde_json::to_string(&AcceptedRequest::Ensure {
             comment_id: number,
@@ -179,6 +173,7 @@ fn independent_pr_ensures_deliver_two_activations_and_retry_one_identity() {
         let plan = f
             .store
             .prepare_implementation_request(NewImplementationRequest {
+                root_intent_id: None,
                 write: NewGhWriteIntent {
                     request_key: format!("ensure-{number}"),
                     operation: "pr_ensure",
@@ -214,13 +209,16 @@ fn independent_pr_ensures_deliver_two_activations_and_retry_one_identity() {
             .unwrap();
         for _ in 0..2 {
             f.store
-                .accept_pr_activation(
-                    plan.write.intent_id.clone(),
-                    "repo".into(),
-                    format!("pr-{number}"),
-                    number,
+                .accept_pr_activation(crate::store::PrActivation {
+                    intent_id: plan.write.intent_id.clone(),
+                    repository_node: "repo".into(),
+                    pr_node: format!("pr-{number}"),
+                    pr_number: number,
                     policy,
-                )
+                    owner: owner.clone(),
+                    issue_basis: f.store.begin_observation("item".into()).unwrap(),
+                    target_basis: f.store.begin_observation(format!("pr-{number}")).unwrap(),
+                })
                 .unwrap();
         }
         assert!(
@@ -387,21 +385,14 @@ async fn a_published_version_is_not_an_echo_after_a_human_changes_its_content() 
     prior.metadata_digest = Some("c".repeat(64));
     f.store
         .commit_observation(ObservationCommit {
-            work_item_node_id: "item".into(),
-            expected: vec![],
+            basis: f.store.begin_observation("item".into()).unwrap(),
             current: vec![prior],
             events: vec![],
             policy: SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 },
         })
         .unwrap();
     observed.metadata_digest = Some("d".repeat(64));
-    let prior = f
-        .store
-        .processed_objects("item".into())
-        .unwrap()
-        .into_iter()
-        .map(|o| (o.node_id.clone(), o))
-        .collect();
+    let basis = f.store.begin_observation("item".into()).unwrap();
     let scope = ReconcileScope {
         work_item_node_id: "item".into(),
         work_item_kind: "issue",
@@ -412,15 +403,8 @@ async fn a_published_version_is_not_an_echo_after_a_human_changes_its_content() 
         repository: "owner/repository".into(),
     };
     assert_eq!(
-        reconcile::reconcile_observations(
-            &f.store,
-            &github,
-            &f.config,
-            &scope,
-            &prior,
-            &[observed]
-        )
-        .unwrap(),
+        reconcile::reconcile_observations(&f.store, &github, &f.config, &scope, basis, &[observed])
+            .unwrap(),
         1
     );
     assert_eq!(f.db().query_row("SELECT count(*) FROM events WHERE kind='invalidate' AND origin='reconciliation' AND requires_attention=1",[],|r|r.get::<_,i64>(0)).unwrap(),1);

@@ -44,6 +44,7 @@ pub struct GhWriteReceipt {
 
 #[derive(Debug, Clone)]
 pub struct NewImplementationRequest {
+    pub root_intent_id: Option<String>,
     pub write: NewGhWriteIntent,
     pub comment_database_id: u64,
     pub comment_node_id: String,
@@ -68,6 +69,11 @@ pub struct ImplementationRequestReceipt {
     pub pull_request_number: Option<u64>,
     pub stage: String,
     pub activation_delivered: bool,
+    pub issue_node_id: String,
+    pub pull_request_node_id: Option<String>,
+    pub root_intent_id: String,
+    pub root_request_id: String,
+    pub root_target: String,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +144,25 @@ pub(super) fn prepare_gh_write(
         }
         intent_id
     };
+    if write.operation == "pr_ensure" {
+        let issue:Option<String>=transaction.query_row("SELECT i.issue_node_id FROM implementation_requests i JOIN implementation_requests root ON root.intent_id=COALESCE(i.root_intent_id,i.intent_id) WHERE i.intent_id=?1 AND i.pull_request_node_id IS NOT NULL AND COALESCE(i.activation_event_id,root.activation_event_id) IS NULL",[&intent_id],|r|r.get(0)).optional()?;
+        if let Some(issue) = issue {
+            if let Some(source) = &write.source {
+                let caller: String = transaction.query_row(
+                    "SELECT work_item_node_id FROM assignments WHERE assignment_id=?1",
+                    [&source.assignment_id],
+                    |r| r.get(0),
+                )?;
+                if caller != issue || source.role != "issue_agent" {
+                    return Err(StoreError::InvalidData(
+                        "implementation recovery must originate from its own Issue".into(),
+                    ));
+                }
+            }
+            transaction.execute("UPDATE write_intents SET lifecycle='pending',last_error=NULL,updated_at=?2 WHERE intent_id=?1 AND lifecycle IN ('applied','rejected','conflict')",params![intent_id,now_rfc3339()])?;
+            transaction.execute("UPDATE github_write_outbox SET lifecycle='pending',next_attempt_at=?2,updated_at=?2,last_error=NULL WHERE intent_id=?1 AND lifecycle IN ('applied','rejected','conflict')",params![intent_id,now_rfc3339()])?;
+        }
+    }
     enqueue(&transaction, &intent_id)?;
     let receipt = gh_write_receipt_on(&transaction, &intent_id)?.ok_or_else(|| {
         StoreError::InvalidData(format!("write intent {intent_id} disappeared during prepare"))
@@ -203,7 +228,7 @@ pub(super) fn prepare_implementation_request(
         intent_id
     };
     let now = now_rfc3339();
-    transaction.execute(
+    let inserted = transaction.execute(
         "INSERT OR IGNORE INTO implementation_requests(
                intent_id,repository,comment_database_id,comment_node_id,issue_node_id,issue_number,
                issue_title,base_ref,head_ref,pr_profile_id,bootstrap_authored_at,stage,updated_at
@@ -222,6 +247,17 @@ pub(super) fn prepare_implementation_request(
             now,
         ],
     )?;
+    if inserted == 1
+        && let Some(root) = &request.root_intent_id
+    {
+        let valid: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM implementation_requests WHERE intent_id=?1 AND root_intent_id IS NULL AND repository=?2 AND issue_node_id=?3 AND head_ref=?4 AND base_ref=?5 AND pr_profile_id=?6 AND pull_request_node_id IS NOT NULL AND pull_request_number IS NOT NULL)",params![root,request.write.repository,request.issue_node_id,request.head_ref,request.base_ref,request.pr_profile_id],|r|r.get(0))?;
+        if !valid {
+            return Err(StoreError::InvalidData(
+                "continuation differs from the managed implementation identity".into(),
+            ));
+        }
+        transaction.execute("UPDATE implementation_requests SET root_intent_id=?2,stage='activation_pending',bootstrap_authored_at=(SELECT bootstrap_authored_at FROM implementation_requests WHERE intent_id=?2),pull_request_database_id=(SELECT pull_request_database_id FROM implementation_requests WHERE intent_id=?2),pull_request_node_id=(SELECT pull_request_node_id FROM implementation_requests WHERE intent_id=?2),pull_request_number=(SELECT pull_request_number FROM implementation_requests WHERE intent_id=?2) WHERE intent_id=?1",params![intent_id,root])?;
+    }
     enqueue(&transaction, &intent_id)?;
     let receipt =
         implementation_request_receipt_on(&transaction, &intent_id)?.ok_or_else(|| {
@@ -303,6 +339,25 @@ pub(super) fn implementation_request_receipt(
     implementation_request_receipt_on(&connection, intent_id)
 }
 
+pub(super) fn managed_implementations(
+    database: &Path,
+    repository: &str,
+    head: &str,
+) -> Result<Vec<ImplementationRequestReceipt>, StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_only(database)?;
+    let mut statement=connection.prepare("SELECT intent_id FROM implementation_requests WHERE repository=?1 AND head_ref=?2 AND root_intent_id IS NULL ORDER BY updated_at DESC,intent_id")?;
+    let ids = statement
+        .query_map(params![repository, head], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    ids.into_iter()
+        .map(|id| {
+            implementation_request_receipt_on(&connection, &id)?
+                .ok_or_else(|| StoreError::InvalidData("managed implementation disappeared".into()))
+        })
+        .collect()
+}
+
 fn implementation_request_receipt_on(
     connection: &Connection,
     intent_id: &str,
@@ -312,10 +367,12 @@ fn implementation_request_receipt_on(
     };
     connection
         .query_row(
-            "SELECT comment_database_id,issue_number,issue_title,
-                    base_ref,head_ref,pr_profile_id,bootstrap_authored_at,
-                    pull_request_number,stage,activation_event_id IS NOT NULL
-             FROM implementation_requests WHERE intent_id=?1",
+            "SELECT i.comment_database_id,i.issue_number,i.issue_title,
+                    i.base_ref,i.head_ref,i.pr_profile_id,i.bootstrap_authored_at,
+                    i.pull_request_number,i.stage,COALESCE(i.activation_event_id,root.activation_event_id) IS NOT NULL,
+                    i.issue_node_id,i.pull_request_node_id,root.intent_id,rw.public_request_id,rw.target
+             FROM implementation_requests i JOIN implementation_requests root ON root.intent_id=COALESCE(i.root_intent_id,i.intent_id)
+             JOIN write_intents rw ON rw.intent_id=root.intent_id WHERE i.intent_id=?1",
             [intent_id],
             |row| {
                 Ok(ImplementationRequestReceipt {
@@ -336,6 +393,11 @@ fn implementation_request_receipt_on(
                         .transpose()?,
                     stage: row.get(8)?,
                     activation_delivered: row.get(9)?,
+                    issue_node_id: row.get(10)?,
+                    pull_request_node_id: row.get(11)?,
+                    root_intent_id: row.get(12)?,
+                    root_request_id: row.get(13)?,
+                    root_target: row.get(14)?,
                 })
             },
         )
