@@ -90,6 +90,7 @@ impl WireEvent {
             other => anyhow::bail!("platform event has unsupported origin {other}"),
         };
         Ok(IngressEvent {
+            identity: crate::store::ChangeIdentity::Occurrence,
             delivery_guid: self.delivery_guid,
             event_name: self.event_name,
             action: self.action,
@@ -112,6 +113,8 @@ impl WireEvent {
             kind,
             detail,
             cross_surface_invalidation: self.cross_surface_invalidation,
+            requires_attention: origin != "agent"
+                && matches!(kind, EventKind::Wake | EventKind::Invalidate | EventKind::Mention),
             origin,
             reference: self.reference,
             mention_candidate: self.mention_candidate,

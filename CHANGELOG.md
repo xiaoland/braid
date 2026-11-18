@@ -19,6 +19,12 @@ Versioning once release artifacts are published.
 
 ### Changed
 
+- 持续协作合同改为：有效职责内的相关外部修订既更新记忆，也保留待处理输入。
+  空闲时不再只换 session 后静默结束；运行中与 continuation 合并，不额外并行。
+  所有新 turn 在安全边界取得完整当前 Context，读取失败保留批次并公开等待原因。
+- `braid gh pr ensure` 的 applied 回执必须绑定该请求、该 PR 的持久 activation 事件；
+  `gh status` 单独显示 activation 交付状态，不把 PR 存在或交付成功当作实现完成。
+  历史缺失的 activation 明确报告需显式恢复，不偷偷激活旧任务。
 - Agent 的 `braid gh` 写命令必须携带当前 runtime 输入提供的 `--source-turn`；
   `--profile` 不能替换 source 身份。人工调用使用显式 `--operator`，且不能在已登记
   Agent worktree 内降级为人工身份。旧脚本需按新 help 更新。
@@ -31,12 +37,21 @@ Versioning once release artifacts are published.
   HTTP 账单由 Issue 13→5、PR 10→5；保留分页和前后 marker，不推断线上 points 同降。
 - `status` 分开显示原始 runnable 数、durable 领取资格及当前/历史代；物理 provider
   可用性仍明确未知，不因对象 closed/merged 就删除可能合法的 Finalization。
-- Harness schema 升至 **10**；配置 schema 保持 3。升级前须停止旧 runtime 并执行
-  带备份的迁移。旧 schema 8 binary 不能打开升级后的账本；回滚需停止新 runtime，
+- Harness schema 升至 **11**；配置 schema 保持 3。处理基线与普通 Context 投影分开，
+  完整观察的事件和基线原子提交；发生身份与版本身份分开，接单复用记录可追溯。
+  升级前须停止旧 runtime 并执行带备份的迁移。旧 binary 不能打开升级后的账本；回滚需停止新 runtime，
   将升级前备份恢复到独立 runtime 目录，不支持 down migration。
 
 ### Fixed
 
+- 普通 Context／关联 PR 读取不再提前消费 Issue 的变更；stale 判定不再依赖可被读取
+  覆盖的投影。无版本的反复恢复不会撞键，隐藏 HTML／时间变化不会制造语义工作。
+  Human 保留旧 Braid 署名的编辑也不再被误判为 OriginEcho。
+- Quick Tunnel 独立监督明确失效、签名入口和 App URL，同步或重建失败持续暴露降级；
+  不靠重启 Agent 自愈。Unix 候选单独拥有 wrapper/cloudflared 进程组，失败构造和停止
+  收口附属树；停止未确认时阻断新候选。health 不是进程存活的别名。
+- Pi 原生入口保留普通 gh 原有配置定位，避免 execution-local XDG 目录隐藏凭据；
+  Git 的 gh credential helper 继承同一路径，不复制凭据。新材料须独立安装并验证 manifest。
 - GitHub 巡检不再每分钟完整重读所有历史 Work Item：OPEN 或仍有存活 Assignment
   的条目默认 60 秒，已完成收尾的终态历史项 30 分钟。Schema 8 独立记录完整成功与
   尝试时钟，失败不导致每 5 秒本地检查都重新联网；跨仓库按最久未尝试优先，单项

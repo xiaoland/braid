@@ -99,6 +99,8 @@ pub struct CommentSnapshot {
     pub author: Option<Actor>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub last_edited_at: Option<String>,
     pub body: Option<String>,
     pub minimized: bool,
     pub minimized_reason: Option<String>,
@@ -212,6 +214,8 @@ pub struct RenderedContext {
 
 #[derive(Debug, Clone)]
 pub struct CanonicalObservation {
+    /// Original authorship is usable only when the API proves no subsequent edit.
+    pub unedited_creation: bool,
     pub work_item_node_id: String,
     pub work_item_kind: &'static str,
     pub work_item_number: u64,
@@ -228,6 +232,25 @@ pub struct CanonicalObservation {
     pub author_login: Option<String>,
     pub body: Option<String>,
     pub visible_body: Option<String>,
+    /// Exact body/title content used to correlate a known publication version.
+    pub title: Option<String>,
+    pub metadata_digest: Option<String>,
+}
+
+impl CanonicalObservation {
+    /// Versioned wire evidence is distinct from visible semantic equality.
+    pub(crate) fn version_digest(&self) -> String {
+        if matches!(self.object_kind, "issue" | "pr") {
+            crate::store::publication_digest(
+                &self.object_node_id,
+                &self.version,
+                self.title.as_deref(),
+                self.body.as_deref().unwrap_or(""),
+            )
+        } else {
+            object_digest(&self.object_node_id, &self.version, self.body.as_deref())
+        }
+    }
 }
 
 #[tracing::instrument(skip_all, fields(repository = %locator.repository, work_item = locator.number, resource = "graphql"))]
@@ -464,6 +487,7 @@ pub fn canonical_observations(context: &CanonicalContext) -> Vec<CanonicalObserv
 
 fn issue_observation(issue: &IssueSnapshot) -> CanonicalObservation {
     CanonicalObservation {
+        unedited_creation: false,
         work_item_node_id: issue.node_id.clone(),
         work_item_kind: "issue",
         work_item_number: issue.number,
@@ -480,11 +504,14 @@ fn issue_observation(issue: &IssueSnapshot) -> CanonicalObservation {
         author_login: issue.author.as_ref().map(|author| author.login.clone()),
         body: Some(issue.body.clone()),
         visible_body: Some(filter_html_comments(&issue.body)),
+        title: Some(issue.title.clone()),
+        metadata_digest: Some(issue_metadata_digest(issue)),
     }
 }
 
 fn pull_request_observation(pull_request: &PullRequestSnapshot) -> CanonicalObservation {
     CanonicalObservation {
+        unedited_creation: false,
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
@@ -501,6 +528,8 @@ fn pull_request_observation(pull_request: &PullRequestSnapshot) -> CanonicalObse
         author_login: pull_request.author.as_ref().map(|author| author.login.clone()),
         body: Some(pull_request.body.clone()),
         visible_body: Some(filter_html_comments(&pull_request.body)),
+        title: Some(pull_request.title.clone()),
+        metadata_digest: Some(pull_request_metadata_digest(pull_request)),
     }
 }
 
@@ -517,6 +546,7 @@ fn review_observation(
         "active"
     };
     CanonicalObservation {
+        unedited_creation: false,
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
@@ -526,13 +556,15 @@ fn review_observation(
         object_node_id: review.node_id.clone(),
         database_id: review.database_id.clone(),
         object_kind: "review",
-        digest: object_digest(&review.node_id, &version, Some(&review.body)),
+        digest: review_semantic_digest(review, false),
         version,
         lifecycle,
         author_node_id: review.author.as_ref().map(|author| author.node_id.clone()),
         author_login: review.author.as_ref().map(|author| author.login.clone()),
         body: Some(review.body.clone()),
         visible_body: Some(filter_html_comments(&review.body)),
+        title: None,
+        metadata_digest: Some(review_semantic_digest(review, true)),
     }
 }
 
@@ -551,6 +583,7 @@ fn review_thread_observation(
         thread.comments.iter().map(|comment| comment.updated_at.as_str()).max().unwrap_or("")
     );
     CanonicalObservation {
+        unedited_creation: false,
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
@@ -560,13 +593,15 @@ fn review_thread_observation(
         object_node_id: thread.node_id.clone(),
         database_id: String::new(),
         object_kind: "review_thread",
-        digest: object_digest(&thread.node_id, &version, None),
+        digest: thread_semantic_digest(thread, false),
         version,
         lifecycle,
         author_node_id: thread.resolved_by.as_ref().map(|author| author.node_id.clone()),
         author_login: thread.resolved_by.as_ref().map(|author| author.login.clone()),
         body: None,
         visible_body: None,
+        title: None,
+        metadata_digest: Some(thread_semantic_digest(thread, true)),
     }
 }
 
@@ -577,6 +612,7 @@ fn observation(
 ) -> CanonicalObservation {
     let (version, digest, lifecycle) = comment_identity(comment);
     CanonicalObservation {
+        unedited_creation: unedited_comment(comment),
         work_item_node_id: issue.node_id.clone(),
         work_item_kind: "issue",
         work_item_number: issue.number,
@@ -593,6 +629,8 @@ fn observation(
         author_login: comment.author.as_ref().map(|author| author.login.clone()),
         body: comment.body.clone(),
         visible_body: comment.body.as_deref().map(filter_html_comments),
+        title: None,
+        metadata_digest: Some(comment_semantic_digest(comment, true)),
     }
 }
 
@@ -603,6 +641,7 @@ fn pr_observation(
 ) -> CanonicalObservation {
     let (version, digest, lifecycle) = comment_identity(comment);
     CanonicalObservation {
+        unedited_creation: unedited_comment(comment),
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
@@ -619,6 +658,8 @@ fn pr_observation(
         author_login: comment.author.as_ref().map(|author| author.login.clone()),
         body: comment.body.clone(),
         visible_body: comment.body.as_deref().map(filter_html_comments),
+        title: None,
+        metadata_digest: Some(comment_semantic_digest(comment, true)),
     }
 }
 
@@ -630,7 +671,7 @@ fn comment_identity(comment: &CommentSnapshot) -> (String, String, &'static str)
         lifecycle,
         comment.minimized_reason.as_deref().unwrap_or_default()
     );
-    let digest = object_digest(&comment.node_id, &version, comment.body.as_deref());
+    let digest = comment_semantic_digest(comment, false);
     (version, digest, lifecycle)
 }
 
@@ -648,6 +689,46 @@ fn object_digest(node_id: &str, version: &str, body: Option<&str>) -> String {
         digest.update(body.as_bytes());
     }
     hex::encode(digest.finalize())
+}
+
+fn comment_semantic_digest(comment: &CommentSnapshot, metadata_only: bool) -> String {
+    let mut visible = comment.clone();
+    visible.updated_at.clear();
+    visible.last_edited_at = None;
+    visible.body = if metadata_only || visible.minimized {
+        None
+    } else {
+        visible.body.as_deref().map(filter_html_comments)
+    };
+    hex::encode(Sha256::digest(serde_json::to_vec(&visible).expect("typed comment serializes")))
+}
+
+fn review_semantic_digest(review: &ReviewSnapshot, metadata_only: bool) -> String {
+    let mut visible = review.clone();
+    visible.updated_at.clear();
+    visible.body = if metadata_only || visible.minimized {
+        String::new()
+    } else {
+        filter_html_comments(&visible.body)
+    };
+    hex::encode(Sha256::digest(serde_json::to_vec(&visible).expect("typed review serializes")))
+}
+
+fn thread_semantic_digest(thread: &ReviewThreadSnapshot, metadata_only: bool) -> String {
+    let mut visible = thread.clone();
+    visible.comments.clear();
+    if metadata_only {
+        visible.resolved = false;
+        visible.resolved_by = None;
+    }
+    hex::encode(Sha256::digest(serde_json::to_vec(&visible).expect("typed thread serializes")))
+}
+
+fn unedited_comment(comment: &CommentSnapshot) -> bool {
+    comment.last_edited_at.is_none()
+        && comment.created_at == comment.updated_at
+        && !comment.minimized
+        && !comment.pinned
 }
 
 fn reconcile_issue_comments(
@@ -767,6 +848,37 @@ fn pull_request_root_digest(pull_request: &PullRequestSnapshot) -> String {
     root_projection_digest(&root.node_id, &projection)
 }
 
+fn issue_metadata_digest(issue: &IssueSnapshot) -> String {
+    let mut metadata = issue.clone();
+    metadata.body.clear();
+    metadata.title.clear();
+    metadata.comments.clear();
+    let mut projection = String::new();
+    render_issue(&mut projection, &metadata, true);
+    root_projection_digest(&metadata.node_id, &projection)
+}
+
+fn pull_request_metadata_digest(pr: &PullRequestSnapshot) -> String {
+    let mut metadata = pr.clone();
+    metadata.body.clear();
+    metadata.title.clear();
+    metadata.associated_issues.clear();
+    metadata.conversation.clear();
+    metadata.reviews.clear();
+    metadata.review_threads.clear();
+    let mut projection = String::new();
+    render_pull_request(&mut projection, &metadata);
+    // Native graph identity is relevant even when the PR's updatedAt and body
+    // did not move. Associated bodies have their own source-change contract.
+    for issue in &pr.associated_issues {
+        for value in [&issue.node_id, &issue.repository, &issue.state] {
+            projection.push('\0');
+            projection.push_str(value);
+        }
+    }
+    root_projection_digest(&metadata.node_id, &projection)
+}
+
 fn extend_tombstones(
     comments: &mut Vec<CommentSnapshot>,
     tombstones: Vec<DeletedComment>,
@@ -798,6 +910,7 @@ fn deleted_comment(
             .map(|login| Actor { node_id: comment.author_node_id.unwrap_or_default(), login }),
         created_at: comment.created_at,
         updated_at: comment.updated_at,
+        last_edited_at: None,
         body: None,
         minimized: false,
         minimized_reason: None,
@@ -1748,6 +1861,8 @@ struct CommentRaw {
     body: String,
     #[serde(rename = "isMinimized")]
     is_minimized: bool,
+    #[serde(rename = "lastEditedAt")]
+    last_edited_at: Option<String>,
     #[serde(rename = "minimizedReason")]
     minimized_reason: Option<String>,
     #[serde(rename = "isPinned", default)]
@@ -1764,6 +1879,7 @@ impl CommentRaw {
             author: self.author.map(Into::into),
             created_at: self.created_at,
             updated_at: self.updated_at,
+            last_edited_at: self.last_edited_at,
             body: (!self.is_minimized).then_some(self.body),
             minimized: self.is_minimized,
             minimized_reason: self.minimized_reason,

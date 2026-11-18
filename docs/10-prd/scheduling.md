@@ -10,10 +10,21 @@ Replacing or removing a fact already present in a Work Item's Context is Hard
 Invalidation. Braid fences the stale Context Revision immediately. If a turn is
 active, it requests safe interruption, discards later stale Agent output, starts
 a fresh physical Provider Session with current Context, and continues once
-with the invalidation reference. If idle, it replaces Context without starting
-a turn. Rapid Cross-surface edits to an open Associated Issue description wait
-for debounce before interrupting a PR turn. Other Associated Issue changes mark
-the dependency dirty and are incorporated before the next PR turn.
+with the invalidation reference. Context freshness and attention are independent:
+a relevant external revision both invalidates old memory and leaves durable work
+for the still-active responsibility. If idle, replacement preserves one ordinary
+debounced batch; if running, replacement and pending input coalesce into one
+continuation, not a second parallel turn. No second Human mention is required.
+Rapid Cross-surface edits to an open Associated Issue description wait for
+debounce before interrupting a PR turn and remain input for an idle active PR
+Agent too. Other Associated Issue changes mark the dependency dirty and are
+incorporated before the next PR turn.
+
+Timestamp-only and HTML-comment-only changes carry no new semantic input.
+Repeated observations/redeliveries of the same change do not schedule another
+turn. Closed, sleeping, dormant or retired responsibilities are not activated by
+ordinary revisions. An unavailable executor or Context must leave an observable
+pending/blocked obligation, not pretend that memory replacement handled it.
 
 Every newly ingested external comment receives Braid's `eyes` reaction. Only a
 Trusted Braid Mention has turn-lifecycle reactions on that same comment:

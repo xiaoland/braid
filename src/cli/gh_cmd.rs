@@ -110,6 +110,7 @@ fn print_gh_receipt(
             request_id: &receipt.request_id,
             operation: &receipt.operation,
             stage: plan.as_ref().map(|plan| plan.stage.as_str()),
+            activation: plan.as_ref().map(|plan| activation_delivery(plan)),
             head: plan.as_ref().map(|plan| plan.head_ref.as_str()),
             base: plan.as_ref().map(|plan| plan.base_ref.as_str()),
             pull_request: plan
@@ -139,6 +140,10 @@ fn print_gh_receipt(
         println!("Profile: {} ({})", receipt.profile_id, receipt.role);
         if let Some(plan) = &plan {
             println!("stage: {}", plan.stage);
+            println!(
+                "activation delivery: {} (not execution completion)",
+                activation_delivery(plan)
+            );
             println!("head: {} / base: {}", plan.head_ref, plan.base_ref);
             if let Some(number) = plan.pull_request_number {
                 println!("PR: https://github.com/{}/pull/{number}", receipt.repository);
@@ -154,6 +159,16 @@ fn print_gh_receipt(
         }
     }
     Ok(())
+}
+
+fn activation_delivery(plan: &crate::store::ImplementationRequestReceipt) -> &'static str {
+    if plan.activation_delivered {
+        "delivered"
+    } else if plan.write.lifecycle == "applied" {
+        "missing_requires_explicit_activation"
+    } else {
+        "pending"
+    }
 }
 
 fn gh_handoff(arguments: GhPrHandoff) -> Result<()> {

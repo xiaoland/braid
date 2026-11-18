@@ -66,7 +66,7 @@ contract; consumers never see GitHub event names or actions:
 | First Trusted Braid Mention on a dormant Work Item | `mention`, consumed as `assign` (activates the group, exactly like native assignment) |
 | `issues.unassigned` (canonical-reread confirmed) | `unassign` |
 | Comment/review created, `pull_request.synchronize`, review requested; Trusted Braid Mention on an already-active Work Item | `mention` / `wake` |
-| Body/description/comment edits or deletions, review dismissed, review thread resolved | `invalidate` |
+| Relevant external body/description/comment edits or deletions, review dismissed, review thread resolved | `invalidate` with durable `requires_attention` |
 | `closed` / `reopened` / `merged` | `lifecycle` |
 | Correlated Braid App or Profile-actor writes | `origin_echo` (recorded, never wakes or invalidates the same Agent) |
 | `ping`, unknown variants | `noop` (recorded as reconciliation evidence) |
@@ -193,6 +193,47 @@ See GitHub's [linking contract](https://docs.github.com/en/issues/tracking-your-
 [Pull request schema](https://docs.github.com/en/graphql/reference/pulls).
 
 ## Reconciliation and Tombstones
+
+Schema 11 separates the latest Context/tombstone projection (`canonical_objects`)
+from the producer's processed frontier (`processed_objects`). A projection read,
+including reading an associated Issue through a PR, cannot advance the latter.
+The producer classifies one complete observation outside SQLite, then atomically
+compares its expected frontier, admits all resulting events, and commits the new
+frontier. Failure or a changed precondition commits neither. Network awaits never
+occur inside that transaction. The frontier is an acknowledgement of classified
+input, not a second current-content authority or another execution queue.
+Event staleness likewise uses admitted change evidence and the processed frontier,
+never a Context cache row. Root synchronize/assignment hints do not acknowledge
+body changes. Comparable upstream timestamps may reject older facts; lifecycle
+suffixes and review-thread projection strings are not lexical clocks. A complete
+snapshot older than a classified fact is retried without advancing its frontier.
+
+A correlated title/body version proves only those published fields. A separate
+root metadata fingerprint includes relevant non-body facts and native PR edges;
+a metadata/edge change can require attention even when `updatedAt` and body did
+not change. Missing action provenance is handled conservatively rather than
+turning the entire root into an Agent echo.
+
+Change identity also distinguishes a versioned object from an occurrence.
+GitHub delivery GUIDs and built-in event sequences identify occurrences;
+returning to the same unversioned thread state is not a redelivery. Complete
+observation transitions are committed under their expected frontier and may
+reuse the latest matching admitted state transition when non-state metadata is
+unchanged. `deliveries.effect_event_id` records that reuse explicitly. A missing
+new event is therefore not silently treated as successful delivery: its existing
+cause must be bound and auditable. PR activation separately requires its exact
+request/target event, not an arbitrary dedupe collision.
+
+Visible semantic fingerprints exclude timestamp-only and filtered HTML-comment
+changes. Versioned raw-content evidence remains separate for correlation and
+ordering. Original comment authorship is usable only for an API-proven unedited
+creation; an edited comment's unknown current actor cannot inherit the creator's
+trusted-mention authority. Already-active responsibilities still receive ordinary
+attention for real revisions when the current action actor is unknown.
+
+Migration bootstraps a new frontier from retained observations; it cannot prove
+that old silently lost inputs were executed. Historical activation gaps remain
+visible and require explicit authorized recovery, never automatic activation.
 
 Webhook 是观察，不是完整历史。巡检在正常预算下按两档到期：OPEN Work Item，
 或仍有 materializing/active/finalizing Assignment 的条目，完整巡检成功后默认

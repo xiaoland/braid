@@ -15,7 +15,9 @@ use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
+mod observations;
 mod reconciliation;
+pub(crate) use observations::{ObservationCommit, publication_digest};
 mod scheduler_status;
 pub use reconciliation::TrackedWorkItem;
 pub use scheduler_status::BatchEligibility;
@@ -38,7 +40,7 @@ use gh_writes::{
     prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 10;
+pub const DATABASE_SCHEMA_VERSION: u32 = 11;
 
 const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
 const EVENT_KINDS_SQL: &str = include_str!("../../migrations/0002_event_kinds.sql");
@@ -84,6 +86,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 10,
         name: "pr_handoff",
         sql: include_str!("../../migrations/0010_pr_handoff.sql"),
+    },
+    Migration {
+        version: 11,
+        name: "collaboration_inputs",
+        sql: include_str!("../../migrations/0011_collaboration_inputs.sql"),
     },
 ];
 
@@ -224,8 +231,22 @@ impl std::fmt::Display for EventKind {
     }
 }
 
+/// An upstream object revision and an occurrence are different identities.
+/// Complete observation transitions are additionally fenced by their frontier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeIdentity {
+    ObjectVersion,
+    Occurrence,
+    ObservedTransition,
+}
+
+// Admission, mention authorization, cross-surface propagation and attention
+// are independent dimensions; combining them into one lifecycle loses valid
+// cases such as an invalidation that still owes ordinary input delivery.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct IngressEvent {
+    pub identity: ChangeIdentity,
     pub delivery_guid: String,
     pub event_name: String,
     pub action: Option<String>,
@@ -244,6 +265,8 @@ pub struct IngressEvent {
     pub kind: EventKind,
     pub detail: Option<&'static str>,
     pub cross_surface_invalidation: bool,
+    /// Pending work is independent of whether this change also invalidates Context.
+    pub requires_attention: bool,
     pub origin: &'static str,
     pub reference: String,
     pub mention_candidate: bool,
@@ -311,6 +334,7 @@ pub struct WakeBatchSummary {
     pub quiet_deadline: String,
     pub urgent: bool,
     pub lifecycle: String,
+    pub input_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -345,8 +369,10 @@ pub struct PendingGitHubWrite {
     pub owner: RuntimeLease,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalObjectState {
+    /// Separates non-body facts from the scope of a correlated body publication.
+    pub metadata_digest: Option<String>,
     pub node_id: String,
     pub database_id: Option<String>,
     pub object_kind: String,
@@ -847,13 +873,66 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub fn canonical_objects(
+    pub(crate) fn processed_objects(
         &self,
-        work_item_node_id: String,
+        work_item: String,
     ) -> Result<Vec<CanonicalObjectState>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::CanonicalObjects(work_item_node_id, reply))
+            .send(Command::ProcessedObjects(work_item, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub(crate) fn commit_observation(
+        &self,
+        observation: ObservationCommit,
+    ) -> Result<usize, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::CommitObservation(Box::new(observation), reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub(crate) fn record_publication_version(
+        &self,
+        intent: String,
+        node: String,
+        version: String,
+        digest: String,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::RecordPublicationVersion(intent, node, version, digest, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub(crate) fn is_agent_version(
+        &self,
+        node: String,
+        version: String,
+        digest: String,
+    ) -> Result<bool, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::IsAgentVersion(node, version, digest, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub(crate) fn accept_pr_activation(
+        &self,
+        intent: String,
+        repository_node: String,
+        node: String,
+        number: u64,
+        policy: SchedulerPolicy,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::AcceptPrActivation(intent, repository_node, node, number, policy, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1210,9 +1289,17 @@ impl StoreActor {
     }
 
     pub fn defer_turn_claim(&self, turn_id: String) -> Result<(), StoreError> {
+        self.defer_turn_claim_with_reason(turn_id, None)
+    }
+
+    pub(crate) fn defer_turn_claim_with_reason(
+        &self,
+        turn_id: String,
+        reason: Option<String>,
+    ) -> Result<(), StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::DeferTurnClaim(turn_id, reply))
+            .send(Command::DeferTurnClaim(turn_id, reason, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1410,7 +1497,18 @@ enum Command {
     RecordImplementationProgress(String, ImplementationProgress, Sender<Result<(), StoreError>>),
     DueReconciliationWorkItems(u64, Sender<Result<Vec<TrackedWorkItem>, StoreError>>),
     RecordReconciliation(String, bool, Sender<Result<(), StoreError>>),
-    CanonicalObjects(String, Sender<Result<Vec<CanonicalObjectState>, StoreError>>),
+    ProcessedObjects(String, Sender<Result<Vec<CanonicalObjectState>, StoreError>>),
+    CommitObservation(Box<ObservationCommit>, Sender<Result<usize, StoreError>>),
+    RecordPublicationVersion(String, String, String, String, Sender<Result<(), StoreError>>),
+    IsAgentVersion(String, String, String, Sender<Result<bool, StoreError>>),
+    AcceptPrActivation(
+        String,
+        String,
+        String,
+        u64,
+        SchedulerPolicy,
+        Sender<Result<(), StoreError>>,
+    ),
     BeginReconciliation(String, String, Sender<Result<ReconciliationRun, StoreError>>),
     FinishReconciliation(
         ReconciliationRun,
@@ -1498,7 +1596,7 @@ enum Command {
     ),
     MarkTurnStarted(String, String, Sender<Result<(), StoreError>>),
     MarkTurnTerminal(String, String, Sender<Result<(), StoreError>>),
-    DeferTurnClaim(String, Sender<Result<(), StoreError>>),
+    DeferTurnClaim(String, Option<String>, Sender<Result<(), StoreError>>),
     RetireHandoffInputs(
         TurnClaim,
         Vec<handoff::RetiredInput>,
@@ -1643,8 +1741,34 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
                 });
                 let _ = reply.send(result);
             }
-            Command::CanonicalObjects(work_item_node_id, reply) => {
-                let _ = reply.send(canonical_objects(database, &work_item_node_id));
+            Command::ProcessedObjects(work_item, reply) => {
+                let _ = reply.send(
+                    open_read_only(database)
+                        .and_then(|connection| observations::load(&connection, &work_item)),
+                );
+            }
+            Command::CommitObservation(observation, reply) => {
+                let _ = reply.send(observations::commit(database, &observation));
+            }
+            Command::RecordPublicationVersion(intent, node, version, digest, reply) => {
+                let _ = reply.send(observations::record_publication(
+                    database, &intent, &node, &version, &digest,
+                ));
+            }
+            Command::IsAgentVersion(node, version, digest, reply) => {
+                let _ = reply.send(open_read_only(database).and_then(|connection| {
+                    observations::is_agent_version(&connection, &node, &version, &digest)
+                }));
+            }
+            Command::AcceptPrActivation(intent, repository_node, node, number, policy, reply) => {
+                let _ = reply.send(observations::accept_pr_activation(
+                    database,
+                    &intent,
+                    &repository_node,
+                    &node,
+                    number,
+                    policy,
+                ));
             }
             Command::BeginReconciliation(repository_node_id, repository_name, reply) => {
                 let _ = reply.send(begin_reconciliation(
@@ -1846,8 +1970,8 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::RetireHandoffInputs(claim, inputs, reply) => {
                 let _ = reply.send(retire_handoff_inputs(database, claim, &inputs));
             }
-            Command::DeferTurnClaim(turn_id, reply) => {
-                let _ = reply.send(defer_turn_claim(database, &turn_id));
+            Command::DeferTurnClaim(turn_id, reason, reply) => {
+                let _ = reply.send(defer_turn_claim(database, &turn_id, reason.as_deref()));
             }
             Command::RecordTurnError(turn_id, error, reply) => {
                 let _ = reply.send(record_turn_error(database, &turn_id, &error));
@@ -2290,10 +2414,35 @@ fn ingest_event(
     policy: SchedulerPolicy,
 ) -> Result<IngestResult, StoreError> {
     require_current_schema(database)?;
-    let now = now_rfc3339();
     let mut connection = open_read_write(database)?;
     configure_connection(&connection)?;
     let transaction = connection.transaction()?;
+    if event.identity == ChangeIdentity::ObservedTransition {
+        return Err(StoreError::InvalidData(
+            "observed transitions require a complete observation commit".into(),
+        ));
+    }
+    let result = ingest_event_on(&transaction, event, policy)?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+#[allow(clippy::too_many_lines)]
+fn ingest_event_on(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &IngressEvent,
+    policy: SchedulerPolicy,
+) -> Result<IngestResult, StoreError> {
+    let now = now_rfc3339();
+    if event.identity == ChangeIdentity::ObjectVersion
+        && (event.object_node_id.is_none()
+            || event.object_version.is_none()
+            || event.object_digest.is_none())
+    {
+        return Err(StoreError::InvalidData(
+            "versioned change requires object, version and evidence digest".into(),
+        ));
+    }
     let duplicate = transaction
         .query_row(
             "SELECT 1 FROM deliveries WHERE delivery_guid=?1",
@@ -2307,7 +2456,6 @@ fn ingest_event(
             "UPDATE deliveries SET duplicate_count=duplicate_count+1 WHERE delivery_guid=?1",
             [&event.delivery_guid],
         )?;
-        transaction.commit()?;
         return Ok(IngestResult {
             duplicate: true,
             delivery_guid: event.delivery_guid.clone(),
@@ -2318,6 +2466,8 @@ fn ingest_event(
         });
     }
 
+    let object_kind = event_object_kind(event);
+    let stale = observations::event_is_stale(transaction, event, object_kind)?;
     transaction.execute(
         "INSERT INTO repositories(node_id,name_with_owner,observed_at)
          VALUES (?1,?2,?3)
@@ -2326,12 +2476,14 @@ fn ingest_event(
            observed_at=excluded.observed_at",
         params![event.repository_node_id, event.repository, now],
     )?;
-    if let (Some(node_id), Some(kind), Some(number), Some(state)) = (
-        event.work_item_node_id.as_deref(),
-        event.work_item_kind,
-        event.work_item_number,
-        event.work_item_state.as_deref(),
-    ) {
+    if !stale
+        && let (Some(node_id), Some(kind), Some(number), Some(state)) = (
+            event.work_item_node_id.as_deref(),
+            event.work_item_kind,
+            event.work_item_number,
+            event.work_item_state.as_deref(),
+        )
+    {
         let number = sqlite_u64(number, "GitHub work-item number")?;
         transaction.execute(
             "INSERT INTO work_items(node_id,repository_node_id,kind,number,state,observed_at)
@@ -2368,32 +2520,24 @@ fn ingest_event(
         ],
     )?;
 
+    if event.identity == ChangeIdentity::ObservedTransition
+        && let Some(existing) = observations::matching_latest_transition(transaction, event)?
+    {
+        transaction.execute(
+            "UPDATE deliveries SET effect_event_id=?2 WHERE delivery_guid=?1",
+            params![event.delivery_guid, existing],
+        )?;
+        return Ok(IngestResult {
+            duplicate: false,
+            delivery_guid: event.delivery_guid.clone(),
+            event_id: None,
+            event_lifecycle: Some("already_admitted".into()),
+            batch_id: None,
+            batch_lifecycle: None,
+        });
+    }
     let event_id = Uuid::now_v7().to_string();
     let dedupe_key = event_dedupe_key(event);
-    let object_kind = event_object_kind(event);
-    let stale = match (
-        object_kind,
-        event.object_node_id.as_deref(),
-        event.object_version.as_deref(),
-        event.object_digest.as_deref(),
-    ) {
-        (Some(object_kind), Some(node_id), Some(version), Some(digest)) => transaction
-            .query_row(
-                "SELECT version,digest FROM canonical_objects WHERE node_id=?1",
-                [node_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?
-            .is_some_and(|(canonical_version, canonical_digest)| {
-                let duplicate = canonical_version == version && canonical_digest == digest;
-                if object_kind == "review_thread" {
-                    duplicate
-                } else {
-                    canonical_version.as_str() > version || duplicate
-                }
-            }),
-        _ => false,
-    };
     let lifecycle = if stale {
         "superseded"
     } else if event.kind.consumed_at_ingest() {
@@ -2405,8 +2549,8 @@ fn ingest_event(
         "INSERT OR IGNORE INTO events(
            event_id,delivery_guid,work_item_node_id,object_node_id,object_version,
            kind,detail,origin,reference,lifecycle,observed_at,dedupe_key,
-           mention_candidate,trusted_mention,body_digest
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,NULL,?14)",
+           mention_candidate,trusted_mention,body_digest,requires_attention
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,NULL,?14,?15)",
         params![
             event_id,
             event.delivery_guid,
@@ -2422,10 +2566,19 @@ fn ingest_event(
             dedupe_key,
             i64::from(event.mention_candidate),
             event.object_digest,
+            i64::from(event.requires_attention),
         ],
     )?;
     if inserted == 0 {
-        transaction.commit()?;
+        let existing: String = transaction.query_row(
+            "SELECT event_id FROM events WHERE dedupe_key=?1",
+            [&dedupe_key],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE deliveries SET effect_event_id=?2 WHERE delivery_guid=?1",
+            params![event.delivery_guid, existing],
+        )?;
         return Ok(IngestResult {
             duplicate: false,
             delivery_guid: event.delivery_guid.clone(),
@@ -2436,6 +2589,10 @@ fn ingest_event(
         });
     }
 
+    transaction.execute(
+        "UPDATE deliveries SET effect_event_id=?2 WHERE delivery_guid=?1",
+        params![event.delivery_guid, event_id],
+    )?;
     if !stale
         && let (
             Some(object_kind),
@@ -2493,9 +2650,11 @@ fn ingest_event(
         // PR activation (`braid gh pr ensure`) wakes the new group urgently;
         // native Issue assignment creates an idle session and no turn.
         let activation = event.kind == EventKind::Assign;
-        if event.kind == EventKind::Wake || activation {
+        let active_revision = event.requires_attention && event.kind == EventKind::Invalidate
+            && transaction.query_row("SELECT EXISTS(SELECT 1 FROM assignments a JOIN work_items w ON w.node_id=a.work_item_node_id WHERE w.node_id=?1 AND a.lifecycle='active' AND lower(w.state)='open')", [work_item_node_id], |row| row.get::<_, bool>(0))?;
+        if event.kind == EventKind::Wake || activation || active_revision {
             batch = Some(schedule_event(
-                &transaction,
+                transaction,
                 work_item_node_id,
                 &event_id,
                 policy,
@@ -2507,12 +2666,11 @@ fn ingest_event(
     if lifecycle == "pending"
         && let Some(target) = &event.reaction_target
     {
-        enqueue_reaction(&transaction, event, &event_id, target, &now)?;
+        enqueue_reaction(transaction, event, &event_id, target, &now)?;
     }
     if lifecycle == "pending" && event.cross_surface_invalidation && event.origin != "agent" {
-        schedule_cross_surface_invalidations(&transaction, event, &event_id, policy, &now)?;
+        schedule_cross_surface_invalidations(transaction, event, &event_id, policy, &now)?;
     }
-    transaction.commit()?;
     Ok(IngestResult {
         duplicate: false,
         delivery_guid: event.delivery_guid.clone(),
@@ -2571,7 +2729,9 @@ fn schedule_cross_surface_invalidations(
             })?
             .collect::<Result<Vec<_>, _>>()?
     };
-    for (pr_node_id, repository, number) in targets.into_iter().filter(|_| changed) {
+    for (pr_node_id, repository, number) in targets {
+        let (kind, detail) =
+            if changed { ("invalidate", "cross_surface") } else { ("wake", "dependency") };
         let event_id = Uuid::now_v7().to_string();
         let dedupe_key = hex::encode(Sha256::digest(
             format!("braid-cross-surface-v1\0{source_event_id}\0{pr_node_id}").as_bytes(),
@@ -2584,8 +2744,8 @@ fn schedule_cross_surface_invalidations(
             "INSERT OR IGNORE INTO events(
                event_id,delivery_guid,work_item_node_id,object_node_id,object_version,
                kind,detail,origin,reference,lifecycle,observed_at,dedupe_key,
-               mention_candidate,trusted_mention,body_digest
-             ) VALUES (?1,?2,?3,?4,?5,'invalidate','cross_surface',?6,?7,'pending',?8,?9,0,0,?10)",
+               mention_candidate,trusted_mention,body_digest,requires_attention
+             ) VALUES (?1,?2,?3,?4,?5,?11,?12,?6,?7,'pending',?8,?9,0,0,?10,1)",
             params![
                 event_id,
                 source.delivery_guid,
@@ -2597,6 +2757,8 @@ fn schedule_cross_surface_invalidations(
                 now,
                 dedupe_key,
                 source.object_digest,
+                kind,
+                detail,
             ],
         )?;
         if inserted == 1 {
@@ -2629,8 +2791,16 @@ fn event_object_kind(event: &IngressEvent) -> Option<&'static str> {
 
 fn event_dedupe_key(event: &IngressEvent) -> String {
     let mut digest = Sha256::new();
+    if event.identity != ChangeIdentity::ObjectVersion {
+        digest.update(b"braid-occurrence-v1\0");
+        digest.update(event.delivery_guid.as_bytes());
+        return hex::encode(digest.finalize());
+    }
     for value in [
+        "braid-object-version-v2",
         event.repository_node_id.as_str(),
+        event.work_item_node_id.as_deref().unwrap_or(""),
+        event.event_name.as_str(),
         event.object_node_id.as_deref().unwrap_or(""),
         event.object_version.as_deref().unwrap_or(""),
         event.object_digest.as_deref().unwrap_or(""),
@@ -2877,7 +3047,7 @@ fn load_wake_batches(
 ) -> Result<Vec<WakeBatchSummary>, StoreError> {
     let mut statement = connection.prepare(
         "SELECT b.batch_id,r.name_with_owner,w.kind,w.number,w.node_id,b.event_count,
-                b.quiet_deadline,b.urgent,b.lifecycle
+                b.quiet_deadline,b.urgent,b.lifecycle,b.input_error
          FROM wake_batches b
          JOIN work_items w ON w.node_id=b.work_item_node_id
          JOIN repositories r ON r.node_id=w.repository_node_id
@@ -2900,6 +3070,7 @@ fn load_wake_batches(
             quiet_deadline: row.get(6)?,
             urgent: row.get::<_, i64>(7)? != 0,
             lifecycle: row.get(8)?,
+            input_error: row.get(9)?,
         })
     })?;
     let mut batches = rows.collect::<Result<Vec<_>, _>>()?;
@@ -3094,33 +3265,6 @@ fn due_reconciliation_work_items(
     let connection = open_read_only(database)?;
     reconciliation::due(&connection, OffsetDateTime::now_utc().unix_timestamp(), hot_seconds)
         .map_err(StoreError::from)
-}
-
-fn canonical_objects(
-    database: &Path,
-    work_item_node_id: &str,
-) -> Result<Vec<CanonicalObjectState>, StoreError> {
-    require_current_schema(database)?;
-    let connection = open_read_only(database)?;
-    let mut statement = connection.prepare(
-        "SELECT node_id,database_id,object_kind,version,digest,lifecycle,
-                author_node_id,author_login
-         FROM canonical_objects WHERE work_item_node_id=?1
-         ORDER BY object_kind,node_id",
-    )?;
-    let rows = statement.query_map([work_item_node_id], |row| {
-        Ok(CanonicalObjectState {
-            node_id: row.get(0)?,
-            database_id: row.get(1)?,
-            object_kind: row.get(2)?,
-            version: row.get(3)?,
-            digest: row.get(4)?,
-            lifecycle: row.get(5)?,
-            author_node_id: row.get(6)?,
-            author_login: row.get(7)?,
-        })
-    })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
 }
 
 fn begin_reconciliation(
@@ -4699,7 +4843,7 @@ fn complete_context_reset(
                AND NOT EXISTS (
                  SELECT 1 FROM wake_batch_events be
                  JOIN events e ON e.event_id=be.event_id
-                 WHERE be.batch_id=wake_batches.batch_id AND e.lifecycle='pending'
+                 WHERE be.batch_id=wake_batches.batch_id AND (e.lifecycle='pending' OR e.requires_attention=1)
                )",
             params![reset_id, now],
         )?;
@@ -4796,7 +4940,7 @@ fn claim_runnable_turn(
             &format!(
                 "SELECT b.batch_id,ps.session_id,ps.provider_session_id,
                     r.name_with_owner,w.kind,w.number,
-                    COALESCE(w.context_revision,ps.context_revision),ai.profile_id,a.lifecycle
+                    ps.context_revision,ai.profile_id,a.lifecycle
              FROM wake_batches b
              JOIN work_items w ON w.node_id=b.work_item_node_id
              JOIN repositories r ON r.node_id=w.repository_node_id
@@ -4881,7 +5025,11 @@ fn claim_runnable_turn(
     }))
 }
 
-fn defer_turn_claim(database: &Path, turn_id: &str) -> Result<(), StoreError> {
+fn defer_turn_claim(
+    database: &Path,
+    turn_id: &str,
+    reason: Option<&str>,
+) -> Result<(), StoreError> {
     require_current_schema(database)?;
     let mut connection = open_read_write(database)?;
     configure_connection(&connection)?;
@@ -4909,8 +5057,12 @@ fn defer_turn_claim(database: &Path, turn_id: &str) -> Result<(), StoreError> {
         )?;
         transaction.execute("UPDATE wake_batches SET lifecycle='runnable',event_count=(SELECT COUNT(*) FROM wake_batch_events WHERE batch_id=?1),urgent=MAX(urgent,(SELECT urgent FROM wake_batches WHERE batch_id=?2)),updated_at=?3 WHERE batch_id=?1", params![next, batch, now_rfc3339()])?;
         transaction.execute("UPDATE wake_batches SET event_count=0 WHERE batch_id=?1", [&batch])?;
+        transaction.execute(
+            "UPDATE wake_batches SET input_error=?2 WHERE batch_id=?1",
+            params![next, reason],
+        )?;
     } else {
-        transaction.execute("UPDATE wake_batches SET lifecycle='runnable',updated_at=?2 WHERE batch_id=?1 AND lifecycle='consumed'", params![batch, now_rfc3339()])?;
+        transaction.execute("UPDATE wake_batches SET lifecycle='runnable',updated_at=?2,input_error=?3 WHERE batch_id=?1 AND lifecycle='consumed'", params![batch, now_rfc3339(),reason])?;
     }
     transaction.execute(
         "UPDATE provider_sessions SET lifecycle='idle' WHERE session_id=?1 AND lifecycle='running'",

@@ -125,6 +125,9 @@ impl Database {
             connection
                 .execute_batch(include_str!("../migrations/0009_durable_publication.sql"))
                 .unwrap();
+            connection
+                .execute_batch(include_str!("../migrations/0011_collaboration_inputs.sql"))
+                .unwrap();
         }
         Self(path)
     }

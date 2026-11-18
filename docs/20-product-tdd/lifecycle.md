@@ -45,11 +45,11 @@ names alone:
 | Previously absent included scalar/set value added | Wake | Add reference; debounce/count. |
 | Comment/thread unminimized or unresolved | Wake | Restored body enters Context; debounce/count. |
 | PR synchronize, checks terminal, reviewer request change, or other excluded implementation fact | Wake reference | Does not enter Context; debounce/count. |
-| Existing visible body/title/description edited or cleared | Hard Invalidation | Replace Context; continue only if a turn was interrupted. |
-| Included scalar replaced/cleared or set member removed | Hard Invalidation | Same. Dedicated close/unassign rules take precedence. |
-| Comment/review deleted or minimized; review thread resolved | Hard Invalidation | Remove body, retain lifecycle metadata, replace Context. |
+| Existing visible body/title/description edited or cleared | Hard Invalidation + attention | Fence/replace Context; retain one ordinary input when idle, coalesce one continuation when running. |
+| Included scalar replaced/cleared or set member removed | Hard Invalidation + attention | Same. Dedicated close/unassign rules take precedence. |
+| Comment/review deleted or minimized; review thread resolved | Hard Invalidation + attention | Remove stale body, retain metadata and an input to consider the revision. |
 | Direct Issue↔PR association graph changes | Hard Invalidation for affected PR groups; addition also Wake | Rebuild full direct graph. |
-| Non-Agent edit to an open direct Associated Issue description | Cross-surface Hard Invalidation | Debounce edits, then interrupt/fence active PR and replace Context. |
+| Non-Agent edit to an open direct Associated Issue description | Cross-surface Hard Invalidation + attention | Debounce, fence/replace active PR Context; an idle active PR also retains the input. |
 | Other included direct Associated Issue change | Dependency Dirty plus Wake when Human-origin | No active PR interruption; rematerialize before next PR turn. |
 | Closed Associated Issue body/comment change | No PR effect | Content is excluded until reopen. |
 | Correlated Braid App Agent write, or write by the Profile's configured stable GitHub node identity | Agent-origin | Update canonical ledger; no wake/reset of originating group. |
@@ -62,7 +62,10 @@ Each group has one pending batch. A Wake Event starts/resets a 30-second Quiet
 Window and increments the unsuperseded Wake count. The batch becomes runnable
 when no Wake arrives for 30 seconds or the count reaches eight. Both values are
 Profile-overridable. Lifecycle/invalidation refs can join the batch without
-turning into Wake Events.
+turning into Wake Events. `requires_attention` separately records whether a
+revision still owes ordinary input delivery; consuming an invalidation for
+Context replacement does not consume that batch. It never activates a dormant
+or closed responsibility.
 
 A Trusted Braid Mention is an exact configured handle in visible Markdown prose
 from a current repository `MAINTAIN` or `ADMIN` actor. Code spans/blocks,
@@ -87,7 +90,8 @@ canonical diff
   -> create fresh physical Provider Session
   -> inject complete current GitHub Context
   -> if an active turn was interrupted: start one continuation turn with refs
-     else: return idle unless the batch independently contains Wake/urgent input
+     else: preserve the ordinary attention batch and its original quiet deadline
+  -> dispatch at most one turn with current Context when that batch is runnable
 ```
 
 Output emitted after fencing is retained in provider/telemetry evidence but is
@@ -104,7 +108,13 @@ Title/label/project changes with the same visible body,
 HTML-comment-only edits, closed Issues, inactive edges, and inactive PR Agent
 Groups do not create this invalidation. The derived reference enters the PR's
 ordinary Quiet Window/count batch; the Wrapper never infers semantic urgency
-from the edited prose.
+from the edited prose. Other relevant source revisions with unchanged visible
+body create an ordinary dependency Wake, not an interruption.
+
+Origin is established by this action's verified actor or by an exact correlated
+publication version/content. Creator identity and a retained Braid attribution
+block cannot establish who made an edit. Unknown edit origin is not silently
+classified as Agent-origin.
 
 ## Assignment and Terminal Lifecycle
 

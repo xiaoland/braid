@@ -9,8 +9,8 @@ use crate::{
     context,
     github::{GitHubClient, GitHubError, PullRequest, WorkItemLocator},
     store::{
-        GhWriteReceipt, ImplementationProgress, ImplementationRequestReceipt, IngressEvent,
-        NewGhWriteIntent, NewImplementationRequest, SchedulerPolicy, StoreActor,
+        GhWriteReceipt, ImplementationProgress, ImplementationRequestReceipt, NewGhWriteIntent,
+        NewImplementationRequest, SchedulerPolicy, StoreActor,
     },
 };
 
@@ -171,7 +171,7 @@ pub(crate) async fn execute(
         return handoff::execute(config, github, &receipt).await;
     }
     if receipt.operation == "body_edit" {
-        return edit::execute(config, github, &receipt, mutation_possible).await;
+        return edit::execute(config, store, github, &receipt, mutation_possible).await;
     }
     if receipt.operation == "comment_create" {
         let target: WorkItemLocator = receipt.target.parse()?;
@@ -293,4 +293,4 @@ pub(crate) fn check_source(config: &Config, receipt: &GhWriteReceipt) -> Result<
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

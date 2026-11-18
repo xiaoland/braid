@@ -101,8 +101,13 @@ Codex thread, and inject current complete Context. The replacement must contain
 new description/comment bodies, only metadata for the minimized/deleted
 comments, and no stale body or provider transcript.
 
-Repeat equivalent lifecycle on an idle group. Context/session is replaced but
-no turn starts until a Wake Event. Unminimizing the comment restores its body and
+Repeat equivalent lifecycle on an idle active group without posting another
+comment or mention. Context/session replacement must preserve one ordinary
+pending input, and after debounce the Agent must handle the revised agreement.
+Its observable behavior must use the new description, not the superseded
+requirement; it may discuss, revise, clarify or explicitly wait. Repeat delivery
+and restart while waiting: neither may silently settle the input or add a second
+turn for the same revision. Unminimizing the comment restores its body and
 creates a Wake Event. Older-after-newer webhook redelivery must not regress the
 projection or create a duplicate turn.
 
@@ -114,8 +119,10 @@ Draft PR, native association, ActivationIntent, PR Agent generation, PR Profile,
 and dedicated worktree must result. When the selected branch initially equals
 base, the PR contains exactly one Braid App bootstrap commit whose tree equals
 its parent and whose message identifies the request comment; it changes no
-file. A second distinct request comment may create a second PR; 1:N and N:1
-associations must not be rejected.
+file. A second distinct request comment must independently deliver activation to its
+own PR and start that authorized PR Agent; 1:N and N:1 associations must not be
+rejected. An applied ensure receipt must report durable activation delivery,
+separately from provider readiness/completion. PR existence alone is not pass.
 
 The PR Agent's initial Context must contain all current directly Associated
 Issues followed by the PR section. Open Issues are complete; a closed Issue is
@@ -144,6 +151,11 @@ match suppresses self-wake/reset. Repeat under an unconfigured/shared Human
 identity: it remains allowed but is processed as a normal external change and
 may wake/invalidate. This is the explicit autonomy/attribution tradeoff.
 
+Have the Human revise an Agent-maintained description while preserving its old
+Braid attribution block. It must still be handled as a Human revision. Repeat
+with webhook delivery unavailable so canonical reconciliation observes it;
+original authorship and displayed attribution must not suppress the newer input.
+
 ### 6. Close, Merge, Reopen, and Finalization
 
 Close an active Issue and an active PR without merging. Current turns must not
@@ -168,6 +180,14 @@ No partial, truncated, or generated summary may reach Codex.
 Exercise duplicate delivery, temporary tunnel loss, 60-second reconciliation,
 and an out-of-order edit. GitHub state must converge without duplicate logical
 turns, reactions, status comments, or `pr ensure` PRs.
+
+While the Issue Agent is idle, lose a body-edit webhook and let another complete
+Context read (including an associated PR read) see the new description first.
+Periodic reconciliation must still deliver the changed agreement to the Issue
+Agent without an extra mention. Repeat with only a timestamp or hidden HTML
+comment changed: no new work is required. Recover the Tunnel without restarting
+Agent execution: the public signed ingress and the App's registered URL must
+agree before reporting connected; failures must be visibly degraded.
 
 Restart Braid while debouncing, while a reaction/status write is uncertain, and
 while a provider turn is active. Repository owner lease, batches, outbox, and

@@ -15,6 +15,13 @@ Group 不根据 backend 决定连接数量或故障范围。
 GitHub 接入而遗漏路径、继承宿主的其它实例或自行寻找旧运行配置。这提供明确
 绑定，不构成对同账户进程的文件系统隔离。
 
+锁定 Pi 入口在建立 execution-local XDG 目录前，保留普通 `gh` 的配置定位：
+显式 `GH_CONFIG_DIR` 优先，否则固定原有 `XDG_CONFIG_HOME/gh` 或 Unix 默认
+`$HOME/.config/gh`。Git 的 `gh auth git-credential` 子进程继承同一路径，不复制
+凭据值或整个宿主 XDG 配置。该修正需要新建不可变 Pi 材料安装；不要原地修改已冻结
+manifest 的文件。旧材料可由 operator 显式配置 `GH_CONFIG_DIR` 作为过渡。
+
+
 | Core method | Adapter behavior |
 | --- | --- |
 | `SessionFactory::check()` | 检查 adapter 的启动前置条件；共享运行资源由 adapter 自己维护。 |

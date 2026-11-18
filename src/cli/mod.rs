@@ -501,6 +501,7 @@ struct ContextReport<'a> {
 struct CommentWriteResult<'a> {
     request_id: &'a str,
     stage: Option<&'a str>,
+    activation: Option<&'static str>,
     head: Option<&'a str>,
     base: Option<&'a str>,
     pull_request: Option<String>,

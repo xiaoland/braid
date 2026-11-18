@@ -11,7 +11,10 @@ included metadata, and unfolded content are Wake Events. They accumulate until
 the Quiet Window expires or the count threshold is reached. The Issue Agent
 receives one current Context plus coalesced Event References and decides
 whether to discuss, update the design description, wait, or request
-implementation.
+implementation. Relevant external revisions to existing working memory are also
+inputs to an already-active responsibility. Replacing an idle session does not
+settle that input: Braid supplies the current agreement at the next safe boundary
+without requiring another Human mention.
 
 ### Implement
 
@@ -23,7 +26,10 @@ the selected remote head has no difference from base, Braid creates an
 App-authored empty bootstrap commit with the same tree, so GitHub can open the
 Draft PR before implementation changes exist. This public commit changes no
 file and records the Implementation Request; the PR Agent then implements in
-the resulting branch/worktree.
+the resulting branch/worktree. An applied ensure receipt must confirm durable
+delivery of the activation to that exact PR, not merely that the PR exists.
+Activation delivery is distinct from executor readiness or implementation
+completion; any blocked handover must remain diagnosable.
 
 PR Profile selection is deterministic: use the sole eligible `pr` Profile, or
 the configured default when several exist; otherwise leave activation visibly

@@ -329,12 +329,30 @@ SQLite. An active turn without provider terminal evidence remains `unknown` on
 the next compatible resume; Braid neither starts a parallel turn nor calls it a
 success or failure.
 
-Quick Tunnel URLs are temporary. A graceful stop restores the prior App webhook
-URL. If the supervised Wrangler child exits unexpectedly, Braid immediately
-marks tunnel health unavailable and attempts the same restoration while the
-local runtime and reconciliation remain available. A failed repair stays
-explicit in health and requires operator action. GitHub does not automatically
-redeliver failed webhooks; reconciliation is the recovery path.
+Quick Tunnel URLs are temporary. A dedicated supervisor owns the child, public
+verification and App URL synchronization independently of Agent execution. Child
+exit or an explicit `Tunnel not found` marks connectivity unavailable and starts
+bounded, backed-off candidate rebuilding without restarting `serve` or its Agent
+sessions. Every 60 seconds it verifies a signed public request receives ingress
+202 and that the App still names that URL. A failed check reports degraded
+immediately; three consecutive public failures replace the candidate. URL drift
+retries synchronization of the live candidate rather than creating a new Agent
+session. Failed App synchronization remains `sync_pending` and retries with a
+10–120-second backoff. On Unix, each candidate starts in its own owned process
+group, including Wrangler's Node wrappers and cloudflared. Stop and failed
+registration close that group; cancellation retains a last-resort group signal.
+An unconfirmed stop reports `stop_unconfirmed` and stops creating candidates
+until operator recovery. It does not restart Agent execution to hide the fault.
+
+`/healthz` returns 503 while a requested Tunnel is not connected. Its
+`webhook_sync`, `tunnel_verified_at` and `tunnel_error` distinguish the last
+confirmed URL from a pending or failed repair; systemd active is not webhook
+readiness. `doctor` primarily checks installation preconditions and cannot
+substitute for these live observations. On graceful stop, Braid restores the
+prior App webhook only if the current URL still belongs to its own candidate.
+GitHub does not automatically redeliver failed deliveries: canonical
+reconciliation recovers current-state changes, while `github redeliver` remains
+the explicit route for recovering a particular delivery.
 On networks that block outbound QUIC, the Quick Tunnel supervisor explicitly
 uses Cloudflare's TCP HTTP/2 transport. Readiness requires both cloudflared's
 registered-connection signal and a signed request that traverses the public URL
@@ -372,7 +390,9 @@ physical sessions and requested kind/Profile. Closed/merged alone is not an
 exclusion: finalization can remain eligible. Diagnostics never delete/consume
 residual batches or change Group lifecycle. Agent groups mark `current_generation`
 by the highest durable assignment generation for that Work Item; historical blocked
-records are not current-generation failures. Both JSON and text expose this split.
+records are not current-generation failures. Both JSON and text expose this split. A deferred complete-input read also keeps
+its bounded `input_error` on the batch, so a runnable lifecycle cannot disguise
+repeated Context failures. Native execution has not started for that input.
 
 Health never reports task acceptance, design readiness, or implementation
 success. Operational Status Comments are the GitHub-visible projection for

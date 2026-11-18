@@ -67,6 +67,7 @@ pub struct ImplementationRequestReceipt {
     pub bootstrap_authored_at: String,
     pub pull_request_number: Option<u64>,
     pub stage: String,
+    pub activation_delivered: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -313,7 +314,7 @@ fn implementation_request_receipt_on(
         .query_row(
             "SELECT comment_database_id,issue_number,issue_title,
                     base_ref,head_ref,pr_profile_id,bootstrap_authored_at,
-                    pull_request_number,stage
+                    pull_request_number,stage,activation_event_id IS NOT NULL
              FROM implementation_requests WHERE intent_id=?1",
             [intent_id],
             |row| {
@@ -334,6 +335,7 @@ fn implementation_request_receipt_on(
                         .map(|value| sqlite_i64_to_u64(value, "pull request number"))
                         .transpose()?,
                     stage: row.get(8)?,
+                    activation_delivered: row.get(9)?,
                 })
             },
         )

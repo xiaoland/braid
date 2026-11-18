@@ -526,7 +526,7 @@ impl GroupDriver<'_> {
         }?;
         // Retire only canonically invalid historical handoff inputs. Transient
         // Context failures retain every unsent input through ordinary defer.
-        let prepared = super::handoff::prepare_input(
+        let prepared = super::input::prepare_input(
             self.config,
             self.collaboration,
             store,
@@ -538,8 +538,9 @@ impl GroupDriver<'_> {
             Ok(Some(input)) => input,
             Ok(None) => return None,
             Err(error) => {
-                tracing::warn!(%error, turn = %claim.turn_id, "handoff Context refresh deferred; no provider turn started");
-                let _ = store.defer_turn_claim(claim.turn_id.clone());
+                tracing::warn!(%error, turn = %claim.turn_id, "canonical input refresh deferred; no provider turn started");
+                let reason = error.to_string().chars().take(1024).collect();
+                let _ = store.defer_turn_claim_with_reason(claim.turn_id.clone(), Some(reason));
                 return None;
             }
         };

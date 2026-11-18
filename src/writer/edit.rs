@@ -288,6 +288,7 @@ pub(super) async fn authorize(
 
 pub(super) async fn execute(
     config: &Config,
+    store: &StoreActor,
     github: &GitHubClient,
     receipt: &GhWriteReceipt,
     mutation_possible: &mut bool,
@@ -302,6 +303,7 @@ pub(super) async fn execute(
     // Recovery checks exact resulting content before any possible retry. A later Human
     // change is a conflict, not evidence of our success and never overwritten.
     if receipt.attempts > 0 && current.title == title && current.body.as_deref() == Some(&body) {
+        record_version(store, receipt, &current)?;
         return Ok(RemoteWrite { database_id: current.id.to_string(), node_id: current.node_id });
     }
     if current.digest() != expected {
@@ -335,5 +337,31 @@ pub(super) async fn execute(
         )
         .into());
     }
+    record_version(store, receipt, &result)?;
     Ok(RemoteWrite { database_id: result.id.to_string(), node_id: result.node_id })
+}
+
+fn record_version(
+    store: &StoreActor,
+    receipt: &GhWriteReceipt,
+    snapshot: &BodySnapshot,
+) -> Result<(), GitHubError> {
+    let digest = crate::store::publication_digest(
+        &snapshot.node_id,
+        &snapshot.updated_at,
+        Some(&snapshot.title),
+        snapshot.body.as_deref().unwrap_or(""),
+    );
+    store
+        .record_publication_version(
+            receipt.intent_id.clone(),
+            snapshot.node_id.clone(),
+            snapshot.updated_at.clone(),
+            digest,
+        )
+        .map_err(|error| {
+            GitHubError::ConvergencePending(format!(
+                "publication version evidence could not be committed: {error}"
+            ))
+        })
 }

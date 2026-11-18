@@ -15,7 +15,6 @@ pub(crate) const LEASE_TTL_SECONDS: u64 = 30;
 
 use crate::{
     config::Config,
-    config::agent_attributions,
     context::{self, CanonicalContext, CanonicalObservation},
     github::{GitHubClient, RepositoryName, WorkItemLocator},
     health::HealthSnapshot,
@@ -182,7 +181,7 @@ async fn reconcile_work_item(
         return Ok(0);
     };
     let prior = store
-        .canonical_objects(work_item.node_id.clone())?
+        .processed_objects(work_item.node_id.clone())?
         .into_iter()
         .filter(|object| {
             matches!(
@@ -252,19 +251,47 @@ pub(crate) fn reconcile_observations(
         quiet_seconds: config.scheduler.quiet_seconds,
         event_threshold: config.scheduler.event_threshold,
     };
-    let attributions = agent_attributions(config);
-    let mut changes = 0;
+    let mut events = Vec::new();
+    let mut processed = current
+        .iter()
+        .map(|observation| CanonicalObjectState {
+            node_id: observation.object_node_id.clone(),
+            database_id: Some(observation.database_id.clone()),
+            object_kind: observation.object_kind.into(),
+            version: observation.version.clone(),
+            digest: observation.digest.clone(),
+            lifecycle: if matches!(observation.object_kind, "issue" | "pr") {
+                observation.work_item_state.to_ascii_lowercase()
+            } else {
+                observation.lifecycle.into()
+            },
+            author_node_id: observation.author_node_id.clone(),
+            author_login: observation.author_login.clone(),
+            metadata_digest: observation.metadata_digest.clone(),
+        })
+        .collect::<Vec<_>>();
     for observation in current {
         let previous = prior.get(&observation.object_node_id);
         // A work-item state transition (close/reopen/merge) must never be
         // skipped: the body digest often survives it, and the issue/pr
         // unchanged rule intentionally treats digest-equal as unchanged for
         // ordinary comment-bump noise.
+        let previous_state =
+            previous.map_or(scope.previous_work_item_state.as_str(), |p| p.lifecycle.as_str());
         let state_transition = matches!(observation.object_kind, "issue" | "pr")
-            && !scope.previous_work_item_state.eq_ignore_ascii_case(&observation.work_item_state);
+            && !previous_state.eq_ignore_ascii_case(&observation.work_item_state);
         if !state_transition
             && previous.is_some_and(|previous| observation_unchanged(previous, observation))
         {
+            if previous.is_some_and(|p| p.metadata_digest.is_none())
+                && observation.metadata_digest.is_some()
+            {
+                let mut epoch =
+                    reconciled_event(observation, "observed", EventKind::Noop, true, false, config);
+                epoch.identity = crate::store::ChangeIdentity::Occurrence;
+                epoch.delivery_guid = format!("reconcile-epoch-{}", uuid::Uuid::now_v7());
+                events.push(epoch);
+            }
             continue;
         }
         let (mut action, mut kind) = reconciled_change(previous, observation);
@@ -280,9 +307,8 @@ pub(crate) fn reconcile_observations(
                 None
             };
             if let Some(lifecycle_action) = lifecycle_action {
-                let state_changed = !scope
-                    .previous_work_item_state
-                    .eq_ignore_ascii_case(&observation.work_item_state);
+                let state_changed =
+                    !previous_state.eq_ignore_ascii_case(&observation.work_item_state);
                 let observed = store.has_lifecycle_observation(
                     observation.work_item_node_id.clone(),
                     lifecycle_action.into(),
@@ -294,15 +320,21 @@ pub(crate) fn reconcile_observations(
                 }
             }
         }
-        let external = observation_is_external(
-            observation,
-            github.identity().actor_node_id.as_str(),
-            config,
-            &attributions,
-        );
+        let metadata_changed =
+            previous.is_some_and(|p| p.metadata_digest != observation.metadata_digest);
+        // A title/body publication proves only those fields, never a later
+        // metadata or native-edge change sharing a coarse root timestamp.
+        let external = metadata_changed
+            || observation_is_external(
+                store,
+                observation,
+                action,
+                github.identity().actor_node_id.as_str(),
+                config,
+            )?;
         let cross_surface_invalidation =
             external && observation.object_kind == "issue" && action == "edited";
-        let event = reconciled_event(
+        let mut event = reconciled_event(
             observation,
             action,
             kind,
@@ -310,26 +342,37 @@ pub(crate) fn reconcile_observations(
             cross_surface_invalidation,
             config,
         );
-        let ingested = store.ingest_event(event, policy)?;
-        tracing::debug!(
-            object = %observation.object_node_id,
-            object_kind = observation.object_kind,
-            action,
-            ?kind,
-            external,
-            event_id = ?ingested.event_id,
-            event_lifecycle = ?ingested.event_lifecycle,
-            "reconcile observation ingested"
-        );
-        if ingested.event_id.is_some() {
-            changes += 1;
+        if metadata_changed {
+            event.identity = crate::store::ChangeIdentity::Occurrence;
+            event.delivery_guid = format!("reconcile-transition-{}", uuid::Uuid::now_v7());
+            event.object_digest = Some(hex::encode(Sha256::digest(
+                format!(
+                    "braid-metadata-change-v1\0{}\0{}",
+                    observation.digest,
+                    observation.metadata_digest.as_deref().unwrap_or("")
+                )
+                .as_bytes(),
+            )));
         }
+        if observation.object_kind == "review_thread"
+            && !metadata_changed
+            && previous.is_some_and(|p| p.lifecycle != observation.lifecycle)
+            && matches!(action, "resolved" | "unresolved")
+        {
+            event.identity = crate::store::ChangeIdentity::ObservedTransition;
+        }
+        events.push(event);
     }
     for previous in prior.values() {
-        if current_map.contains_key(previous.node_id.as_str()) || previous.lifecycle == "deleted" {
+        if current_map.contains_key(previous.node_id.as_str()) {
+            continue;
+        }
+        if previous.lifecycle == "deleted" {
+            processed.push(previous.clone());
             continue;
         }
         let observation = CanonicalObservation {
+            unedited_creation: false,
             work_item_node_id: scope.work_item_node_id.clone(),
             work_item_kind: scope.work_item_kind,
             work_item_number: scope.work_item_number,
@@ -352,47 +395,82 @@ pub(crate) fn reconcile_observations(
             author_login: previous.author_login.clone(),
             body: None,
             visible_body: None,
+            title: None,
+            metadata_digest: None,
         };
-        let event =
-            reconciled_event(&observation, "deleted", EventKind::Invalidate, true, false, config);
-        if store.ingest_event(event, policy)?.event_id.is_some() {
-            changes += 1;
-        }
+        let mut deleted = previous.clone();
+        deleted.version.clone_from(&observation.version);
+        deleted.lifecycle = "deleted".into();
+        processed.push(deleted);
+        events.push(reconciled_event(
+            &observation,
+            "deleted",
+            EventKind::Invalidate,
+            true,
+            false,
+            config,
+        ));
     }
-    Ok(changes)
+    store
+        .commit_observation(crate::store::ObservationCommit {
+            work_item_node_id: scope.work_item_node_id.clone(),
+            expected: prior.values().cloned().collect(),
+            current: processed,
+            events,
+            policy,
+        })
+        .map_err(Into::into)
 }
 
 pub(crate) fn observation_is_external(
+    store: &StoreActor,
     observation: &CanonicalObservation,
+    action: &str,
     app_actor_node_id: &str,
     config: &Config,
-    attributions: &[String],
-) -> bool {
+) -> Result<bool> {
+    let fingerprint = observation.version_digest();
+    if store.is_agent_version(
+        observation.object_node_id.clone(),
+        observation.version.clone(),
+        fingerprint,
+    )? {
+        return Ok(false);
+    }
+    // The creator is evidence for creation only, never for a later Human edit.
+    if !current_actor_known(observation, action) {
+        return Ok(true);
+    }
     let profile_origin = observation.author_node_id.as_deref().is_some_and(|author_node_id| {
         config
             .profiles
             .iter()
             .any(|profile| profile.github_actor_node_id.as_deref() == Some(author_node_id))
     });
-    observation.author_node_id.as_deref() != Some(app_actor_node_id)
-        && !profile_origin
-        && !observation
-            .body
-            .as_deref()
-            .is_some_and(|body| webhook::has_agent_attribution(body, attributions))
+    Ok(observation.author_node_id.as_deref() != Some(app_actor_node_id) && !profile_origin)
+}
+
+fn current_actor_known(observation: &CanonicalObservation, action: &str) -> bool {
+    (observation.unedited_creation && matches!(action, "created" | "submitted"))
+        || (observation.object_kind == "review_thread"
+            && action == "resolved"
+            && observation.author_node_id.is_some())
 }
 
 pub(crate) fn observation_unchanged(
     previous: &CanonicalObjectState,
     observation: &CanonicalObservation,
 ) -> bool {
-    if previous.lifecycle != observation.lifecycle {
-        return false;
-    }
     if matches!(observation.object_kind, "issue" | "pr") {
-        previous.version == observation.version || previous.digest == observation.digest
+        previous.lifecycle.eq_ignore_ascii_case(&observation.work_item_state)
+            && previous.digest == observation.digest
+            && (previous.metadata_digest.is_none()
+                || previous.metadata_digest == observation.metadata_digest)
     } else {
-        previous.version == observation.version && previous.digest == observation.digest
+        previous.lifecycle == observation.lifecycle
+            && (previous.digest == observation.digest
+                || (previous.metadata_digest.is_none()
+                    && previous.digest == observation.version_digest()))
     }
 }
 
@@ -415,7 +493,10 @@ pub(crate) fn reconciled_change(
         }
         "review" if previous.is_none() => ("submitted", EventKind::Wake),
         "review" if observation.lifecycle == "dismissed" => ("dismissed", EventKind::Invalidate),
-        "review_thread" if observation.lifecycle == "resolved" => {
+        "review_thread"
+            if observation.lifecycle == "resolved"
+                && previous.is_some_and(|p| p.lifecycle != "resolved") =>
+        {
             ("resolved", EventKind::Invalidate)
         }
         "review_thread" if previous.is_some_and(|previous| previous.lifecycle == "resolved") => {
@@ -445,6 +526,7 @@ pub(crate) fn reconciled_event(
         _ => "issue_comment",
     };
     let mention_candidate = external
+        && observation.unedited_creation
         && matches!(action, "created" | "edited" | "unminimized")
         && observation.body.as_deref().is_some_and(|body| {
             config
@@ -467,17 +549,28 @@ pub(crate) fn reconciled_event(
         "version":observation.version,
     }))
     .expect("reconciliation evidence serializes");
-    let delivery_guid = format!(
-        "reconcile-{}",
-        &hex::encode(Sha256::digest(
-            format!(
-                "{}\0{}\0{}\0{}",
-                observation.object_node_id, observation.version, observation.digest, action
-            )
-            .as_bytes()
-        ))[..32]
-    );
+    let occurrence =
+        observation.object_kind == "review_thread" || matches!(action, "minimized" | "unminimized");
+    let delivery_guid = if occurrence {
+        format!("reconcile-transition-{}", uuid::Uuid::now_v7())
+    } else {
+        format!(
+            "reconcile-{}",
+            &hex::encode(Sha256::digest(
+                format!(
+                    "{}\0{}\0{}\0{}",
+                    observation.object_node_id, observation.version, observation.digest, action
+                )
+                .as_bytes()
+            ))[..32]
+        )
+    };
     IngressEvent {
+        identity: if occurrence {
+            crate::store::ChangeIdentity::Occurrence
+        } else {
+            crate::store::ChangeIdentity::ObjectVersion
+        },
         delivery_guid,
         event_name: event_name.into(),
         action: Some(action.into()),
@@ -489,13 +582,20 @@ pub(crate) fn reconciled_event(
         work_item_state: Some(observation.work_item_state.clone()),
         object_node_id: Some(observation.object_node_id.clone()),
         object_version: Some(observation.version.clone()),
-        object_digest: Some(observation.digest.clone()),
+        object_digest: Some(observation.version_digest()),
         visible_body: observation.visible_body.clone(),
-        actor_node_id: observation.author_node_id.clone(),
-        actor_login: observation.author_login.clone(),
+        actor_node_id: observation
+            .author_node_id
+            .clone()
+            .filter(|_| current_actor_known(observation, action)),
+        actor_login: observation
+            .author_login
+            .clone()
+            .filter(|_| current_actor_known(observation, action)),
         kind: if external { kind } else { EventKind::OriginEcho },
         detail: Some(action),
         cross_surface_invalidation,
+        requires_attention: external && matches!(kind, EventKind::Wake | EventKind::Invalidate),
         origin: if external { "reconciliation" } else { "agent" },
         reference: webhook::event_reference(
             event_name,
@@ -504,7 +604,10 @@ pub(crate) fn reconciled_event(
             Some(observation.work_item_kind),
             Some(observation.work_item_number),
             (!observation.database_id.is_empty()).then_some(observation.database_id.as_str()),
-            observation.author_login.as_deref(),
+            observation
+                .author_login
+                .as_deref()
+                .filter(|_| current_actor_known(observation, action)),
         ),
         mention_candidate,
         reaction_target,

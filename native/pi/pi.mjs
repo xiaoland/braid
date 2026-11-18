@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
+import { preserveToolConfig } from './tool-environment.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
@@ -20,6 +22,7 @@ if (informational) {
   }
   const nativeHome = process.env.PI_CODING_AGENT_DIR;
   if (!nativeHome || !path.isAbsolute(nativeHome)) throw new Error('PI_CODING_AGENT_DIR must be an absolute, persistent Braid native home.');
+  preserveToolConfig(process.env, os.homedir());
   for (const [name, relative] of Object.entries({ TMPDIR: 'tmp', XDG_CACHE_HOME: 'cache', XDG_DATA_HOME: 'data', XDG_CONFIG_HOME: 'config' })) {
     const value = path.join(process.env.BRAID_NATIVE_EXECUTION_DIR, relative);
     fs.mkdirSync(value, { recursive: true, mode: 0o700 });

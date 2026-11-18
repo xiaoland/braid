@@ -162,7 +162,7 @@ async fn applied_issue_design_is_materialized_at_handoff_safe_boundary_not_from_
     let turn = claim(&f).unwrap();
     let mut reference = crate::group::provider::render_event_references(&f.config, &turn);
     let collaboration = crate::collaboration::CollaborationBackend::GitHub(github);
-    crate::group::handoff::append_current_context(
+    crate::group::input::append_current_context(
         f.config.runtime.database(),
         &collaboration,
         &f.store,
@@ -173,13 +173,13 @@ async fn applied_issue_design_is_materialized_at_handoff_safe_boundary_not_from_
     .await
     .unwrap();
     assert!(reference.contains("Scope, verification, risks"), "{reference}");
-    assert!(reference.contains("Current canonical handoff Context"));
+    assert!(reference.contains("Current canonical Context"));
     assert!(!reference.contains("old-pr-context"));
     // Association deletion after acceptance cannot deliver an old cached Issue.
     remote.lock().unwrap().associated = false;
     let mut denied = String::new();
     assert!(
-        crate::group::handoff::append_current_context(
+        crate::group::input::append_current_context(
             f.config.runtime.database(),
             &collaboration,
             &f.store,
@@ -188,7 +188,7 @@ async fn applied_issue_design_is_materialized_at_handoff_safe_boundary_not_from_
             &mut denied
         )
         .await
-        .is_ok_and(|d| matches!(d, crate::group::handoff::RefreshDisposition::Retire(_)))
+        .is_ok_and(|d| matches!(d, crate::group::input::RefreshDisposition::Retire(_)))
     );
     assert!(denied.is_empty());
     task.abort();
@@ -232,6 +232,7 @@ async fn app_comment_with_mention_is_not_a_handoff() {
     let f = Fixture::new(true);
     bind_pr(&f);
     let event = IngressEvent {
+        identity: crate::store::ChangeIdentity::Occurrence,
         delivery_guid: "app-echo".into(),
         event_name: "issue_comment".into(),
         action: Some("created".into()),
@@ -242,7 +243,7 @@ async fn app_comment_with_mention_is_not_a_handoff() {
         work_item_number: Some(9),
         work_item_state: Some("open".into()),
         object_node_id: Some("app-comment".into()),
-        object_version: Some("v1".into()),
+        object_version: None,
         object_digest: None,
         visible_body: Some("@braid please continue".into()),
         actor_node_id: Some("app".into()),
@@ -250,6 +251,7 @@ async fn app_comment_with_mention_is_not_a_handoff() {
         kind: crate::store::EventKind::OriginEcho,
         detail: None,
         cross_surface_invalidation: false,
+        requires_attention: true,
         origin: "agent",
         reference: "owner/repository#9".into(),
         mention_candidate: false,
@@ -305,7 +307,7 @@ async fn refresh_failure_defers_and_merges_an_arriving_handoff_without_losing_in
     let backend = crate::collaboration::CollaborationBackend::GitHub(github);
     let mut input = String::new();
     assert!(
-        crate::group::handoff::append_current_context(
+        crate::group::input::append_current_context(
             f.config.runtime.database(),
             &backend,
             &f.store,
@@ -338,7 +340,7 @@ async fn refresh_failure_defers_and_merges_an_arriving_handoff_without_losing_in
     let recorder = RecordingSession::new();
     send_prepared(&f, &backend, retry, &recorder).await;
     assert_eq!(recorder.inputs.lock().unwrap().len(), 1);
-    assert!(recorder.inputs.lock().unwrap()[0].contains("Current canonical handoff Context"));
+    assert!(recorder.inputs.lock().unwrap()[0].contains("Current canonical Context"));
     assert_eq!(count(&f, "pr_handoffs"), 2);
     assert!(
         recorder.inputs.lock().unwrap()[0].contains("HumanWake arriving during network failure")
@@ -418,7 +420,7 @@ async fn send_prepared(
     recorder: &RecordingSession,
 ) {
     use crate::agent_session::AgentSession;
-    let (turn, input) = crate::group::handoff::prepare_input(
+    let (turn, input) = crate::group::input::prepare_input(
         &f.config,
         backend,
         &f.store,
@@ -457,7 +459,7 @@ async fn canonical_invalid_handoff_retires_only_itself_and_survivors_really_send
         bind_pr(&f);
         let receipt = handoff(&f, mode).unwrap();
         let remote = Arc::new(Mutex::new(body_edit::BodyRemote::new(false)));
-        let (github, task) = body_edit::body_server(remote.clone()).await;
+        let (mut github, mut task) = body_edit::body_server(remote.clone()).await;
         f.drain(github.clone()).await;
         assert_eq!(f.receipt(&receipt.request_id).lifecycle, "applied");
         let reference = match mode {
@@ -475,7 +477,8 @@ async fn canonical_invalid_handoff_retires_only_itself_and_survivors_really_send
             }
             "new-generation" => {
                 f.db().execute_batch("UPDATE assignments SET lifecycle='retired' WHERE assignment_id='pr-assignment'; INSERT INTO assignments VALUES ('new-pr','pr',2,'active','now',NULL); UPDATE agent_instances SET lifecycle='retired' WHERE agent_id='pr-agent'; UPDATE provider_sessions SET lifecycle='retired' WHERE session_id='pr-session'; INSERT INTO agent_instances(agent_id,assignment_id,profile_id,profile_revision,role,lifecycle) SELECT 'new-pr-agent','new-pr',profile_id,profile_revision,role,'idle' FROM agent_instances WHERE agent_id='pr-agent'; INSERT INTO provider_sessions(session_id,agent_id,provider_kind,provider_session_id,context_revision,instruction_revision,lifecycle,started_at) VALUES ('new-pr-session','new-pr-agent','codex','new-pr-provider','new-pr-context','instructions','idle','now');").unwrap();
-                // Generation mismatch is local durable proof: no GitHub read required.
+                // Retirement has local durable proof; a surviving new turn
+                // still needs complete current Context before native input.
                 remote.lock().unwrap().limited = true;
             }
             _ => unreachable!(),
@@ -489,6 +492,31 @@ async fn canonical_invalid_handoff_retires_only_itself_and_survivors_really_send
         if mode == "new-generation" {
             assert_eq!(turn.provider_session_id, "new-pr-provider");
         }
+        let turn = if mode == "new-generation" {
+            let backend = crate::collaboration::CollaborationBackend::GitHub(github.clone());
+            assert!(
+                crate::group::input::prepare_input(
+                    &f.config,
+                    &backend,
+                    &f.store,
+                    f.config.profile("issue-codex").unwrap(),
+                    turn.clone()
+                )
+                .await
+                .is_err()
+            );
+            f.store.defer_turn_claim(turn.turn_id).unwrap();
+            remote.lock().unwrap().limited = false;
+            // The failed transport keeps its real installation cooldown. A
+            // fresh client models recovery/restart without sleeping in a test.
+            task.abort();
+            let recovered = body_edit::body_server(remote.clone()).await;
+            github = recovered.0;
+            task = recovered.1;
+            claim(&f).unwrap()
+        } else {
+            turn
+        };
         let batch = turn.batch_id.clone();
         let recorder = RecordingSession::new();
         let backend = crate::collaboration::CollaborationBackend::GitHub(github);
@@ -497,7 +525,7 @@ async fn canonical_invalid_handoff_retires_only_itself_and_survivors_really_send
         assert_eq!(inputs.len(), 1, "{mode}");
         assert!(inputs[0].contains(reference), "{mode}: {}", inputs[0]);
         assert!(!inputs[0].contains("Explicit Issue handoff"), "{mode}");
-        assert!(!inputs[0].contains("Current canonical handoff Context"), "{mode}");
+        assert!(inputs[0].contains("Current canonical Context"), "{mode}");
         assert_eq!(f.receipt(&receipt.request_id).lifecycle, "applied");
         assert_eq!(count(&f, "pr_handoffs"), 1);
         assert_eq!(
@@ -542,7 +570,7 @@ async fn invalid_handoff_only_batch_ends_and_returns_claim_without_losing_concur
     add_input(&f, "wake", "Arrived during refresh");
     let backend = crate::collaboration::CollaborationBackend::GitHub(github);
     assert!(
-        crate::group::handoff::prepare_input(
+        crate::group::input::prepare_input(
             &f.config,
             &backend,
             &f.store,
@@ -641,7 +669,7 @@ async fn retirement_is_fenced_atomic_and_preserves_other_handoff_and_historical_
     let recorder = RecordingSession::new();
     let backend = crate::collaboration::CollaborationBackend::GitHub(github);
     send_prepared(&f, &backend, remaining, &recorder).await;
-    assert!(recorder.inputs.lock().unwrap()[0].contains("Current canonical handoff Context"));
+    assert!(recorder.inputs.lock().unwrap()[0].contains("Current canonical Context"));
     // No mutation using a stale claim after the provider boundary.
     assert!(f.store.retire_handoff_inputs(turn, vec![input]).is_err());
     assert_eq!(count(&f, "pr_handoffs"), 2);

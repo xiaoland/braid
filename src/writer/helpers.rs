@@ -205,47 +205,17 @@ pub fn record_pr_activation(
                 .into(),
         ));
     }
-    let reference = format!(
-        "Implementation Request comment {repository}#issuecomment-{} ensured GitHub PR {repository}#{}.",
-        receipt.comment_database_id, pull_request.number,
-    );
     store
-        .ingest_event(
-            IngressEvent {
-                delivery_guid: format!(
-                    "braid-pr-ensure-{repository}-{}",
-                    receipt.comment_database_id
-                ),
-                event_name: "braid".into(),
-                action: Some("pr_ensure".into()),
-                repository_node_id: github.identity().repository_node_id.clone(),
-                repository: repository.clone(),
-                work_item_node_id: Some(pull_request.node_id.clone()),
-                work_item_kind: Some("pr"),
-                work_item_number: Some(pull_request.number),
-                work_item_state: Some(pull_request.state.clone()),
-                object_node_id: None,
-                object_version: None,
-                object_digest: None,
-                visible_body: None,
-                actor_node_id: Some(github.identity().actor_node_id.clone()),
-                actor_login: Some(github.identity().actor_login.clone()),
-                kind: crate::store::EventKind::Assign,
-                detail: Some("pr_ensure"),
-                cross_surface_invalidation: false,
-                origin: "braid",
-                reference,
-                mention_candidate: false,
-                reaction_target: None,
-                known: true,
-                raw_payload: Vec::new(),
-            },
+        .accept_pr_activation(
+            receipt.write.intent_id.clone(),
+            github.identity().repository_node_id.clone(),
+            pull_request.node_id.clone(),
+            pull_request.number,
             SchedulerPolicy {
                 quiet_seconds: config.scheduler.quiet_seconds,
                 event_threshold: config.scheduler.event_threshold,
             },
         )
-        .map(|_| ())
         .map_err(|error| store_as_github_error(&error))
 }
 

@@ -17,7 +17,7 @@ use tokio::{
     net::TcpListener,
     sync::{RwLock, watch},
     task::{JoinHandle, JoinSet},
-    time::{Duration, MissedTickBehavior},
+    time::Duration,
 };
 use uuid::Uuid;
 
@@ -28,7 +28,6 @@ use crate::{
     telemetry::TelemetryGuard,
 };
 
-use crate::config::agent_attributions;
 use crate::group::{GroupKind, GroupSpec, agent_group_worker};
 use crate::health::HealthSnapshot;
 use crate::outbox::{drain_one_write, outbox_worker};
@@ -37,7 +36,7 @@ use crate::producer::{
     IngressState, lease_worker, mention_worker, reconciliation_worker, webhook_handler,
 };
 use crate::queue::queue_worker;
-use crate::tunnel::{restore_webhook, start_verified_quick_tunnel};
+use crate::tunnel::start_verified_quick_tunnel;
 
 struct RuntimeLeaseGuard {
     store: Arc<StoreActor>,
@@ -63,6 +62,9 @@ pub(crate) fn initial_health(config: &Config, provider_enabled: bool) -> HealthS
         repository: config.github_repositories().join(", "),
         tunnel: "disabled",
         webhook_url: None,
+        webhook_sync: "disabled",
+        tunnel_verified_at: None,
+        tunnel_error: None,
         reconciliation: "starting",
         provider: if provider_enabled { "starting" } else { "disabled" },
         last_error: None,
@@ -215,7 +217,6 @@ async fn serve_github_managed(
             .iter()
             .filter_map(|profile| profile.github_actor_node_id.clone())
             .collect(),
-        agent_attributions: agent_attributions(&config),
         webhook_secret: Arc::new(secret.into_bytes()),
     });
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
@@ -294,12 +295,11 @@ async fn serve_github_managed(
     }
 
     let local_url = format!("http://{}", config.server.ingress);
-    let mut tunnel = None;
-    let mut prior_webhook = None;
     if quick_tunnel {
         {
             let mut current = health.write().await;
             current.tunnel = "verifying";
+            current.webhook_sync = "pending";
         }
         let (started, public_webhook) = start_verified_quick_tunnel(
             &config,
@@ -309,7 +309,6 @@ async fn serve_github_managed(
             &github.identity().repository_node_id,
         )
         .await?;
-        health.write().await.webhook_url = Some(public_webhook.clone());
         let prior = github.app_webhook_config().await?;
         github
             .update_app_webhook(
@@ -320,23 +319,33 @@ async fn serve_github_managed(
                 ),
             )
             .await?;
+        let confirmed = github.app_webhook_config().await?;
+        if confirmed.url != public_webhook {
+            bail!("App webhook URL did not converge to the verified Tunnel");
+        }
         {
             let mut current = health.write().await;
             current.tunnel = "connected";
+            current.webhook_sync = "confirmed";
+            current.tunnel_verified_at = Some(time::OffsetDateTime::now_utc().to_string());
             current.webhook_url = Some(public_webhook);
         }
-        prior_webhook = Some(prior);
-        tunnel = Some(started);
+        workers.spawn(crate::tunnel::supervise(
+            config.clone(),
+            github.clone(),
+            state.webhook_secret.clone(),
+            health.clone(),
+            started,
+            prior,
+            shutdown_receiver.clone(),
+        ));
     }
     health.write().await.ready = true;
     tracing::info!(repositories = %config.github_repositories().join(", "), "Braid transport runtime is ready");
 
-    let mut tunnel_poll = tokio::time::interval(Duration::from_secs(2));
-    tunnel_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut runtime_failure = None;
-    loop {
-        tokio::select! {
-            _ = external_stop.changed() => {break;}
+    tokio::select! {
+            _ = external_stop.changed() => {}
             worker = workers.join_next() => {
                 let message = match worker {
                     Some(Ok(Ok(()))) => "a supervised runtime worker stopped unexpectedly".to_owned(),
@@ -350,47 +359,10 @@ async fn serve_github_managed(
                     current.last_error = Some(message.clone());
                 }
                 runtime_failure = Some(message);
-                break;
             }
-            _ = tunnel_poll.tick(), if tunnel.is_some() => {
-                if tunnel.as_mut().is_some_and(|running| running.has_exited().unwrap_or(true)) {
-                    let repair = if let Some(prior) = prior_webhook.take() {
-                        restore_webhook(&github, &prior).await.map(|()| prior.url)
-                    } else {
-                        Ok(String::new())
-                    };
-                    let mut current = health.write().await;
-                    current.tunnel = "unavailable";
-                    match repair {
-                        Ok(url) => {
-                            current.webhook_url = (!url.is_empty()).then_some(url);
-                            current.last_error = Some(
-                                "Wrangler Quick Tunnel exited; the prior App webhook was restored and reconciliation remains active".into(),
-                            );
-                        }
-                        Err(error) => {
-                            current.last_error = Some(format!(
-                                "Wrangler Quick Tunnel exited and App webhook repair failed: {error}"
-                            ));
-                        }
-                    }
-                    tunnel = None;
-                }
-            }
-        }
     }
 
     health.write().await.ready = false;
-    if let Some(prior) = &prior_webhook
-        && let Err(error) = restore_webhook(&github, prior).await
-    {
-        tracing::error!(%error, "cannot restore prior GitHub App webhook");
-    }
-    if let Some(tunnel) = tunnel
-        && let Err(error) = tunnel.stop().await
-    {
-        tracing::error!(%error, "cannot stop Wrangler Quick Tunnel");
-    }
     let _ = shutdown_sender.send(true);
     let workers_stopped =
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -513,7 +485,8 @@ pub(crate) async fn spawn_health(
 }
 
 async fn health_handler(State(state): State<Arc<RwLock<HealthSnapshot>>>) -> impl IntoResponse {
-    let snapshot = state.read().await.clone();
+    let mut snapshot = state.read().await.clone();
+    snapshot.ready &= matches!(snapshot.tunnel, "disabled" | "connected");
     let status = if snapshot.ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (status, axum::Json(snapshot))
 }

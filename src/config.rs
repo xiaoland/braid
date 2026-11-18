@@ -1464,23 +1464,3 @@ pub(crate) fn validate_token(name: &str, value: &str) -> Result<(), ConfigError>
 const fn default_log_format() -> LogFormat {
     LogFormat::Text
 }
-
-/// Attribution markers identifying Braid-authored Agent text, derived
-/// from the configured Profiles. Used by ingress/reconcile to classify
-/// authorship; a pure derivation with no state of its own.
-pub fn agent_attributions(config: &Config) -> Vec<String> {
-    let mut attributions = Vec::new();
-    for profile in &config.profiles {
-        if profile.has_tag("issue") {
-            attributions
-                .push(format!("> **Braid Agent · {}**\n> Issue Agent", profile.display_name));
-        }
-        if profile.has_tag("pr") {
-            attributions.push(format!(
-                "> **Braid Agent · {}**\n> PR Implementation Agent",
-                profile.display_name
-            ));
-        }
-    }
-    attributions
-}

@@ -1,5 +1,6 @@
 //! Production acceptance → actor/outbox → HTTP convergence, with no store/executor shims.
 use super::*;
+use crate::store::IngressEvent;
 use axum::{
     Json, Router,
     routing::{get, post},
@@ -12,13 +13,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-struct Fixture {
+pub(crate) struct Fixture {
     root: PathBuf,
-    config: Config,
-    store: StoreActor,
+    pub(crate) config: Config,
+    pub(crate) store: StoreActor,
 }
 impl Fixture {
-    fn new(source: bool) -> Self {
+    pub(crate) fn new(source: bool) -> Self {
         let root = std::env::temp_dir().join(format!("braid-writer-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("config.toml");
@@ -41,7 +42,7 @@ impl Fixture {
         }
         fixture
     }
-    fn db(&self) -> Connection {
+    pub(crate) fn db(&self) -> Connection {
         Connection::open(self.config.runtime.database()).unwrap()
     }
     fn bind_source(&self) {
@@ -393,4 +394,14 @@ mod turn_start;
 
 mod body_edit;
 
+mod continuous_collaboration;
 mod handoff;
+mod semantic_contract;
+
+pub(crate) async fn issue_context_server(
+    body: &str,
+) -> (Arc<GitHubClient>, tokio::task::JoinHandle<()>) {
+    let mut remote = body_edit::BodyRemote::new(false);
+    remote.snapshot.body = Some(body.into());
+    body_edit::body_server(Arc::new(Mutex::new(remote))).await
+}

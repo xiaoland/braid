@@ -61,6 +61,9 @@ pub fn status(arguments: &ConfigPath) -> Result<()> {
                         .ineligible_reason
                         .unwrap_or("durable_eligible_provider_unknown")
                 );
+                if let Some(error) = &batch.input_error {
+                    println!("    waiting for complete input: {error}");
+                }
             }
             for group in &transport.agent_groups {
                 println!(

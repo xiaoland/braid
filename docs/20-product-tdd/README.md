@@ -169,7 +169,7 @@ best-effort one-way projection from it. Nonessential state is not persisted.
 | State | Authority | Projections |
 | --- | --- | --- |
 | Work Items, assignments, turns, context ledger/resets, queue/batches, outbox, owner lease | Durable store (SQLite) | In-memory `RunningAgentTurn` (claim cache for the in-flight turn), health snapshot |
-| GitHub canonical state | GitHub (per configured repository) | `canonical_objects` / `sync_cursors` snapshots for diffing |
+| GitHub canonical state | GitHub (per configured repository) | `canonical_objects` is the latest Context/tombstone projection; `processed_objects` is the separate event-processing acknowledgement frontier |
 | Physical session identity (`provider_session_id`) | Durable store (`provider_sessions`) | `SessionManager` 的 opaque key 与 adapter 寻址；句柄可替换，assignment 与 worktree 连续性不依赖连接 |
 | Current provider turn | Provider process | `SessionEvent` stream (exactly one `TurnStarted`/`TurnTerminal` per turn; receiver handed off with the turn, never re-subscribed) → durable store; 恢复时 fencing 遗留的 starting/running turn |
 | Provider connectivity | Provider connection | adapter 内部观察连接退出 → 受影响句柄的 latched availability；runtime 汇总各 driver 的恢复结果，成功不能覆盖另一方的失败 |
@@ -220,25 +220,39 @@ committed for the released binary. Rust 1.93 is the first verified toolchain.
    mutation has a durable intent before leaving the process.
 10. Provider terminal means only that a turn ended; it never proves task,
     implementation, review, or acceptance success.
+11. Observation, input delivery and execution are different commitments. A
+    Context projection read cannot acknowledge pending collaboration input.
+    Classified events and their processed frontier commit atomically; Context
+    replacement preserves independently recorded attention.
+12. An applied implementation request has an exact durable activation event for
+    its target PR. PR existence, activation delivery, executor readiness and
+    Human acceptance are not interchangeable.
 
 ## Durable State and Migrations
 
 SQLite starts in WAL mode with foreign keys, a busy timeout, and FULL
-synchronous durability. One DB actor serializes writes. Schema v1 owns:
+synchronous durability. One DB actor serializes writes. The Harness ledger owns:
 
 - `schema_migrations(version, name, checksum, applied_at)`;
 - `owner_leases(scope, generation, owner_id, expires_at)`;
 - `repositories` and `work_items` keyed by stable GitHub node IDs;
 - `profiles` with immutable revision and effective-config digest;
 - `assignments` and `agent_instances` with group/profile/generation/lifecycle;
-- `provider_sessions` and `turns` with opaque provider IDs and Context revision;
+- `provider_sessions` and `turns` with opaque provider IDs and the session's
+  Context-replacement fence revision; ordinary additive input does not replace
+  that fence with the latest projection revision;
 - `worktrees` for the default PR Implementation Agent workspace;
 - `associations` for direct Issue↔PR edges and their observed version;
 - `issue_context_sources` for one exact visible-description comparison state
   per Issue, independent of association fan-out;
-- `canonical_objects` for latest object version/lifecycle, the internal
-  reconciliation equality fingerprint, and deletion tombstones;
-- `deliveries` and `events` for webhook/reconciliation dedupe/classification;
+- `canonical_objects` for the latest observed Context metadata and tombstones;
+- `processed_objects` for the separately acknowledged complete observation and
+  semantic equality fingerprint, committed atomically with its event decisions;
+- `publication_versions` for exact version/content evidence of a correlated
+  Agent edit, never inferred from a presentation marker;
+- `deliveries` and `events` for webhook/reconciliation dedupe/classification and
+  independently recorded attention;
+- `implementation_requests.activation_event_id` for durable PR activation delivery;
 - `scheduler_batches` and `batch_events` for quiet/count/urgent state;
 - `write_intents`, `reaction_targets`, and `status_comments` for Braid-owned
   GitHub convergence;

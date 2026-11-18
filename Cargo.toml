@@ -52,6 +52,11 @@ octocrab = "0.54.1"
 git2 = "0.21.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
+# Safe process-group signals are needed in synchronous cancellation cleanup;
+# killing only Wrangler's direct PID leaves its cloudflared descendants alive.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.32", features = ["signal", "process"] }
+
 [profile.release]
 codegen-units = 1
 lto = "thin"

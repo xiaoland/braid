@@ -2,12 +2,14 @@
 //! queue decisions through neutral session handles; adapters own physical resources.
 
 pub(crate) mod dispatch;
-pub(crate) mod handoff;
+pub(crate) mod input;
 pub(crate) mod issue_agent;
 pub(crate) mod pr_agent;
 pub(crate) mod provider;
 mod session_manager;
 
+#[cfg(test)]
+mod continuous_tests;
 pub(crate) mod turn_start;
 mod worker;
 use session_manager::SessionManager;

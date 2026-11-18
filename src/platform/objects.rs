@@ -543,6 +543,7 @@ impl PlatformObjects {
                 author: Some(actor(&c.author)),
                 created_at: c.created_at.clone(),
                 updated_at: c.created_at,
+                last_edited_at: None,
                 body: Some(c.reply_to.map_or_else(
                     || c.body.clone(),
                     |parent| format!("Reply to local comment #{parent}.\n\n{}", c.body),
@@ -620,7 +621,7 @@ impl PlatformObjects {
         rows.into_iter().map(|(id,number,kind,detail,author,body,revision,state,at,origin)| {
             let item=self.item(number)?;
             let detail=match detail.as_deref() {Some("closed")=>Some("closed"),Some("reopened")=>Some("reopened"),Some("merged")=>Some("merged"),Some("cross_surface")=>Some("cross_surface"),_=>None};
-            let event=IngressEvent {delivery_guid:format!("local:{id}"),event_name:"local".into(),action:None,repository_node_id:repository_node(&self.repository),repository:self.repository.clone(),work_item_node_id:Some(item_node(&self.repository,number)),work_item_kind:Some(if item.kind=="issue" {"issue"} else {"pr"}),work_item_number:Some(number),work_item_state:Some(state),object_node_id:Some(format!("local:{}:event:{id}",self.repository)),object_version:Some(format!("{revision}:{at}")),object_digest:None,visible_body:body.clone(),actor_node_id:Some(actor(&author).node_id),actor_login:Some(author.clone()),kind:EventKind::from_str(&kind).context("invalid local event kind")?,detail,cross_surface_invalidation:detail==Some("cross_surface"),origin:match origin.as_str(){"agent"=>"agent","human"=>"human",_=>bail!("invalid local event origin {origin}")},reference:format!("Braid {}#{} event {id}",self.repository,number),mention_candidate:false,reaction_target:None,known:true,raw_payload:serde_json::to_vec(&serde_json::json!({"event_id":id,"number":number,"revision":revision,"actor":author,"body":body}))?};
+            let event=IngressEvent {identity:crate::store::ChangeIdentity::Occurrence,delivery_guid:format!("local:{id}"),event_name:"local".into(),action:None,repository_node_id:repository_node(&self.repository),repository:self.repository.clone(),work_item_node_id:Some(item_node(&self.repository,number)),work_item_kind:Some(if item.kind=="issue" {"issue"} else {"pr"}),work_item_number:Some(number),work_item_state:Some(state),object_node_id:Some(format!("local:{}:event:{id}",self.repository)),object_version:Some(format!("{revision}:{at}")),object_digest:None,visible_body:body.clone(),actor_node_id:Some(actor(&author).node_id),actor_login:Some(author.clone()),kind:EventKind::from_str(&kind).context("invalid local event kind")?,detail,cross_surface_invalidation:detail==Some("cross_surface"),requires_attention:origin!="agent" && matches!(kind.as_str(),"wake"|"invalidate"|"mention"),origin:match origin.as_str(){"agent"=>"agent","human"=>"human",_=>bail!("invalid local event origin {origin}")},reference:format!("Braid {}#{} event {id}",self.repository,number),mention_candidate:false,reaction_target:None,known:true,raw_payload:serde_json::to_vec(&serde_json::json!({"event_id":id,"number":number,"revision":revision,"actor":author,"body":body}))?};
             Ok(PendingEvent {event_id:id,event})
         }).collect()
     }

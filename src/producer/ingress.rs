@@ -22,7 +22,6 @@ pub(crate) struct IngressState {
     pub(crate) app_actor_node_id: String,
     pub(crate) app_actor_login: String,
     pub(crate) agent_actor_node_ids: Vec<String>,
-    pub(crate) agent_attributions: Vec<String>,
     pub(crate) webhook_secret: Arc<Vec<u8>>,
 }
 
@@ -46,7 +45,6 @@ pub(crate) async fn webhook_handler(
             app_node_id: &state.app_actor_node_id,
             app_login: &state.app_actor_login,
             agent_node_ids: &state.agent_actor_node_ids,
-            agent_attributions: &state.agent_attributions,
         },
     );
     let event = match parsed {

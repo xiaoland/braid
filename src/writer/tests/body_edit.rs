@@ -594,7 +594,9 @@ async fn executor_rejects_missing_existing_request_source_before_mutation() {
     receipt.payload = serde_json::to_string(&payload).unwrap();
     let mut mutation_possible = false;
     assert!(
-        edit::execute(&fixture.config, &github, &receipt, &mut mutation_possible).await.is_err()
+        edit::execute(&fixture.config, &fixture.store, &github, &receipt, &mut mutation_possible)
+            .await
+            .is_err()
     );
     assert!(!mutation_possible);
     assert_eq!(remote.lock().unwrap().writes, 0);
