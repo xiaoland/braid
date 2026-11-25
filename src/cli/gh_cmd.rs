@@ -42,10 +42,11 @@ pub fn gh(command: GhCommand) -> Result<()> {
             if !arguments.request_id.starts_with("request-") {
                 bail!("expected a public request ID");
             }
-            let receipt = helpers::store(&config)?
+            let actor = helpers::store(&config)?;
+            let receipt = actor
                 .gh_write_receipt(arguments.request_id)?
                 .context("unknown publication request")?;
-            print_gh_receipt(&receipt, arguments.json, &helpers::store(&config)?)
+            print_gh_receipt(&receipt, arguments.json, &actor)
         }
         GhCommand::Comment { command: GhCommentCommand::Create(arguments) } => {
             let config_path = arguments.source.resolve_config_path()?;
@@ -71,7 +72,7 @@ pub fn gh(command: GhCommand) -> Result<()> {
                     request_id: arguments.request_id,
                 },
             )?;
-            print_gh_receipt(&receipt, arguments.json, &helpers::store(&config)?)
+            print_gh_receipt(&receipt, arguments.json, &actor)
         }
         GhCommand::Pr { command: GhPrCommand::Ensure(arguments) } => {
             let config_path = arguments.source.resolve_config_path()?;
@@ -94,7 +95,7 @@ pub fn gh(command: GhCommand) -> Result<()> {
                     head: arguments.head,
                 },
             )?;
-            print_gh_receipt(&receipt, arguments.json, &helpers::store(&config)?)
+            print_gh_receipt(&receipt, arguments.json, &actor)
         }
     }
 }

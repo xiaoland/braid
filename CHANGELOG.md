@@ -24,7 +24,7 @@ Versioning once release artifacts are published.
   所有新 turn 在安全边界取得完整当前 Context，读取失败保留批次并公开等待原因。
 - `braid gh pr ensure` 的 applied 回执必须绑定该请求、该 PR 的持久 activation 事件；
   `gh status` 单独显示 activation 交付状态，不把 PR 存在或交付成功当作实现完成。
-  历史缺失的 activation 明确报告需显式恢复，不偷偷激活旧任务。
+  历史缺失的 activation 仅按已固定 PR 的原授权恢复，不从任意关联激活旧任务。
 - Agent 的 `braid gh` 写命令必须携带当前 runtime 输入提供的 `--source-turn`；
   `--profile` 不能替换 source 身份。人工调用使用显式 `--operator`，且不能在已登记
   Agent worktree 内降级为人工身份。旧脚本需按新 help 更新。
@@ -37,13 +37,20 @@ Versioning once release artifacts are published.
   HTTP 账单由 Issue 13→5、PR 10→5；保留分页和前后 marker，不推断线上 points 同降。
 - `status` 分开显示原始 runnable 数、durable 领取资格及当前/历史代；物理 provider
   可用性仍明确未知，不因对象 closed/merged 就删除可能合法的 Finalization。
-- Harness schema 升至 **13**；配置 schema 保持 3。处理基线与普通 Context 投影分开，
+- Harness schema 升至 **14**；配置 schema 保持 3。处理基线与普通 Context 投影分开，
   完整观察的事件和基线原子提交；发生身份与版本身份分开，接单复用记录可追溯。
   升级前须停止旧 runtime 并执行带备份的迁移。旧 binary 不能打开升级后的账本；回滚需停止新 runtime，
   将升级前备份恢复到独立 runtime 目录，不支持 down migration。
 
 ### Fixed
 
+- 修复多仓库健康状态覆盖与 mention 权限故障互相阻塞；失败轮次重放保留完整事件引用，
+  明确拒绝的 steer 不再重复发送，Context replacement/reopen 校验原 Profile revision。
+- 修复 worktree 仓库身份验证、超时子进程清理和 Tunnel 停止失败的传播；删除无用 Provider 转发层。
+- 安装在创建 App 前完成本地预检，保留 GitHub 返回的 webhook secret，头像下载移出 async executor；
+  凭据解析错误不输出秘密，强制导入收紧文件权限。修正首次迁移与 Pi 参数指引。
+- 发布统一使用打包脚本，按所选 tag 构建并校验版本，支持外置 target 目录；CI 与发布改用仍受支持的 macOS 15 runner。
+- Console 分页保持已应用筛选，导航保留未提交的 run 草稿，并同步运行表单边界。
 - 已确认接手或正常终止的新 generation 会收敛旧 Operational Status：沿原 comment
   展示最后确认时间与明确的历史/接替关系，不把旧 blocked generation 伪装成复活，
   也不声称代码、review 或产品完成。唯一 outbox 从持久账本补偿重启，发送中旧 create

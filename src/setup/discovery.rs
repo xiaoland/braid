@@ -1,7 +1,8 @@
 use std::{
+    collections::HashSet,
     io::BufRead as _,
     path::{Path, PathBuf},
-    process::Output,
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -31,12 +32,16 @@ pub async fn discover(adapter_type: &str) -> Result<Vec<DiscoveredRuntime>> {
     };
 
     let mut found = Vec::new();
+    let mut seen = HashSet::new();
     for (executable, source) in candidates {
         if !executable.is_file() {
             continue;
         }
+        if !seen.insert(executable.canonicalize().unwrap_or_else(|_| executable.clone())) {
+            continue;
+        }
         match version_line(&executable).await {
-            Ok(version) if !version.is_empty() => {
+            Ok(version) => {
                 found.push(DiscoveredRuntime {
                     adapter_type: adapter_type.to_owned(),
                     version,
@@ -44,7 +49,6 @@ pub async fn discover(adapter_type: &str) -> Result<Vec<DiscoveredRuntime>> {
                     source,
                 });
             }
-            Ok(_) => {}
             Err(error) => {
                 tracing::debug!(%error, path = %executable.display(), "ignoring candidate");
             }
@@ -106,13 +110,15 @@ pub async fn from_executable(adapter_type: &str, executable: &Path) -> Result<Ru
     if !executable.is_file() {
         bail!("executable does not exist: {}", executable.display());
     }
-    let version = version_line(executable)
+    let executable = std::path::absolute(executable)
+        .with_context(|| format!("cannot resolve runtime executable {}", executable.display()))?;
+    let version = version_line(&executable)
         .await
         .with_context(|| format!("cannot run {} --version", executable.display()))?;
     verify(DiscoveredRuntime {
         adapter_type: adapter_type.to_owned(),
         version,
-        executable: executable.to_path_buf(),
+        executable,
         source: "--runtime-executable".to_owned(),
     })
     .await
@@ -126,7 +132,7 @@ pub fn install_hint(adapter_type: &str) -> String {
             # Then re-run `braid setup`."
             .to_owned(),
         "codex" => "Install the Codex CLI:\n\
-            npm install -g codex-cli\n\
+            npm install -g @openai/codex\n\
             # Then re-run `braid setup`."
             .to_owned(),
         other => format!("No install instructions for adapter_type {other:?}"),
@@ -160,14 +166,19 @@ fn codex_candidates() -> Vec<(PathBuf, String)> {
 }
 
 async fn version_line(executable: &Path) -> Result<String> {
-    let output = run(executable, &["--version"]).await?;
-    Ok(output.stdout.lines().map_while(Result::ok).next().unwrap_or_default().trim().to_owned())
-}
-
-async fn run(executable: &Path, args: &[&str]) -> Result<Output> {
-    Command::new(executable)
-        .args(args)
-        .output()
-        .await
-        .with_context(|| format!("cannot spawn {}", executable.display()))
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new(executable).arg("--version").kill_on_drop(true).output(),
+    )
+    .await
+    .with_context(|| format!("{} --version timed out", executable.display()))?
+    .with_context(|| format!("cannot spawn {}", executable.display()))?;
+    if !output.status.success() {
+        bail!("{} --version exited with {}", executable.display(), output.status);
+    }
+    let version = output.stdout.lines().next().transpose()?.unwrap_or_default().trim().to_owned();
+    if version.is_empty() {
+        bail!("{} --version returned no version", executable.display());
+    }
+    Ok(version)
 }

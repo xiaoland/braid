@@ -251,7 +251,7 @@ fn source_checkout_check(config: &Config) -> Check {
             }
             continue;
         }
-        let remote = std::process::Command::new("git")
+        let remote = std::process::Command::new(&config.tools.git)
             .arg("-C")
             .arg(source)
             .args(["remote", "get-url", "origin"])
@@ -259,7 +259,9 @@ fn source_checkout_check(config: &Config) -> Check {
         match remote {
             Ok(output) if output.status.success() => {
                 let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                if !url.to_ascii_lowercase().contains(&repository.to_ascii_lowercase()) {
+                if crate::worktree::normalized_github_repository(&url).as_deref()
+                    != Some(&repository.to_ascii_lowercase())
+                {
                     return Check {
                         name: name.into(),
                         state: CheckState::Fail,
@@ -474,7 +476,7 @@ async fn command_version(name: &str, executable: &Path) -> Check {
     }
     let result = timeout(
         Duration::from_secs(10),
-        Command::new(executable).arg("--version").stdin(Stdio::null()).output(),
+        Command::new(executable).arg("--version").stdin(Stdio::null()).kill_on_drop(true).output(),
     )
     .await;
     match result {

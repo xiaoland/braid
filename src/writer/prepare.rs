@@ -40,7 +40,8 @@ async fn prepare_plan(
     }
     if let Some(source) = &accepted.source {
         let (source_repository, source_kind, source_number) =
-            crate::store::publication_source::work_item(config.runtime.database(), source)?;
+            crate::store::publication_source::work_item(config.runtime.database(), source)
+                .map_err(|e| helpers::store_as_github_error(&e))?;
         if source_repository != repository.to_string()
             || source_kind != "issue"
             || source_number != issue_number
@@ -108,7 +109,7 @@ async fn prepare_plan(
             head_ref,
             pr_profile_id: profile.id.clone(),
         })
-        .map_err(Into::into)
+        .map_err(|e| helpers::store_as_github_error(&e).into())
 }
 
 async fn managed_root(
@@ -120,7 +121,9 @@ async fn managed_root(
     issue: &crate::github::IssueOrPullRequest,
     profile: &Profile,
 ) -> Result<Option<String>> {
-    let candidates = store.managed_implementations(repository.into(), head.into())?;
+    let candidates = store
+        .managed_implementations(repository.into(), head.into())
+        .map_err(|e| helpers::store_as_github_error(&e))?;
     if candidates.len() > 100 {
         return Err(GitHubError::Ambiguous(
             "managed implementation head exceeds recovery bound".into(),

@@ -112,7 +112,8 @@ Options:
 1. Verifies `gh auth` and reads the acting GitHub login.
 2. Resolves the Braid user home (`~/.braid` by default) and instance key
    (owner by default).
-3. Generates a random webhook secret.
+3. Checks the required tools, runtime executable, and generated configuration
+   before creating a GitHub App.
 4. For Pi, validates the explicit credential file when the selected route
    declares `api_key` or `oauth`.
 5. Builds a GitHub App Manifest with the permissions Braid needs
@@ -121,7 +122,8 @@ Options:
 7. Opens a browser to `github.com/settings/apps/new` (or the organization
    variant) with the manifest pre-filled.
 8. Captures the browser redirect and exchanges the code for the App's
-   private key, slug, and ID.
+   private key, slug, ID, and webhook secret. Braid preserves the returned secret
+   so local signature verification matches the App configuration.
 9. Writes files under `~/.braid`:
    - `registry.toml` — the instance registry (SSoT for `BRAID_INSTANCE`
      resolution).
@@ -140,9 +142,10 @@ file only when you intentionally reference the same file.
 After setup:
 
 1. Install the App on your repository by visiting the printed install URL.
-2. Run diagnostics:
+2. Apply the initial database migrations, then run diagnostics:
 
    ```shell
+   braid migrate apply --instance <KEY>
    braid doctor --instance <KEY>
    ```
 
@@ -161,7 +164,7 @@ The tunnel receives GitHub webhooks and routes them to Braid's local ingress.
 
 Braid activates through a **trusted `@braid` mention**: a visible `@braid` in
 an issue comment from a repository MAINTAIN/ADMIN actor wakes the Issue Agent
-(after the Quiet Window). Braid acknowledges the mention with an `eyes`
+without waiting for the Quiet Window. Braid acknowledges the mention with an `eyes`
 reaction.
 
 Native Issue assignment is a GitHub-side *Agent App* provisioning (the same

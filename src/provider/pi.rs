@@ -1122,9 +1122,8 @@ fn configure_braid_environment(cmd: &mut Command, config: &PiConfig) -> Result<(
     {
         let mut path_parts: Vec<PathBuf> =
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
-        if !path_parts.iter().any(|p| p == exe_dir) {
-            path_parts.insert(0, exe_dir.to_path_buf());
-        }
+        path_parts.retain(|path| path != exe_dir);
+        path_parts.insert(0, exe_dir.to_path_buf());
         cmd.env(
             "PATH",
             std::env::join_paths(path_parts).map_err(|error| {

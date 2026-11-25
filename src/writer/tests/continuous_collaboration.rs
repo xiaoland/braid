@@ -442,3 +442,112 @@ async fn native_association_changes_are_visible_without_a_root_version_change() 
     assert!(!reconcile::observation_unchanged(&prior, &after));
     http.abort();
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Keep both repositories and their fault ordering in one scenario.
+async fn permission_failure_in_one_repository_does_not_starve_other_mentions() {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse as _;
+    let f = Fixture::new(false);
+    let policy = SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 };
+    let mut healthy_event = String::new();
+    for index in 0..17 {
+        let repository = if index < 16 { "owner/blocked" } else { "owner/healthy" };
+        let id = format!("mention-{index}");
+        let mut event = revision(&id, "@braid please continue");
+        event.repository = repository.into();
+        event.repository_node_id = repository.into();
+        event.work_item_node_id = Some(repository.into());
+        event.object_node_id = Some(id.clone());
+        event.event_name = "issue_comment".into();
+        event.action = Some("created".into());
+        event.kind = EventKind::Wake;
+        event.detail = Some("created");
+        event.cross_surface_invalidation = false;
+        event.mention_candidate = true;
+        let result = f.store.ingest_event(event, policy).unwrap();
+        if index == 16 {
+            healthy_event = result.event_id.unwrap();
+        }
+    }
+    let checked = Arc::new(tokio::sync::Notify::new());
+    let notified = checked.clone();
+    let router = Router::new()
+        .route(
+            "/repos/owner/blocked/collaborators/human/permission",
+            get(|| async {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"message":"Resource not accessible by integration"})),
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/repos/owner/healthy/collaborators/human/permission",
+            get(move || {
+                let notified = notified.clone();
+                async move {
+                    notified.notify_one();
+                    Json(json!({"permission":"admin","role_name":"admin"}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let http = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = octocrab::Octocrab::builder()
+        .base_uri(format!("http://{address}"))
+        .unwrap()
+        .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+        .build()
+        .unwrap();
+    let clients = ["owner/blocked", "owner/healthy"]
+        .into_iter()
+        .map(|repository| {
+            let identity = crate::github::GitHubIdentity {
+                app_id: 1,
+                app_slug: "braid".into(),
+                installation_id: 1,
+                repository: repository.into(),
+                repository_node_id: repository.into(),
+                actor_node_id: "app".into(),
+                actor_login: "braid[bot]".into(),
+                token_expires_at: String::new(),
+                permissions: BTreeMap::new(),
+            };
+            (
+                repository.into(),
+                Arc::new(GitHubClient::publication_test_client(
+                    client.clone(),
+                    identity,
+                    f.config.github().unwrap().clone(),
+                )),
+            )
+        })
+        .collect();
+    let store = Arc::new(
+        StoreActor::start(
+            f.config.runtime.database().to_owned(),
+            f.config.runtime.backups().to_owned(),
+        )
+        .unwrap(),
+    );
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let worker =
+        tokio::spawn(crate::producer::mention_worker(store, Arc::new(clients), policy, receiver));
+    tokio::time::timeout(Duration::from_secs(3), checked.notified())
+        .await
+        .expect("healthy repository must reach its permission check despite older denied mentions");
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    let trusted: bool = f
+        .db()
+        .query_row("SELECT trusted_mention FROM events WHERE event_id=?1", [healthy_event], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(trusted);
+    assert_eq!(f.store.mention_candidates("owner/blocked".into(), 16).unwrap().len(), 16);
+    http.abort();
+}

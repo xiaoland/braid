@@ -174,6 +174,16 @@ fn verify_existing(
     }
     let branch = tokio::task::block_in_place(|| {
         let repo = Repository::open(request.target)?;
+        let source_repo = Repository::open(source)?;
+        let canonical_common_dir = |repo: &Repository| {
+            repo.commondir().canonicalize().map_err(|source| WorktreeError::Io {
+                path: repo.commondir().to_path_buf(),
+                source,
+            })
+        };
+        if canonical_common_dir(&repo)? != canonical_common_dir(&source_repo)? {
+            return Err(WorktreeError::TargetConflict(request.target.to_path_buf()));
+        }
         let head = repo.head()?;
         Ok::<String, WorktreeError>(head.shorthand()?.to_owned())
     })?;
@@ -203,7 +213,7 @@ fn canonical_repository(path: &Path) -> Result<PathBuf, WorktreeError> {
         })
 }
 
-fn normalized_github_repository(remote: &str) -> Option<String> {
+pub(crate) fn normalized_github_repository(remote: &str) -> Option<String> {
     let path = remote
         .strip_prefix("https://github.com/")
         .or_else(|| remote.strip_prefix("ssh://git@github.com/"))

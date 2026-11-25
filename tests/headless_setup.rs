@@ -1,5 +1,7 @@
 use std::{
     fs,
+    io::{Read as _, Write as _},
+    net::TcpListener,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -27,8 +29,8 @@ fn write_executable(path: &Path, contents: &str) {
     }
 }
 
-fn fake_bin() -> PathBuf {
-    let directory = std::env::temp_dir().join(format!("braid-headless-bin-{}", std::process::id()));
+fn fake_bin(temporary: &Path) -> PathBuf {
+    let directory = temporary.join("bin");
     fs::create_dir_all(&directory).expect("create fake bin");
     write_executable(
         &directory.join("gh"),
@@ -39,9 +41,14 @@ if [ "$1" = "api" ] && [ "$2" = "user" ]; then
 fi
 case "$2" in
   app-manifests/*/conversions)
+    if [ -n "$BRAID_TEST_CONVERSIONS" ]; then touch "$BRAID_TEST_CONVERSIONS"; fi
     cat <<'JSON'
 {"id":123456,"slug":"braid-of-testuser","name":"braid-of-testuser","pem":"-----BEGIN PRIVATE KEY-----\nTEST\n-----END PRIVATE KEY-----\n","webhook_secret":"webhook","html_url":"https://github.com/apps/braid-of-testuser"}
 JSON
+    exit 0
+    ;;
+  users/testuser|orgs/testuser)
+    printf '{"avatar_url":"%s"}\n' "$BRAID_TEST_AVATAR_URL"
     exit 0
     ;;
 esac
@@ -50,6 +57,9 @@ exit 1
 "#,
     );
     write_executable(&directory.join("pi"), "#!/bin/sh\necho 'pi 1.2.3'\n");
+    for browser in ["open", "xdg-open"] {
+        write_executable(&directory.join(browser), "#!/bin/sh\ntouch \"$BRAID_TEST_BROWSER\"\n");
+    }
     write_executable(&directory.join("wrangler"), "#!/bin/sh\necho 'wrangler 0.0.0-test'\n");
     write_executable(
         &directory.join("git"),
@@ -82,7 +92,25 @@ fn no_browser_setup_can_be_completed_from_callback_url() {
     let temporary =
         std::env::temp_dir().join(format!("braid-headless-setup-{}", std::process::id()));
     let home = temporary.join("home");
-    let fake_bin = fake_bin();
+    let fake_bin = fake_bin(&temporary);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind avatar server");
+    let avatar_url =
+        format!("http://{}/avatar.png", listener.local_addr().expect("avatar address"));
+    let avatar_server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept avatar request");
+        let mut request = [0; 4096];
+        let _ = stream.read(&mut request).expect("read avatar request");
+        let png = include_bytes!(
+            "../docs/assets/logo/png/braid-color-on-transparent/braid-color-on-transparent-512.png"
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            png.len()
+        )
+        .expect("write avatar response");
+        stream.write_all(png).expect("write avatar image");
+    });
 
     let output = setup_command(&fake_bin, &home)
         .args(["--no-browser"])
@@ -119,6 +147,9 @@ fn no_browser_setup_can_be_completed_from_callback_url() {
 
     let callback = format!("http://127.0.0.1/callback?code=code123&state={state}");
     let output = setup_command(&fake_bin, &home)
+        .current_dir(&fake_bin)
+        .env("BRAID_TEST_AVATAR_URL", avatar_url)
+        .env("BRAID_TEST_BROWSER", temporary.join("browser-opened"))
         .args([
             "--model",
             "example-chat",
@@ -130,12 +161,20 @@ fn no_browser_setup_can_be_completed_from_callback_url() {
             "https://llm.example.invalid/v1",
         ])
         .args(["--runtime-executable"])
-        .arg(fake_bin.join("pi"))
+        .arg("./pi")
         .args(["--callback-url", &callback])
         .output()
         .expect("complete headless setup");
     assert!(output.status.success(), "stdout:\n{}\nstderr:\n{}", stdout(&output), stderr(&output));
     assert!(!draft_path.exists());
+    assert!(home.join("instances/demo/braid-of-testuser-logo.png").is_file());
+    avatar_server.join().expect("avatar server");
+    assert!(!temporary.join("browser-opened").exists());
+    assert_eq!(
+        fs::read_to_string(home.join("instances/demo/secrets.toml")).expect("webhook secret"),
+        "webhook_secret = \"webhook\"\n"
+    );
+    assert!(stdout(&output).contains("braid migrate apply --instance demo"));
 
     let config = home.join("instances/demo/config.toml");
     assert!(config.is_file());
@@ -145,6 +184,49 @@ fn no_browser_setup_can_be_completed_from_callback_url() {
         .output()
         .expect("check completed config");
     let _ = fs::remove_dir_all(&temporary);
-    let _ = fs::remove_dir_all(&fake_bin);
     assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
+fn setup_rejects_local_runtime_failures_before_consuming_the_manifest() {
+    let temporary =
+        std::env::temp_dir().join(format!("braid-setup-preflight-{}", std::process::id()));
+    let home = temporary.join("home");
+    let fake_bin = fake_bin(&temporary);
+    fs::create_dir_all(home.join("setup-drafts")).expect("create setup drafts");
+    fs::write(
+        home.join("setup-drafts/demo.toml"),
+        "repository = \"testuser/repository\"\ninstance_key = \"demo\"\nstate = \"expected\"\n",
+    )
+    .expect("write draft");
+    let converted = temporary.join("converted");
+    for (runtime, expected) in [
+        ("#!/bin/sh\necho 'pi 1.2.3'\nexit 1\n", "--version exited"),
+        ("#!/bin/sh\nexit 0\n", "--version returned no version"),
+    ] {
+        write_executable(&fake_bin.join("pi"), runtime);
+        let output = setup_command(&fake_bin, &home)
+            .env("BRAID_TEST_CONVERSIONS", &converted)
+            .args([
+                "--model",
+                "example-chat",
+                "--llm-provider",
+                "example-llm",
+                "--llm-credential-kind",
+                "none",
+                "--llm-base-url",
+                "https://llm.example.invalid/v1",
+                "--callback-url",
+                "http://127.0.0.1/callback?code=once&state=expected",
+                "--runtime-executable",
+            ])
+            .arg(fake_bin.join("pi"))
+            .output()
+            .expect("run invalid runtime setup");
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains(expected), "{}", stderr(&output));
+        assert!(!converted.exists());
+        assert!(!home.join("instances/demo").exists());
+    }
+    let _ = fs::remove_dir_all(&temporary);
 }

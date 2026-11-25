@@ -3,12 +3,10 @@ use super::*;
 
 pub fn status(arguments: &ConfigPath) -> Result<()> {
     let config = helpers::load(&arguments.resolve_config_path()?)?;
-    let database = helpers::store(&config)?.status()?;
-    let transport = if database.pending_migrations == 0 {
-        Some(helpers::store(&config)?.runtime_status()?)
-    } else {
-        None
-    };
+    let store = helpers::store(&config)?;
+    let database = store.status()?;
+    let transport =
+        if database.pending_migrations == 0 { Some(store.runtime_status()?) } else { None };
     let status = LocalStatus {
         binary_version: env!("CARGO_PKG_VERSION"),
         config_schema: config.schema_version,

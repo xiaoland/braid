@@ -71,7 +71,10 @@ pub async fn unique_request_pull_request(
     match pull_requests.as_slice() {
         [] => Ok(None),
         [pull_request]
-            if pull_request.body.as_deref().is_some_and(|body| body.contains(marker)) =>
+            if pull_request
+                .body
+                .as_deref()
+                .is_some_and(|body| body.lines().any(|line| line.trim() == marker)) =>
         {
             Ok(Some(pull_request.clone()))
         }
@@ -305,16 +308,7 @@ pub fn validate_request_id(request_id: &str) -> Result<()> {
 }
 
 pub fn validate_branch(branch: &str) -> Result<()> {
-    let invalid = branch.is_empty()
-        || branch.starts_with(['/', '.'])
-        || branch.ends_with(['/', '.'])
-        || branch.to_ascii_lowercase().ends_with(".lock")
-        || branch.contains("..")
-        || branch.contains("@{")
-        || branch.chars().any(|character| {
-            character.is_control() || character.is_whitespace() || "~^:?*[\\".contains(character)
-        });
-    if invalid {
+    if !git2::Reference::is_valid_name(&format!("refs/heads/{branch}")) {
         bail!("invalid Git branch name {branch:?}");
     }
     Ok(())
@@ -325,5 +319,18 @@ pub fn digest(value: &str) -> String {
 }
 
 pub fn store_as_github_error(error: &crate::store::StoreError) -> GitHubError {
-    GitHubError::GraphQl(format!("local durable state rejected PR convergence: {error}"))
+    use crate::store::StoreError;
+    let retryable = match error {
+        StoreError::ActorUnavailable | StoreError::ActorStopped => true,
+        StoreError::Sqlite(error) => matches!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        ),
+        _ => false,
+    };
+    if retryable {
+        GitHubError::ConvergencePending(format!("local durable state is unavailable: {error}"))
+    } else {
+        GitHubError::GraphQl(format!("local durable state rejected publication: {error}"))
+    }
 }

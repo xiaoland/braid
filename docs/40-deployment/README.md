@@ -6,7 +6,7 @@ GitHub mutation authority by itself.
 
 ## Supported Shape
 
-The supported packaged artifacts are signed/checksummed macOS arm64 and
+The supported packaged artifacts are checksummed macOS arm64 and
 Linux x86_64 `braid` binaries produced by the release workflow from the same
 locked source. They run without Python, PDM, Cargo, or a source checkout.
 Runtime prerequisites remain explicit:
@@ -79,7 +79,7 @@ Everything below is scoped by trust boundary:
     state/
       braid.sqlite3
       backups/
-      worktrees/<repository>/<issue-or-pr-number>-<assignment-generation>/
+      worktrees/<owner>--<repo>/<issue-or-pr-number>/<profile>-g<generation>/
     provider/                   # adapter home (e.g. Codex provider state)
     logs/                       # optional sampled-log export
 ```
@@ -399,6 +399,11 @@ Schema 13 只修复 Operational Status 的公开投影。已有 generation 的�
 当作当前凭据仍有效或工作已验收的证明。若旧评论创建尚未确认，执行器先对账原
 请求再更新，避免重复 comment。OAuth 源文件生命周期不在这次迁移范围内。
 
+Schema 14 将事件与批次的唯一关系限定在单个批次内。结果 unknown 的轮次重放时，
+新批次可保留原 Event References 与 trusted mention 身份，旧轮次的输入历史不变。
+迁移不把 unknown 当作已停止；替代执行仍须经过旧执行停止与 Context replacement
+屏障。升级前停止服务并备份；旧 binary 不能打开 schema 14 账本。
+
 ## Health and Status
 
 Loopback `/healthz` and `braid status` expose bounded, non-semantic state:
@@ -462,7 +467,7 @@ Harness 配置 schema 3 选择 `[github]` 或 `[builtin]`。原 GitHub schema 2 
 数据库迁移至 schema 6，平台此后使用自己的 schema，不读取执行表。迁移及
 启动命令见[内建平台指南](../user-manual/local.md)。
 
-平台当前 schema 2 持有自己的嵌入迁移名称与 SHA-256 校验。旧平台 schema 1
+平台当前 schema 3 持有自己的嵌入迁移名称与 SHA-256 校验。旧平台 schema 1
 在启动时先备份再向前升级，保留空间身份、对象和回执；不通过重建空库升级。
 未知版本或迁移校验不一致明确拒绝。历史候选与合并提交保留平台专属 Git 引用，
 避免工作分支移动或清理后丢失已接受的提交。

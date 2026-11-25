@@ -26,8 +26,8 @@ control, provider executable, Git, installed artifact, and OTLP export. SQLite
 inspection, internal Rust APIs, fake providers/GitHub, and hand-injected inbox
 events are never pass oracles.
 
-验收按本页描述操作真实产品并保留原始证据，不维护或运行自动测试、模拟、包 smoke
-或换名后的自检入口。GitHub 对象和人工判断仍是产品验收依据。
+验收按本页描述操作真实产品并保留原始证据。自动测试、模拟和包 smoke 可验证
+局部实现，但不能替代本页的真实产品验收。GitHub 对象和人工判断仍是产品验收依据。
 
 ## Campaign Setup
 

@@ -192,10 +192,6 @@ pub(crate) async fn execute(
             )
             .map_err(|e| GitHubError::GraphQl(e.to_string()))?;
         }
-        if let Some(remote) = comment::recover_comment(github, target.number, &receipt).await? {
-            return Ok(remote);
-        }
-        edit::authorize(config, github, &receipt, false).await?;
         comment::converge_comment(config, github, target.number, &receipt, mutation_possible).await
     } else {
         let mut plan = if let Some(plan) = store
@@ -286,7 +282,7 @@ pub(crate) fn check_execution_owner(
         .as_ref()
         .ok_or_else(|| GitHubError::GraphQl("publication has no runtime owner".into()))?;
     crate::store::check_publication_owner(config.runtime.database(), owner)
-        .map_err(|e| GitHubError::GraphQl(e.to_string()))
+        .map_err(|e| helpers::store_as_github_error(&e))
 }
 
 pub(crate) fn check_source(config: &Config, receipt: &GhWriteReceipt) -> Result<(), GitHubError> {
@@ -295,7 +291,7 @@ pub(crate) fn check_source(config: &Config, receipt: &GhWriteReceipt) -> Result<
     }
     if let Some(source) = &receipt.source {
         crate::store::publication_source::check(config.runtime.database(), source)
-            .map_err(|e| GitHubError::GraphQl(e.to_string()))?;
+            .map_err(|e| helpers::store_as_github_error(&e))?;
         let profile =
             config.profile(&source.profile_id).map_err(|e| GitHubError::GraphQl(e.to_string()))?;
         let materials =

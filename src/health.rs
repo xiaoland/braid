@@ -19,6 +19,7 @@ pub struct HealthSnapshot {
 
 /// Per-driver observations are aggregated before publishing provider health.
 pub(crate) struct ProviderHealthUpdate {
+    pub(crate) repository: String,
     pub(crate) group: &'static str,
     pub(crate) error: Option<String>,
 }
@@ -37,7 +38,7 @@ pub(crate) async fn provider_health_worker(
             _ = shutdown.changed() => return,
             report = reports.recv() => match report { Some(report) => report, None => return },
         };
-        observations.insert(report.group, report.error);
+        observations.insert((report.repository, report.group), report.error);
         let error = observations.values().find_map(Clone::clone);
         let mut current = health.write().await;
         current.provider = if error.is_some() {

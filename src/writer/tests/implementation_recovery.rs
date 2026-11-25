@@ -52,6 +52,73 @@ fn activations(f: &Fixture) -> i64 {
 }
 
 #[tokio::test]
+async fn discovery_cannot_adopt_a_different_request_with_a_matching_id_prefix() {
+    let f = Fixture::new(true);
+    let receipt = request(&f, 7);
+    let remote = Arc::new(Mutex::new(Remote {
+        pr_body: Some(
+            "Closes #1\n\nImplementation request: https://github.com/owner/repository/issues/comments/70"
+                .into(),
+        ),
+        ..Remote::default()
+    }));
+    let (github, http) = server(remote.clone(), true).await;
+    f.drain(github).await;
+    let result = f.receipt(&receipt.request_id);
+    assert_eq!(result.lifecycle, "rejected");
+    assert!(result.last_error.as_deref().unwrap().contains("unrelated PR"));
+    assert_eq!(activations(&f), 0);
+    assert_eq!(remote.lock().unwrap().writes, 0);
+    http.abort();
+}
+
+#[test]
+fn ensure_rejects_invalid_ref_components_before_accepting_an_obligation() {
+    let f = Fixture::new(false);
+    for head in ["topic//task", "topic/.task", "topic.lock/task"] {
+        let result = ensure_pull_request(
+            &f.config,
+            &f.store,
+            PullRequestEnsureRequest {
+                invocation: Invocation::Operator,
+                repository: "owner/repository".parse().unwrap(),
+                comment_id: 7,
+                head: Some(head.into()),
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("invalid Git branch"), "{head}");
+    }
+    assert_eq!(
+        f.db().query_row("SELECT COUNT(*) FROM write_intents", [], |r| r.get::<_, i64>(0)).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn temporary_ledger_contention_preserves_the_publication_obligation() {
+    use crate::store::StoreError;
+    for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+        let error = StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some("another connection holds the ledger".into()),
+        ));
+        assert!(helpers::store_as_github_error(&error).is_unavailable());
+    }
+    for error in [StoreError::ActorUnavailable, StoreError::ActorStopped] {
+        assert!(helpers::store_as_github_error(&error).is_unavailable());
+    }
+    let constraint = StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+        Some("invalid reference".into()),
+    ));
+    assert!(!helpers::store_as_github_error(&constraint).is_unavailable());
+    assert!(
+        !helpers::store_as_github_error(&StoreError::InvalidData("source was revoked".into()))
+            .is_unavailable()
+    );
+}
+
+#[tokio::test]
 async fn a_published_request_recovers_delivery_without_replaying_fenced_mutations() {
     let f = Fixture::new(true);
     let receipt = request(&f, 7);

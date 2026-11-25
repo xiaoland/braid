@@ -366,6 +366,7 @@ impl Execution {
                 .args(["cleanup", "--execution-dir"])
                 .arg(&self.directory)
                 .args(["--execution-id", &self.id])
+                .kill_on_drop(true)
                 .output(),
         )
         .await

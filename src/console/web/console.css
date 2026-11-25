@@ -91,9 +91,6 @@ h2 {
   font-weight:600;
   margin:0 0 18px
 }
-h3 {
-  font-size:15px
-}
 .eyebrow {
   font-size:10px;
   color:var(--accent);
@@ -329,9 +326,6 @@ footer {
   margin-top:32px;
   line-height:1.7
 }
-.receipt {
-  border-left:3px solid var(--accent)
-}
 .form-grid {
   display:grid;
   gap:15px
@@ -339,13 +333,6 @@ footer {
 .metric-point {
   font-family:ui-monospace,monospace;
   font-size:12px
-}
-.sr-only {
-  position:absolute;
-  width:1px;
-  height:1px;
-  overflow:hidden;
-  clip:rect(0,0,0,0)
 }
 @media(max-width:900px) {
   aside {

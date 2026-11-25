@@ -29,6 +29,8 @@ mod implementation_delivery;
 mod operational_status;
 #[cfg(test)]
 mod operational_status_migration_tests;
+#[cfg(test)]
+mod replay_tests;
 pub(crate) use implementation_delivery::PrActivation;
 pub(crate) mod handoff;
 mod write_execution;
@@ -45,7 +47,7 @@ use gh_writes::{
     prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 13;
+pub const DATABASE_SCHEMA_VERSION: u32 = 14;
 
 const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
 const EVENT_KINDS_SQL: &str = include_str!("../../migrations/0002_event_kinds.sql");
@@ -106,6 +108,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 13,
         name: "operational_status_convergence",
         sql: include_str!("../../migrations/0013_operational_status_convergence.sql"),
+    },
+    Migration {
+        version: 14,
+        name: "replay_batch_membership",
+        sql: include_str!("../../migrations/0014_replay_batch_membership.sql"),
     },
 ];
 
@@ -321,7 +328,6 @@ pub struct IngestResult {
 #[derive(Debug, Clone)]
 pub struct MentionCandidate {
     pub event_id: String,
-    pub repository: String,
     pub actor_login: String,
 }
 
@@ -478,6 +484,7 @@ pub struct ContextResetClaim {
     pub work_item_kind: String,
     pub number: u64,
     pub profile_id: String,
+    pub profile_revision: u64,
     pub active_turn_id: Option<String>,
     pub provider_turn_id: Option<String>,
     pub references: Vec<String>,
@@ -711,10 +718,14 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub fn mention_candidates(&self, limit: usize) -> Result<Vec<MentionCandidate>, StoreError> {
+    pub fn mention_candidates(
+        &self,
+        repository: String,
+        limit: usize,
+    ) -> Result<Vec<MentionCandidate>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::MentionCandidates(limit, reply))
+            .send(Command::MentionCandidates(repository, limit, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1379,17 +1390,9 @@ impl StoreActor {
     }
 
     pub fn consume_steer_batch(&self, batch_id: String) -> Result<(), StoreError> {
-        self.settle_steer_batch(batch_id, "consumed".into())
-    }
-
-    pub fn settle_steer_batch(
-        &self,
-        batch_id: String,
-        lifecycle: String,
-    ) -> Result<(), StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::ConsumeSteerBatch(batch_id, lifecycle, reply))
+            .send(Command::ConsumeSteerBatch(batch_id, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1505,7 +1508,7 @@ enum Command {
     OperationalStatusCommentIds(String, Sender<Result<BTreeSet<String>, StoreError>>),
     ReconcileAssociations(AssociationSet, Sender<Result<(), StoreError>>),
     IngestEvent(Box<IngressEvent>, SchedulerPolicy, Sender<Result<IngestResult, StoreError>>),
-    MentionCandidates(usize, Sender<Result<Vec<MentionCandidate>, StoreError>>),
+    MentionCandidates(String, usize, Sender<Result<Vec<MentionCandidate>, StoreError>>),
     ResolveMention(String, bool, SchedulerPolicy, Sender<Result<(), StoreError>>),
     AdvanceScheduler(Sender<Result<u64, StoreError>>),
     RuntimeStatus(Sender<Result<RuntimeStoreStatus, StoreError>>),
@@ -1642,7 +1645,7 @@ enum Command {
     ),
     RecordTurnError(String, String, Sender<Result<(), StoreError>>),
     ClaimUrgentSteer(String, Sender<Result<Option<TurnClaim>, StoreError>>),
-    ConsumeSteerBatch(String, String, Sender<Result<(), StoreError>>),
+    ConsumeSteerBatch(String, Sender<Result<(), StoreError>>),
     EnqueueTurnReaction(String, String, Sender<Result<(), StoreError>>),
     EnqueueOperationalStatus(String, String, Sender<Result<(), StoreError>>),
     BeginContextReset(
@@ -1705,8 +1708,8 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::IngestEvent(event, policy, reply) => {
                 let _ = reply.send(ingest_event(database, &event, policy));
             }
-            Command::MentionCandidates(limit, reply) => {
-                let _ = reply.send(mention_candidates(database, limit));
+            Command::MentionCandidates(repository, limit, reply) => {
+                let _ = reply.send(mention_candidates(database, &repository, limit));
             }
             Command::ResolveMention(event_id, trusted, policy, reply) => {
                 let _ = reply.send(resolve_mention(database, &event_id, trusted, policy));
@@ -2021,8 +2024,8 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::ClaimUrgentSteer(turn_id, reply) => {
                 let _ = reply.send(claim_urgent_steer(database, &turn_id));
             }
-            Command::ConsumeSteerBatch(batch_id, lifecycle, reply) => {
-                let _ = reply.send(consume_steer_batch(database, &batch_id, &lifecycle));
+            Command::ConsumeSteerBatch(batch_id, reply) => {
+                let _ = reply.send(consume_steer_batch(database, &batch_id));
             }
             Command::EnqueueTurnReaction(turn_id, content, reply) => {
                 let _ = reply.send(enqueue_turn_reaction(database, &turn_id, &content));
@@ -2927,7 +2930,7 @@ fn schedule_event(
     };
     let inserted = transaction.execute(
         "INSERT OR IGNORE INTO wake_batch_events(batch_id,event_id,ordinal)
-         VALUES (?1,?2,(SELECT COUNT(*) FROM wake_batch_events WHERE batch_id=?1))",
+         VALUES (?1,?2,(SELECT COALESCE(MAX(ordinal)+1,0) FROM wake_batch_events WHERE batch_id=?1))",
         params![batch_id, event_id],
     )?;
     let count = old_count + i64::try_from(inserted).expect("SQLite change count fits i64");
@@ -2950,24 +2953,24 @@ fn schedule_event(
     Ok((batch_id, lifecycle.into()))
 }
 
-fn mention_candidates(database: &Path, limit: usize) -> Result<Vec<MentionCandidate>, StoreError> {
+fn mention_candidates(
+    database: &Path,
+    repository: &str,
+    limit: usize,
+) -> Result<Vec<MentionCandidate>, StoreError> {
     require_current_schema(database)?;
     let connection = open_read_only(database)?;
     let limit =
         i64::try_from(limit).map_err(|_| StoreError::InvalidData("limit exceeds i64".into()))?;
     let mut statement = connection.prepare(
-        "SELECT e.event_id,d.repository_name,d.actor_login
+        "SELECT e.event_id,d.actor_login
          FROM events e JOIN deliveries d ON d.delivery_guid=e.delivery_guid
          WHERE e.mention_candidate=1 AND e.trusted_mention IS NULL AND e.lifecycle='pending'
-           AND d.repository_name IS NOT NULL AND d.actor_login IS NOT NULL
-         ORDER BY e.observed_at,e.event_id LIMIT ?1",
+           AND d.repository_name=?1 AND d.actor_login IS NOT NULL
+         ORDER BY e.observed_at,e.event_id LIMIT ?2",
     )?;
-    let rows = statement.query_map([limit], |row| {
-        Ok(MentionCandidate {
-            event_id: row.get(0)?,
-            repository: row.get(1)?,
-            actor_login: row.get(2)?,
-        })
+    let rows = statement.query_map(params![repository, limit], |row| {
+        Ok(MentionCandidate { event_id: row.get(0)?, actor_login: row.get(1)? })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
 }
@@ -4714,7 +4717,7 @@ fn load_context_reset_claim(
     let mut claim = connection.query_row(
         "SELECT cr.reset_id,a.assignment_id,r.name_with_owner,w.kind,w.number,ai.profile_id,
                 cr.active_turn_id,t.provider_turn_id,cr.continuation,
-                wt.path,wt.head_ref,ps.provider_session_id,ps.lifecycle,t.lifecycle
+                wt.path,wt.head_ref,ps.provider_session_id,ps.lifecycle,t.lifecycle,ai.profile_revision
          FROM context_resets cr
          JOIN provider_sessions ps ON ps.session_id=cr.old_session_id
          JOIN agent_instances ai ON ai.agent_id=cr.agent_id
@@ -4736,6 +4739,7 @@ fn load_context_reset_claim(
                 work_item_kind: row.get(3)?,
                 number: sqlite_i64_to_u64(row.get(4)?, "context reset Work Item number")?,
                 profile_id: row.get(5)?,
+                profile_revision: sqlite_i64_to_u64(row.get(14)?, "Context reset Profile revision")?,
                 active_turn_id: row.get(6)?,
                 provider_turn_id: row.get(7)?,
                 references: Vec::new(),
@@ -5441,17 +5445,14 @@ fn claim_urgent_steer(database: &Path, turn_id: &str) -> Result<Option<TurnClaim
     }))
 }
 
-fn consume_steer_batch(database: &Path, batch_id: &str, lifecycle: &str) -> Result<(), StoreError> {
+fn consume_steer_batch(database: &Path, batch_id: &str) -> Result<(), StoreError> {
     require_current_schema(database)?;
     let connection = open_read_write(database)?;
     configure_connection(&connection)?;
-    if !matches!(lifecycle, "consumed" | "failed" | "unknown") {
-        return Err(StoreError::InvalidData(format!("invalid steer batch terminal {lifecycle}")));
-    }
     let updated = connection.execute(
-        "UPDATE wake_batches SET lifecycle=?3,updated_at=?2
+        "UPDATE wake_batches SET lifecycle='consumed',updated_at=?2
          WHERE batch_id=?1 AND lifecycle='runnable' AND urgent=1",
-        params![batch_id, now_rfc3339(), lifecycle],
+        params![batch_id, now_rfc3339()],
     )?;
     if updated == 1 {
         Ok(())

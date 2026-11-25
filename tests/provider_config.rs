@@ -503,6 +503,22 @@ fn provider_import_auth_converts_pi_credentials() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("already exists"), "{}", stderr(&output));
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&imported, fs::Permissions::from_mode(0o644))
+            .expect("simulate an existing unprotected credential");
+        let output = braid()
+            .args(["provider", "import-auth", "example-llm", "--force", "--from"])
+            .arg(&pi_auth)
+            .args(["--user-home"])
+            .arg(&user_home)
+            .output()
+            .expect("replace an existing credential");
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(fs::metadata(&imported).expect("metadata").permissions().mode() & 0o777, 0o600);
+    }
+
     // BRAID_USER_HOME is honored without an explicit --user-home flag.
     let env_home = temporary.join("env-home");
     let output = braid()

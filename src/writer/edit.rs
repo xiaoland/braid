@@ -250,7 +250,7 @@ pub(super) async fn authorize(
     };
     let (repository, kind, number) =
         crate::store::publication_source::work_item(config.runtime.database(), source)
-            .map_err(|e| GitHubError::GraphQl(e.to_string()))?;
+            .map_err(|e| helpers::store_as_github_error(&e))?;
     if repository != target.repository.to_string() {
         return Err(GitHubError::GraphQl("source repository mismatch".into()));
     }

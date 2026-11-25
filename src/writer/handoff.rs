@@ -60,12 +60,12 @@ pub(super) async fn execute(
 ) -> helpers::WriteResult {
     check_source(config, receipt)?;
     crate::store::handoff::validate(config.runtime.database(), receipt)
-        .map_err(|e| GitHubError::GraphQl(e.to_string()))?;
+        .map_err(|e| helpers::store_as_github_error(&e))?;
     let source =
         receipt.source.as_ref().ok_or_else(|| GitHubError::GraphQl("missing source".into()))?;
     let (repository, _, number) =
         crate::store::publication_source::work_item(config.runtime.database(), source)
-            .map_err(|e| GitHubError::GraphQl(e.to_string()))?;
+            .map_err(|e| helpers::store_as_github_error(&e))?;
     if github.identity().repository != repository {
         return Err(GitHubError::GraphQl("handoff installation repository mismatch".into()).into());
     }

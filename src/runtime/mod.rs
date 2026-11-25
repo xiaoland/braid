@@ -252,114 +252,123 @@ async fn serve_github_managed(
         shutdown_receiver.clone(),
     )));
 
-    if provider_enabled {
-        let factories = crate::provider::session_factories(&config)?;
-        let mut spec_scopes = Vec::new();
-        for repository in config.github_repositories() {
-            for kind in [GroupKind::Issue, GroupKind::Pr] {
-                if !config.profiles_for_repository(repository, kind.as_str()).is_empty() {
-                    spec_scopes.push((repository, kind));
+    // Startup can fail after workers have resumed persisted executions. Route
+    // those failures through the same bounded shutdown as a running service.
+    let startup: Result<()> = async {
+        if provider_enabled {
+            let factories = crate::provider::session_factories(&config)?;
+            let mut spec_scopes = Vec::new();
+            for repository in config.github_repositories() {
+                for kind in [GroupKind::Issue, GroupKind::Pr] {
+                    if !config.profiles_for_repository(repository, kind.as_str()).is_empty() {
+                        spec_scopes.push((repository, kind));
+                    }
                 }
             }
+            let specs = spec_scopes
+                .into_iter()
+                .map(|(repository, kind)| GroupSpec::new(kind, &config, &store, repository))
+                .collect::<Result<Vec<_>>>()?;
+            let (reports, receiver) = tokio::sync::mpsc::channel(8);
+            workers.spawn(worker_result(crate::health::provider_health_worker(
+                Arc::clone(&health),
+                specs.len(),
+                receiver,
+                shutdown_receiver.clone(),
+            )));
+            for spec in specs {
+                let factory = factories
+                    .get(spec.profile_id())
+                    .context("Profile session factory missing")?
+                    .clone();
+                workers.spawn(agent_group_worker(
+                    Arc::clone(&store),
+                    github_clients
+                        .get(&spec.repository)
+                        .context("repository GitHub client missing")?
+                        .clone(),
+                    config.clone(),
+                    spec,
+                    factory,
+                    reports.clone(),
+                    shutdown_receiver.clone(),
+                ));
+            }
+            drop(reports);
         }
-        let specs = spec_scopes
-            .into_iter()
-            .map(|(repository, kind)| GroupSpec::new(kind, &config, &store, repository))
-            .collect::<Result<Vec<_>>>()?;
-        let (reports, receiver) = tokio::sync::mpsc::channel(8);
-        workers.spawn(worker_result(crate::health::provider_health_worker(
-            Arc::clone(&health),
-            specs.len(),
-            receiver,
-            shutdown_receiver.clone(),
-        )));
-        for spec in specs {
-            let factory = factories
-                .get(spec.profile_id())
-                .context("Profile session factory missing")?
-                .clone();
-            workers.spawn(agent_group_worker(
-                Arc::clone(&store),
-                github_clients
-                    .get(&spec.repository)
-                    .context("repository GitHub client missing")?
-                    .clone(),
+
+        let local_url = format!("http://{}", config.server.ingress);
+        if quick_tunnel {
+            {
+                let mut current = health.write().await;
+                current.tunnel = "verifying";
+                current.webhook_sync = "pending";
+            }
+            let (started, public_webhook) = start_verified_quick_tunnel(
+                &config,
+                &local_url,
+                &state.webhook_secret,
+                config.repository(),
+                &github.identity().repository_node_id,
+            )
+            .await?;
+            let prior = github.app_webhook_config().await?;
+            github
+                .update_app_webhook(
+                    &public_webhook,
+                    Some(
+                        std::str::from_utf8(&state.webhook_secret)
+                            .context("webhook secret is UTF-8")?,
+                    ),
+                )
+                .await?;
+            let confirmed = github.app_webhook_config().await?;
+            if confirmed.url != public_webhook {
+                bail!("App webhook URL did not converge to the verified Tunnel");
+            }
+            {
+                let mut current = health.write().await;
+                current.tunnel = "connected";
+                current.webhook_sync = "confirmed";
+                current.tunnel_verified_at = Some(time::OffsetDateTime::now_utc().to_string());
+                current.webhook_url = Some(public_webhook);
+            }
+            workers.spawn(crate::tunnel::supervise(
                 config.clone(),
-                spec,
-                factory,
-                reports.clone(),
+                github.clone(),
+                state.webhook_secret.clone(),
+                health.clone(),
+                started,
+                prior,
                 shutdown_receiver.clone(),
             ));
         }
-        drop(reports);
+        Ok(())
     }
+    .await;
 
-    let local_url = format!("http://{}", config.server.ingress);
-    if quick_tunnel {
-        {
-            let mut current = health.write().await;
-            current.tunnel = "verifying";
-            current.webhook_sync = "pending";
-        }
-        let (started, public_webhook) = start_verified_quick_tunnel(
-            &config,
-            &local_url,
-            &state.webhook_secret,
-            config.repository(),
-            &github.identity().repository_node_id,
-        )
-        .await?;
-        let prior = github.app_webhook_config().await?;
-        github
-            .update_app_webhook(
-                &public_webhook,
-                Some(
-                    std::str::from_utf8(&state.webhook_secret)
-                        .context("webhook secret is UTF-8")?,
-                ),
-            )
-            .await?;
-        let confirmed = github.app_webhook_config().await?;
-        if confirmed.url != public_webhook {
-            bail!("App webhook URL did not converge to the verified Tunnel");
-        }
-        {
-            let mut current = health.write().await;
-            current.tunnel = "connected";
-            current.webhook_sync = "confirmed";
-            current.tunnel_verified_at = Some(time::OffsetDateTime::now_utc().to_string());
-            current.webhook_url = Some(public_webhook);
-        }
-        workers.spawn(crate::tunnel::supervise(
-            config.clone(),
-            github.clone(),
-            state.webhook_secret.clone(),
-            health.clone(),
-            started,
-            prior,
-            shutdown_receiver.clone(),
-        ));
-    }
-    health.write().await.ready = true;
-    tracing::info!(repositories = %config.github_repositories().join(", "), "Braid transport runtime is ready");
-
-    let mut runtime_failure = None;
-    tokio::select! {
-            _ = external_stop.changed() => {}
-            worker = workers.join_next() => {
-                let message = match worker {
-                    Some(Ok(Ok(()))) => "a supervised runtime worker stopped unexpectedly".to_owned(),
-                    Some(Ok(Err(error))) => format!("a supervised runtime worker failed: {error:#}"),
-                    Some(Err(error)) => format!("a supervised runtime worker failed: {error}"),
-                    None => "all supervised runtime workers stopped unexpectedly".to_owned(),
-                };
-                {
-                    let mut current = health.write().await;
-                    current.ready = false;
-                    current.last_error = Some(message.clone());
+    let mut runtime_failure =
+        startup.err().map(|error| format!("runtime startup failed: {error:#}"));
+    if runtime_failure.is_none() {
+        health.write().await.ready = true;
+        tracing::info!(repositories = %config.github_repositories().join(", "), "Braid transport runtime is ready");
+        tokio::select! {
+                _ = external_stop.changed() => {}
+                worker = workers.join_next() => {
+                    let message = match worker {
+                        Some(Ok(Ok(()))) => "a supervised runtime worker stopped unexpectedly".to_owned(),
+                        Some(Ok(Err(error))) => format!("a supervised runtime worker failed: {error:#}"),
+                        Some(Err(error)) => format!("a supervised runtime worker failed: {error}"),
+                        None => "all supervised runtime workers stopped unexpectedly".to_owned(),
+                    };
+                    {
+                        let mut current = health.write().await;
+                        current.ready = false;
+                        current.last_error = Some(message.clone());
+                    }
+                    runtime_failure = Some(message);
                 }
-                runtime_failure = Some(message);
-            }
+        }
     }
 
     health.write().await.ready = false;

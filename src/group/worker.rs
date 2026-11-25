@@ -351,6 +351,7 @@ impl GroupDriver<'_> {
                         let error = result.err().map(|error| error.to_string());
                         if let Some(error) = &error { tracing::warn!(%error, kind = self.spec.kind.as_str(), "session recovery unavailable"); }
                         if reports.send(crate::health::ProviderHealthUpdate {
+                            repository: self.spec.repository.clone(),
                             group: self.spec.kind.as_str(), error,
                         }).await.is_err() { return; }
                         recovery = tokio::time::Instant::now() + Duration::from_secs(2);
