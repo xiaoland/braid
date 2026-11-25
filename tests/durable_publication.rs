@@ -107,6 +107,8 @@ fn schedule_event(
 mod gh_writes;
 #[path = "../src/store/handoff.rs"]
 mod handoff;
+#[path = "../src/store/operational_status.rs"]
+mod operational_status;
 #[path = "../src/store/publication_source.rs"]
 mod publication_source;
 #[path = "../src/store/write_execution.rs"]
@@ -130,6 +132,11 @@ impl Database {
                 .unwrap();
             connection
                 .execute_batch(include_str!("../migrations/0012_implementation_delivery.sql"))
+                .unwrap();
+            connection
+                .execute_batch(include_str!(
+                    "../migrations/0013_operational_status_convergence.sql"
+                ))
                 .unwrap();
         }
         Self(path)
@@ -224,6 +231,15 @@ fn legacy_cli_pending_uncertain_sending_all_get_one_execution_obligation() {
         db.connect().execute("INSERT INTO write_intents(intent_id,operation,request_digest,lifecycle,created_at,updated_at,request_key,repository,target,profile_id,role,payload) VALUES (?1,'comment_create',?2,?1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',?1,'owner/repository','owner/repository#1','profile','Issue Agent','body')",params![state,"a".repeat(64)]).unwrap();
     }
     db.connect().execute_batch(include_str!("../migrations/0009_durable_publication.sql")).unwrap();
+    db.connect()
+        .execute_batch(include_str!("../migrations/0011_collaboration_inputs.sql"))
+        .unwrap();
+    db.connect()
+        .execute_batch(include_str!("../migrations/0012_implementation_delivery.sql"))
+        .unwrap();
+    db.connect()
+        .execute_batch(include_str!("../migrations/0013_operational_status_convergence.sql"))
+        .unwrap();
     let owner = db.owner();
     for _ in 0..3 {
         let write = claim_github_write(&db.0, &owner).unwrap().unwrap();

@@ -26,6 +26,9 @@ mod runs;
 pub use runs::RunCommand;
 mod gh_writes;
 mod implementation_delivery;
+mod operational_status;
+#[cfg(test)]
+mod operational_status_migration_tests;
 pub(crate) use implementation_delivery::PrActivation;
 pub(crate) mod handoff;
 mod write_execution;
@@ -42,7 +45,7 @@ use gh_writes::{
     prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 12;
+pub const DATABASE_SCHEMA_VERSION: u32 = 13;
 
 const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
 const EVENT_KINDS_SQL: &str = include_str!("../../migrations/0002_event_kinds.sql");
@@ -98,6 +101,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 12,
         name: "implementation_delivery",
         sql: include_str!("../../migrations/0012_implementation_delivery.sql"),
+    },
+    Migration {
+        version: 13,
+        name: "operational_status_convergence",
+        sql: include_str!("../../migrations/0013_operational_status_convergence.sql"),
     },
 ];
 
@@ -5547,15 +5555,15 @@ fn enqueue_operational_status(
 ) -> Result<(), StoreError> {
     require_current_schema(database)?;
     let connection = open_read_only(database)?;
-    let assignment_id = connection.query_row(
-        "SELECT ai.assignment_id FROM turns t
+    let (assignment_id, observed_at) = connection.query_row(
+        "SELECT ai.assignment_id,t.ended_at FROM turns t
          JOIN provider_sessions ps ON ps.session_id=t.session_id
          JOIN agent_instances ai ON ai.agent_id=ps.agent_id
          WHERE t.turn_id=?1",
         [turn_id],
-        |row| row.get::<_, String>(0),
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
     )?;
-    enqueue_assignment_operational_status(database, &assignment_id, body)
+    operational_status::enqueue_failure(database, &assignment_id, body, observed_at.as_deref())
 }
 
 fn enqueue_assignment_operational_status(
@@ -5563,86 +5571,7 @@ fn enqueue_assignment_operational_status(
     assignment_id: &str,
     body: &str,
 ) -> Result<(), StoreError> {
-    require_current_schema(database)?;
-    if body.trim().is_empty() {
-        return Err(StoreError::InvalidData("Operational Status body is empty".into()));
-    }
-    let now = now_rfc3339();
-    let body_digest = hex::encode(Sha256::digest(body.as_bytes()));
-    let mut connection = open_read_write(database)?;
-    configure_connection(&connection)?;
-    let transaction = connection.transaction()?;
-    let (work_item_node_id, repository, number, profile_id, generation, remote_node, remote_id) =
-        transaction.query_row(
-            "SELECT w.node_id,r.name_with_owner,w.number,ai.profile_id,a.generation,
-                    sc.remote_comment_node_id,sc.remote_comment_database_id
-             FROM assignments a
-             JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
-             JOIN work_items w ON w.node_id=a.work_item_node_id
-             JOIN repositories r ON r.node_id=w.repository_node_id
-             LEFT JOIN status_comments sc
-               ON sc.work_item_node_id=w.node_id AND sc.profile_id=ai.profile_id
-              AND sc.assignment_generation=a.generation
-             WHERE a.assignment_id=?1",
-            [assignment_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    sqlite_i64_to_u64(row.get(2)?, "status Issue number")?,
-                    row.get::<_, String>(3)?,
-                    sqlite_i64_to_u64(row.get(4)?, "status assignment generation")?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                ))
-            },
-        )?;
-    let (operation, target_kind, target_database_id) = match (remote_node, remote_id) {
-        (Some(_), Some(database_id)) => ("comment_update", "issue_comment", database_id),
-        _ => ("comment_create", "issue", number.to_string()),
-    };
-    let intent_id = Uuid::now_v7().to_string();
-    transaction.execute(
-        "INSERT INTO status_comments(
-           work_item_node_id,profile_id,assignment_generation,remote_comment_node_id,
-           remote_comment_database_id,write_intent_id,body_digest,lifecycle,updated_at
-         ) VALUES (?1,?2,?3,NULL,NULL,?4,?5,'pending',?6)
-         ON CONFLICT(work_item_node_id,profile_id,assignment_generation) DO UPDATE SET
-           write_intent_id=excluded.write_intent_id,body_digest=excluded.body_digest,
-           lifecycle='pending',updated_at=excluded.updated_at",
-        params![
-            work_item_node_id,
-            profile_id,
-            sqlite_u64(generation, "status generation")?,
-            intent_id,
-            body_digest,
-            now
-        ],
-    )?;
-    let request_digest = hex::encode(Sha256::digest(
-        format!(
-            "operational-status\0{repository}\0{work_item_node_id}\0{profile_id}\0{generation}\0{body_digest}"
-        )
-        .as_bytes(),
-    ));
-    transaction.execute(
-        "INSERT OR IGNORE INTO github_write_outbox(
-           intent_id,repository,target_kind,target_database_id,operation,content,
-           request_digest,lifecycle,next_attempt_at,created_at,updated_at
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?8,?8)",
-        params![
-            intent_id,
-            repository,
-            target_kind,
-            target_database_id,
-            operation,
-            body,
-            request_digest,
-            now,
-        ],
-    )?;
-    transaction.commit()?;
-    Ok(())
+    operational_status::enqueue_failure(database, assignment_id, body, None)
 }
 
 fn settle_operational_status(
@@ -5653,13 +5582,14 @@ fn settle_operational_status(
     remote_node_id: Option<&str>,
     now: &str,
 ) -> Result<(), StoreError> {
-    transaction.execute(
-        "UPDATE status_comments SET remote_comment_node_id=COALESCE(?3,remote_comment_node_id),
-           remote_comment_database_id=COALESCE(?4,remote_comment_database_id),
-           lifecycle=?2,updated_at=?5 WHERE write_intent_id=?1",
-        params![intent_id, lifecycle, remote_node_id, remote_database_id, now],
-    )?;
-    Ok(())
+    operational_status::settle(
+        transaction,
+        intent_id,
+        lifecycle,
+        remote_database_id,
+        remote_node_id,
+        now,
+    )
 }
 
 fn enqueue_rocket_removal(

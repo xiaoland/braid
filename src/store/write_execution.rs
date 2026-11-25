@@ -26,13 +26,19 @@ pub(super) fn claim_github_write(
     configure_connection(&connection)?;
     let transaction = connection.transaction()?;
     gh_writes::require_owner(&transaction, owner)?;
+    super::operational_status::reconcile(&transaction, &now)?;
     let recovery_until = deadline_rfc3339(5)?;
     let write = transaction
         .query_row(
             "SELECT intent_id,repository,target_kind,target_database_id,operation,content,
                     remote_database_id,lifecycle,created_at,attempts
-             FROM github_write_outbox
+             FROM github_write_outbox AS current
              WHERE lifecycle IN ('pending','uncertain') AND next_attempt_at<=?1
+               AND NOT EXISTS(SELECT 1 FROM github_write_outbox previous
+                   WHERE previous.status_work_item_node_id=current.status_work_item_node_id
+                     AND previous.status_profile_id=current.status_profile_id
+                     AND previous.status_generation=current.status_generation
+                     AND previous.rowid<current.rowid AND previous.lifecycle IN ('sending','uncertain'))
              ORDER BY created_at,intent_id LIMIT 1",
             [&now],
             |row| {

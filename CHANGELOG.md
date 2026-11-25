@@ -37,13 +37,17 @@ Versioning once release artifacts are published.
   HTTP 账单由 Issue 13→5、PR 10→5；保留分页和前后 marker，不推断线上 points 同降。
 - `status` 分开显示原始 runnable 数、durable 领取资格及当前/历史代；物理 provider
   可用性仍明确未知，不因对象 closed/merged 就删除可能合法的 Finalization。
-- Harness schema 升至 **12**；配置 schema 保持 3。处理基线与普通 Context 投影分开，
+- Harness schema 升至 **13**；配置 schema 保持 3。处理基线与普通 Context 投影分开，
   完整观察的事件和基线原子提交；发生身份与版本身份分开，接单复用记录可追溯。
   升级前须停止旧 runtime 并执行带备份的迁移。旧 binary 不能打开升级后的账本；回滚需停止新 runtime，
   将升级前备份恢复到独立 runtime 目录，不支持 down migration。
 
 ### Fixed
 
+- 已确认接手或正常终止的新 generation 会收敛旧 Operational Status：沿原 comment
+  展示最后确认时间与明确的历史/接替关系，不把旧 blocked generation 伪装成复活，
+  也不声称代码、review 或产品完成。唯一 outbox 从持久账本补偿重启，发送中旧 create
+  的回执不会丢失，uncertain 先对账再更新；重复故障与旧代晚到不会产生重复 comment。
 - Operational Status 的展示过滤不再被当作删除证据；完整成员集合与 Agent 投影分开。
   本地 tombstone 不是上游 updatedAt，当前正向完整观察可安全纠正；读取前事件栅栏
   防止提交期间的新 delete 被旧快照覆盖，冲突会说明 node、版本、状态和来源。

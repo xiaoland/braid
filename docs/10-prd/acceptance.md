@@ -210,6 +210,15 @@ claiming success/failure.
 自行恢复且 status 本身不产生业务 turn；不允许通过直接改库作为 pass oracle。对真正
 较新 edit、读取期间到达的 delete，保留乱序保护并以安全元数据说明冲突来源。
 
+公开状态恢复验收：保留一个已发布 Provider unavailable 的旧 generation，再通过
+受支持入口建立新 generation。仅 assignment/materialization 完成不能显示恢复；
+Provider 确认接手或正常终止后，原 status comment 应更新为带最后确认时间、明确
+新 generation 接替的历史故障。旧 generation 仍 blocked，新状态不暗示实现完成。
+在已有恢复结果但未更新评论的现场升级，也应只靠账本补偿，不需要再调用模型。
+重启、同一故障重复发布及旧代故障晚到，均不新增重复 comment 或恢复旧职责。
+旧 create 已远端成功而本地回执未落库时，必须先对账并沿原 comment 更新，不能以
+再次 POST 掩盖恢复；blocked、unknown 或未被 Provider 接受的新代不能通过此验收。
+
 ### 9. Telemetry, Migration, and Distribution
 
 With sample ratio 1.0, the retained OTLP trace must correlate webhook receipt,

@@ -455,6 +455,21 @@ Profiles choose Issue, PR, or both direct surfaces. Status covers context
 pressure/unavailability, provider/transport unknown, blocked Profile/worktree,
 and ambiguous/rejected Braid writes.
 
+公开故障投影不是只追加的告警。唯一 outbox owner 领取写入前，按持久账本对账已有
+status：最新 active generation 的当前 Session 中，Provider 已接受的 running turn
+或正常 completed turn 才是接手证据；仅创建 assignment、替换记忆或工作树干净不算。
+同代在故障之后有新的确认，可将原 comment 标为恢复；新代确认后，旧代 comment
+标为有时间的历史故障并说明由哪代、哪个 Profile 接替，旧代并未被解阻。正文明确
+这是最后确认的执行状态，不是代码、review 或产品完成，也不是持续可用保证。
+正常 turn 不因此新增评论；重启从账本补偿，没有额外队列或周期性模型调用。
+
+status 的 desired publication 与远端 comment 身份分开。每个 outbox publication
+持久绑定原 status key；旧 create 在发送中或 uncertain 时，新投影等待它对账，旧
+回执仍能补回 remote ID，但不能覆盖较新投影的生命周期。确认 ID 后新投影改为
+更新同一 comment；未发送旧投影可 supersede。重复故障不更换回执指针，故障恢复后
+再次发生则是新的 publication，不由正文永久去重。已被新代接替的旧代故障晚到，
+不会把公开状态降回当前失败。Schema 13 对已有 status/outbox 回填映射，不改职责状态。
+
 For initial `pr ensure`, the source is the calling Issue assignment; the frozen
 PR Profile selects the new implementation role and must not replace that source.
 Cwd/session resolution checks the durable source role and treats an explicit

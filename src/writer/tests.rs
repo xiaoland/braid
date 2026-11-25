@@ -132,6 +132,7 @@ async fn server(
 ) -> (Arc<GitHubClient>, tokio::task::JoinHandle<()>) {
     let listing = remote.clone();
     let writing = remote.clone();
+    let updating = remote.clone();
     let target = remote.clone();
     let continuation = remote.clone();
     let pr_read = remote.clone();
@@ -151,6 +152,7 @@ async fn server(
             let comment=json!({"id":99,"node_id":"comment","url":"https://api.github.com/repos/owner/repository/issues/comments/99","html_url":"https://github.com/owner/repository/issues/1#issuecomment-99","issue_url":"https://api.github.com/repos/owner/repository/issues/1","body":body["body"],"created_at":time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap(),"updated_at":"now","user":{"login":"braid[bot]","id":1,"node_id":"app","type":"Bot","site_admin":false,"avatar_url":"https://example.invalid","url":"https://example.invalid","html_url":"https://example.invalid"}});
             remote.comments.push(comment); Json(json!({"id":99,"node_id":"comment"}))
         }}))
+        .route("/repos/owner/repository/issues/comments/99",axum::routing::patch(move |Json(body):Json<Value>|{let remote=updating.clone();async move{let mut remote=remote.lock().unwrap();remote.writes+=1;remote.comments.last_mut().unwrap()["body"]=body["body"].clone();Json(json!({"id":99,"node_id":"comment"}))}}))
         .route("/repos/owner/repository/issues/comments/7", get(|| async { Json(json!({"id":7,"node_id":"request-comment","url":"https://api.github.com/repos/owner/repository/issues/comments/7","html_url":"https://github.com/owner/repository/issues/1#issuecomment-7","issue_url":"https://api.github.com/repos/owner/repository/issues/1","body":"implement","created_at":"now","updated_at":"now"})) }))
         .route("/repos/owner/repository/issues/comments/8",get(move||{let remote=continuation.clone();async move{let number=if remote.lock().unwrap().authority==Authority::OtherIssue {2}else{1};Json(json!({"id":8,"node_id":"followup-comment","html_url":format!("https://github.com/owner/repository/issues/{number}#issuecomment-8"),"issue_url":format!("https://api.github.com/repos/owner/repository/issues/{number}"),"body":"continue current implementation","created_at":"now","updated_at":"now"}))}}))
         .route("/repos/owner/repository/issues/2",get(||async{Json(json!({"id":2,"node_id":"other-issue","number":2,"title":"Other issue","state":"open","html_url":"https://github.com/owner/repository/issues/2"}))}))
@@ -418,6 +420,7 @@ mod handoff;
 mod implementation_recovery;
 mod observation_recovery;
 mod semantic_contract;
+mod status_convergence;
 
 pub(crate) async fn issue_context_server(
     body: &str,

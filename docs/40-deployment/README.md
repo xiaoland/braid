@@ -393,6 +393,12 @@ Session 或分支。材料/指令不匹配会明确失败；材料回退后
 的必要条件，不是 owned execution 已停止的证明；当前不提供把旧 blocked 记录自动
 翻回 active 的通用入口，不把现场特定的 SQL 逆向操作当作受支持恢复流程。
 
+Schema 13 只修复 Operational Status 的公开投影。已有 generation 的正常运行证据
+可在服务恢复、outbox 下一次领取时，把旧故障 comment 更新为已恢复或由新代接替，
+无需再次激活或调用模型；原 blocked 记录不会改变。更新包含最后确认时间，不能
+当作当前凭据仍有效或工作已验收的证明。若旧评论创建尚未确认，执行器先对账原
+请求再更新，避免重复 comment。OAuth 源文件生命周期不在这次迁移范围内。
+
 ## Health and Status
 
 Loopback `/healthz` and `braid status` expose bounded, non-semantic state:
