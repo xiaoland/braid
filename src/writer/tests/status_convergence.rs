@@ -155,6 +155,61 @@ async fn an_uncertain_create_is_recovered_before_publishing_the_new_projection()
 }
 
 #[tokio::test]
+async fn ambiguous_create_blocks_only_that_comments_successor_after_restart() {
+    let f = Fixture::new(true);
+    let remote = Arc::new(Mutex::new(Remote::default()));
+    let (github, http) = server(remote.clone(), true).await;
+    failure(&f);
+    let owner = f.store.acquire_runtime_lease("runtime".into(), "publisher".into(), 3600).unwrap();
+    let old = f.store.claim_github_write(owner.clone()).unwrap().unwrap();
+    github.create_issue_comment(1, &old.content).await.unwrap();
+    {
+        let mut state = remote.lock().unwrap();
+        let mut twin = state.comments[0].clone();
+        twin["id"] = json!(100);
+        twin["node_id"] = json!("other-comment");
+        state.comments.push(twin);
+    }
+    f.store.release_runtime_lease(owner).unwrap();
+    replacement(&f, "completed");
+    f.store.recover_writes().unwrap();
+    f.drain(github.clone()).await;
+    assert_eq!(
+        f.db()
+            .query_row(
+                "SELECT lifecycle FROM github_write_outbox WHERE intent_id=?1",
+                [old.intent_id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "ambiguous"
+    );
+    f.store
+        .enqueue_assignment_operational_status("replacement".into(), "new generation fault".into())
+        .unwrap();
+    f.drain(github.clone()).await;
+    f.drain(github).await;
+    let state = remote.lock().unwrap();
+    assert_eq!(
+        state.writes, 2,
+        "one original POST and one independent generation's POST; no third POST or guessed PATCH"
+    );
+    assert_eq!(state.comments.len(), 3);
+    assert!(state.comments[2]["body"].as_str().unwrap().contains("new generation fault"));
+    assert_eq!(
+        f.db()
+            .query_row(
+                "SELECT lifecycle FROM status_comments WHERE assignment_generation=1",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "ambiguous"
+    );
+    http.abort();
+}
+
+#[tokio::test]
 async fn repeated_identical_failures_do_not_orphan_receipts_and_a_new_cycle_can_publish_again() {
     let f = Fixture::new(true);
     let remote = Arc::new(Mutex::new(Remote::default()));

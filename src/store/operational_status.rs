@@ -98,8 +98,41 @@ pub(super) fn reconcile(tx: &rusqlite::Transaction<'_>, now: &str) -> Result<(),
     // A preceding create may have settled since this desired projection was
     // queued. Resolve the stable remote ID at claim, never create a second one.
     tx.execute("UPDATE github_write_outbox AS o SET operation='comment_update',target_kind='issue_comment',target_database_id=(SELECT s.remote_comment_database_id FROM status_comments s WHERE s.work_item_node_id=o.status_work_item_node_id AND s.profile_id=o.status_profile_id AND s.assignment_generation=o.status_generation) WHERE o.lifecycle='pending' AND o.operation='comment_create' AND EXISTS(SELECT 1 FROM status_comments s WHERE s.work_item_node_id=o.status_work_item_node_id AND s.profile_id=o.status_profile_id AND s.assignment_generation=o.status_generation AND s.remote_comment_database_id IS NOT NULL AND s.remote_comment_node_id IS NOT NULL)",[])?;
+    block_unidentified_creates(tx, now)?;
     Ok(())
 }
+
+/// A terminal multiple-match receipt cannot identify the original comment.
+/// Propagate that uncertainty to later creates for this key rather than
+/// guessing a PATCH target, issuing another POST, or stalling other keys.
+fn block_unidentified_creates(tx: &rusqlite::Transaction<'_>, now: &str) -> Result<(), StoreError> {
+    let blocked = tx.execute(
+        "UPDATE github_write_outbox AS desired
+         SET lifecycle='ambiguous', updated_at=?1,
+             last_error='Earlier status create matched multiple App comments; remote identity unresolved; no new create attempted'
+         WHERE desired.status_work_item_node_id IS NOT NULL
+           AND desired.operation='comment_create' AND desired.lifecycle='pending'
+           AND EXISTS (
+             SELECT 1 FROM github_write_outbox AS earlier
+             WHERE earlier.status_work_item_node_id=desired.status_work_item_node_id
+               AND earlier.status_profile_id=desired.status_profile_id
+               AND earlier.status_generation=desired.status_generation
+               AND earlier.rowid<desired.rowid AND earlier.operation='comment_create'
+               AND earlier.lifecycle='ambiguous')",
+        [now],
+    )?;
+    if blocked != 0 {
+        tx.execute(
+            "UPDATE status_comments SET lifecycle='ambiguous',updated_at=?1
+                    WHERE lifecycle='pending' AND write_intent_id IN
+                      (SELECT intent_id FROM github_write_outbox WHERE lifecycle='ambiguous'
+                       AND status_work_item_node_id IS NOT NULL)",
+            [now],
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn confirmation_after(
     confirmed: &str,
     failure: Option<&str>,

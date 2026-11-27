@@ -468,7 +468,9 @@ status 的 desired publication 与远端 comment 身份分开。每个 outbox pu
 回执仍能补回 remote ID，但不能覆盖较新投影的生命周期。确认 ID 后新投影改为
 更新同一 comment；未发送旧投影可 supersede。重复故障不更换回执指针，故障恢复后
 再次发生则是新的 publication，不由正文永久去重。已被新代接替的旧代故障晚到，
-不会把公开状态降回当前失败。Schema 13 对已有 status/outbox 回填映射，不改职责状态。
+不会把公开状态降回当前失败。若旧 create 的恢复匹配到多个 App 评论，则远端身份不唯一：
+同一工作项、Profile 和 generation 的后续 create 也记为 ambiguous，不再 POST，更不猜测
+PATCH 目标；不影响其他键。只有已确认的远端身份才允许更新原评论。Schema 13 对已有 status/outbox 回填映射，不改职责状态。
 
 For initial `pr ensure`, the source is the calling Issue assignment; the frozen
 PR Profile selects the new implementation role and must not replace that source.
