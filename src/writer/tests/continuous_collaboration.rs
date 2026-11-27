@@ -147,7 +147,10 @@ fn failed_observation_commits_neither_events_nor_frontier() {
         events: vec![revision("v2", "new")],
         policy: SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 },
     });
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(crate::store::StoreError::InvalidData(ref reason)) if reason == "complete observation has no root"),
+        "{result:?}"
+    );
     assert_eq!(
         f.db().query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0)).unwrap(),
         0

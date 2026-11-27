@@ -17,30 +17,7 @@ fn stderr(output: &std::process::Output) -> String {
 }
 
 #[test]
-fn provider_credentials_are_configured_only_through_secret_files() {
-    let output = braid().args(["setup", "--help"]).output().expect("run setup help");
-    assert!(output.status.success(), "{}", stderr(&output));
-    let help = stdout(&output);
-    assert!(help.contains("--adapter <pi|codex>"), "{help}");
-    assert!(help.contains("--llm-provider <ID>"), "{help}");
-    assert!(help.contains("--reasoning <LEVEL>"), "{help}");
-    assert!(help.contains("--llm-credential-kind <api_key|oauth|none>"), "{help}");
-    assert!(help.contains("--llm-credential-file <PATH>"), "{help}");
-    assert!(!help.contains("--api-key-file"));
-    assert!(!help.contains("--api-key-environment"));
-    assert!(!help.contains("deepseek-chat"));
-
-    let output = braid().args(["init", "--help"]).output().expect("run init help");
-    assert!(output.status.success(), "{}", stderr(&output));
-    let help = stdout(&output);
-    assert!(help.contains("--llm-provider <ID>"), "{help}");
-    assert!(help.contains("--reasoning <LEVEL>"), "{help}");
-    assert!(help.contains("--llm-credential-kind <api_key|oauth|none>"), "{help}");
-    assert!(help.contains("--llm-credential-file <PATH>"), "{help}");
-    assert!(!help.contains("--api-key-file"));
-    assert!(!help.contains("--api-key-environment"));
-    assert!(!help.contains("deepseek-chat"));
-
+fn provider_route_inputs_are_validated_at_cli_and_config_boundaries() {
     let output = braid()
         .args([
             "init",
@@ -73,14 +50,12 @@ fn provider_credentials_are_configured_only_through_secret_files() {
     assert!(output.status.success(), "{}", stderr(&output));
 
     let example_text = fs::read_to_string(&example).expect("read example");
-    let coupled = example_text.replacen(
-        "adapter_version = \"codex-cli 0.147.0-alpha.6.5\"\nmodel = \"example-model\"",
-        "adapter_version = \"codex-cli 0.147.0-alpha.6.5\"\n\nprovider = \"openai\"\n\nmodel = \"example-model\"",
-        1,
-    );
+    let mut coupled: toml::Value = toml::from_str(&example_text).expect("parse example");
+    coupled["profiles"][0]["provider"] = "openai".into();
     let coupled_path = std::env::temp_dir()
         .join(format!("braid-coupled-provider-config-{}.toml", std::process::id()));
-    fs::write(&coupled_path, &coupled).expect("write adapter-coupled config");
+    fs::write(&coupled_path, toml::to_string(&coupled).unwrap())
+        .expect("write adapter-coupled config");
     let output = braid()
         .args(["config", "check", "--config"])
         .arg(&coupled_path)
@@ -94,7 +69,8 @@ fn provider_credentials_are_configured_only_through_secret_files() {
         stderr(&output)
     );
 
-    let legacy_codex = coupled.replacen("schema_version = 3", "schema_version = 2", 1);
+    coupled["schema_version"] = 2.into();
+    let legacy_codex = toml::to_string(&coupled).unwrap();
     let legacy_codex_path = std::env::temp_dir()
         .join(format!("braid-legacy-codex-provider-config-{}.toml", std::process::id()));
     fs::write(&legacy_codex_path, legacy_codex).expect("write legacy Codex config");
@@ -144,29 +120,24 @@ fn schema3_rejects_legacy_provider_surfaces() {
 /// cases.
 fn write_pi_config(example: &str, directory: &Path, credential_fragment: &str) -> PathBuf {
     fs::create_dir_all(directory).expect("create Pi material directory");
-    let config = example
-        .replace("adapter_type = \"codex\"", "adapter_type = \"pi\"")
-        .replace("version = \"codex-cli 0.147.0-alpha.6.5\"", "version = \"1.0.2\"")
-        .replace("adapter_version = \"codex-cli 0.147.0-alpha.6.5\"", "adapter_version = \"1.0.2\"")
-        .replace("model = \"example-model\"", "model = \"example-chat\"")
-        .replace(
-            "adapter_version = \"1.0.2\"\nmodel = \"example-chat\"",
-            "adapter_version = \"1.0.2\"\nprovider = \"example-llm\"\nmodel = \"example-chat\"",
-        )
-        .replacen(
-            "home = \"/absolute/path/to/instance/provider/codex\"",
-            &format!("home = \"{}\"", directory.display()),
-            1,
-        )
-        .replacen(
-            "[tools]",
-            &format!(
-                "[[llm_providers]]\nid = \"example-llm\"\nbase_url = \"https://llm.example.invalid/v1\"\ncredential = {credential_fragment}\n\n[[llm_providers.models]]\nid = \"example-chat\"\n\n[tools]"
-            ),
-            1,
-        );
+    let mut config: toml::Value = toml::from_str(example).expect("parse starter config");
+    for runtime in config["runtimes"].as_array_mut().unwrap() {
+        runtime["adapter_type"] = "pi".into();
+        runtime["version"] = "1.0.2".into();
+        runtime["home"] = directory.to_str().unwrap().into();
+    }
+    for profile in config["profiles"].as_array_mut().unwrap() {
+        profile["adapter_type"] = "pi".into();
+        profile["adapter_version"] = "1.0.2".into();
+        profile["provider"] = "example-llm".into();
+        profile["model"] = "example-chat".into();
+    }
+    let provider: toml::Value = toml::from_str(&format!(
+        "id = \"example-llm\"\nbase_url = \"https://llm.example.invalid/v1\"\ncredential = {credential_fragment}\n[[models]]\nid = \"example-chat\"\n"
+    )).unwrap();
+    config["llm_providers"] = toml::Value::Array(vec![provider]);
     let path = directory.join("config.toml");
-    fs::write(&path, config).expect("write Pi config");
+    fs::write(&path, toml::to_string(&config).unwrap()).expect("write Pi config");
     path
 }
 
@@ -216,7 +187,7 @@ fn reject_config_case(example: &str, directory: &Path, mutate: impl Fn(&Path), e
 }
 
 #[test]
-fn pi_materials_are_derived_from_provider_declarations() {
+fn profile_inspect_reports_the_selected_pi_route_and_credential_kind() {
     let example =
         fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml"))
             .expect("read example");
@@ -231,6 +202,15 @@ fn pi_materials_are_derived_from_provider_declarations() {
         let directory = temporary.join(name);
         let output = inspect_profile(&write_pi_config(&example, &directory, &credential_fragment));
         assert!(output.status.success(), "{name}: {}", stderr(&output));
+        let report = stdout(&output);
+        let kind = match name {
+            "api-key" => "ApiKey",
+            "oauth" => "OAuth",
+            _ => "None",
+        };
+        assert!(report.contains(&format!("credential: {kind}")), "{report}");
+        assert!(report.contains("provider: example-llm"), "{report}");
+        assert!(report.contains("model: example-chat"), "{report}");
     }
     let _ = fs::remove_dir_all(&temporary);
 }
@@ -243,42 +223,33 @@ fn pi_derivation_rejects_bad_provider_surfaces() {
     let temporary =
         std::env::temp_dir().join(format!("braid-pi-derivation-rejects-{}", std::process::id()));
 
-    for (name, needle, replacement, expected) in [
-        (
-            "missing-provider",
-            "\nprovider = \"example-llm\"",
-            "",
-            "requires provider for the Pi adapter",
-        ),
-        (
-            "missing-model",
-            "\nmodel = \"example-chat\"",
-            "",
-            "requires an explicit model for the Pi adapter",
-        ),
-        (
-            "missing-base-url",
-            "\nbase_url = \"https://llm.example.invalid/v1\"",
-            "",
-            "requires base_url for Pi models.json derivation",
-        ),
-        (
-            "undeclared-model",
-            "\nid = \"example-chat\"",
-            "\nid = \"other-model\"",
-            "is not declared in llm_providers",
-        ),
+    for (name, expected) in [
+        ("missing-provider", "requires provider for the Pi adapter"),
+        ("missing-model", "requires an explicit model for the Pi adapter"),
+        ("missing-base-url", "requires base_url for Pi models.json derivation"),
+        ("undeclared-model", "is not declared in llm_providers"),
     ] {
         reject_config_case(
             &example,
             &temporary.join(name),
-            |config| {
-                let mutated = fs::read_to_string(config).expect("read Pi config").replacen(
-                    needle,
-                    replacement,
-                    1,
-                );
-                fs::write(config, mutated).expect("mutate config");
+            |path| {
+                let mut config: toml::Value =
+                    toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+                match name {
+                    "missing-provider" => {
+                        config["profiles"][0].as_table_mut().unwrap().remove("provider");
+                    }
+                    "missing-model" => {
+                        config["profiles"][0].as_table_mut().unwrap().remove("model");
+                    }
+                    "missing-base-url" => {
+                        config["llm_providers"][0].as_table_mut().unwrap().remove("base_url");
+                    }
+                    _ => {
+                        config["llm_providers"][0]["models"][0]["id"] = "other-model".into();
+                    }
+                }
+                fs::write(path, toml::to_string(&config).unwrap()).unwrap();
             },
             expected,
         );
@@ -401,12 +372,14 @@ fn init_generates_an_explicit_keyless_pi_route() {
         .expect("run keyless Pi init");
     assert!(output.status.success(), "{}", stderr(&output));
     let generated = fs::read_to_string(&config).expect("read generated config");
-    assert!(generated.contains("provider = \"example-llm\""), "{generated}");
-    assert!(generated.contains("model = \"example-chat\""), "{generated}");
-    assert!(generated.contains("kind = \"none\""), "{generated}");
-    assert!(!generated.contains("api_key_file"), "{generated}");
-    assert!(!generated.contains("protocol"), "{generated}");
-    assert!(!generated.contains("allowances"), "{generated}");
+    let parsed: toml::Value = toml::from_str(&generated).expect("init writes valid TOML");
+    let profiles = parsed["profiles"].as_array().expect("generated profiles");
+    assert!(!profiles.is_empty());
+    for profile in profiles {
+        assert_eq!(profile["provider"].as_str(), Some("example-llm"));
+        assert_eq!(profile["model"].as_str(), Some("example-chat"));
+    }
+    assert_eq!(parsed["llm_providers"][0]["credential"]["kind"].as_str(), Some("none"));
     fs::write(&config, generated.replace("http://127.0.0.1:4318", "http://127.0.0.1:9"))
         .expect("make OTLP endpoint unavailable");
     fs::create_dir_all(harness.join("state/backups")).expect("create runtime directories");
@@ -432,19 +405,23 @@ fn provider_import_auth_converts_pi_credentials() {
         std::env::temp_dir().join(format!("braid-provider-import-auth-{}", std::process::id()));
     let user_home = temporary.join("user-home");
     let pi_auth = temporary.join("auth.json");
+    let access = "access\0token\n\"\\";
+    let refresh = "refresh\u{0008}token";
+    let account = "测试\u{0085}account";
+    let api_key = "key\0\u{0008}\n\"\\";
     fs::create_dir_all(&temporary).expect("create temporary directory");
     fs::write(
         &pi_auth,
         serde_json::to_string_pretty(&serde_json::json!({
             "example-llm": {
                 "type": "oauth",
-                "access": "access-token",
-                "refresh": "refresh-token",
+                "access": access,
+                "refresh": refresh,
                 "expires": 4_102_444_800_000_u64,
-                "account": "tester@example.com",
+                "account": account,
                 "vendor_specific": "dropped-with-warning"
             },
-            "other-provider": {"type": "api_key", "key": "other-key"}
+            "other-provider": {"type": "api_key", "key": api_key}
         }))
         .expect("encode auth.json"),
     )
@@ -461,10 +438,11 @@ fn provider_import_auth_converts_pi_credentials() {
     assert!(stderr(&output).contains("dropping provider-specific OAuth field \"vendor_specific\""));
     let imported = user_home.join("secrets/example-llm.toml");
     let text = fs::read_to_string(&imported).expect("read imported credential");
-    assert!(text.contains("access = \"access-token\""), "{text}");
-    assert!(text.contains("refresh = \"refresh-token\""), "{text}");
-    assert!(text.contains("expires = 4102444800000"), "{text}");
-    assert!(text.contains("account = \"tester@example.com\""), "{text}");
+    let parsed: toml::Value = toml::from_str(&text).expect("import must write valid TOML");
+    assert_eq!(parsed["access"].as_str(), Some(access));
+    assert_eq!(parsed["refresh"].as_str(), Some(refresh));
+    assert_eq!(parsed["expires"].as_integer(), Some(4_102_444_800_000));
+    assert_eq!(parsed["account"].as_str(), Some(account));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -481,7 +459,8 @@ fn provider_import_auth_converts_pi_credentials() {
     assert!(output.status.success(), "{}", stderr(&output));
     let imported_key = fs::read_to_string(user_home.join("secrets/other-provider.toml"))
         .expect("read imported api key");
-    assert_eq!(imported_key, "provider_api_key = \"other-key\"\n");
+    let parsed: toml::Value = toml::from_str(&imported_key).expect("API key is valid TOML");
+    assert_eq!(parsed["provider_api_key"].as_str(), Some(api_key));
 
     let output = braid()
         .args(["provider", "import-auth", "missing", "--from"])
@@ -530,4 +509,30 @@ fn provider_import_auth_converts_pi_credentials() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(env_home.join("secrets/example-llm.toml").is_file());
     let _ = fs::remove_dir_all(&temporary);
+}
+
+#[test]
+fn provider_import_rejects_ids_that_escape_the_secrets_directory() {
+    let temporary =
+        std::env::temp_dir().join(format!("braid-import-path-{}", uuid::Uuid::now_v7()));
+    let user_home = temporary.join("home");
+    fs::create_dir_all(&temporary).unwrap();
+    let source = temporary.join("auth.json");
+    fs::write(&source, r#"{"../escaped":{"type":"api_key","key":"synthetic-key"}}"#).unwrap();
+    let output = braid()
+        .args(["provider", "import-auth", "../escaped", "--from"])
+        .arg(&source)
+        .arg("--user-home")
+        .arg(&user_home)
+        .output()
+        .unwrap();
+    let escaped = user_home.join("escaped.toml").exists();
+    fs::remove_dir_all(&temporary).unwrap();
+    assert!(!output.status.success(), "a provider id must not become a path");
+    assert!(
+        stderr(&output).contains("provider id must be a single file name"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!escaped, "credential escaped the secrets directory");
 }

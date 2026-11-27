@@ -29,6 +29,49 @@ events are never pass oracles.
 验收按本页描述操作真实产品并保留原始证据。自动测试、模拟和包 smoke 可验证
 局部实现，但不能替代本页的真实产品验收。GitHub 对象和人工判断仍是产品验收依据。
 
+## 开发回归与产品验收的分层
+
+修改代码时，先运行所属边界的回归，再由 CI 验证 macOS arm64 和 Linux x86_64。
+每个测试须能指出具体可信回归；不同层保护不同风险时分别保留。不要为了减少
+测试数量删除协议、数据库兼容、授权或停止证明，也不要把测试自建的配置、状态机
+或回执当作生产实现的证明。
+
+| 契约 | 主要自动证明归属 | 仍需真实验收的部分 |
+| --- | --- | --- |
+| 配置、凭据导入、headless setup、公开回执 | `tests/` 中实际 binary 子进程；配置与 doctor 的局部不变式 | GitHub App 转换、登录、provider 认证与安装后的工具环境 |
+| GitHub 准入、完整读取、发布及 uncertain 写入 | `producer`、`context`、`github`、`writer` 的生产 owner，外部 HTTP 固定夹具 | 实际 webhook、GitHub 权限、native 关联及跨仓库行为 |
+| durable intent、租约、迁移和重放 | `store` 的真实 SQLite actor；旧 schema 建库、备份还原、关闭重开 | 已发布旧 binary 升级及现场恢复，不能以直接造库代替 |
+| Context 替换和 provider 事件 | `group`、`provider` 的真实编排；受控外部会话通知和停止回执 | 真实模型消费新 Context、适配器后台执行停止、长轮次中撤销职责 |
+| 内建对象与观测存储 | `platform`、`console` 的 HTTP→SQLite/Git 回归；独立 OTLP 编码器输入 | 浏览器草稿、并发交互、serve 装配和实际 Harness 控制 |
+| 原生执行与材料 | Node 真实进程树；Profile snapshot 和 auth 文件重新读取 | 锁定 Pi 安装、插件组合、真实模型工具调用及跨宿主进程行为 |
+| 采样与完整敏感证据 | `telemetry` 中真实 SDK→HTTP→protobuf；每次独立子进程初始化 SDK | 生产 Collector 的权限、保留、查询及完整长旅程关联 |
+
+默认入口与 `.github/workflows/ci.yml` 一致：
+
+```shell
+cargo fmt --check
+agent-build cargo check --locked --all-targets
+agent-build cargo clippy --locked --all-targets -- -D warnings
+agent-build cargo test --locked --all-targets
+node --test native/pi/tests/*.test.mjs
+```
+
+`agent-build` 是本机编译串行入口；CI 直接运行相同 Cargo 命令。局部迭代可加
+`--bin braid <模块名>::` 或 `--test <文件名>` 筛选。Linux CI 另运行
+`cargo test --locked --bin braid --features opentelemetry-otlp/internal-logs telemetry::tests`，
+实际启用 SDK 内部错误诊断，验证 Collector 返回的敏感正文不会进入普通日志。
+这不改变发行 binary 的 feature。标为 ignored 的 `telemetry_child` 只供父测试
+用独立子进程调用，父测试负责检查退出状态与所有输出；不能单独计作通过。
+
+负向用例应断言错误阶段、类型或关键诊断，并有能够到达该守卫的合法前置条件。
+恢复用例应先让真实 owner 写入，关闭并重新打开，再从消费者取回结果。新缺陷
+修复保留同一输入下修复前红、修复后绿的证据；缺少这种证据时说明原因。删除或
+迁移测试前，核对原断言在保留测试中的归属；仅重复编译同一模块不算额外证明。
+
+全绿支持上述局部合同，不授予产品发布资格。真实 campaign 仍按下列场景记录
+`pass`、`fail` 或 `unavailable`，尤其不得把 Provider terminal、HTTP 请求受理或
+命令 `prepared` 回执当作任务完成、持久采用或停止确认。
+
 ## Campaign Setup
 
 Create a real Issue whose description contains a distinguishable design fact,

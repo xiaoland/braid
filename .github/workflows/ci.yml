@@ -28,8 +28,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24.15.0
-      - run: node --test native/pi/tests/tool-environment.test.mjs
+      - run: node --test native/pi/tests/*.test.mjs
       - run: cargo fmt --check
       - run: cargo check --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
+      - name: Verify OTLP internal diagnostics stay out of ordinary logs
+        if: matrix.name == 'linux'
+        run: cargo test --locked --bin braid --features opentelemetry-otlp/internal-logs telemetry::tests

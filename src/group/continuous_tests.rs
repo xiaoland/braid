@@ -16,9 +16,12 @@ struct Captured {
     memory: Mutex<Vec<String>>,
     inputs: Mutex<Vec<String>>,
     steer_error: Mutex<Option<SessionError>>,
+    close_error: Mutex<Option<SessionError>>,
+    close_attempts: Mutex<Vec<String>>,
 }
 struct Factory(Arc<Captured>);
 struct Session {
+    id: String,
     captured: Arc<Captured>,
     events: broadcast::Sender<SessionEvent>,
 }
@@ -37,6 +40,7 @@ impl SessionFactory for Factory {
         Ok(CreatedSession {
             id: "fresh-provider".into(),
             session: Arc::new(Session {
+                id: "fresh-provider".into(),
                 captured: self.0.clone(),
                 events: broadcast::channel(8).0,
             }),
@@ -44,11 +48,19 @@ impl SessionFactory for Factory {
     }
     async fn resume(
         &self,
-        _id: &str,
+        id: &str,
         _profile: Profile,
         _instructions: String,
     ) -> Result<CreatedSession, SessionError> {
-        Err(SessionError::Failed("unexpected resume".into()))
+        assert_eq!(id, "provider", "only the existing session is restored");
+        Ok(CreatedSession {
+            id: id.into(),
+            session: Arc::new(Session {
+                id: id.into(),
+                captured: self.0.clone(),
+                events: broadcast::channel(8).0,
+            }),
+        })
     }
 }
 #[async_trait::async_trait]
@@ -60,7 +72,8 @@ impl AgentSession for Session {
         false
     }
     async fn close(&self) -> Result<(), SessionError> {
-        Ok(())
+        self.captured.close_attempts.lock().unwrap().push(self.id.clone());
+        self.captured.close_error.lock().unwrap().clone().map_or(Ok(()), Err)
     }
     async fn send_user_msg(&self, msg: String, steering: bool) -> Result<SendResult, SessionError> {
         assert!(!steering);
@@ -116,47 +129,80 @@ fn revision() -> IngressEvent {
 
 #[tokio::test]
 async fn idle_revision_replaces_memory_then_starts_once_without_a_second_mention() {
-    let f = Fixture::new(true);
-    let captured = Arc::new(Captured::default());
-    let (github, http) = issue_context_server("The new contract: authorized Twitter User").await;
-    let collaboration = Arc::new(CollaborationBackend::GitHub(github));
-    let spec = GroupSpec::new(GroupKind::Issue, &f.config, &f.store, "owner/repository").unwrap();
-    let driver = worker::GroupDriver {
-        store: &f.store,
-        config: &f.config,
-        collaboration: &collaboration,
-        spec: &spec,
-        sessions: SessionManager::new(Arc::new(Factory(captured.clone())), collaboration.clone()),
-    };
-    let policy = SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 };
-    f.store.ingest_event(revision(), policy).unwrap();
-    f.store.ingest_event(revision(), policy).unwrap();
-    assert!(driver.materialize_next_context_reset().await);
-    assert!(captured.memory.lock().unwrap()[0].contains("authorized Twitter User"));
-    // Resetting an idle session is not an acknowledgement of the work input.
-    assert_eq!(f.store.runtime_status().unwrap().batches.len(), 1);
-    assert!(driver.start_next_agent_turn().await.is_none(), "ordinary revision must keep debounce");
-    f.db().execute("UPDATE wake_batches SET quiet_deadline='2000-01-01T00:00:00Z' WHERE lifecycle='pending'",[]).unwrap();
-    f.store.advance_scheduler().unwrap();
-    let active = driver
-        .start_next_agent_turn()
-        .await
-        .expect("revision starts native work without another Human comment");
-    assert_eq!(active.provider_turn_id, "after-revision");
-    assert_eq!(active.claim.trigger_kind, "wake_batch");
-    assert!(!active.claim.trusted_mention);
-    assert_eq!(captured.inputs.lock().unwrap().len(), 1);
-    assert!(driver.start_next_agent_turn().await.is_none());
-    assert_eq!(
-        f.db()
-            .query_row("SELECT count(*) FROM context_resets WHERE lifecycle='applied'", [], |r| r
-                .get::<_, i64>(
-                0
-            ))
-            .unwrap(),
-        1
-    );
-    http.abort();
+    for stop_before_materialization in [false, true] {
+        let f = Fixture::new(true);
+        let captured = Arc::new(Captured::default());
+        let (github, http) =
+            issue_context_server("The new contract: authorized Twitter User").await;
+        let collaboration = Arc::new(CollaborationBackend::GitHub(github));
+        let spec =
+            GroupSpec::new(GroupKind::Issue, &f.config, &f.store, "owner/repository").unwrap();
+        let sessions =
+            SessionManager::new(Arc::new(Factory(captured.clone())), collaboration.clone());
+        sessions
+            .resume("provider".into(), spec.profile.clone(), "instructions".into())
+            .await
+            .unwrap();
+        let driver = worker::GroupDriver {
+            store: &f.store,
+            config: &f.config,
+            collaboration: &collaboration,
+            spec: &spec,
+            sessions,
+        };
+        let policy = SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 };
+        f.store.ingest_event(revision(), policy).unwrap();
+        f.store.ingest_event(revision(), policy).unwrap();
+        if stop_before_materialization {
+            // The worker can already have closed the old handle when it reaches
+            // reset materialization. Preserve that real stop receipt in the manager.
+            f.store
+                .begin_context_reset(None, "issue".into(), "issue-codex".into())
+                .unwrap()
+                .unwrap();
+            driver.sessions.remove("provider").await.unwrap();
+            assert!(driver.sessions.get("provider").await.is_none());
+            assert!(driver.sessions.confirmed_stopped("provider").await);
+        }
+        assert!(driver.materialize_next_context_reset().await);
+        assert!(!driver.materialize_next_context_reset().await);
+        assert_eq!(
+            captured.memory.lock().unwrap().len(),
+            1,
+            "one replacement after confirmed stop; already closed: {stop_before_materialization}"
+        );
+        assert_eq!(*captured.close_attempts.lock().unwrap(), ["provider"]);
+        assert!(driver.sessions.confirmed_stopped("provider").await);
+        assert!(captured.memory.lock().unwrap()[0].contains("authorized Twitter User"));
+        // Resetting an idle session is not an acknowledgement of the work input.
+        assert_eq!(f.store.runtime_status().unwrap().batches.len(), 1);
+        assert!(
+            driver.start_next_agent_turn().await.is_none(),
+            "ordinary revision must keep debounce"
+        );
+        f.db().execute("UPDATE wake_batches SET quiet_deadline='2000-01-01T00:00:00Z' WHERE lifecycle='pending'",[]).unwrap();
+        f.store.advance_scheduler().unwrap();
+        let active = driver
+            .start_next_agent_turn()
+            .await
+            .expect("revision starts native work without another Human comment");
+        assert_eq!(active.provider_turn_id, "after-revision");
+        assert_eq!(active.claim.trigger_kind, "wake_batch");
+        assert!(!active.claim.trusted_mention);
+        assert_eq!(captured.inputs.lock().unwrap().len(), 1);
+        assert!(driver.start_next_agent_turn().await.is_none());
+        assert_eq!(
+            f.db()
+                .query_row(
+                    "SELECT count(*) FROM context_resets WHERE lifecycle='applied'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        http.abort();
+    }
 }
 
 #[tokio::test]
@@ -248,7 +294,7 @@ async fn pending_reset_cannot_silently_adopt_changed_profile_materials() {
     f.store
         .ingest_event(revision(), SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 })
         .unwrap();
-    // The reset was persisted under the old Profile before the service restarted.
+    // The reset was persisted under the old Profile; its old handle can still stop.
     f.store.begin_context_reset(None, "issue".into(), "issue-codex".into()).unwrap().unwrap();
     let mut config = f.config.clone();
     config.profiles.iter_mut().find(|p| p.id == "issue-codex").unwrap().model =
@@ -257,12 +303,14 @@ async fn pending_reset_cannot_silently_adopt_changed_profile_materials() {
     let (github, http) = issue_context_server("Current context").await;
     let collaboration = Arc::new(CollaborationBackend::GitHub(github));
     let spec = GroupSpec::new(GroupKind::Issue, &config, &f.store, "owner/repository").unwrap();
+    let sessions = SessionManager::new(Arc::new(Factory(captured.clone())), collaboration.clone());
+    sessions.resume("provider".into(), spec.profile.clone(), "instructions".into()).await.unwrap();
     let driver = worker::GroupDriver {
         store: &f.store,
         config: &config,
         collaboration: &collaboration,
         spec: &spec,
-        sessions: SessionManager::new(Arc::new(Factory(captured.clone())), collaboration.clone()),
+        sessions,
     };
     assert!(driver.materialize_next_context_reset().await);
     assert!(captured.memory.lock().unwrap().is_empty(), "must not create a physical session");
@@ -329,6 +377,82 @@ async fn unknown_replay_cannot_replace_a_session_without_confirmed_stop() {
     );
     assert_eq!(status.batches.len(), 1, "the replay obligation remains visible");
     assert_eq!(status.batches[0].event_count, 1);
+    http.abort();
+}
+
+#[tokio::test]
+async fn persisted_idle_reset_cannot_replace_execution_without_stop_evidence() {
+    let mut f = Fixture::new(true);
+    f.store
+        .ingest_event(revision(), SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 })
+        .unwrap();
+    let reset =
+        f.store.begin_context_reset(None, "issue".into(), "issue-codex".into()).unwrap().unwrap();
+    assert_eq!(
+        f.store.runtime_status().unwrap().agent_groups[0].session_lifecycle.as_deref(),
+        Some("reset_pending")
+    );
+    assert_eq!(reset.active_turn_id, None);
+    // Stop the old actor before the replacement reads the persisted reset.
+    let reopened = crate::store::StoreActor::start(
+        f.config.runtime.database().to_path_buf(),
+        f.config.runtime.backups().to_path_buf(),
+    )
+    .unwrap();
+    drop(std::mem::replace(&mut f.store, reopened));
+    let captured = Arc::new(Captured::default());
+    let (github, http) = issue_context_server("Current context").await;
+    let collaboration = Arc::new(CollaborationBackend::GitHub(github));
+    let spec = GroupSpec::new(GroupKind::Issue, &f.config, &f.store, "owner/repository").unwrap();
+    let driver = worker::GroupDriver {
+        store: &f.store,
+        config: &f.config,
+        collaboration: &collaboration,
+        spec: &spec,
+        sessions: SessionManager::new(Arc::new(Factory(captured.clone())), collaboration.clone()),
+    };
+    assert!(driver.materialize_next_context_reset().await);
+    assert!(captured.memory.lock().unwrap().is_empty(), "missing handle is not proof of stop");
+    let status = f.store.runtime_status().unwrap();
+    assert_eq!(status.context_resets[0].lifecycle, "blocked");
+    assert!(status.agent_groups[0].context_error.as_deref().unwrap().contains("no stop evidence"));
+    assert_eq!(status.batches.len(), 1, "the revised contract still requires attention");
+    http.abort();
+}
+
+#[tokio::test]
+async fn failed_idle_stop_keeps_the_handle_and_blocks_replacement() {
+    let f = Fixture::new(true);
+    let captured = Arc::new(Captured::default());
+    *captured.close_error.lock().unwrap() =
+        Some(SessionError::Unknown("owned task still alive".into()));
+    let (github, http) = issue_context_server("Current context").await;
+    let collaboration = Arc::new(CollaborationBackend::GitHub(github));
+    let spec = GroupSpec::new(GroupKind::Issue, &f.config, &f.store, "owner/repository").unwrap();
+    let sessions = SessionManager::new(Arc::new(Factory(captured.clone())), collaboration.clone());
+    sessions.resume("provider".into(), spec.profile.clone(), "instructions".into()).await.unwrap();
+    let driver = worker::GroupDriver {
+        store: &f.store,
+        config: &f.config,
+        collaboration: &collaboration,
+        spec: &spec,
+        sessions,
+    };
+    f.store
+        .ingest_event(revision(), SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 })
+        .unwrap();
+    assert!(driver.materialize_next_context_reset().await);
+    assert_eq!(*captured.close_attempts.lock().unwrap(), ["provider"]);
+    assert!(driver.sessions.get("provider").await.is_some());
+    assert!(!driver.sessions.confirmed_stopped("provider").await);
+    assert!(captured.memory.lock().unwrap().is_empty());
+    assert!(captured.inputs.lock().unwrap().is_empty());
+    let status = f.store.runtime_status().unwrap();
+    assert_eq!(status.context_resets[0].lifecycle, "blocked");
+    assert!(
+        status.agent_groups[0].context_error.as_deref().unwrap().contains("owned task still alive")
+    );
+    assert_eq!(status.batches.len(), 1);
     http.abort();
 }
 

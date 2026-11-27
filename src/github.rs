@@ -1010,3 +1010,7 @@ where
 #[cfg(test)]
 #[path = "../tests/support/publication_github.rs"]
 mod publication_github;
+
+#[cfg(test)]
+#[path = "github/budget_tests.rs"]
+mod budget_tests;

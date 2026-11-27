@@ -268,12 +268,16 @@ async fn changed_association_closed_target_old_context_generation_session_and_hu
             "profile" => {
                 assert!(
                     resolve_source(&fixture.config, Some("pr-codex"), &fixture.invocation())
-                        .is_err()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("publication Profile does not match source assignment")
                 );
             }
             "turn" => assert!(
                 resolve_source(&fixture.config, None, &Invocation::Agent("not-current".into()))
-                    .is_err()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("publication turn does not match current runtime worktree")
             ),
             _ => unreachable!(),
         }
@@ -331,31 +335,35 @@ async fn own_issue_body_edit_and_input_boundaries_use_the_same_acceptance_path()
     let (github, task) = body_server(remote.clone()).await;
     let target: WorkItemLocator = "owner/repository#1".parse().unwrap();
     let snapshot = edit::read_snapshot(&github, &target).await.unwrap();
-    for (title, body) in [
-        (Some(String::new()), None),
-        (Some("x".repeat(257)), None),
-        (None, Some(String::new())),
-        (None, Some("界".repeat(20_001))),
-        (None, None),
+    for (title, body, expected) in [
+        (Some(String::new()), None, "title must contain 1-256 bytes"),
+        (Some("x".repeat(257)), None, "title must contain 1-256 bytes"),
+        (None, Some(String::new()), "body must not be empty"),
+        (None, Some("界".repeat(20_001)), "Braid's safe limit is 60000"),
+        (None, None, "edit requires --title or --body-file"),
     ] {
-        assert!(
-            edit(
-                &fixture.config,
-                &fixture.store,
-                EditRequest {
-                    invocation: fixture.invocation(),
-                    target: target.clone(),
-                    profile_id: "issue-codex".into(),
-                    snapshot: snapshot.clone(),
-                    title,
-                    body,
-                    request_id: "invalid".into()
-                }
-            )
-            .is_err()
-        );
+        let error = edit(
+            &fixture.config,
+            &fixture.store,
+            EditRequest {
+                invocation: fixture.invocation(),
+                target: target.clone(),
+                profile_id: "issue-codex".into(),
+                snapshot: snapshot.clone(),
+                title,
+                body,
+                request_id: "invalid".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(expected), "wrong failure: {error}");
     }
-    assert!(resolve_source(&fixture.config, None, &Invocation::Operator).is_err());
+    assert!(
+        resolve_source(&fixture.config, None, &Invocation::Operator)
+            .unwrap_err()
+            .to_string()
+            .contains("operator entry is unavailable inside an Agent runtime worktree")
+    );
     let receipt = accept(&fixture, &github).await;
     fixture.drain(github).await;
     assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
@@ -414,7 +422,12 @@ async fn repeated_snapshot_body_edit_does_not_duplicate_attribution_or_protected
     assert_eq!(remote.lock().unwrap().snapshot.body.as_deref(), Some(body.as_str()));
     task.abort();
     fixture.db().execute("DELETE FROM turns", []).unwrap();
-    assert!(resolve_source(&fixture.config, None, &Invocation::Operator).is_err());
+    assert!(
+        resolve_source(&fixture.config, None, &Invocation::Operator)
+            .unwrap_err()
+            .to_string()
+            .contains("operator entry is unavailable inside an Agent runtime worktree")
+    );
 }
 
 #[tokio::test]
@@ -593,10 +606,13 @@ async fn executor_rejects_missing_existing_request_source_before_mutation() {
     payload["body"] = json!("Closes #7\n\nCloses #999");
     receipt.payload = serde_json::to_string(&payload).unwrap();
     let mut mutation_possible = false;
-    assert!(
+    let error =
         edit::execute(&fixture.config, &fixture.store, &github, &receipt, &mut mutation_possible)
             .await
-            .is_err()
+            .unwrap_err();
+    assert!(
+        matches!(error, helpers::WriteFailure::GitHub(GitHubError::GraphQl(ref message)) if message == "body maintenance must retain recognized existing closing and request sources"),
+        "wrong failure: {error:?}"
     );
     assert!(!mutation_possible);
     assert_eq!(remote.lock().unwrap().writes, 0);
@@ -640,7 +656,14 @@ async fn context_dependent_protected_blocks_fail_closed_but_title_only_is_allowe
                 fixture.drain(github.clone()).await;
                 assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
             } else {
-                assert!(result.is_err(), "{protected}");
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error
+                        == "body maintenance requires self-contained paragraph/heading closing and request blocks without links or HTML; keep this body unchanged"
+                        || error
+                            == "body maintenance cannot change context-dependent closing or request blocks",
+                    "{protected}: {error}"
+                );
                 assert_eq!(remote.lock().unwrap().writes, 0);
             }
         }

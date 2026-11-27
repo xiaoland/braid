@@ -720,3 +720,6 @@ pub fn run_probe(config: &TelemetryConfig, marker: &str) -> Result<ProbeResult, 
         flush_errors,
     })
 }
+
+#[cfg(test)]
+mod tests;

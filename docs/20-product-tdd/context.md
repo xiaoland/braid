@@ -105,7 +105,9 @@ changes to them produce Event References when subscribed.
 Braid preserves original Markdown bytes except for actual HTML comment nodes.
 The Context projector parses GitHub Flavored Markdown, obtains source ranges for
 HTML inline/block comments beginning with `<!--`, and splices those ranges from
-the original UTF-8 body. Text that resembles `<!-- -->` inside fenced or inline
+the original UTF-8 body. A block's closing line can also contain visible text;
+only its actual comment delimiters and contents are removed, preserving that
+suffix and any HTML attribute values. Text that resembles `<!-- -->` inside fenced or inline
 code remains. Malformed HTML that the parser does not recognize as a comment is
 ordinary visible text.
 

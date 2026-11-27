@@ -79,7 +79,12 @@ async fn handoff_is_atomic_idempotent_and_uses_next_batch_without_parallel_turns
 async fn handoff_rejects_local_authority_and_generation_changes() {
     let unassigned = Fixture::new(true);
     unassigned.db().execute("INSERT INTO work_items(node_id,repository_node_id,kind,number,state,observed_at) VALUES ('pr','repo','pr',9,'open','now')", []).unwrap();
-    assert!(handoff(&unassigned, "no-assignment").is_err());
+    assert!(
+        handoff(&unassigned, "no-assignment")
+            .unwrap_err()
+            .to_string()
+            .contains("handoff target needs a current active schedulable PR generation")
+    );
     for sql in [
         "UPDATE assignments SET lifecycle='blocked' WHERE assignment_id='pr-assignment'",
         "UPDATE assignments SET lifecycle='finalizing' WHERE assignment_id='pr-assignment'",
@@ -92,7 +97,13 @@ async fn handoff_rejects_local_authority_and_generation_changes() {
         let f = Fixture::new(true);
         bind_pr(&f);
         f.db().execute(sql, []).unwrap();
-        assert!(handoff(&f, "reject").is_err(), "{sql}");
+        let expected = if sql.contains("node_id='item'") {
+            "handoff requires an active Issue Agent on its OPEN Issue"
+        } else {
+            "handoff target needs a current active schedulable PR generation"
+        };
+        let error = handoff(&f, "reject").unwrap_err();
+        assert!(error.to_string().contains(expected), "{sql}: {error}");
         assert_eq!(count(&f, "pr_handoffs"), 0);
     }
     let f = Fixture::new(true);
@@ -110,7 +121,7 @@ async fn handoff_rejects_local_authority_and_generation_changes() {
 
 #[tokio::test]
 async fn handoff_remote_validation_never_schedules_before_confirmation() {
-    for mode in ["unrelated", "closed", "merged-target", "limited", "old-source"] {
+    for mode in ["unrelated", "closed", "closed-target", "limited", "old-source"] {
         let f = Fixture::new(true);
         bind_pr(&f);
         let a = handoff(&f, mode).unwrap();
@@ -121,7 +132,7 @@ async fn handoff_remote_validation_never_schedules_before_confirmation() {
         if mode == "closed" {
             state.snapshot.state = "closed".into();
         }
-        if mode == "merged-target" {
+        if mode == "closed-target" {
             state.pr_closed = true;
         }
         if mode == "limited" {
@@ -209,7 +220,9 @@ fn handoff_same_key_cannot_change_target_or_impersonate_issue_agent() {
                 request_id: "stable".into()
             }
         )
-        .is_err()
+        .unwrap_err()
+        .to_string()
+        .contains("already used for a different payload")
     );
     assert!(
         super::super::handoff(
@@ -221,10 +234,17 @@ fn handoff_same_key_cannot_change_target_or_impersonate_issue_agent() {
                 request_id: "operator".into()
             }
         )
-        .is_err()
+        .unwrap_err()
+        .to_string()
+        .contains("operator entry is unavailable inside an Agent runtime worktree")
     );
     f.db().execute_batch("UPDATE agent_instances SET role='pr_implementation_agent' WHERE agent_id='agent'; UPDATE work_items SET kind='pr',number=10 WHERE node_id='item';").unwrap();
-    assert!(handoff(&f, "pr-source").is_err());
+    assert!(
+        handoff(&f, "pr-source")
+            .unwrap_err()
+            .to_string()
+            .contains("handoff requires an Issue Agent")
+    );
 }
 
 #[tokio::test]
@@ -359,7 +379,12 @@ async fn uncertain_issue_design_is_not_handed_off_as_published() {
     remote.lock().unwrap().lose_response = true;
     f.drain(github).await;
     assert_eq!(f.receipt(&edit.request_id).lifecycle, "uncertain");
-    assert!(handoff(&f, "must-wait").is_err());
+    assert!(
+        handoff(&f, "must-wait")
+            .unwrap_err()
+            .to_string()
+            .contains("Issue design edit is not confirmed applied")
+    );
     assert_eq!(count(&f, "pr_handoffs"), 0);
     task.abort();
 }
@@ -651,7 +676,9 @@ async fn retirement_is_fenced_atomic_and_preserves_other_handoff_and_historical_
                     }
                 ]
             )
-            .is_err()
+            .unwrap_err()
+            .to_string()
+            .contains("handoff retirement membership changed")
     );
     assert_eq!(
         f.db()
@@ -671,7 +698,10 @@ async fn retirement_is_fenced_atomic_and_preserves_other_handoff_and_historical_
     send_prepared(&f, &backend, remaining, &recorder).await;
     assert!(recorder.inputs.lock().unwrap()[0].contains("Current canonical Context"));
     // No mutation using a stale claim after the provider boundary.
-    assert!(f.store.retire_handoff_inputs(turn, vec![input]).is_err());
+    assert!(matches!(
+        f.store.retire_handoff_inputs(turn, vec![input]),
+        Err(crate::store::StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    ));
     assert_eq!(count(&f, "pr_handoffs"), 2);
     assert_eq!(f.receipt(&first.request_id).lifecycle, "applied");
     task.abort();

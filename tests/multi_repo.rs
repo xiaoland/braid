@@ -12,61 +12,28 @@ fn stderr(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-fn multi_repo_config(example: &str, temporary: &Path) -> String {
-    let other_workspace = temporary.join("other-source");
-    let primary_workspace = temporary.join("primary-source");
-    let config = example
-        .replacen(
-            "repository = \"owner/repository\"",
-            "repository = \"owner/repository\"\nadditional_repositories = [{ name = \"owner/other\" }]",
-            1,
-        )
-        .replace(
-            "adapter_version = \"codex-cli 0.147.0-alpha.6.5\"\nmodel = \"example-model\"",
-            &format!(
-                "adapter_version = \"codex-cli 0.147.0-alpha.6.5\"\nrepository = \"owner/repository\"\nworkspace = \"{}\"\nmodel = \"example-model\"",
-                primary_workspace.display()
-            ),
-        );
-    config.replacen(
-        "[profile_selection]",
-        &format!(
-            "[[profiles]]\n\
-                 id = \"issue-other\"\n\
-                 display_name = \"Other issue agent\"\n\
-                 tags = [\"issue\"]\n\
-                 adapter_type = \"codex\"\n\
-                 adapter_version = \"codex-cli 0.147.0-alpha.6.5\"\n\
-                 repository = \"owner/other\"\n\
-                 model = \"example-model\"\n\
-                 user_instructions = \"Serve the other repository.\"\n\
-                 workspace = \"{}\"\n\
-                 github_actor_node_id = \"MDQ6VXNlcjEyMzQ1\"\n\
-                 status_surfaces = [\"issue\"]\n\
-                 github_context_soft_ratio = 0.8\n\
-                 github_context_hard_bytes = 100000\n\
-                 \n\
-                 [[profiles]]\n\
-                 id = \"pr-other\"\n\
-                 display_name = \"Other implementation agent\"\n\
-                 tags = [\"pr\", \"implementation\"]\n\
-                 adapter_type = \"codex\"\n\
-                 adapter_version = \"codex-cli 0.147.0-alpha.6.5\"\n\
-                 repository = \"owner/other\"\n\
-                 model = \"example-model\"\n\
-                 user_instructions = \"Implement in the other repository.\"\n\
-                 workspace = \"{}\"\n\
-                 github_actor_node_id = \"MDQ6VXNlcjEyMzQ1\"\n\
-                 status_surfaces = [\"pr\"]\n\
-                 github_context_soft_ratio = 0.8\n\
-                 github_context_hard_bytes = 100000\n\
-                 \n\
-                 [profile_selection]",
-            other_workspace.display(),
-            other_workspace.display()
-        ),
-        1,
-    )
+fn multi_repo_config(example: &str, temporary: &Path) -> toml::Value {
+    let mut config: toml::Value = toml::from_str(example).expect("parse starter config");
+    config["github"]["additional_repositories"] = toml::Value::Array(vec![toml::Value::Table(
+        toml::Table::from_iter([("name".into(), "owner/other".into())]),
+    )]);
+    let profiles = config["profiles"].as_array_mut().unwrap();
+    for profile in &mut *profiles {
+        profile["repository"] = "owner/repository".into();
+        profile["workspace"] = temporary.join("primary-source").to_str().unwrap().into();
+    }
+    let other_profiles: Vec<_> = profiles
+        .iter()
+        .map(|profile| {
+            let mut other = profile.clone();
+            other["id"] = format!("{}-other", profile["id"].as_str().unwrap()).into();
+            other["repository"] = "owner/other".into();
+            other["workspace"] = temporary.join("other-source").to_str().unwrap().into();
+            other
+        })
+        .collect();
+    profiles.extend(other_profiles);
+    config
 }
 
 #[test]
@@ -78,7 +45,8 @@ fn multi_repository_config_requires_repo_scoped_profiles() {
         std::env::temp_dir().join(format!("braid-multi-repo-config-{}", std::process::id()));
     fs::create_dir_all(&temporary).expect("create temporary directory");
     let path = temporary.join("config.toml");
-    fs::write(&path, multi_repo_config(&example, &temporary)).expect("write multi-repo config");
+    fs::write(&path, toml::to_string(&multi_repo_config(&example, &temporary)).unwrap())
+        .expect("write multi-repo config");
 
     let output = braid()
         .args(["config", "check", "--config"])
@@ -90,37 +58,41 @@ fn multi_repository_config_requires_repo_scoped_profiles() {
     let output = braid()
         .args(["profile", "inspect", "--config"])
         .arg(&path)
-        .args(["--profile", "issue-other"])
+        .args(["--profile", "issue-codex-other", "--json"])
         .output()
         .expect("inspect repo-scoped profile");
     assert!(output.status.success(), "{}", stderr(&output));
 
-    let missing_binding = fs::read_to_string(&path).expect("read multi config").replacen(
-        "repository = \"owner/repository\"\nworkspace",
-        "workspace",
-        1,
-    );
-    fs::write(&path, missing_binding).expect("remove one repository binding");
-    let output = braid()
-        .args(["config", "check", "--config"])
-        .arg(&path)
-        .output()
-        .expect("reject omitted repository binding");
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("requires an explicit repository"), "{}", stderr(&output));
+    let profile: serde_json::Value = serde_json::from_slice(&output.stdout).expect("profile JSON");
+    assert_eq!(profile["id"], "issue-codex-other");
+    assert_eq!(profile["repository"], "owner/other");
+    assert_eq!(profile["workspace"], temporary.join("other-source").to_str().unwrap());
 
-    let unconfigured = multi_repo_config(&example, &temporary).replacen(
-        "repository = \"owner/other\"",
-        "repository = \"owner/unconfigured\"",
-        1,
-    );
-    fs::write(&path, unconfigured).expect("write unconfigured repository binding");
-    let output = braid()
-        .args(["config", "check", "--config"])
-        .arg(&path)
-        .output()
-        .expect("reject unconfigured repository binding");
-    let _ = fs::remove_dir_all(&temporary);
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("unconfigured GitHub repository"), "{}", stderr(&output));
+    for (case, expected) in [
+        ("omitted", "requires an explicit repository"),
+        ("unconfigured", "unconfigured GitHub repository"),
+        ("workspace", "must share one source checkout"),
+    ] {
+        let mut candidate = multi_repo_config(&example, &temporary);
+        let profile = candidate["profiles"][0].as_table_mut().unwrap();
+        match case {
+            "omitted" => {
+                profile.remove("repository");
+            }
+            "unconfigured" => {
+                profile.insert("repository".into(), "owner/unconfigured".into());
+            }
+            _ => {
+                profile.insert(
+                    "workspace".into(),
+                    temporary.join("different-source").to_str().unwrap().into(),
+                );
+            }
+        }
+        fs::write(&path, toml::to_string(&candidate).unwrap()).expect("write invalid config");
+        let output = braid().args(["config", "check", "--config"]).arg(&path).output().unwrap();
+        assert!(!output.status.success(), "{case}");
+        assert!(stderr(&output).contains(expected), "{case}: {}", stderr(&output));
+    }
+    fs::remove_dir_all(&temporary).unwrap();
 }

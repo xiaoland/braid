@@ -524,3 +524,7 @@ fn enqueue(connection: &Connection, intent_id: &str) -> Result<(), StoreError> {
         SELECT intent_id,repository,'agent',target,'agent_write',payload,?2,'pending',created_at,created_at,created_at FROM write_intents WHERE intent_id=?1", params![intent_id, hex::encode(sha2::Sha256::digest(format!("outbox:{intent_id}").as_bytes()))])?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "gh_writes/tests.rs"]
+mod tests;

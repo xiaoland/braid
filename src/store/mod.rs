@@ -476,8 +476,6 @@ pub struct TurnClaim {
 #[derive(Debug, Clone)]
 pub struct ContextResetClaim {
     pub old_provider_session_id: String,
-    pub old_session_lifecycle: String,
-    pub active_turn_lifecycle: Option<String>,
     pub reset_id: String,
     pub assignment_id: String,
     pub repository: String,
@@ -4717,7 +4715,7 @@ fn load_context_reset_claim(
     let mut claim = connection.query_row(
         "SELECT cr.reset_id,a.assignment_id,r.name_with_owner,w.kind,w.number,ai.profile_id,
                 cr.active_turn_id,t.provider_turn_id,cr.continuation,
-                wt.path,wt.head_ref,ps.provider_session_id,ps.lifecycle,t.lifecycle,ai.profile_revision
+                wt.path,wt.head_ref,ps.provider_session_id,ai.profile_revision
          FROM context_resets cr
          JOIN provider_sessions ps ON ps.session_id=cr.old_session_id
          JOIN agent_instances ai ON ai.agent_id=cr.agent_id
@@ -4731,15 +4729,16 @@ fn load_context_reset_claim(
         |row| {
             Ok(ContextResetClaim {
                 old_provider_session_id: row.get(11)?,
-                old_session_lifecycle: row.get(12)?,
-                active_turn_lifecycle: row.get(13)?,
                 reset_id: row.get(0)?,
                 assignment_id: row.get(1)?,
                 repository: row.get(2)?,
                 work_item_kind: row.get(3)?,
                 number: sqlite_i64_to_u64(row.get(4)?, "context reset Work Item number")?,
                 profile_id: row.get(5)?,
-                profile_revision: sqlite_i64_to_u64(row.get(14)?, "Context reset Profile revision")?,
+                profile_revision: sqlite_i64_to_u64(
+                    row.get(12)?,
+                    "Context reset Profile revision",
+                )?,
                 active_turn_id: row.get(6)?,
                 provider_turn_id: row.get(7)?,
                 references: Vec::new(),

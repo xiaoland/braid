@@ -14,9 +14,9 @@ use std::{
 };
 
 pub(crate) struct Fixture {
-    root: PathBuf,
     pub(crate) config: Config,
     pub(crate) store: StoreActor,
+    root: TemporaryRoot,
 }
 impl Fixture {
     pub(crate) fn new(source: bool) -> Self {
@@ -36,11 +36,21 @@ impl Fixture {
         )
         .unwrap();
         store.apply().unwrap();
-        let fixture = Self { root, config, store };
+        let fixture = Self { root: TemporaryRoot(root), config, store };
         if source {
             fixture.bind_source();
         }
         fixture
+    }
+    fn reopen(self) -> Self {
+        let Self { root, config, store } = self;
+        drop(store);
+        let store = StoreActor::start(
+            config.runtime.database().to_owned(),
+            config.runtime.backups().to_owned(),
+        )
+        .unwrap();
+        Self { root, config, store }
     }
     pub(crate) fn db(&self) -> Connection {
         Connection::open(self.config.runtime.database()).unwrap()
@@ -87,13 +97,17 @@ impl Fixture {
             .execute("UPDATE github_write_outbox SET next_attempt_at='2000-01-01T00:00:00Z'", [])
             .unwrap();
     }
+    fn lose_comment_acknowledgement(&self) {
+        self.db().execute_batch("UPDATE github_write_outbox SET lifecycle='sending',remote_database_id=NULL; UPDATE write_intents SET lifecycle='pending',remote_database_id=NULL,remote_node_id=NULL;").unwrap();
+    }
     fn receipt(&self, id: &str) -> GhWriteReceipt {
         self.store.gh_write_receipt(id.into()).unwrap().unwrap()
     }
 }
-impl Drop for Fixture {
+struct TemporaryRoot(PathBuf);
+impl Drop for TemporaryRoot {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -126,6 +140,10 @@ struct Remote {
     comment_reads: usize,
     writes: usize,
     limit: Option<u64>,
+    target_status: Option<axum::http::StatusCode>,
+    commit_requests: Vec<Value>,
+    ref_requests: Vec<Value>,
+    pr_requests: Vec<Value>,
 }
 async fn server(
     remote: Arc<Mutex<Remote>>,
@@ -143,6 +161,7 @@ async fn server(
         .route("/repos/owner/repository/issues/1", get(move || { let remote=target.clone(); async move {
             use axum::response::IntoResponse as _;
             if remote.lock().unwrap().limit.is_some() { return (axum::http::StatusCode::TOO_MANY_REQUESTS, [("retry-after","120")], Json(json!({"message":"rate limit"}))).into_response(); }
+            if let Some(status) = remote.lock().unwrap().target_status { return (status, Json(json!({"message":"target unavailable"}))).into_response(); }
             let mut item = json!({"id":1,"node_id":"item","number":1,"title":"Issue","state":"open","html_url":"https://github.com/owner/repository/issues/1"});
             if remote.lock().unwrap().authority==Authority::SourceClosed {item["state"]=json!("closed");}
             if matches!(remote.lock().unwrap().target_kind, TargetKind::PullRequest) { item["pull_request"] = json!({"url":"pr"}); }
@@ -158,15 +177,15 @@ async fn server(
         .route("/repos/owner/repository/issues/comments/8",get(move||{let remote=continuation.clone();async move{let number=if remote.lock().unwrap().authority==Authority::OtherIssue {2}else{1};Json(json!({"id":8,"node_id":"followup-comment","html_url":format!("https://github.com/owner/repository/issues/{number}#issuecomment-8"),"issue_url":format!("https://api.github.com/repos/owner/repository/issues/{number}"),"body":"continue current implementation","created_at":"now","updated_at":"now"}))}}))
         .route("/repos/owner/repository/issues/2",get(||async{Json(json!({"id":2,"node_id":"other-issue","number":2,"title":"Other issue","state":"open","html_url":"https://github.com/owner/repository/issues/2"}))}))
         .route("/repos/owner/repository", get(|| async { Json(json!({"default_branch":"main"})) }))
-        .route("/repos/owner/repository/pulls", get({ let pr=pr.clone(); let remote=remote.clone(); move || { let mut pr=pr.clone(); let remote=remote.clone(); async move { let state=remote.lock().unwrap(); if let Some(body)=&state.pr_body {pr["body"]=json!(body);} Json(if state.create_pr && !state.pr_created {json!([])} else {json!([pr])}) } }}).post({ let pr=pr.clone(); let remote=remote.clone(); move || {let pr=pr.clone(); let remote=remote.clone(); async move { let mut state=remote.lock().unwrap(); state.pr_created=true; state.writes+=1; Json(pr) }}}))
+        .route("/repos/owner/repository/pulls", get({ let pr=pr.clone(); let remote=remote.clone(); move || { let mut pr=pr.clone(); let remote=remote.clone(); async move { let state=remote.lock().unwrap(); if let Some(body)=&state.pr_body {pr["body"]=json!(body);} Json(if state.create_pr && !state.pr_created {json!([])} else {json!([pr])}) } }}).post({ let pr=pr.clone(); let remote=remote.clone(); move |Json(body): Json<Value>| {let pr=pr.clone(); let remote=remote.clone(); async move { let mut state=remote.lock().unwrap(); state.pr_requests.push(body); state.pr_created=true; state.writes+=1; Json(pr) }}}))
         .route("/repos/owner/repository/git/ref/heads/main",get(|| async {Json(json!({"ref":"refs/heads/main","object":{"sha":"base"}}))}))
         .route("/repos/owner/repository/git/ref/heads/head",get({let remote=remote.clone(); move || {let remote=remote.clone(); async move {
             use axum::response::IntoResponse as _;
             if remote.lock().unwrap().head_created {Json(json!({"ref":"refs/heads/head","object":{"sha":"new"}})).into_response()} else {(axum::http::StatusCode::NOT_FOUND,Json(json!({"message":"missing"}))).into_response()}
         }}}))
         .route("/repos/owner/repository/git/commits/base",get(|| async {Json(json!({"sha":"base","tree":{"sha":"tree"}}))}))
-        .route("/repos/owner/repository/git/commits",post({let remote=remote.clone(); move || {let remote=remote.clone(); async move {remote.lock().unwrap().writes+=1; Json(json!({"sha":"new","tree":{"sha":"tree"}}))}}}))
-        .route("/repos/owner/repository/git/refs",post({let remote=remote.clone(); move || {let remote=remote.clone(); async move {let mut state=remote.lock().unwrap(); state.head_created=true; state.writes+=1; Json(json!({"ref":"refs/heads/head","object":{"sha":"new"}}))}}}))
+        .route("/repos/owner/repository/git/commits",post({let remote=remote.clone(); move |Json(body): Json<Value>| {let remote=remote.clone(); async move {let mut state=remote.lock().unwrap(); state.commit_requests.push(body); state.writes+=1; Json(json!({"sha":"new","tree":{"sha":"tree"}}))}}}))
+        .route("/repos/owner/repository/git/refs",post({let remote=remote.clone(); move |Json(body): Json<Value>| {let remote=remote.clone(); async move {let mut state=remote.lock().unwrap(); state.ref_requests.push(body); state.head_created=true; state.writes+=1; Json(json!({"ref":"refs/heads/head","object":{"sha":"new"}}))}}}))
         .route("/repos/owner/repository/pulls/9", get(move || {let mut pr=pr.clone();let remote=pr_read.clone(); async move {let remote=remote.lock().unwrap();if remote.authority==Authority::TargetClosed{pr["state"]=json!("closed");}
             if let Some(body)=&remote.pr_body{pr["body"]=json!(body);}Json(pr)}}))
         .route("/graphql", post(move||{let remote=associations.clone(); async move {let nodes=if remote.lock().unwrap().authority==Authority::AssociationRemoved{json!([])}else{json!([{"number":1,"repository":{"nameWithOwner":"owner/repository"}}])};Json(json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}})) }}));
@@ -243,11 +262,18 @@ async fn outbox_delivery_recovery_and_rate_deadline_use_production_executor() {
     fixture.drain(github.clone()).await;
     assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
     assert_eq!(remote.lock().unwrap().writes, 1);
-    // Simulate remote success before local acknowledgement persisted, then restart recovery.
-    fixture.db().execute("UPDATE github_write_outbox SET lifecycle='sending'", []).unwrap();
+    // Reopen SQLite with a fresh actor; recovery may read a completed remote
+    // mutation even when the installation has lost write permission.
+    task.abort();
+    let (github, task) = server(remote.clone(), false).await;
+    fixture.lose_comment_acknowledgement();
+    assert!(fixture.receipt(&receipt.request_id).remote_database_id.is_none());
+    let fixture = fixture.reopen();
     fixture.store.recover_writes().unwrap();
     fixture.drain(github).await;
-    assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
+    let recovered = fixture.receipt(&receipt.request_id);
+    assert_eq!(recovered.lifecycle, "applied");
+    assert_eq!(recovered.remote_database_id.as_deref(), Some("99"));
     assert_eq!(remote.lock().unwrap().writes, 1);
     task.abort();
 }
@@ -327,25 +353,51 @@ async fn issue_source_ensures_pr_with_frozen_plan_and_one_native_activation() {
 }
 
 #[tokio::test]
-async fn source_invalidation_and_missing_permissions_reject_before_mutation() {
-    for invalidated in [false, true] {
+async fn completed_turn_can_publish_but_source_fences_reject_before_mutation() {
+    for fence in ["completed", "reset", "invalidation", "replacement"] {
         let fixture = Fixture::new(true);
         let receipt = fixture.comment();
-        if invalidated {
-            fixture
-                .db()
-                .execute("UPDATE provider_sessions SET lifecycle='reset_pending'", [])
-                .unwrap();
+        match fence {
+            "reset" => {
+                fixture
+                    .db()
+                    .execute("UPDATE provider_sessions SET lifecycle='reset_pending'", [])
+                    .unwrap();
+            }
+            "invalidation" => {
+                fixture.db().execute("INSERT INTO events(event_id,work_item_node_id,origin,reference,lifecycle,observed_at,kind) VALUES ('invalidate','item','human','changed','pending','now','invalidate')", []).unwrap();
+            }
+            "replacement" => {
+                fixture.db().execute_batch("UPDATE assignments SET lifecycle='retired'; INSERT INTO assignments VALUES ('replacement','item',2,'active','now',NULL);").unwrap();
+            }
+            _ => {}
         }
-        if invalidated {
-            // No environment flag is needed to reject a stale cwd binding.
-            assert!(resolve_source(&fixture.config, None, &fixture.invocation()).is_err());
+        if fence != "completed" {
+            let error = resolve_source(&fixture.config, None, &fixture.invocation()).unwrap_err();
+            assert!(
+                error.to_string().contains("publication source was invalidated or superseded"),
+                "{fence}: {error}"
+            );
         }
         let remote = Arc::new(Mutex::new(Remote::default()));
-        let (github, task) = server(remote.clone(), invalidated).await;
+        let (github, task) = server(remote.clone(), true).await;
         fixture.drain(github).await;
-        assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "rejected");
-        assert_eq!(remote.lock().unwrap().writes, 0);
+        let result = fixture.receipt(&receipt.request_id);
+        assert_eq!(
+            result.lifecycle,
+            if fence == "completed" { "applied" } else { "rejected" },
+            "{fence}: {:?}",
+            result.last_error
+        );
+        if fence != "completed" {
+            assert!(
+                result
+                    .last_error
+                    .unwrap()
+                    .contains("publication source was invalidated or superseded")
+            );
+        }
+        assert_eq!(remote.lock().unwrap().writes, usize::from(fence == "completed"));
         task.abort();
     }
 }
@@ -369,8 +421,26 @@ async fn initial_ensure_bootstrap_pr_association_and_restart_do_not_duplicate_mu
     fixture.drain(github.clone()).await;
     let result = fixture.receipt(&receipt.request_id);
     assert_eq!(result.lifecycle, "applied", "{:?}", result.last_error);
-    assert_eq!(remote.lock().unwrap().writes, 3); // commit, ref, PR
+    {
+        let remote = remote.lock().unwrap();
+        assert_eq!(remote.writes, 3);
+        assert_eq!(remote.commit_requests.len(), 1);
+        assert_eq!(remote.commit_requests[0]["tree"], "tree");
+        assert_eq!(remote.commit_requests[0]["parents"], json!(["base"]));
+        assert_eq!(remote.ref_requests, vec![json!({"ref":"refs/heads/head","sha":"new"})]);
+        assert_eq!(remote.pr_requests.len(), 1);
+        assert_eq!(remote.pr_requests[0]["head"], "head");
+        assert_eq!(remote.pr_requests[0]["base"], "main");
+        assert_eq!(remote.pr_requests[0]["draft"], true);
+        let body = remote.pr_requests[0]["body"].as_str().unwrap();
+        assert!(body.contains("Closes #1"), "missing Issue association: {body}");
+        assert!(
+            body.contains("https://github.com/owner/repository/issues/comments/7"),
+            "missing durable request: {body}"
+        );
+    }
     fixture.db().execute("UPDATE github_write_outbox SET lifecycle='sending'", []).unwrap();
+    let fixture = fixture.reopen();
     fixture.store.recover_writes().unwrap();
     fixture.drain(github).await;
     assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
@@ -427,6 +497,7 @@ async fn source_role_can_publish_related_cross_surface_without_target_profile_ta
     }
 }
 
+mod publication_contract;
 mod turn_start;
 
 mod body_edit;

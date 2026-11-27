@@ -224,7 +224,11 @@ async fn contract_restoration_cycles_survive_polling_and_share_a_real_ingress_re
                 events: vec![invalid],
                 policy: policy()
             })
-            .is_err()
+            .unwrap_err()
+            .to_string()
+            .contains(
+                "state receipt cannot acknowledge changed metadata or an unproven transition"
+            )
     );
     assert_eq!(f.store.processed_objects("pr".into()).unwrap(), expected);
     http.abort();

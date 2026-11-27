@@ -1,26 +1,4 @@
-#![allow(dead_code)]
-mod config {
-    #[derive(Clone, Copy)]
-    pub enum LogFormat {
-        Text,
-        Json,
-    }
-    pub struct TelemetryConfig {
-        pub endpoint: url::Url,
-        pub service_name: String,
-        pub export_timeout_seconds: u64,
-        pub sample_ratio: f64,
-        pub incident_mode: bool,
-        pub log_format: LogFormat,
-    }
-    impl TelemetryConfig {
-        pub fn effective_sample_ratio(&self) -> f64 {
-            self.sample_ratio
-        }
-    }
-}
-#[path = "../src/telemetry.rs"]
-mod telemetry;
+use crate::{config, telemetry};
 
 use opentelemetry::trace::TraceContextExt as _;
 use opentelemetry_proto::tonic::collector::{
@@ -42,16 +20,15 @@ const SENTINEL: &str = "PRIVATE_PAYLOAD_SENTINEL_";
 const RESPONSE_SENTINEL: &str = "PRIVATE_COLLECTOR_RESPONSE_SENTINEL";
 
 #[test]
+#[ignore = "subprocess entry; exercised by the two parent telemetry tests"]
 fn telemetry_child() {
-    let Ok(endpoint) = std::env::var("BRAID_TEST_OTLP") else {
-        return;
-    };
+    let endpoint = std::env::var("BRAID_TEST_OTLP").expect("parent provides OTLP endpoint");
     let config = config::TelemetryConfig {
         endpoint: endpoint.parse().unwrap(),
         service_name: "braid-test".into(),
         export_timeout_seconds: 1,
         sample_ratio: std::env::var("BRAID_TEST_RATIO").unwrap().parse().unwrap(),
-        incident_mode: false,
+        incident_mode: std::env::var("BRAID_TEST_INCIDENT").unwrap() == "1",
         log_format: if std::env::var("BRAID_TEST_FORMAT").unwrap() == "json" {
             config::LogFormat::Json
         } else {
@@ -89,7 +66,7 @@ fn telemetry_child() {
                 stream,
                 &payload
             ),
-            config.sample_ratio > 0.5
+            std::env::var("BRAID_TEST_RETAIN").unwrap() == "1"
         );
     }
     let root = tracing::info_span!("test.root");
@@ -121,11 +98,12 @@ fn telemetry_child() {
 #[test]
 fn telemetry_routes_complete_evidence_only_to_otlp() {
     for format in ["text", "json"] {
-        for ratio in ["0", "1"] {
-            verify(format, ratio, false, false, "trace");
+        for (ratio, incident, retained) in [("0", false, "0"), ("1", false, "1"), ("0", true, "1")]
+        {
+            verify(format, ratio, incident, retained, false, false, "trace");
         }
     }
-    verify("json", "1", false, true, "trace");
+    verify("json", "1", false, "1", false, true, "trace");
 }
 
 // Also run with --features opentelemetry-otlp/internal-logs to exercise its raw
@@ -135,15 +113,23 @@ fn telemetry_isolates_collector_rejection_bodies_from_ordinary_diagnostics() {
     for format in ["text", "json"] {
         for rust_log in ["debug", "trace", "trace,opentelemetry-otlp=trace,opentelemetry_sdk=trace"]
         {
-            verify(format, "1", true, true, rust_log);
-            verify(format, "1", true, false, rust_log);
+            verify(format, "1", false, "1", true, true, rust_log);
+            verify(format, "1", false, "1", true, false, rust_log);
         }
     }
 }
 
 type Requests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
-fn verify(format: &str, ratio: &str, fail: bool, probe: bool, rust_log: &str) {
+fn verify(
+    format: &str,
+    ratio: &str,
+    incident: bool,
+    retained: &str,
+    fail: bool,
+    probe: bool,
+    rust_log: &str,
+) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -200,10 +186,13 @@ fn verify(format: &str, ratio: &str, fail: bool, probe: bool, rust_log: &str) {
     });
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
-        .args(["--exact", "telemetry_child", "--nocapture"])
+        .args(["--ignored", "--exact", "telemetry::tests::telemetry_child", "--nocapture"])
         .env("BRAID_TEST_OTLP", &endpoint)
         .env("BRAID_TEST_FORMAT", format)
         .env("BRAID_TEST_RATIO", ratio)
+        .env("BRAID_TEST_INCIDENT", if incident { "1" } else { "0" })
+        .env("BRAID_TEST_RETAIN", retained)
+        .env_remove("BRAID_TEST_PROBE")
         .env("RUST_LOG", rust_log);
     if probe {
         command.env("BRAID_TEST_PROBE", "1");
@@ -242,12 +231,13 @@ fn verify(format: &str, ratio: &str, fail: bool, probe: bool, rust_log: &str) {
             }
         }
     }
-    verify_otlp(&requests.lock().unwrap(), ratio, probe);
+    verify_otlp(&requests.lock().unwrap(), retained, probe);
 }
 
 fn verify_otlp(requests: &[(String, Vec<u8>)], ratio: &str, probe: bool) {
     let mut log_records = Vec::new();
     let mut span_ids = Vec::new();
+    let mut metrics = Vec::new();
     for (path, body) in requests {
         match path.as_str() {
             "/v1/logs" => {
@@ -279,7 +269,13 @@ fn verify_otlp(requests: &[(String, Vec<u8>)], ratio: &str, probe: bool) {
                 }
             }
             "/v1/metrics" => {
-                ExportMetricsServiceRequest::decode(body.as_slice()).unwrap();
+                for resource in
+                    ExportMetricsServiceRequest::decode(body.as_slice()).unwrap().resource_metrics
+                {
+                    for scope in resource.scope_metrics {
+                        metrics.extend(scope.metrics);
+                    }
+                }
             }
             other => panic!("unexpected signal {other}"),
         }
@@ -328,7 +324,13 @@ fn verify_otlp(requests: &[(String, Vec<u8>)], ratio: &str, probe: bool) {
     if ratio == "0" {
         assert!(span_ids.is_empty());
     }
-    if probe {
-        assert!(requests.iter().any(|(path, _)| path == "/v1/metrics"));
-    }
+    let counter = if probe { "braid.telemetry.probes" } else { "braid.runtime.transitions" };
+    let metric = metrics
+        .iter()
+        .find(|metric| metric.name == counter)
+        .expect("counter exported even with trace sampling disabled");
+    let Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(sum)) = &metric.data else {
+        panic!("{counter} is not a counter");
+    };
+    assert!(sum.data_points.iter().any(|point| matches!(point.value, Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(value)) if value > 0)));
 }

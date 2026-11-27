@@ -71,7 +71,10 @@ async fn failed_registration_also_closes_the_owned_process_tree() {
     use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
     let root = std::env::temp_dir().join(format!("braid-tunnel-failed-tree-{}", Uuid::now_v7()));
     let script = tree_script(&root, false);
-    assert!(QuickTunnel::start(&script, "http://127.0.0.1:1").await.is_err());
+    assert!(matches!(
+        QuickTunnel::start(&script, "http://127.0.0.1:1").await,
+        Err(TunnelError::MissingUrl)
+    ));
     let group = Pid::from_raw(
         std::fs::read_to_string(root.join("wrapper.pid")).unwrap().trim().parse().unwrap(),
     );
@@ -103,7 +106,11 @@ async fn signed_probe_requires_ingress_acceptance_not_an_arbitrary_http_success(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/webhook", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    assert!(signed_public_probe_once(&url, b"secret", "owner/repo", "repo").await.is_err());
+    let error = signed_public_probe_once(&url, b"secret", "owner/repo", "repo")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("HTTP 200 OK, expected 202"), "{error}");
     signed_public_probe_once(&url, b"secret", "owner/repo", "repo").await.unwrap();
     assert_eq!(counter.load(Ordering::SeqCst), 2);
     server.abort();

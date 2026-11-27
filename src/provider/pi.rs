@@ -6,6 +6,10 @@ use std::process::ExitStatus;
 #[path = "pi_runtime.rs"]
 mod runtime;
 
+#[cfg(test)]
+#[path = "pi_tests.rs"]
+mod tests;
+
 struct PiRequest {
     response: oneshot::Sender<Result<Value, ProviderError>>,
     turn_id: Option<String>,

@@ -2,7 +2,6 @@
 //! provider credential files. The resulting Braid-schema file is the only
 //! credential input; Pi's auth.json remains an adapter-owned runtime format.
 use std::{
-    fmt::Write as _,
     fs::OpenOptions,
     io::Write as _,
     path::{Path, PathBuf},
@@ -11,7 +10,7 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use clap::Args;
 
-use crate::config::{OAuthCredentialFile, validate_token};
+use crate::config::{OAuthCredentialFile, ProviderSecretFile, validate_token};
 use crate::home::UserHome;
 
 #[derive(Debug, Args)]
@@ -32,6 +31,12 @@ pub(crate) struct ProviderImportAuth {
 pub fn import_auth(arguments: &ProviderImportAuth) -> Result<()> {
     validate_token("provider id", &arguments.provider_id)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    // The id becomes a filename, unlike provider ids used only for routing.
+    if arguments.provider_id.contains(['/', '\\'])
+        || matches!(arguments.provider_id.as_str(), "." | "..")
+    {
+        bail!("provider id must be a single file name, without path separators");
+    }
     let user_home = UserHome::resolve(Some(&arguments.user_home))?;
     let from = arguments.from.canonicalize().context("cannot resolve Pi auth.json source")?;
     let (rendered, kind_label) = convert_credential(&from, &arguments.provider_id)?;
@@ -135,14 +140,7 @@ fn convert_oauth(
     }
     let oauth =
         OAuthCredentialFile { access, refresh, expires, account: account.map(str::to_owned) };
-    let mut text = format!(
-        "access = {:?}\nrefresh = {:?}\nexpires = {}\n",
-        oauth.access, oauth.refresh, oauth.expires
-    );
-    if let Some(account) = &oauth.account {
-        writeln!(text, "account = {account:?}").expect("write to string cannot fail");
-    }
-    Ok((text, "oauth"))
+    Ok((toml::to_string(&oauth)?, "oauth"))
 }
 
 fn convert_api_key(
@@ -156,7 +154,7 @@ fn convert_api_key(
     if key.trim().is_empty() {
         bail!("api_key credential {provider_id:?} in {} is empty", from.display());
     }
-    Ok((format!("provider_api_key = {key:?}\n"), "api_key"))
+    Ok((toml::to_string(&ProviderSecretFile { provider_api_key: key.into() })?, "api_key"))
 }
 
 fn required_string(entry: &serde_json::Value, field: &str) -> Result<String> {

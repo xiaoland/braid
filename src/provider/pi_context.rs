@@ -5,6 +5,10 @@ use serde_json::Value;
 
 use super::ProviderError;
 
+#[cfg(test)]
+#[path = "pi_context_tests.rs"]
+mod tests;
+
 /// Staging input only. Native history, rather than a second consumed flag,
 /// decides whether this Context still needs to be sent.
 #[derive(Serialize, Deserialize)]

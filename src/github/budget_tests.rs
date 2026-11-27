@@ -1,20 +1,5 @@
-#[allow(dead_code)]
-#[path = "../src/telemetry/github.rs"]
-pub mod github_metrics;
-mod telemetry {
-    pub use super::github_metrics as github;
-}
-#[path = "../src/github/error.rs"]
-pub mod error;
-#[path = "../src/github/graphql.rs"]
-pub mod graphql;
-#[path = "../src/github/rate_limit.rs"]
-pub mod rate_limit;
-#[path = "../src/store/reconciliation.rs"]
-pub mod reconciliation;
-
+use super::{GitHubError, graphql, rate_limit};
 use axum::{Router, body::Body, http::Response, routing::post};
-use error::GitHubError;
 use octocrab::{Octocrab, service::middleware::retry::RetryConfig};
 use serde_json::Value;
 use std::sync::{
@@ -253,7 +238,10 @@ async fn permission_denial_does_not_cool_down_an_entire_installation() {
 async fn graphql_transport_failure_is_deferred_without_repeated_network_requests() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    drop(listener);
+    let disconnect = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
+    });
     let client = Octocrab::builder()
         .base_uri(format!("http://{address}"))
         .unwrap()
@@ -269,6 +257,7 @@ async fn graphql_transport_failure_is_deferred_without_repeated_network_requests
         graphql::request::<_, Value>(&client, &limits, 1, false, "query{viewer{id}}", &()).await,
         Err(GitHubError::Delayed(_))
     ));
+    disconnect.await.unwrap();
     let installation = limits.installation(1);
     let mut budget = installation.lock().await;
     for _ in 0..100 {

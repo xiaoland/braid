@@ -325,14 +325,10 @@ impl GroupDriver<'_> {
             }
         };
         let Some(reset) = reset else { return false };
-        let uncertain =
-            matches!(reset.old_session_lifecycle.as_str(), "unknown" | "blocked" | "running")
-                || reset
-                    .active_turn_lifecycle
-                    .as_deref()
-                    .is_some_and(|state| matches!(state, "starting" | "running" | "unknown"));
-        let stop = if uncertain
-            && self.sessions.get(&reset.old_provider_session_id).await.is_none()
+        // Ledger lifecycle (including an idle reset) cannot prove that native
+        // background execution stopped. Every replacement needs the adapter's
+        // close confirmation, even after the reset was persisted before a restart.
+        let stop = if self.sessions.get(&reset.old_provider_session_id).await.is_none()
             && !self.sessions.confirmed_stopped(&reset.old_provider_session_id).await
         {
             Err(crate::agent_session::SessionError::Failed(

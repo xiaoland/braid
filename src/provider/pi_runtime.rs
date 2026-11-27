@@ -12,6 +12,10 @@ use super::{Command, PiConfig, ProviderError, Value};
 const CAPABILITIES: &[&str] =
     &["retry_intent", "settle_extensions", "owned_inference", "managed_execution", "owned_stop"];
 
+#[cfg(test)]
+#[path = "pi_runtime_tests.rs"]
+mod tests;
+
 #[derive(Deserialize)]
 struct Artifact {
     path: PathBuf,

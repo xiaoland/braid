@@ -88,3 +88,7 @@ pub(crate) async fn webhook_handler(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ingress_tests.rs"]
+mod tests;

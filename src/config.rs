@@ -554,8 +554,8 @@ pub struct WebhookSecretFile {
     pub webhook_secret: String,
 }
 
-/// Secrets file referenced by `[[llm_providers]].api_key_file`.
-#[derive(Debug, Deserialize)]
+/// Braid API-key schema referenced by `llm_providers[].credential.file`.
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ProviderSecretFile {
     pub provider_api_key: String,
 }
@@ -1483,7 +1483,7 @@ mod tests {
 
         let mut config = example();
         config.instance.key = " owner ".into();
-        assert!(config.validate().is_err());
+        assert!(config.validate().unwrap_err().to_string().contains("instance.key"));
 
         let mut config = example();
         config.github.as_mut().unwrap().repository = "owner/repo?query".into();

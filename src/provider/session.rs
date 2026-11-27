@@ -6,6 +6,10 @@ use std::sync::{
 
 use tokio::sync::{Mutex, broadcast};
 
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;
+
 use crate::{
     agent_session::{AgentSession, SendResult, SessionError, SessionEvent, TurnOutcome},
     config::Profile,

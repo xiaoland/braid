@@ -544,18 +544,15 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_optional_otlp_does_not_block_readiness() {
-        let checks = vec![
-            check("SQLite", CheckState::Pass),
-            check("OTLP endpoint", CheckState::Unavailable),
-        ];
-        assert!(report_ready(&checks));
-    }
-
-    #[test]
-    fn other_unavailable_checks_block_readiness() {
-        let checks =
-            vec![check("SQLite", CheckState::Pass), check("GitHub App", CheckState::Unavailable)];
-        assert!(!report_ready(&checks));
+    fn readiness_only_tolerates_unavailable_optional_otlp() {
+        for (name, state, ready) in [
+            ("OTLP endpoint", CheckState::Unavailable, true),
+            ("OTLP endpoint", CheckState::Fail, false),
+            ("GitHub App", CheckState::Unavailable, false),
+            ("GitHub App", CheckState::Pass, true),
+        ] {
+            let checks = vec![check("SQLite", CheckState::Pass), check(name, state)];
+            assert_eq!(report_ready(&checks), ready, "{name} {state:?}");
+        }
     }
 }
