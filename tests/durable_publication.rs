@@ -311,6 +311,7 @@ mod config {
     #[derive(Clone)]
     pub struct GitHubConfig {
         pub app_id: u64,
+        pub api_version: String,
         pub private_key_file: std::path::PathBuf,
         pub projects_v2_enabled: bool,
     }
@@ -321,6 +322,19 @@ use github::{GitHubClient, GitHubError};
 struct Config;
 fn check_source(_: &Config, _: &GhWriteReceipt) -> Result<(), GitHubError> {
     Ok(())
+}
+// Source/target authorization is covered by the production writer actor tests.
+mod edit {
+    use super::{Config, GhWriteReceipt, GitHubClient, GitHubError};
+    #[allow(clippy::unused_async)] // Match the production authorization boundary.
+    pub async fn authorize(
+        _: &Config,
+        _: &GitHubClient,
+        _: &GhWriteReceipt,
+        _: bool,
+    ) -> Result<(), GitHubError> {
+        Ok(())
+    }
 }
 mod helpers {
     use crate::github::GitHubError;
@@ -407,6 +421,7 @@ async fn comment_server(
         identity,
         config::GitHubConfig {
             app_id: 1,
+            api_version: "2022-11-28".into(),
             private_key_file: PathBuf::new(),
             projects_v2_enabled: false,
         },

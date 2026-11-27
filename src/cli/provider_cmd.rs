@@ -54,7 +54,7 @@ pub fn import_auth(arguments: &ProviderImportAuth) -> Result<()> {
         );
     }
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create(true).create_new(!arguments.force).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -63,6 +63,11 @@ pub fn import_auth(arguments: &ProviderImportAuth) -> Result<()> {
     let mut file = options
         .open(&target)
         .with_context(|| format!("cannot write Braid credential file {}", target.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     file.write_all(rendered.as_bytes())?;
     file.sync_all()?;
 

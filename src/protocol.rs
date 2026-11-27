@@ -121,10 +121,12 @@ pub fn verify_identity(
 }
 
 async fn run(executable: &Path, arguments: &[&str]) -> Result<String, ProtocolError> {
-    let output =
-        timeout(Duration::from_secs(30), Command::new(executable).args(arguments).output())
-            .await
-            .map_err(|_| ProtocolError::Timeout)??;
+    let output = timeout(
+        Duration::from_secs(30),
+        Command::new(executable).args(arguments).kill_on_drop(true).output(),
+    )
+    .await
+    .map_err(|_| ProtocolError::Timeout)??;
     output_text(&output)
 }
 

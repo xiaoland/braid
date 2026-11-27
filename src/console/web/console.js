@@ -156,10 +156,16 @@ function runtimePanel(runtime){
   let recentDescription=null;
   description.addEventListener('input',()=>{recentDescription=null;});
   const rootIssue=el('input',{type:'number',min:1,step:1,'aria-label':'根 Issue 编号',placeholder:'根 Issue 编号'});
-  const runId=el('input',{'aria-label':'Run ID',value:requestId(),maxlength:100});
+  const runId=el('input',{'aria-label':'Run ID',value:requestId(),maxlength:96});
   const deliveryRef=el('input',{'aria-label':'交付 Git ref',value:'refs/heads/braid/run/'+runId.value});
-  const concurrency=el('input',{type:'number',min:1,step:1,value:2,'aria-label':'最大并发 Braid 轮次'});
+  const concurrency=el('input',{type:'number',min:1,max:64,step:1,value:2,'aria-label':'最大并发 Braid 轮次'});
   const runInputs=el('div',{},el('label',{},'Run ID ',runId),el('label',{},'根任务输入 ',inputKind),description,rootIssue,el('label',{},'交付 Git ref ',deliveryRef),el('label',{},'最大并发 Braid 轮次 ',concurrency));
+  function rememberRunInputs(){
+    for(const input of runInputs.querySelectorAll('input,textarea,select')){
+      input.dataset.draft='true';input.dataset.initialValue=input.value;
+    }
+  }
+  rememberRunInputs();
   function updateInputs(){
     runInputs.hidden=mode.value!=='run';
     transport.disabled=mode.value==='run';
@@ -181,6 +187,7 @@ function runtimePanel(runtime){
     deliveryRef.value=request.deliveryRef;
     concurrency.value=request.maxConcurrency??2;
     updateInputs();
+    rememberRunInputs();
   }):null;
   async function command(operation){
     if(controlPending)return;
@@ -194,15 +201,17 @@ function runtimePanel(runtime){
       const payload={request_id:id,operation,expected_generation:runtime.generation,transport_only:operation==='start'&&transport.checked};
       if(operation==='start'&&mode.value==='run'){
         const root=Number(rootIssue.value),limit=Number(concurrency.value);
-        if(!/^[A-Za-z0-9_-]{1,100}$/.test(runId.value))throw new Error('Run ID 须为 1–100 个英文字母、数字、连字符或下划线。');
+        if(!/^[A-Za-z0-9_-]{1,96}$/.test(runId.value))throw new Error('Run ID 须为 1–96 个英文字母、数字、连字符或下划线。');
         if(inputKind.value==='root'&&(!Number.isSafeInteger(root)||root<1))throw new Error('请填写有效的根 Issue 编号。');
         if(inputKind.value==='description'&&!description.value.trim())throw new Error('请填写任务描述。');
         if(!deliveryRef.value.trim())throw new Error('请填写交付 Git ref。');
-        if(!Number.isSafeInteger(limit)||limit<1)throw new Error('最大并发 Braid 轮次须为正整数。');
+        if(!Number.isSafeInteger(limit)||limit<1||limit>64)throw new Error('最大并发 Braid 轮次须为 1–64 的整数。');
         payload.run_request={runId:runId.value,rootIssue:inputKind.value==='root'?root:null,description:inputKind.value==='description'?(recentDescription??description.value):null,deliveryRef:deliveryRef.value,maxConcurrency:limit};
       }
+      const submittedRunInputs=payload.run_request?[...runInputs.querySelectorAll('input,textarea,select')].map(input=>[input,input.value]):[];
       submitted=true;
       const result=await api('/api/runtime/commands',payload);
+      for(const [input,value] of submittedRunInputs)input.dataset.initialValue=value;
       receipt.replaceChildren(el('div',{
         class:'row'
       },badge(result.state||'未报告'),el('code',{},result.request_id||id)),raw(result,'控制受理回执'),el('p',{
@@ -249,21 +258,22 @@ async function telemetry(page,token){
   turn.input.value=selected.get('turn')||'';
   trace.input.value=selected.get('trace')||'';
   const records=[],target=el('div');
-  let after=0,loadSequence=0;
+  let after=0,loadSequence=0,filtersApplied={signal,instance:instance.input.value,session:session.input.value,turn:turn.input.value,trace:trace.input.value};
   const more=button('加载更多',()=>load(false));
   const status=el('div',{
     class:'meta'
   });
   async function load(reset){
     const sequence=++loadSequence;
-    if(reset){
-      records.length=0;
-      after=0;
-    }
+    const filters=reset?{signal,instance:instance.input.value,session:session.input.value,turn:turn.input.value,trace:trace.input.value}:filtersApplied;
     const result=await api('/api/records?'+query({
-      signal,instance:instance.input.value,session:session.input.value,turn:turn.input.value,trace:trace.input.value,after,limit:100
+      ...filters,after:reset?0:after,limit:100
     }));
     if(token!==generation||sequence!==loadSequence)return;
+    if(reset){
+      records.length=0;
+      filtersApplied=filters;
+    }
     records.push(...result.records);
     after=result.next_after;
     status.textContent=`已加载 ${records.length} 条 · 按接收顺序 · 每页最多 100 条`;

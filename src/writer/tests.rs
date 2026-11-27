@@ -123,6 +123,7 @@ struct Remote {
     pr_created: bool,
     head_created: bool,
     comments: Vec<Value>,
+    comment_reads: usize,
     writes: usize,
     limit: Option<u64>,
 }
@@ -147,7 +148,7 @@ async fn server(
             if matches!(remote.lock().unwrap().target_kind, TargetKind::PullRequest) { item["pull_request"] = json!({"url":"pr"}); }
             Json(item).into_response()
         }}))
-        .route("/repos/owner/repository/issues/1/comments", get(move || { let remote=listing.clone(); async move { Json(remote.lock().unwrap().comments.clone()) } }).post(move |Json(body): Json<Value>| { let remote=writing.clone(); async move {
+        .route("/repos/owner/repository/issues/1/comments", get(move || { let remote=listing.clone(); async move { let mut state=remote.lock().unwrap(); state.comment_reads+=1; Json(state.comments.clone()) } }).post(move |Json(body): Json<Value>| { let remote=writing.clone(); async move {
             let mut remote=remote.lock().unwrap(); remote.writes+=1;
             let comment=json!({"id":99,"node_id":"comment","url":"https://api.github.com/repos/owner/repository/issues/comments/99","html_url":"https://github.com/owner/repository/issues/1#issuecomment-99","issue_url":"https://api.github.com/repos/owner/repository/issues/1","body":body["body"],"created_at":time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap(),"updated_at":"now","user":{"login":"braid[bot]","id":1,"node_id":"app","type":"Bot","site_admin":false,"avatar_url":"https://example.invalid","url":"https://example.invalid","html_url":"https://example.invalid"}});
             remote.comments.push(comment); Json(json!({"id":99,"node_id":"comment"}))
@@ -157,7 +158,7 @@ async fn server(
         .route("/repos/owner/repository/issues/comments/8",get(move||{let remote=continuation.clone();async move{let number=if remote.lock().unwrap().authority==Authority::OtherIssue {2}else{1};Json(json!({"id":8,"node_id":"followup-comment","html_url":format!("https://github.com/owner/repository/issues/{number}#issuecomment-8"),"issue_url":format!("https://api.github.com/repos/owner/repository/issues/{number}"),"body":"continue current implementation","created_at":"now","updated_at":"now"}))}}))
         .route("/repos/owner/repository/issues/2",get(||async{Json(json!({"id":2,"node_id":"other-issue","number":2,"title":"Other issue","state":"open","html_url":"https://github.com/owner/repository/issues/2"}))}))
         .route("/repos/owner/repository", get(|| async { Json(json!({"default_branch":"main"})) }))
-        .route("/repos/owner/repository/pulls", get({ let pr=pr.clone(); let remote=remote.clone(); move || { let pr=pr.clone(); let remote=remote.clone(); async move { let state=remote.lock().unwrap(); Json(if state.create_pr && !state.pr_created {json!([])} else {json!([pr])}) } }}).post({ let pr=pr.clone(); let remote=remote.clone(); move || {let pr=pr.clone(); let remote=remote.clone(); async move { let mut state=remote.lock().unwrap(); state.pr_created=true; state.writes+=1; Json(pr) }}}))
+        .route("/repos/owner/repository/pulls", get({ let pr=pr.clone(); let remote=remote.clone(); move || { let mut pr=pr.clone(); let remote=remote.clone(); async move { let state=remote.lock().unwrap(); if let Some(body)=&state.pr_body {pr["body"]=json!(body);} Json(if state.create_pr && !state.pr_created {json!([])} else {json!([pr])}) } }}).post({ let pr=pr.clone(); let remote=remote.clone(); move || {let pr=pr.clone(); let remote=remote.clone(); async move { let mut state=remote.lock().unwrap(); state.pr_created=true; state.writes+=1; Json(pr) }}}))
         .route("/repos/owner/repository/git/ref/heads/main",get(|| async {Json(json!({"ref":"refs/heads/main","object":{"sha":"base"}}))}))
         .route("/repos/owner/repository/git/ref/heads/head",get({let remote=remote.clone(); move || {let remote=remote.clone(); async move {
             use axum::response::IntoResponse as _;
@@ -249,6 +250,21 @@ async fn outbox_delivery_recovery_and_rate_deadline_use_production_executor() {
     assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
     assert_eq!(remote.lock().unwrap().writes, 1);
     task.abort();
+}
+
+#[tokio::test]
+async fn uncertain_comment_recovery_scans_the_remote_conversation_once() {
+    let fixture = Fixture::new(false);
+    let receipt = fixture.comment();
+    fixture.db().execute("UPDATE github_write_outbox SET lifecycle='uncertain'", []).unwrap();
+    let remote = Arc::new(Mutex::new(Remote::default()));
+    let (github, http) = server(remote.clone(), true).await;
+    fixture.drain(github).await;
+    assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
+    let remote = remote.lock().unwrap();
+    assert_eq!(remote.comment_reads, 1);
+    assert_eq!(remote.writes, 1);
+    http.abort();
 }
 
 #[tokio::test]

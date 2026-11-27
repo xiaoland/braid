@@ -116,10 +116,16 @@ impl GroupDriver<'_> {
         else {
             return Ok(());
         };
-        if materialization.profile_id != profile.id {
+        if materialization.profile_id != profile.id
+            || materialization.profile_revision != self.spec.profile_record.revision
+        {
             let message = format!(
-                "reopened {} Profile {} does not match active Profile {}",
-                candidate.work_item_kind, materialization.profile_id, profile.id
+                "reopened {} Profile {} revision {} does not match active Profile {} revision {}",
+                candidate.work_item_kind,
+                materialization.profile_id,
+                materialization.profile_revision,
+                profile.id,
+                self.spec.profile_record.revision
             );
             store.fail_work_item_reactivation(
                 candidate.event_id,
@@ -371,11 +377,15 @@ impl GroupDriver<'_> {
         let config = self.config;
         let sessions = &self.sessions;
         let profile = &self.spec.profile;
-        if reset.profile_id != profile.id {
+        if reset.profile_id != profile.id
+            || reset.profile_revision != self.spec.profile_record.revision
+        {
             bail!(
-                "Context reset Profile {} does not match active Profile {}",
+                "Context reset Profile {} revision {} does not match active Profile {} revision {}",
                 reset.profile_id,
-                profile.id
+                reset.profile_revision,
+                profile.id,
+                self.spec.profile_record.revision
             );
         }
         let repository = if github.is_builtin() {
@@ -488,7 +498,11 @@ impl GroupDriver<'_> {
             Ok(SendResult::Deferred) => None,
             Ok(SendResult::Started) => Some("steer unexpectedly started a new turn".into()),
             Err(error @ crate::agent_session::SessionError::Failed(_)) => {
-                let _ = self.store.settle_steer_batch(steer.batch_id.clone(), "failed".into());
+                if let Err(ledger_error) = self.store.consume_steer_batch(steer.batch_id.clone()) {
+                    return Some(format!(
+                        "rejected steer could not be recorded: {ledger_error}; {error}"
+                    ));
+                }
                 self.publish_turn_error(
                     &steer,
                     "input_failed",
@@ -497,7 +511,8 @@ impl GroupDriver<'_> {
                 None
             }
             Err(error) => {
-                let _ = self.store.settle_steer_batch(steer.batch_id.clone(), "unknown".into());
+                // Keep this input pending while the caller fences the uncertain turn.
+                // A confirmed stop and replacement will coalesce it with the replay.
                 Some(format!("steer batch {} reception is unknown: {error}", steer.batch_id))
             }
         }

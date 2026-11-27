@@ -20,48 +20,45 @@ pub(crate) async fn mention_worker(
     // Mention-authority resolution talks to GitHub; on persistent failure
     // (e.g. token expiry before the client refreshes) back off exponentially
     // instead of hammering the API every tick.
-    let mut mention_failures: u32 = 0;
-    let mut mention_cooldown_until = tokio::time::Instant::now();
+    // Repository permission failures must not hold another repository's
+    // trusted activations behind this repository's oldest pending mention.
+    let mut cooldowns = HashMap::<String, (u32, tokio::time::Instant)>::new();
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
             _ = tick.tick() => {
-                if tokio::time::Instant::now() >= mention_cooldown_until {
-                    match store.mention_candidates(16) {
-                        Ok(candidates) => {
-                            let mut failed = false;
-                            for candidate in candidates {
-                                let Some(client) = github.get(&candidate.repository) else {
-                                    tracing::error!(repository = %candidate.repository, "mention event references an unconfigured repository");
-                                    continue;
-                                };
-                                match client.repository_permission(&candidate.actor_login).await {
-                                    Ok(role) => {
-                                        let trusted = matches!(role.to_ascii_lowercase().as_str(), "maintain" | "admin");
-                                        if let Err(error) = store.resolve_mention(candidate.event_id, trusted, policy) {
-                                            tracing::error!(%error, "cannot resolve mention authority");
-                                        }
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(%error, actor = %candidate.actor_login, "mention authority remains unresolved");
-                                        failed = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if failed {
-                                mention_failures = (mention_failures + 1).min(6);
-                                let backoff = Duration::from_secs(2u64.pow(mention_failures).min(60));
-                                mention_cooldown_until = tokio::time::Instant::now() + backoff;
-                                tracing::debug!(?backoff, "mention authority resolution backing off");
-                            } else {
-                                mention_failures = 0;
-                            }
+                for (repository, client) in github.iter() {
+                    let (failures, until) = cooldowns
+                        .entry(repository.clone())
+                        .or_insert_with(|| (0, tokio::time::Instant::now()));
+                    if tokio::time::Instant::now() < *until {
+                        continue;
+                    }
+                    match resolve_repository_mentions(&store, client, repository, policy).await {
+                        Ok(()) => *failures = 0,
+                        Err(error) => {
+                            *failures = (*failures + 1).min(6);
+                            let backoff = Duration::from_secs(2u64.pow(*failures).min(60));
+                            *until = tokio::time::Instant::now() + backoff;
+                            tracing::warn!(%error, %repository, ?backoff, "mention authority remains unresolved");
                         }
-                        Err(error) => tracing::error!(%error, "cannot load mention candidates"),
                     }
                 }
             }
         }
     }
+}
+
+async fn resolve_repository_mentions(
+    store: &StoreActor,
+    github: &GitHubClient,
+    repository: &str,
+    policy: SchedulerPolicy,
+) -> anyhow::Result<()> {
+    for candidate in store.mention_candidates(repository.into(), 16)? {
+        let role = github.repository_permission(&candidate.actor_login).await?;
+        let trusted = matches!(role.to_ascii_lowercase().as_str(), "maintain" | "admin");
+        store.resolve_mention(candidate.event_id, trusted, policy)?;
+    }
+    Ok(())
 }

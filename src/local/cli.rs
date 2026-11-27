@@ -338,10 +338,8 @@ fn published_commit(source: &Path, cwd: &Path) -> Result<String> {
     let workdir =
         actual.workdir().context("candidate must be a non-bare worktree")?.canonicalize()?;
     ensure!(cwd.starts_with(workdir), "candidate cwd is outside its Git worktree");
-    // libgit2's default status flags include ignored files. Native session
-    // storage and application data do not make a committed candidate dirty.
     let mut options = git2::StatusOptions::new();
-    options.include_untracked(true).recurse_untracked_dirs(true).include_ignored(false);
+    options.include_untracked(true).recurse_untracked_dirs(true);
     let statuses = actual.statuses(Some(&mut options))?;
     ensure!(
         statuses.is_empty(),

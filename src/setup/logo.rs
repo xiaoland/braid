@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use anyhow::{Context as _, Result, bail};
 use image::{ImageFormat, Rgba, RgbaImage, imageops::FilterType};
@@ -55,16 +55,19 @@ pub fn generate(owner: &str, output: &Path) -> Result<()> {
 }
 
 fn fetch_avatar_url(owner: &str) -> Result<String> {
-    let user = gh_api_json::<OwnerInfo>(&format!("users/{owner}"), None);
-    let org = gh_api_json::<OwnerInfo>(&format!("orgs/{owner}"), None);
-    match (user, org) {
-        (Ok(info), _) | (_, Ok(info)) => Ok(info.avatar_url),
-        (Err(user_err), Err(_)) => bail!("cannot look up owner {owner}: {user_err}"),
-    }
+    gh_api_json::<OwnerInfo>(&format!("users/{owner}"), None)
+        .or_else(|_| gh_api_json::<OwnerInfo>(&format!("orgs/{owner}"), None))
+        .map(|info| info.avatar_url)
+        .with_context(|| format!("cannot look up owner {owner}"))
 }
 
 fn download(url: &str) -> Result<Vec<u8>> {
-    let response = reqwest::blocking::get(url).context("cannot fetch avatar URL")?;
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?
+        .get(url)
+        .send()
+        .context("cannot fetch avatar URL")?;
     if !response.status().is_success() {
         bail!("avatar download returned HTTP {}", response.status());
     }

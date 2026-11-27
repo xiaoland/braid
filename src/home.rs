@@ -43,7 +43,6 @@ pub fn expand_home(path: &Path) -> Result<PathBuf> {
 /// The rules intentionally match a subset of GitHub login rules, because the
 /// default instance key is derived from the repository owner.
 pub fn validate_instance_key(key: &str) -> Result<()> {
-    let key = key.trim();
     if key.is_empty() {
         bail!("instance key must be non-empty");
     }

@@ -2,14 +2,19 @@
 set -eu
 
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-target=${BRAID_BUILD_TARGET:-aarch64-apple-darwin}
+target=${BRAID_BUILD_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}
 output_root=${BRAID_DIST_DIR:-"$repository_root/dist"}
 
 cd "$repository_root"
 cargo build --release --locked --target "$target"
 
-binary="$repository_root/target/$target/release/braid"
+target_directory=${CARGO_TARGET_DIR:-"$repository_root/target"}
+binary="$target_directory/$target/release/braid"
 version=$("$binary" --version | awk '{print $2}')
+if [ -n "${BRAID_RELEASE_TAG:-}" ] && [ "$BRAID_RELEASE_TAG" != "v$version" ]; then
+  printf 'Release tag %s does not match binary version v%s\n' "$BRAID_RELEASE_TAG" "$version" >&2
+  exit 1
+fi
 artifact="braid-v${version}-${target}"
 archive="$output_root/$artifact.tar.gz"
 mkdir -p "$output_root"

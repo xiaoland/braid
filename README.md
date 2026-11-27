@@ -69,7 +69,9 @@ For example, using Pi with an explicitly selected LLM provider and an existing
 secret file when that model route needs one:
 
 ```sh
-braid setup owner/repository --adapter pi --model <MODEL> --llm-provider <PROVIDER_ID> --api-key-file /absolute/path/to/secrets/<provider>.toml
+braid setup owner/repository --adapter pi --model <MODEL> \
+  --llm-provider <PROVIDER_ID> --llm-base-url <PROVIDER_ENDPOINT> \
+  --llm-credential-kind api_key --llm-credential-file /absolute/path/to/secrets/<provider>.toml
 ```
 
 The setup guide documents the secret file format and permissions. Codex setups
@@ -78,6 +80,7 @@ use the isolated Codex home instead and do not take LLM provider arguments.
 Follow the printed GitHub App installation link, then check the instance and start the local runtime:
 
 ```sh
+braid migrate apply --instance owner
 braid doctor --instance owner
 braid serve --instance owner --tunnel
 ```
@@ -102,7 +105,7 @@ Web Console 属于整个 Braid，平台配置与 Harness 配置可分别装配�
 
 ```shell
 braid platform init --source /absolute/path/to/repository --config /absolute/path/to/platform.toml --name demo
-braid init --source /absolute/path/to/repository --config /absolute/path/to/harness/config.toml --name demo --endpoint http://127.0.0.1:18082 --adapter pi --executable /absolute/path/to/pi --model <MODEL> --llm-provider <PROVIDER_ID> --api-key-file /absolute/path/to/user/secrets/<provider>.toml
+braid init --source /absolute/path/to/repository --config /absolute/path/to/harness/config.toml --name demo --endpoint http://127.0.0.1:18082 --adapter pi --executable /absolute/path/to/pi --model <MODEL> --llm-provider <PROVIDER_ID> --llm-base-url <PROVIDER_ENDPOINT> --llm-credential-kind api_key --llm-credential-file /absolute/path/to/user/secrets/<provider>.toml
 braid migrate apply --config /absolute/path/to/harness/config.toml
 braid console --platform-config /absolute/path/to/platform.toml --config /absolute/path/to/harness/config.toml --database /absolute/path/to/observations.sqlite3
 ```
@@ -140,4 +143,4 @@ GitHub 或内建上游，不经 CLI 子进程；停止 Harness 后 Collector 和
 For source development, Braid is a single Rust package that produces a portable `braid` executable. Build with `cargo build --locked`; the repository's product and technical contracts live in [`docs/`](docs/10-prd/README.md). See the [MIT license](LICENSE).
 
 
-Braid 使用编译、实际操作及获授权实验取得反馈，不维护或运行测试代码、模拟提供方、包 smoke 或自检入口。GitHub、provider 和 OTel 原始证据及人工判断构成产品验收依据。
+Braid 使用编译、回归测试、实际操作及获授权实验取得反馈。测试验证局部行为和故障边界；真实 GitHub、provider 和 OTel 原始证据及人工判断构成产品验收依据。

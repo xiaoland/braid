@@ -10,19 +10,21 @@ permissions:
 
 jobs:
   rust:
-    runs-on: macos-14
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rust
+            os: macos-15
+            target: aarch64-apple-darwin
+          - name: linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install 1.93.0 --profile minimal --component clippy,rustfmt --target aarch64-apple-darwin
-      - run: cargo fmt --check
-      - run: cargo check --locked --all-targets
-      - run: cargo clippy --locked --all-targets -- -D warnings
-
-  linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install 1.93.0 --profile minimal --component clippy,rustfmt --target x86_64-unknown-linux-gnu
+      - run: rustup toolchain install 1.93.0 --profile minimal --component clippy,rustfmt --target ${{ matrix.target }}
       - uses: actions/setup-node@v4
         with:
           node-version: 24.15.0

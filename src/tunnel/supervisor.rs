@@ -81,6 +81,7 @@ impl Supervisor {
     async fn run(self, initial: QuickTunnel, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut published = format!("{}/webhook", initial.url);
         let mut tunnel = Some(initial);
+        let mut stop_failure = None;
         let mut synchronized = true;
         let mut failures = 0_u8;
         let mut backoff = 10_u64;
@@ -104,6 +105,7 @@ impl Supervisor {
                 {
                     self.publish("stop_unconfirmed", "blocked", Some(error.to_string()), None)
                         .await;
+                    stop_failure = Some(anyhow::Error::from(error));
                     let _ = shutdown.changed().await;
                     break;
                 }
@@ -137,6 +139,7 @@ impl Supervisor {
                                 None,
                             )
                             .await;
+                            stop_failure = Some(error);
                             let _ = shutdown.changed().await;
                             break;
                         }
@@ -215,6 +218,7 @@ impl Supervisor {
                                 None,
                             )
                             .await;
+                            stop_failure = Some(anyhow::Error::from(error));
                             let _ = shutdown.changed().await;
                             break;
                         }
@@ -230,6 +234,7 @@ impl Supervisor {
             && let Err(error) = running.stop().await
         {
             tracing::warn!(%error,"cannot stop Quick Tunnel during shutdown");
+            stop_failure = Some(anyhow::Error::from(error));
         }
         let restoration = tokio::time::timeout(Duration::from_secs(8), async {
             if self.github.app_webhook_config().await?.url == owned {
@@ -240,6 +245,10 @@ impl Supervisor {
         .await;
         if !matches!(restoration, Ok(Ok(()))) {
             tracing::warn!("prior App webhook restoration is unconfirmed");
+        }
+        if let Some(error) = stop_failure {
+            self.publish("stop_unconfirmed", "blocked", Some(error.to_string()), None).await;
+            return Err(error.context("Quick Tunnel execution stop is unconfirmed"));
         }
         self.publish("unavailable", "stopped", None, None).await;
         Ok(())

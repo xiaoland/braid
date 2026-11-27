@@ -12,6 +12,7 @@ pub async fn converge_comment(
     if let Some(remote) = recover_comment(github, issue_number, receipt).await? {
         return Ok(remote);
     }
+    super::edit::authorize(config, github, receipt, false).await?;
     let item = github.issue_or_pull_request(issue_number).await?;
     github.require_write_permissions(&[if item.kind() == "pr" {
         "pull_requests"

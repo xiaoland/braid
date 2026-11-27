@@ -561,47 +561,20 @@ pub struct ProviderSecretFile {
 }
 
 fn load_webhook_secret_file(path: &Path) -> Result<String, ConfigError> {
-    let text = fs::read_to_string(path)
-        .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
-    let deserializer = toml::de::Deserializer::parse(&text).map_err(|error| {
-        ConfigError::Invalid(format!("cannot parse secrets file {}: {error}", path.display()))
-    })?;
-    let file: WebhookSecretFile =
-        serde_path_to_error::deserialize(deserializer).map_err(|error| {
-            ConfigError::Invalid(format!("cannot parse secrets file {}: {error}", path.display()))
-        })?;
+    let file: WebhookSecretFile = load_secret_file(path, "webhook_secret string")?;
     Ok(file.webhook_secret)
 }
 
 pub(crate) fn load_provider_secret_file(path: &Path) -> Result<String, ConfigError> {
-    let text = fs::read_to_string(path)
-        .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
-    let deserializer = toml::de::Deserializer::parse(&text).map_err(|error| {
-        ConfigError::Invalid(format!("cannot parse secrets file {}: {error}", path.display()))
-    })?;
-    let file: ProviderSecretFile =
-        serde_path_to_error::deserialize(deserializer).map_err(|error| {
-            ConfigError::Invalid(format!("cannot parse secrets file {}: {error}", path.display()))
-        })?;
+    let file: ProviderSecretFile = load_secret_file(path, "provider_api_key string")?;
     Ok(file.provider_api_key)
 }
 
 pub(crate) fn load_oauth_file(path: &Path) -> Result<OAuthCredentialFile, ConfigError> {
-    let text = fs::read_to_string(path)
-        .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
-    let deserializer = toml::de::Deserializer::parse(&text).map_err(|error| {
-        ConfigError::Invalid(format!(
-            "cannot parse OAuth credential file {}: {error}",
-            path.display()
-        ))
-    })?;
-    let file: OAuthCredentialFile =
-        serde_path_to_error::deserialize(deserializer).map_err(|error| {
-            ConfigError::Invalid(format!(
-                "cannot parse OAuth credential file {}: {error}",
-                path.display()
-            ))
-        })?;
+    let file: OAuthCredentialFile = load_secret_file(
+        path,
+        "access and refresh strings, expires integer, optional account string",
+    )?;
     if file.access.trim().is_empty() || file.refresh.trim().is_empty() {
         return Err(ConfigError::Invalid(format!(
             "OAuth credential file {} requires non-empty access and refresh tokens",
@@ -609,6 +582,22 @@ pub(crate) fn load_oauth_file(path: &Path) -> Result<OAuthCredentialFile, Config
         )));
     }
     Ok(file)
+}
+
+fn load_secret_file<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    expected: &str,
+) -> Result<T, ConfigError> {
+    let text = fs::read_to_string(path)
+        .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
+    // TOML errors quote source lines and invalid values. Credential parsing
+    // errors reach ordinary CLI/doctor output, outside sampled evidence.
+    toml::from_str(&text).map_err(|_| {
+        ConfigError::Invalid(format!(
+            "cannot parse secrets file {}: expected valid TOML with {expected}",
+            path.display()
+        ))
+    })
 }
 
 impl Config {
@@ -988,6 +977,9 @@ impl Config {
             if !address.ip().is_loopback() {
                 return Err(ConfigError::Invalid(format!("{name} must use a loopback address")));
             }
+            if address.port() == 0 {
+                return Err(ConfigError::Invalid(format!("{name} must use a non-zero port")));
+            }
         }
         if self.server.ingress == self.server.health {
             return Err(ConfigError::Invalid(
@@ -1002,6 +994,12 @@ impl Config {
         let mut runtime_types = HashSet::new();
         for runtime in &self.runtimes {
             validate_token("runtime.adapter_type", &runtime.adapter_type)?;
+            if !matches!(runtime.adapter_type.as_str(), "codex" | "pi") {
+                return Err(ConfigError::Invalid(format!(
+                    "unsupported adapter_type {:?}",
+                    runtime.adapter_type
+                )));
+            }
             require_absolute(
                 &format!("runtime.{}.executable", runtime.adapter_type),
                 &runtime.executable,
@@ -1343,6 +1341,7 @@ impl Profile {
             )));
         }
         if !(0.0..1.0).contains(&self.github_context_soft_ratio)
+            || self.github_context_soft_ratio <= 0.0
             || self.github_context_hard_bytes == 0
         {
             return Err(ConfigError::Invalid(format!(
@@ -1360,11 +1359,6 @@ impl Profile {
             )));
         }
         self.validate_pi_provider_route(config)?;
-        // The profile's model is a request to the provider, and the provider
-        // is the authority on which models it accepts. The llm_providers
-        // catalog only carries cost metadata, so an uncatalogued model is
-        // not a config error: Codex must be able to answer with a real
-        // turn failure for a model it does not support.
         config.profile_materials(self)?;
         Ok(())
     }
@@ -1443,14 +1437,10 @@ fn require_absolute(name: &str, path: &Path) -> Result<(), ConfigError> {
 }
 
 fn validate_repository(repository: &str) -> Result<(), ConfigError> {
-    let mut parts = repository.split('/');
-    let owner = parts.next().unwrap_or_default();
-    let name = parts.next().unwrap_or_default();
-    if owner.is_empty() || name.is_empty() || parts.next().is_some() {
-        return Err(ConfigError::Invalid("github.repository must be owner/repository".into()));
-    }
-    validate_token("github.repository owner", owner)?;
-    validate_token("github.repository name", name)
+    repository
+        .parse::<crate::github::RepositoryName>()
+        .map(|_| ())
+        .map_err(|error| ConfigError::Invalid(format!("github.repository: {error}")))
 }
 
 pub(crate) fn validate_token(name: &str, value: &str) -> Result<(), ConfigError> {
@@ -1463,4 +1453,62 @@ pub(crate) fn validate_token(name: &str, value: &str) -> Result<(), ConfigError>
 
 const fn default_log_format() -> LogFormat {
     LogFormat::Text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn example() -> Config {
+        Config::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml"))
+            .expect("load example")
+    }
+
+    #[test]
+    fn static_validation_rejects_unusable_runtime_and_server_settings() {
+        let mut config = example();
+        config.runtimes[0].adapter_type = "unsupported".into();
+        for profile in &mut config.profiles {
+            profile.adapter_type = "unsupported".into();
+        }
+        assert!(config.validate().unwrap_err().to_string().contains("unsupported adapter_type"));
+
+        let mut config = example();
+        config.server.ingress.set_port(0);
+        assert!(config.validate().unwrap_err().to_string().contains("non-zero port"));
+
+        let mut config = example();
+        config.profiles[0].github_context_soft_ratio = 0.0;
+        assert!(config.validate().unwrap_err().to_string().contains("in (0,1)"));
+
+        let mut config = example();
+        config.instance.key = " owner ".into();
+        assert!(config.validate().is_err());
+
+        let mut config = example();
+        config.github.as_mut().unwrap().repository = "owner/repo?query".into();
+        assert!(config.validate().unwrap_err().to_string().contains("github.repository"));
+    }
+
+    #[test]
+    fn malformed_credentials_never_quote_secret_source_or_values() {
+        let path =
+            std::env::temp_dir().join(format!("braid-secrets-{}.toml", uuid::Uuid::now_v7()));
+        for (kind, contents) in [
+            ("webhook", "webhook_secret = \"sensitive-marker"),
+            ("api_key", "provider_api_key = \"sensitive-marker"),
+            ("oauth", "access = \"token\"\nrefresh = \"token\"\nexpires = \"sensitive-marker\""),
+        ] {
+            fs::write(&path, contents).expect("write malformed credential");
+            let result = match kind {
+                "webhook" => load_webhook_secret_file(&path).map(|_| ()),
+                "api_key" => load_provider_secret_file(&path).map(|_| ()),
+                _ => load_oauth_file(&path).map(|_| ()),
+            };
+            let message = result.unwrap_err().to_string();
+            assert!(message.contains("cannot parse secrets file"), "{message}");
+            assert!(!message.contains("sensitive-marker"), "{message}");
+        }
+        fs::remove_file(path).expect("remove credential fixture");
+    }
 }

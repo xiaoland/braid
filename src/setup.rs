@@ -107,14 +107,17 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     let gh_user = gh_user()?;
     println!("Authenticated to GitHub as @{gh_user}");
 
-    let (owner, repo): (&str, &str) =
-        arguments.repository.split_once('/').context("repository must be OWNER/REPOSITORY")?;
+    let repository = arguments.repository.parse::<crate::github::RepositoryName>()?;
+    let (owner, repo) = (repository.owner.as_str(), repository.name.as_str());
     println!("Target repository: {owner}/{repo}");
     let instance_key = arguments.instance.clone().unwrap_or_else(|| owner.to_lowercase());
     validate_instance_key(&instance_key)?;
     reject_non_pi_llm_options(&arguments)?;
 
     let mut registry = user_home.load_registry()?;
+    if registry.get(&instance_key).is_some() {
+        bail!("instance {instance_key:?} is already registered");
+    }
     let instance_dir = user_home.instance_dir(&instance_key);
     if instance_dir.exists() {
         bail!(
@@ -133,6 +136,13 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         None
     };
     let state = pending_draft.as_ref().map_or_else(|| random_hex(16), |draft| draft.state.clone());
+    let provided_code = arguments
+        .callback_url
+        .as_ref()
+        .map(|callback_url| {
+            callback_code_from_url(callback_url, pending_draft.as_ref().expect("callback draft"))
+        })
+        .transpose()?;
 
     let listener = if arguments.callback_url.is_none() {
         Some(tokio::net::TcpListener::bind("127.0.0.1:0").await?)
@@ -192,7 +202,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         let draft_path = save_setup_draft(&user_home, &draft)?;
         let html_path = write_manifest_html(&form_action, &manifest_json)?;
         print_manual_guide(
-            &arguments.repository,
+            &arguments,
             owner,
             &instance_key,
             user_home.root(),
@@ -210,9 +220,30 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         .context("setup requires --model when writing an instance configuration")?;
     let llm_provider = select_llm_provider(&arguments, &model)?;
     ensure_setup_tools()?;
+    let mut runtime = select_runtime(&arguments).await?;
+    runtime.home = Some(instance_dir.join("provider").join(&runtime.adapter_type));
+    let (ingress, health) = allocate_server_ports(&registry, user_home.root())?;
+    let pem_path = instance_dir.join("github-app.pem");
+    let secrets_path = instance_dir.join("secrets.toml");
+    // Validate the entire local declaration before consuming the one-use App
+    // manifest code. The real App identity is filled in after conversion.
+    let mut config = build_config(
+        &instance_dir,
+        1,
+        &instance_key,
+        &arguments,
+        &model,
+        arguments.reasoning.as_deref(),
+        &pem_path,
+        &secrets_path,
+        runtime,
+        llm_provider.clone(),
+    )?;
+    config.server.ingress = ingress;
+    config.server.health = health;
 
-    let code = if let Some(callback_url) = &arguments.callback_url {
-        callback_code_from_url(callback_url, pending_draft.as_ref().expect("callback draft"))?
+    let code = if let Some(code) = provided_code {
+        code
     } else {
         let html_path = write_manifest_html(&form_action, &manifest_json)?;
         let listener = listener.expect("browser setup listener");
@@ -245,9 +276,6 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
         .context("cannot convert GitHub App manifest")?;
     println!("Created GitHub App: {} (ID {})", app.html_url, app.id);
 
-    let runtime = select_runtime(&arguments).await?;
-    let (ingress, health) = allocate_server_ports(&registry, user_home.root())?;
-
     // Register the instance in memory first so a duplicate App fails before any
     // file is written; the registry is only persisted after all files exist.
     registry.insert(InstanceEntry {
@@ -258,34 +286,13 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     })?;
     user_home.ensure_instance_dirs(&instance_key)?;
     let base_dir = instance_dir;
-    let webhook_secret = random_hex(32);
-
-    let pem_path = base_dir.join("github-app.pem");
     write_secret(&pem_path, app.pem.as_bytes())?;
 
-    let secrets_path = base_dir.join("secrets.toml");
-    let webhook_toml = format!("webhook_secret = {webhook_secret:?}\n");
+    let webhook_toml = format!("webhook_secret = {:?}\n", app.webhook_secret);
     write_secret(&secrets_path, webhook_toml.as_bytes())?;
 
     let config_path = base_dir.join("config.toml");
-    let mut config = build_config(
-        &base_dir,
-        app.id,
-        &instance_key,
-        &arguments,
-        &model,
-        arguments.reasoning.as_deref(),
-        &pem_path,
-        &secrets_path,
-        runtime,
-        llm_provider.clone(),
-    )?;
-    config.server.ingress = ingress;
-    config.server.health = health;
-    if let Some(runtime_entry) = config.runtimes.first_mut() {
-        runtime_entry.home = Some(base_dir.join("provider").join(&runtime_entry.adapter_type));
-    }
-    config.validate().context("generated config failed validation")?;
+    config.github.as_mut().expect("setup creates a GitHub config").app_id = app.id;
 
     let source = base_dir.join("source");
     if let Err(error) = ensure_source_checkout(&source, &arguments.repository, &config.tools.git) {
@@ -314,7 +321,8 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     }
     println!("\nNext, install the App on {}:\n{}\n", arguments.repository, install_url(&app.slug));
     println!(
-        "Then run:\n  braid doctor --instance {instance_key}\n  braid serve --instance {instance_key} --tunnel\n"
+        "Then run:\n  export BRAID_USER_HOME='{}'\n  braid migrate apply --instance {instance_key}\n  braid doctor --instance {instance_key}\n  braid serve --instance {instance_key} --tunnel\n",
+        user_home.root().to_string_lossy().replace('\'', "'\\''")
     );
     println!(
         "Once serving, activate Braid on an issue with a visible @braid comment from a \
@@ -323,7 +331,14 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     );
 
     let logo_path = base_dir.join(format!("braid-of-{owner}-logo.png"));
-    match logo::generate(owner, &logo_path) {
+    let logo_owner = owner.to_owned();
+    let logo_output = logo_path.clone();
+    let logo_result =
+        tokio::task::spawn_blocking(move || logo::generate(&logo_owner, &logo_output))
+            .await
+            .context("App logo worker failed")
+            .and_then(std::convert::identity);
+    match logo_result {
         Ok(()) => {
             println!("Generated App logo: {}", logo_path.display());
             println!(
@@ -332,10 +347,12 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
                 slug = app.slug,
                 owner = owner
             );
-            let _ = open_browser(&format!(
-                "https://github.com/settings/apps/{slug}/logo",
-                slug = app.slug
-            ));
+            if arguments.callback_url.is_none() {
+                let _ = open_browser(&format!(
+                    "https://github.com/settings/apps/{slug}/logo",
+                    slug = app.slug
+                ));
+            }
         }
         Err(error) => {
             eprintln!("Could not generate App logo: {error}");
@@ -353,7 +370,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
 }
 
 fn print_manual_guide(
-    repository: &str,
+    arguments: &SetupArguments,
     owner: &str,
     instance_key: &str,
     user_home: &Path,
@@ -361,6 +378,8 @@ fn print_manual_guide(
     html_path: &str,
     manifest_json: &str,
 ) {
+    let repository = &arguments.repository;
+    let adapter = &arguments.adapter;
     let manifest_shell = manifest_json.replace('\'', "'\\''");
     let instance_dir = user_home.join("instances").join(instance_key);
     println!("\n=== Manual GitHub App creation guide ===\n");
@@ -381,7 +400,7 @@ fn print_manual_guide(
          to the manifest's redirect_url will fail to load. That is expected. Copy the\n\
          complete failing URL, then finish setup on this machine with the same options\n\
          and `--callback-url` instead of `--no-browser`:\n\n\
-            braid setup {repository} --callback-url '<complete-redirect-url>'\n\n\
+            braid setup {repository} --adapter {adapter} --model <MODEL> --callback-url '<complete-redirect-url>'\n\n\
          The pending setup draft proves the state value; Braid rejects a mismatched\n\
          callback instead of converting the wrong App. Manual App credential import\n\
          remains available below for recovery:\n\n\
@@ -410,7 +429,8 @@ fn print_manual_guide(
     println!(
         "\nFinally, install the App on {repository}:\n\
            https://github.com/apps/braid-of-{owner}/installations/new\n\n\
-         Then run `braid doctor --instance {instance_key}` and\n\
+         Then run `braid migrate apply --instance {instance_key}`,\n\
+         `braid doctor --instance {instance_key}` and\n\
          `braid serve --instance {instance_key} --tunnel` (the tunnel step pushes\n\
          the webhook URL and secret to the App).\n"
     );
@@ -603,9 +623,12 @@ fn reject_non_pi_llm_options(arguments: &SetupArguments) -> Result<()> {
     if arguments.adapter != "pi"
         && (arguments.llm_provider.is_some()
             || arguments.llm_credential_kind.is_some()
-            || arguments.llm_credential_file.is_some())
+            || arguments.llm_credential_file.is_some()
+            || arguments.llm_base_url.is_some())
     {
-        bail!("--llm-provider and --llm-credential-* are only supported for the Pi adapter");
+        bail!(
+            "--llm-provider, --llm-base-url and --llm-credential-* are only supported for the Pi adapter"
+        );
     }
     Ok(())
 }
@@ -613,9 +636,6 @@ fn reject_non_pi_llm_options(arguments: &SetupArguments) -> Result<()> {
 fn select_llm_provider(arguments: &SetupArguments, model: &str) -> Result<Option<LlmProvider>> {
     if arguments.adapter != "pi" {
         reject_non_pi_llm_options(arguments)?;
-        if arguments.llm_base_url.is_some() {
-            bail!("--llm-base-url is only supported for the Pi adapter");
-        }
         return Ok(None);
     }
 

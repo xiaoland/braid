@@ -5,10 +5,6 @@ local Coding Agent. GitHub or the built-in collaboration platform holds current 
 sessions are replaceable execution contexts built from that state.
 
 The project vocabulary is owned by [`glossary.md`](glossary.md).
-This document owns product purpose, promises, workflows, and exclusions. The
-cross-unit realization is owned by [`../20-product-tdd/`](../20-product-tdd/),
-and the real operation criteria in [`acceptance.md`](acceptance.md) determine acceptance.
-
 This directory owns product purpose, promises, workflows, and exclusions.
 The cross-unit realization is owned by [`../20-product-tdd/`](../20-product-tdd/),
 and the real operation criteria in [`acceptance.md`](acceptance.md) determine acceptance.

@@ -19,7 +19,7 @@ fn status_convergence_upgrades_an_already_published_schema12_failure_without_a_n
     drop(db);
     let store = StoreActor::start(database.clone(), root.join("backups")).unwrap();
     let migrated = store.apply().unwrap();
-    assert_eq!(migrated.applied, vec![13]);
+    assert_eq!(migrated.applied, vec![13, 14]);
     assert!(migrated.backup.is_some());
     let owner = store.acquire_runtime_lease("runtime".into(), "publisher".into(), 3600).unwrap();
     let write = store.claim_github_write(owner.clone()).unwrap().unwrap();

@@ -142,6 +142,10 @@ impl GitHubClient {
         let app = Arc::new(
             Octocrab::builder()
                 .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+                .add_header(
+                    axum::http::HeaderName::from_static("x-github-api-version"),
+                    config.api_version.clone(),
+                )
                 .app(octocrab::models::AppId(config.app_id), key)
                 .build()
                 .map_err(|error| GitHubError::Client(error.to_string()))?,
@@ -289,7 +293,8 @@ impl GitHubClient {
 
     pub async fn repository_permission(&self, login: &str) -> Result<String, GitHubError> {
         let path = format!("/repos/{}/collaborators/{login}/permission", self.identity.repository);
-        let permission: PermissionResponse = self.installation.get(&path, None::<&()>).await?;
+        let permission: PermissionResponse =
+            github_step("repository permission", self.installation.get(&path, None::<&()>)).await?;
         Ok(permission.role_name.unwrap_or(permission.permission))
     }
 

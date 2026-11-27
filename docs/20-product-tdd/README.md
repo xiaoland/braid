@@ -102,8 +102,8 @@ against it.
 truth for the config schema. `braid setup` builds a `Config` value and
 serializes it, rather than formatting a template. If the type changes, the
 compiler forces the generator to change with it.
-- **Generated artifacts**: 配置由 canonical Rust type 序列化；编译与实际公开
-  命令操作核实消费者能解析和使用产物，不维护测试入口。
+- **Generated artifacts**: 配置由 canonical Rust type 序列化；编译、回归测试与实际公开
+  命令操作核实消费者能解析和使用产物。
 - **No parallel string templates**: Do not maintain a separate text template
 for a file whose shape is already defined by a Rust type. Avoid
 `format!`-based generators for config, manifest, or protocol files.
@@ -124,10 +124,9 @@ crates. Modules are deep and align with authority boundaries:
 | --- | --- |
 | `home` | User root resolution, instance registry, `~/.braid` layout, port allocation, and config-path precedence. |
 | `config` | Versioned config/Profile loading, validation, effective defaults, and diagnostic projection. |
-| `github::webhook` | Raw-body HMAC verification and typed open-enum webhook admission. |
-| `github::client` | GitHub App auth, bounded typed GraphQL pagination, REST writes, reactions, and canonical rereads. |
+| `webhook` | Raw-body HMAC verification and typed open-enum webhook admission. |
+| `github` | GitHub App auth, bounded typed GraphQL pagination, REST writes, reactions, and canonical rereads. |
 | `context` | Canonical snapshot model, HTML-comment removal, deterministic Markdown rendering, budget, and revision. |
-| `events` | Canonical diff classification and compact Event Reference rendering. |
 | `store` | One dedicated SQLite actor, transactions, migrations, leases, ledgers, sessions, batches, and outbox. |
 | `producer` | Webhook/GraphQL observation、canonical diff 与事件分类；独立的 `mentions` 循环补全 GitHub 权限事实并保留失败 backoff。 |
 | `queue` | 独立推进 Quiet Window、count、urgent 与批次状态；通过 store 领取可运行 turn，不执行网络权限查询或持有会话事件 receiver。 |
@@ -175,25 +174,9 @@ best-effort one-way projection from it. Nonessential state is not persisted.
 | Provider connectivity | Provider connection | adapter 内部观察连接退出 → 受影响句柄的 latched availability；runtime 汇总各 driver 的恢复结果，成功不能覆盖另一方的失败 |
 | Worktree presence | Filesystem + git | `worktrees` table (refreshed by inspection at prepare time) |
 
-Selected dependency baseline, verified against crates.io on 2026-08-13:
-
-- Tokio 1.53 for async runtime/process/I/O/signal ownership;
-- Axum 0.8 for loopback HTTP and Reqwest 0.13 with rustls for GitHub/OTLP HTTP;
-- Serde 1.0 and serde_json 1.0 for external JSON boundaries;
-- rusqlite 0.40 with bundled SQLite, used only by a dedicated blocking DB
-  actor so network awaits never occur inside transactions;
-- Clap 4.6 (with `env` feature), `serde_path_to_error` for TOML error paths,
-  `thiserror` for boundary errors, and `anyhow` only at CLI/runtime
-  composition boundaries;
-- HMAC 0.13/SHA-2 0.11 for webhook verification and context revisions,
-  `jsonwebtoken` 11 for GitHub App JWTs;
-- Comrak 0.54 to identify actual Markdown HTML comment nodes while preserving
-  code literals;
-- OpenTelemetry/SDK/OTLP 0.32 plus tracing-opentelemetry 0.33;
-- UUID 1.24, `time` 0.3, and `url` for typed identities and timestamps.
-
-Versions become lower/upper compatible ranges in `Cargo.toml`; `Cargo.lock` is
-committed for the released binary. Rust 1.93 is the first verified toolchain.
+依赖、feature 与兼容版本范围由 `Cargo.toml` 持有，发行 binary 的解析版本由
+已提交的 `Cargo.lock` 固定；不在本文重复维护版本表。工具链由
+`rust-toolchain.toml` 固定，最低 Rust 版本见 `Cargo.toml`。
 
 ## Cross-Unit Invariants
 
@@ -253,10 +236,11 @@ synchronous durability. One DB actor serializes writes. The Harness ledger owns:
 - `deliveries` and `events` for webhook/reconciliation dedupe/classification and
   independently recorded attention;
 - `implementation_requests.activation_event_id` for durable PR activation delivery;
-- `scheduler_batches` and `batch_events` for quiet/count/urgent state;
-- `write_intents`, `reaction_targets`, and `status_comments` for Braid-owned
-  GitHub convergence;
-- `sync_cursors` for repository reconciliation.
+- `wake_batches` and `wake_batch_events` for quiet/count/urgent state; events may
+  belong to a consumed historical batch and its later replay batch;
+- `github_write_outbox` and `status_comments` for Braid-owned GitHub convergence;
+- `work_items.reconciled_at` and `reconcile_attempted_at` for complete traversal
+  success and retry scheduling.
 
 Migration files are embedded, monotonically numbered, forward-only, and never
 edited after release. Startup takes an exclusive migration lease, verifies all
@@ -274,9 +258,9 @@ worktree that Braid provisions from that checkout under the configurable
 generations use a changed location — SQLite records each worktree's actual
 path):
 
-- PR Agent Group: `runtime.root/worktrees/pr-<number>/<profile>-g<generation>`,
+- PR Agent Group: `<worktrees>/<owner>--<repo>/pr-<number>/<profile>-g<generation>`,
   bound to the fetched PR head;
-- Issue Agent Group: `runtime.root/worktrees/issue-<number>/<profile>-g<generation>`,
+- Issue Agent Group: `<worktrees>/<owner>--<repo>/issue-<number>/<profile>-g<generation>`,
   bound to the Issue's sole same-repository Development linked branch when
   exactly one exists, otherwise to the repository default branch
   (`refs/remotes/origin/<default>`). Several Development branches are not an

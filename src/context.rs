@@ -2746,7 +2746,7 @@ fn project_field(value: ProjectFieldRaw) -> Result<Option<ProjectField>, Context
         }
         ProjectFieldRaw::User { field, users } => {
             ensure_nested_complete(&users.page_info, "project user values", &field.name)?;
-            let mut values = users.into_nodes_logins();
+            let mut values = users.nodes.into_iter().map(|user| user.login).collect::<Vec<_>>();
             values.sort();
             (field, (!values.is_empty()).then(|| values.join(", ")))
         }
@@ -2764,16 +2764,6 @@ fn project_field(value: ProjectFieldRaw) -> Result<Option<ProjectField>, Context
     Ok(value
         .filter(|value| !value.is_empty())
         .map(|value| ProjectField { name: field.name, value }))
-}
-
-trait LoginConnectionExt {
-    fn into_nodes_logins(self) -> Vec<String>;
-}
-
-impl LoginConnectionExt for Connection<LoginRaw> {
-    fn into_nodes_logins(self) -> Vec<String> {
-        self.nodes.into_iter().map(|user| user.login).collect()
-    }
 }
 
 fn ensure_nested_complete(
