@@ -815,16 +815,15 @@ impl PlatformObjects {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if let Some((state, Some(commit))) = &receipt {
-            if state == "applied"
+        if let Some((state, Some(commit))) = &receipt
+            && (state == "applied"
                 || (state == "prepared"
-                    && git.refname_to_id(&base_ref)? == git2::Oid::from_str(commit)?)
-            {
-                let result =
-                    MergeResult { number, merge_commit: commit.clone(), base_ref, recovered: true };
-                self.finish_merge(&result, author, request_id)?;
-                return Ok(result);
-            }
+                    && git.refname_to_id(&base_ref)? == git2::Oid::from_str(commit)?))
+        {
+            let result =
+                MergeResult { number, merge_commit: commit.clone(), base_ref, recovered: true };
+            self.finish_merge(&result, author, request_id)?;
+            return Ok(result);
         }
         ensure!(
             receipt.as_ref().is_none_or(|(s, _)| s == "prepared"),

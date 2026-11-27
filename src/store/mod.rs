@@ -31,6 +31,10 @@ mod operational_status;
 mod operational_status_migration_tests;
 #[cfg(test)]
 mod replay_tests;
+#[cfg(test)]
+mod scheduler_tests;
+#[cfg(test)]
+mod schema_tests;
 pub(crate) use implementation_delivery::PrActivation;
 pub(crate) mod handoff;
 mod write_execution;

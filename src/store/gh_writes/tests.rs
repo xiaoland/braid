@@ -43,9 +43,9 @@ fn intent(operation: &'static str) -> NewGhWriteIntent {
         source: None,
     }
 }
-fn invalid_data(error: StoreError, expected: &str) {
+fn invalid_data(error: &StoreError, expected: &str) {
     assert!(
-        matches!(error, StoreError::InvalidData(ref message) if message.contains(expected)),
+        matches!(error, StoreError::InvalidData(message) if message.contains(expected)),
         "wrong failure: {error}"
     );
 }
@@ -62,7 +62,7 @@ fn offline_acceptance_is_atomic_idempotent_and_publicly_queryable() {
     let mut conflict = write;
     conflict.request_digest = "b".repeat(64);
     invalid_data(
-        store.prepare_gh_write(conflict).unwrap_err(),
+        &store.prepare_gh_write(conflict).unwrap_err(),
         "already used for a different payload",
     );
     drop(store);
@@ -107,7 +107,7 @@ fn retry_deadline_survives_actor_restart_and_stale_attempt_cannot_settle() {
     let third = reopened.claim_github_write(owner.clone()).unwrap().unwrap();
     assert_eq!(third.lifecycle, "uncertain");
     invalid_data(
-        reopened.finish_github_write(second, "applied", None, None, None).unwrap_err(),
+        &reopened.finish_github_write(second, "applied", None, None, None).unwrap_err(),
         "stale outbox attempt",
     );
     reopened.finish_github_write(third, "applied", Some("123".into()), None, None).unwrap();
@@ -127,11 +127,11 @@ fn expired_or_replaced_runtime_cannot_claim_or_settle() {
         let first = store.claim_github_write(owner.clone()).unwrap().unwrap();
         db.connect().execute(change, []).unwrap();
         invalid_data(
-            store.claim_github_write(owner).unwrap_err(),
+            &store.claim_github_write(owner).unwrap_err(),
             "outbox runtime owner expired or replaced",
         );
         invalid_data(
-            store.finish_github_write(first, "applied", None, None, None).unwrap_err(),
+            &store.finish_github_write(first, "applied", None, None, None).unwrap_err(),
             "outbox runtime owner expired or replaced",
         );
         assert_eq!(
@@ -216,7 +216,7 @@ fn ensure_plan_and_progress_freeze_and_resume_without_replanning() {
     assert_eq!(frozen.pr_profile_id, "profile");
     assert_eq!(first.bootstrap_authored_at, frozen.bootstrap_authored_at);
     for stage in ["head_ready", "pull_request_ready", "associated", "activation_pending"] {
-        store
+        &store
             .record_implementation_progress(
                 receipt.intent_id.clone(),
                 ImplementationProgress {

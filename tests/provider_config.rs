@@ -51,7 +51,7 @@ fn provider_route_inputs_are_validated_at_cli_and_config_boundaries() {
 
     let example_text = fs::read_to_string(&example).expect("read example");
     let mut coupled: toml::Value = toml::from_str(&example_text).expect("parse example");
-    coupled["profiles"][0]["provider"] = "openai".into();
+    coupled["profiles"][0].as_table_mut().unwrap().insert("provider".into(), "openai".into());
     let coupled_path = std::env::temp_dir()
         .join(format!("braid-coupled-provider-config-{}.toml", std::process::id()));
     fs::write(&coupled_path, toml::to_string(&coupled).unwrap())
@@ -129,13 +129,16 @@ fn write_pi_config(example: &str, directory: &Path, credential_fragment: &str) -
     for profile in config["profiles"].as_array_mut().unwrap() {
         profile["adapter_type"] = "pi".into();
         profile["adapter_version"] = "1.0.2".into();
-        profile["provider"] = "example-llm".into();
+        profile.as_table_mut().unwrap().insert("provider".into(), "example-llm".into());
         profile["model"] = "example-chat".into();
     }
     let provider: toml::Value = toml::from_str(&format!(
         "id = \"example-llm\"\nbase_url = \"https://llm.example.invalid/v1\"\ncredential = {credential_fragment}\n[[models]]\nid = \"example-chat\"\n"
     )).unwrap();
-    config["llm_providers"] = toml::Value::Array(vec![provider]);
+    config
+        .as_table_mut()
+        .unwrap()
+        .insert("llm_providers".into(), toml::Value::Array(vec![provider]));
     let path = directory.join("config.toml");
     fs::write(&path, toml::to_string(&config).unwrap()).expect("write Pi config");
     path
@@ -427,13 +430,16 @@ fn provider_import_auth_converts_pi_credentials() {
     )
     .expect("write fake Pi auth.json");
 
-    let output = braid()
-        .args(["provider", "import-auth", "example-llm", "--from"])
-        .arg(&pi_auth)
-        .args(["--user-home"])
-        .arg(&user_home)
-        .output()
-        .expect("import OAuth credential");
+    let import = |provider| {
+        let mut command = braid();
+        command
+            .args(["provider", "import-auth", provider, "--from"])
+            .arg(&pi_auth)
+            .arg("--user-home")
+            .arg(&user_home);
+        command
+    };
+    let output = import("example-llm").output().expect("import OAuth credential");
     assert!(output.status.success(), "stdout:\n{}\nstderr:\n{}", stdout(&output), stderr(&output));
     assert!(stderr(&output).contains("dropping provider-specific OAuth field \"vendor_specific\""));
     let imported = user_home.join("secrets/example-llm.toml");
@@ -449,36 +455,18 @@ fn provider_import_auth_converts_pi_credentials() {
         assert_eq!(fs::metadata(&imported).expect("metadata").permissions().mode() & 0o777, 0o600);
     }
 
-    let output = braid()
-        .args(["provider", "import-auth", "other-provider", "--from"])
-        .arg(&pi_auth)
-        .args(["--user-home"])
-        .arg(&user_home)
-        .output()
-        .expect("import API key credential");
+    let output = import("other-provider").output().expect("import API key credential");
     assert!(output.status.success(), "{}", stderr(&output));
     let imported_key = fs::read_to_string(user_home.join("secrets/other-provider.toml"))
         .expect("read imported api key");
     let parsed: toml::Value = toml::from_str(&imported_key).expect("API key is valid TOML");
     assert_eq!(parsed["provider_api_key"].as_str(), Some(api_key));
 
-    let output = braid()
-        .args(["provider", "import-auth", "missing", "--from"])
-        .arg(&pi_auth)
-        .args(["--user-home"])
-        .arg(&user_home)
-        .output()
-        .expect("reject missing provider");
+    let output = import("missing").output().expect("reject missing provider");
     assert!(!output.status.success());
     assert!(stderr(&output).contains("has no credential for \"missing\""), "{}", stderr(&output));
 
-    let output = braid()
-        .args(["provider", "import-auth", "example-llm", "--from"])
-        .arg(&pi_auth)
-        .args(["--user-home"])
-        .arg(&user_home)
-        .output()
-        .expect("reject overwrite without force");
+    let output = import("example-llm").output().expect("reject overwrite without force");
     assert!(!output.status.success());
     assert!(stderr(&output).contains("already exists"), "{}", stderr(&output));
 
@@ -487,13 +475,8 @@ fn provider_import_auth_converts_pi_credentials() {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(&imported, fs::Permissions::from_mode(0o644))
             .expect("simulate an existing unprotected credential");
-        let output = braid()
-            .args(["provider", "import-auth", "example-llm", "--force", "--from"])
-            .arg(&pi_auth)
-            .args(["--user-home"])
-            .arg(&user_home)
-            .output()
-            .expect("replace an existing credential");
+        let output =
+            import("example-llm").arg("--force").output().expect("replace an existing credential");
         assert!(output.status.success(), "{}", stderr(&output));
         assert_eq!(fs::metadata(&imported).expect("metadata").permissions().mode() & 0o777, 0o600);
     }

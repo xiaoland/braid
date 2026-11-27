@@ -14,13 +14,19 @@ fn stderr(output: &std::process::Output) -> String {
 
 fn multi_repo_config(example: &str, temporary: &Path) -> toml::Value {
     let mut config: toml::Value = toml::from_str(example).expect("parse starter config");
-    config["github"]["additional_repositories"] = toml::Value::Array(vec![toml::Value::Table(
-        toml::Table::from_iter([("name".into(), "owner/other".into())]),
-    )]);
+    config["github"].as_table_mut().unwrap().insert(
+        "additional_repositories".into(),
+        toml::Value::Array(vec![toml::Value::Table(toml::Table::from_iter([(
+            "name".into(),
+            "owner/other".into(),
+        )]))]),
+    );
     let profiles = config["profiles"].as_array_mut().unwrap();
     for profile in &mut *profiles {
-        profile["repository"] = "owner/repository".into();
-        profile["workspace"] = temporary.join("primary-source").to_str().unwrap().into();
+        let profile = profile.as_table_mut().unwrap();
+        profile.insert("repository".into(), "owner/repository".into());
+        profile
+            .insert("workspace".into(), temporary.join("primary-source").to_str().unwrap().into());
     }
     let other_profiles: Vec<_> = profiles
         .iter()

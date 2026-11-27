@@ -22,7 +22,7 @@ fn oauth_material_is_written_in_the_native_format_with_private_permissions() {
         }
         write_pi_auth_json(&root, &config, &oauth).unwrap();
         let actual: Value = serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
-        let mut expected = json!({"test-llm":{"type":"oauth","access":"PRIVATE_ACCESS","refresh":"PRIVATE_REFRESH","expires":4102444800000_u64}});
+        let mut expected = json!({"test-llm":{"type":"oauth","access":"PRIVATE_ACCESS","refresh":"PRIVATE_REFRESH","expires":4_102_444_800_000_u64}});
         if account.is_some() {
             expected["test-llm"]["account"] = json!("operator@example.invalid");
         }

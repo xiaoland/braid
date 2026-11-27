@@ -50,7 +50,7 @@ impl Fixture {
             config.runtime.backups().to_owned(),
         )
         .unwrap();
-        Self { root, config, store }
+        Self { config, store, root }
     }
     pub(crate) fn db(&self) -> Connection {
         Connection::open(self.config.runtime.database()).unwrap()
