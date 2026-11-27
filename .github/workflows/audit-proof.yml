@@ -20,6 +20,7 @@ jobs:
         with:
           fetch-depth: 0
       - run: rustup toolchain install 1.93.0 --profile minimal
+      - run: cargo test --locked --all-targets
       - name: Confirm keepers reject deliberate owner defects
         shell: python
         run: |

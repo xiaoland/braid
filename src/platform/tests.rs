@@ -355,6 +355,7 @@ async fn adopted_merge_recovers_its_receipt_after_restart_and_writer_revocation(
     let (status, recovered) = fixture.post("/api/control/commands", &request).await;
     assert_eq!(status, StatusCode::OK, "{recovered}");
     assert_eq!(recovered["state"], "applied");
+    assert_eq!(recovered["result"]["recovered"], true);
     assert_eq!(recovered["result"]["merge_commit"], merged);
     assert_eq!(fixture.get("/api/control/receipts/merge-lost").await, recovered);
     let item = fixture.get("/api/control/items/2").await;

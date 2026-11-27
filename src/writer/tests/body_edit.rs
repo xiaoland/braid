@@ -606,13 +606,15 @@ async fn executor_rejects_missing_existing_request_source_before_mutation() {
     payload["body"] = json!("Closes #7\n\nCloses #999");
     receipt.payload = serde_json::to_string(&payload).unwrap();
     let mut mutation_possible = false;
-    let error =
+    let Err(helpers::WriteFailure::GitHub(GitHubError::GraphQl(message))) =
         edit::execute(&fixture.config, &fixture.store, &github, &receipt, &mut mutation_possible)
             .await
-            .unwrap_err();
-    assert!(
-        matches!(error, helpers::WriteFailure::GitHub(GitHubError::GraphQl(ref message)) if message == "body maintenance must retain recognized existing closing and request sources"),
-        "wrong failure: {error:?}"
+    else {
+        panic!("expected a GraphQL rejection for the missing existing request source");
+    };
+    assert_eq!(
+        message,
+        "body maintenance must retain recognized existing closing and request sources"
     );
     assert!(!mutation_possible);
     assert_eq!(remote.lock().unwrap().writes, 0);

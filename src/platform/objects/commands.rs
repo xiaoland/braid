@@ -477,7 +477,7 @@ impl PlatformObjects {
             // Older prepared receipts have no request-bound commit evidence.
             return Ok(receipt);
         };
-        let prepared: super::PreparedMerge =
+        let mut prepared: super::PreparedMerge =
             serde_json::from_value(value.clone()).map_err(CommandFailure::rejected)?;
         let git = git2::Repository::open(&policy.source).map_err(CommandFailure::rejected)?;
         if git
@@ -491,6 +491,7 @@ impl PlatformObjects {
         self.writer = request.writer.as_ref().zip(prepared.writer_item).map(|(grant, item)| {
             super::Writer { grant: grant.clone(), item, actor: request.actor.clone() }
         });
+        prepared.merge.recovered = true;
         let result = self.finish_merge(&prepared.merge, &request.actor, &request.request_id);
         self.writer = None;
         result?;
