@@ -209,6 +209,11 @@ impl PlatformObjects {
                 {
                     return self.apply_external_request(request, policy);
                 }
+                if matches!(receipt.state.as_str(), "prepared" | "blocked")
+                    && matches!(request.command, ObjectCommand::Merge { .. })
+                {
+                    return self.recover_merge_request(request, policy, receipt);
+                }
                 return Ok(receipt);
             }
             Ok(None) => {}
@@ -422,7 +427,7 @@ impl PlatformObjects {
         let result = match &request.command {
             ObjectCommand::ConfigureRunRoot { number, delivery_ref, run_id, client_id } => self.configure_run_root(*number, delivery_ref, run_id, client_id, &request.actor, &policy.source).map(|()| serde_json::json!({"root":number,"deliveryRef":delivery_ref,"runId":run_id,"clientId":client_id})),
             ObjectCommand::Merge { number } => self
-                .merge(*number, &policy.source, &request.actor)
+                .merge(*number, &policy.source, &request.actor, &request.request_id)
                 .and_then(|r| serde_json::to_value(r).map_err(Into::into)),
             ObjectCommand::Publish { number, candidate } => {
                 let commit = match candidate {
@@ -431,7 +436,7 @@ impl PlatformObjects {
                 };
                 commit
                     .and_then(|commit| {
-                        self.publish(*number, &policy.source, &commit, &request.actor)
+                        self.publish_request(request, policy, *number, &commit)
                     })
                     .and_then(|r| serde_json::to_value(r).map_err(Into::into))
             }
@@ -449,19 +454,78 @@ impl PlatformObjects {
             Err(error) => ControlReceipt {
                 request_id: request.request_id.clone(),
                 state: "blocked".into(),
-                result: None,
+                result: self.control_receipt(&request.request_id)?.and_then(|r| r.result),
                 error: Some(error.into()),
             },
         };
-        self.save_control_receipt(&receipt)?;
+        // Merge and Publish commit success with their final database facts.
+        if receipt.state != "applied"
+            || matches!(request.command, ObjectCommand::ConfigureRunRoot { .. })
+        {
+            self.save_control_receipt(&receipt)?;
+        }
         Ok(receipt)
     }
 
+    fn recover_merge_request(
+        &mut self,
+        request: &CommandRequest,
+        policy: &ControlPolicy,
+        receipt: ControlReceipt,
+    ) -> Result<ControlReceipt, CommandFailure> {
+        let Some(value) = receipt.result.as_ref() else {
+            // Older prepared receipts have no request-bound commit evidence.
+            return Ok(receipt);
+        };
+        let prepared: super::PreparedMerge =
+            serde_json::from_value(value.clone()).map_err(CommandFailure::rejected)?;
+        let git = git2::Repository::open(&policy.source).map_err(CommandFailure::rejected)?;
+        if git
+            .refname_to_id(&prepared.merge.base_ref)
+            .map_err(CommandFailure::rejected)?
+            .to_string()
+            != prepared.merge.merge_commit
+        {
+            return Ok(receipt);
+        }
+        self.writer = request.writer.as_ref().zip(prepared.writer_item).map(|(grant, item)| {
+            super::Writer { grant: grant.clone(), item, actor: request.actor.clone() }
+        });
+        let result = self.finish_merge(&prepared.merge, &request.actor, &request.request_id);
+        self.writer = None;
+        result?;
+        self.control_receipt(&request.request_id)?
+            .context("completed merge receipt disappeared")
+            .map_err(Into::into)
+    }
+
+    fn publish_request(
+        &mut self,
+        request: &CommandRequest,
+        policy: &ControlPolicy,
+        number: u64,
+        commit: &str,
+    ) -> Result<super::Item> {
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let item = self.publish(number, &policy.source, commit, &request.actor)?;
+            self.save_control_receipt(&ControlReceipt {
+                request_id: request.request_id.clone(),
+                state: "applied".into(),
+                result: Some(serde_json::to_value(&item)?),
+                error: None,
+            })?;
+            self.connection.execute_batch("COMMIT")?;
+            Ok(item)
+        })();
+        if result.is_err() {
+            let _ = self.connection.execute_batch("ROLLBACK");
+        }
+        result
+    }
+
     fn save_control_receipt(&self, receipt: &ControlReceipt) -> Result<(), CommandFailure> {
-        let response = serde_json::to_string(receipt).map_err(CommandFailure::rejected)?;
-        let error = receipt.error.as_ref().map(|e| e.message.as_str());
-        self.connection.execute("UPDATE control_receipts SET state=?1,response_json=?2,error=?3,updated_at=?4 WHERE scope='objects' AND request_id=?5",params![receipt.state,response,error,now(),receipt.request_id]).map_err(CommandFailure::rejected)?;
-        Ok(())
+        save_control_receipt(&self.connection, receipt)
     }
 
     fn persist_rejection(
@@ -504,6 +568,16 @@ impl PlatformObjects {
         transaction.commit()?;
         Ok(snapshot)
     }
+}
+
+pub(super) fn save_control_receipt(
+    connection: &rusqlite::Connection,
+    receipt: &ControlReceipt,
+) -> Result<(), CommandFailure> {
+    let response = serde_json::to_string(receipt).map_err(CommandFailure::rejected)?;
+    let error = receipt.error.as_ref().map(|e| e.message.as_str());
+    connection.execute("UPDATE control_receipts SET state=?1,response_json=?2,error=?3,updated_at=?4 WHERE scope='objects' AND request_id=?5",params![receipt.state,response,error,now(),receipt.request_id]).map_err(CommandFailure::rejected)?;
+    Ok(())
 }
 
 fn ensure_request_id(id: &str) -> Result<(), CommandFailure> {

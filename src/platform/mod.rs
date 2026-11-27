@@ -4,6 +4,8 @@ pub mod config;
 pub mod grants;
 pub mod objects;
 pub mod store;
+#[cfg(test)]
+mod tests;
 pub mod writes;
 pub use api::router;
 pub use config::PlatformConfig;
