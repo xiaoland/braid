@@ -1,8 +1,7 @@
-// This constructor exists only in the integration-test compilation of github.rs.
-// Production client construction and endpoint selection remain unchanged.
+// Owner-local tests use a loopback HTTP client while retaining production
+// request, permission, rate-limit and recovery behavior.
 use super::*;
 impl GitHubClient {
-    #[allow(dead_code)]
     pub fn publication_test_client(
         client: Octocrab,
         identity: GitHubIdentity,
