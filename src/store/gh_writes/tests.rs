@@ -216,7 +216,7 @@ fn ensure_plan_and_progress_freeze_and_resume_without_replanning() {
     assert_eq!(frozen.pr_profile_id, "profile");
     assert_eq!(first.bootstrap_authored_at, frozen.bootstrap_authored_at);
     for stage in ["head_ready", "pull_request_ready", "associated", "activation_pending"] {
-        &store
+        store
             .record_implementation_progress(
                 receipt.intent_id.clone(),
                 ImplementationProgress {
@@ -234,7 +234,7 @@ fn ensure_plan_and_progress_freeze_and_resume_without_replanning() {
         assert_eq!(resumed.pull_request_number, Some(9));
     }
     invalid_data(
-        store
+        &store
             .record_implementation_progress(
                 receipt.intent_id,
                 ImplementationProgress {
