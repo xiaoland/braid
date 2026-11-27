@@ -1,7 +1,7 @@
 :root {
   color-scheme:light;
   --ink:#202a29;
-  --muted:#647470;
+  --muted:#566863;
   --line:#dce3df;
   --paper:#f6f8f5;
   --accent:#126b54;
@@ -63,12 +63,6 @@ nav a:hover,nav a[aria-current=page] {
   background:#fff;
   color:var(--accent)
 }
-.aside-note {
-  margin-top:auto;
-  font-size:12px;
-  line-height:1.8;
-  color:var(--muted)
-}
 main {
   margin-left:224px;
   padding:36px 44px;
@@ -93,12 +87,6 @@ h2 {
 }
 h3 {
   font-size:15px
-}
-.eyebrow {
-  font-size:10px;
-  color:var(--accent);
-  letter-spacing:1.8px;
-  margin:0
 }
 button,input,select,textarea {
   font:inherit
@@ -160,16 +148,18 @@ input:focus,select:focus,textarea:focus,button:focus-visible,a:focus-visible {
   padding:22px;
   margin-bottom:20px
 }
-.grid {
-  display:grid;
-  grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
-  gap:16px
+.counts {
+  display:flex;
+  flex-wrap:wrap;
+  gap:12px 28px;
+  margin:0 0 24px;
+  padding:0 0 18px;
+  border-bottom:1px solid var(--line)
 }
-.stat {
-  font-size:28px;
-  font-weight:600;
-  margin:6px 0
-}
+.counts dt {font-size:12px;color:var(--muted)}
+.counts dd {margin:4px 0 0;font-weight:600;font-variant-numeric:tabular-nums}
+.counts .bad {padding:0 6px}
+.panel h2 {overflow-wrap:anywhere}
 .muted,.meta {
   color:var(--muted);
   font-size:12px
@@ -253,8 +243,7 @@ tbody tr:last-child td {
   text-align:left
 }
 .empty {
-  padding:32px;
-  text-align:center;
+  padding:4px 0;
   color:var(--muted);
   line-height:1.8
 }
@@ -323,15 +312,6 @@ summary {
   grid-template-columns:1fr 1fr;
   gap:20px
 }
-footer {
-  font-size:11px;
-  color:var(--muted);
-  margin-top:32px;
-  line-height:1.7
-}
-.receipt {
-  border-left:3px solid var(--accent)
-}
 .form-grid {
   display:grid;
   gap:15px
@@ -339,13 +319,6 @@ footer {
 .metric-point {
   font-family:ui-monospace,monospace;
   font-size:12px
-}
-.sr-only {
-  position:absolute;
-  width:1px;
-  height:1px;
-  overflow:hidden;
-  clip:rect(0,0,0,0)
 }
 @media(max-width:900px) {
   aside {
@@ -363,9 +336,6 @@ nav {
 }
 nav a {
   padding:8px 10px
-}
-.aside-note {
-  display:none
 }
 main {
   margin-left:0;

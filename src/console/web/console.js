@@ -55,7 +55,11 @@ function badge(v,bad=false){
   },v);
 }
 function raw(v,label='完整记录'){
-  return el('details',{},el('summary',{},label),el('pre',{},json(v)));
+  const details=el('details',{},el('summary',{},label));
+  details.addEventListener('toggle',()=>{
+    if(details.open && details.childElementCount===1)details.append(el('pre',{},json(v)));
+  });
+  return details;
 }
 function panel(title,...children){
   return el('section',{
@@ -127,14 +131,9 @@ async function overview(token){
   const capabilities=await api('/api/console');
   const [resources,runtime,harness]=await Promise.all([api('/api/resources'),capabilities.harness.configured?api('/api/runtime').catch(e=>({unavailable:e.message})):null,capabilities.harness.configured?api('/api/harness/snapshot').catch(e=>({error:e.message})):null]);
   if(token!==generation)return;
-  const cards=el('div',{
-    class:'grid'
-  },...[[ '已接收记录',resources.records??0],['接收批次',resources.batches??0],['资源来源',(resources.resources||[]).length],['接收错误',resources.receive_errors??0],['重复批次',resources.duplicate_batches??0],['最近接收',stamp(resources.last_received)]].map(([title,value])=>panel(null,el('div',{
-    class:'muted'
-  },title),el('div',{
-    class:'stat'
-  },value))));
-  content.replaceChildren(cards,panel('Harness 权威状态',!runtime?empty('未接入 Harness；平台和 Collector 可独立使用。'):runtime.unavailable?el('div',{
+  const counts=el('dl',{class:'counts','aria-label':'采集摘要'},
+    ...[['已接收记录',resources.records??0],['接收批次',resources.batches??0],['资源来源',(resources.resources||[]).length],['接收错误',resources.receive_errors??0],['重复批次',resources.duplicate_batches??0],['最近接收',stamp(resources.last_received)]].map(([title,value])=>el('div',{},el('dt',{},title),el('dd',{class:title==='接收错误'&&value?'bad':null},value))));
+  content.replaceChildren(counts,panel('Harness 权威状态',!runtime?empty('未接入 Harness；平台和 Collector 可独立使用。'):runtime.unavailable?el('div',{
     class:'notice error'
   },runtime.unavailable):runtimePanel(runtime)),panel('平台接入',capabilities.platform.configured?el('p',{},`${capabilities.platform.endpoint} · ${capabilities.platform.managed?'Console 托管独立监听':'外部独立监听'} · Harness 上游 ${capabilities.harness.backend||'未接入'}`):empty('未声明内建平台。GitHub Harness 的启停与观测仍可使用；此处不提供 GitHub 对象编辑。')),harness?panel('Harness 调度事实',raw(harness,'Session、Turn、队列、Assignment 与 Worktree')):el('div'),panel('采集来源',(resources.resources||[]).length?table(['实例','服务','首次 / 最近接收','记录数'],resources.resources.map(r=>[r.instance||'未标识',r.service||'未标识',`${stamp(r.first_received)} / ${stamp(r.last_received)}`,r.records])):empty('Collector 正在等待 OTLP 数据。请检查 Braid 的 exporter 目标。')),panel('数据边界',el('p',{
     class:'body'
@@ -269,8 +268,7 @@ async function telemetry(page,token){
     after=result.next_after;
     status.textContent=`已加载 ${records.length} 条 · 按接收顺序 · 每页最多 100 条`;
     more.hidden=result.records.length<100;
-    target.replaceChildren(...(page==='traces'?renderTraces(records):page==='metrics'?renderMetrics(records):renderLogs(records)));
-    if(!records.length)target.append(empty('当前筛选下尚未收到记录。'));
+    target.replaceChildren(...(!records.length?[empty('当前筛选下尚未收到记录。')]:page==='traces'?renderTraces(records):page==='metrics'?renderMetrics(records):renderLogs(records)));
   }
   const filters=el('form',{
     class:'toolbar',onsubmit:e=>{
@@ -279,7 +277,7 @@ async function telemetry(page,token){
   },instance.node,session.node,turn.node,trace.node,el('button',{
     type:'submit',class:'primary'
   },'筛选'));
-  content.replaceChildren(filters,el('p',{class:'meta'},page==='metrics'?'指标按原始批次与数据点展示，不跨批次求和或去重；重复接收的批次会明确标识。':'只展示已收到记录；Provider 原生事件、流式片段与未关联内容保持原样，不拼造完整会话。'),status,target,more);
+  content.replaceChildren(filters,el('p',{class:'meta'},page==='metrics'?'指标按原始批次与数据点展示，不跨批次求和或去重；重复接收的批次会明确标识。':page==='traces'?'时间轴仅包含已收到并加载的 Span；缺少父 Span 不等于没有父调用。':'只展示已收到记录；Provider 原生事件、流式片段与未关联内容保持原样，不拼造完整会话。'),status,target,more);
   await load(true);
 }
 function recordMeta(r){
@@ -359,22 +357,18 @@ function renderLogs(records){
       class:'record'
     },el('header',{},badge(name,d.severityNumber>=17),el('span',{
       class:'meta'
-    },nanos(d.timeUnixNano&&d.timeUnixNano!=='0'?d.timeUnixNano:d.observedTimeUnixNano))),recordMeta(r),el('p',{
-      class:'meta'
-    },`Turn ${r.turn_id||a['braid.turn.id']||a['provider.turn.id']||'未关联'}${a['observation.correlated']===false?' · 未关联至权威会话':''}`),native!==undefined?transcript(native):el('div',{
-      class:'body'
-    },text(body)),raw(a,'记录属性（含完整原生 Transcript）'),raw(r));
+    },nanos(d.timeUnixNano&&d.timeUnixNano!=='0'?d.timeUnixNano:d.observedTimeUnixNano)),r.duplicate_of?badge('重复批次'):null),native!==undefined?transcript(native):el('div',{class:'body'},text(body)),a['observation.correlated']===false?el('p',{class:'meta'},'未关联至权威会话'):null,el('details',{},el('summary',{},'来源、关联与原始记录'),recordMeta(r),el('p',{class:'meta'},`Turn ${r.turn_id||a['braid.turn.id']||a['provider.turn.id']||'未关联'}`),raw(r)));
   }))];
 }
 function renderMetrics(records){
   return records.map(r=>{
     const d=r.data,kind=['gauge','sum','histogram','exponentialHistogram','summary'].find(k=>d[k]),points=d[kind]?.dataPoints||[];return panel(d.name||'未命名指标',el('div',{
       class:'meta'
-    },`${kind||'未知类型'} · ${d.unit||'无单位'} · ${d.description||''}`),recordMeta(r),points.length?table(['采样时刻','数值 / 分布','属性'],points.map(p=>[nanos(p.timeUnixNano),el('span',{
+    },[kind||'未知类型',d.unit||'无单位',d.description].filter(Boolean).join(' · ')),points.length?table(['采样时刻','数值 / 分布','属性'],points.map(p=>[nanos(p.timeUnixNano),el('span',{
       class:'metric-point'
     },text(p.asDouble??p.asInt??{
       count:p.count,sum:p.sum,min:p.min,max:p.max,buckets:p.bucketCounts,explicitBounds:p.explicitBounds,quantiles:p.quantileValues
-    })),text(attrs(p.attributes))])):empty('未记录数据点'),raw(r));
+    })),text(attrs(p.attributes))])):empty('未记录数据点'),recordMeta(r),raw(r));
   });
 }
 async function route(){
@@ -393,7 +387,7 @@ async function route(){
     else await telemetry(page,token);
   }
   catch(e){
-    if(token===generation)showError(e);
+    if(token===generation){content.replaceChildren();showError(e);}
   }
   finally{
     if(token===generation)content.setAttribute('aria-busy','false');
@@ -412,7 +406,7 @@ function requestId(){
 async function objects(token){
   const capabilities=await api('/api/console');
   if(!capabilities.platform.configured){if(token===generation)content.replaceChildren(panel('平台对象',empty('未声明内建平台；当前 Console 不提供 GitHub 对象编辑。Harness 启停与 OTLP 观测可在概览中使用。')));return;}
-  const [snapshot,harness]=await Promise.all([api('/api/control/snapshot'),capabilities.harness.configured?api('/api/harness/snapshot').catch(e=>({error:e.message})):null]);
+  const [initial,harness]=await Promise.all([api('/api/control/snapshot'),capabilities.harness.configured?api('/api/harness/snapshot').catch(e=>({error:e.message})):null]);
   if(token!==generation)return;
   const list=el('div'),detail=el('div'),receipt=el('div');
   const createTitle=field('标题'),createBody=field('正文','','textarea'),kind=el('select',{},el('option',{
@@ -422,7 +416,6 @@ async function objects(token){
   },'Pull Request')),head=field('Head 分支'),base=field('Base 分支'),issue=field('关联 Issue 编号','','number');
   let current=null,selection=0;
   const profiles=harness?.profileSuggestions||{};
-  const reply=field('回复评论编号（可选）','','number');
   let lastRequest=null;
   function renderReceipt(value){
     receipt.replaceChildren(panel('控制回执',el('div',{
@@ -457,12 +450,12 @@ async function objects(token){
     }
     finally{controlPending=false;}
   }
-  async function reload(){
-    const s=await api('/api/control/snapshot');
+  async function reload(s){
+    s??=await api('/api/control/snapshot');
     if(token!==generation)return;
     list.replaceChildren(panel('Issue / Pull Request',s.items.length?table(['对象','状态','指派','修订'],s.items.map(v=>{
       const i=v.item;return[button(`#${i.number} ${i.title}`,()=>select(i.number),'link-button'),badge(i.kind+' · '+i.state),i.desired_profile||'未指派',i.revision];
-    })):empty('协作空间为空。创建 Issue 开始讨论。')),panel('平台对象来源',el('p',{class:'meta'},`来源 ${s.source} · 观察 ${s.observedAt||'未记录'} · ${capabilities.platform.endpoint}`)),harness?panel('Harness 调度事实',raw(harness,'独立 Harness ledger（本页打开时读取）')):panel('Harness 接入',empty('未接入 Harness；Actor 指派属于平台对象，不代表 Agent 正在运行。')));
+    })):empty('协作空间为空。创建 Issue 开始讨论。'),el('details',{},el('summary',{},'对象来源与调度状态'),el('p',{class:'meta'},`来源 ${s.source} · 观察 ${s.observedAt||'未记录'} · ${capabilities.platform.endpoint}`),harness?raw(harness,'独立 Harness ledger（本页打开时读取）'):el('p',{class:'meta'},'未接入 Harness；平台指派不代表 Agent 正在运行。'))));
   }
   async function select(number,acceptedRefresh=false){
     if(!acceptedRefresh){if(controlPending){showError(new Error('控制请求尚未取得回执，暂时不能切换对象。'));return;}if(hasDrafts()&&!await confirmAction('切换对象将丢弃尚未提交的编辑与评论，继续吗？'))return;}
@@ -471,6 +464,7 @@ async function objects(token){
     if(token!==generation||selected!==selection)return;
     current=v;
     const i=v.item,title=field('标题',i.title),body=field('正文',i.body,'textarea'),comment=field('新评论','','textarea'),profile=field('指派给 Actor',i.desired_profile||(i.kind==='issue'?profiles.issue:profiles.pr)||''),linked=field('关联 PR 编号','','number');
+    const reply=field('回复评论编号（可选）','','number');
     const merged=v.merge?.lifecycle==='applied';
     const heading=el('div',{
       class:'row'
@@ -550,6 +544,7 @@ async function objects(token){
     },`Revision ${i.revision} · ${i.updated_at} · 作者 ${i.author}`),el('div',{
       class:'body'
     },i.body),raw(i,'完整对象')),discussion,controls,candidate);
+    if(!acceptedRefresh){const titleNode=detail.querySelector('h2'); titleNode.tabIndex=-1; titleNode.focus();}
   }
   const create=panel('创建协作对象',el('div',{
     class:'form-grid'
@@ -571,11 +566,7 @@ async function objects(token){
   function updateCreateType(){for(const f of [head,base,issue])f.node.hidden=kind.value!=='pr';}
   kind.addEventListener('change',updateCreateType);updateCreateType();
   const lookup=field('请求 ID');
-  content.replaceChildren(el('p',{
-    class:'meta'
-  },'对象权威来自独立平台；Harness 调度状态单独读取，OTLP 只用于观测历史。'),panel('请求身份',el('p',{class:'meta'},'本地控制操作以 human 作者记录。指派给对象的 Actor 可自由填写；Agent 写入需要 Harness 授予的 writer grant。')),list,el('div',{
-    class:'split'
-  },create,panel('查询控制回执',lookup.node,button('查询',async()=>renderReceipt(await api('/api/control/receipts/'+encodeURIComponent(lookup.input.value||lastRequest||'')))))),receipt,detail);
-  await reload();
+  content.replaceChildren(list,receipt,detail,el('div',{class:'split'},create,panel('查询控制回执',lookup.node,button('查询',async()=>renderReceipt(await api('/api/control/receipts/'+encodeURIComponent(lookup.input.value||lastRequest||'')))))),el('p',{class:'meta'},'本地操作以 human 身份写入平台。Harness 调度和 OTLP 观测记录不代表对象变更。'));
+  await reload(initial);
 }
 route();
