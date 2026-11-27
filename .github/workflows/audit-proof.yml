@@ -1,0 +1,82 @@
+name: audit preservation controls (temporary)
+
+on:
+  pull_request:
+    paths: [.github/workflows/audit-proof.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-proof-${{ github.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  controls:
+    if: github.head_ref == 'feat/pr149-test-audit'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install 1.93.0 --profile minimal
+      - name: Confirm keepers reject deliberate owner defects
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+
+          def run(test, marker=None):
+              result = subprocess.run(
+                  ['cargo', 'test', '--locked', '--bin', 'braid', test, '--', '--exact', '--nocapture'],
+                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              print(result.stdout, flush=True)
+              if marker is None:
+                  assert result.returncode == 0, f'candidate failed: {test}'
+              else:
+                  assert result.returncode != 0, f'mutation survived: {test}'
+                  assert 'test result: FAILED' in result.stdout, 'not a test assertion failure'
+                  assert marker in result.stdout, f'failed for an unexpected reason: {test}'
+                  print(f'CAUGHT CONTROL: {test} / {marker}', flush=True)
+
+          state = 'group::continuous_tests::idle_revision_replaces_memory_then_starts_once_without_a_second_mention'
+          publication = 'writer::tests::outbox_delivery_recovery_and_rate_deadline_use_production_executor'
+          merge = 'platform::tests::adopted_merge_recovers_its_receipt_after_restart_and_writer_revocation'
+          publish = 'platform::tests::publishing_and_its_receipt_commit_together_or_leave_the_candidate_unchanged'
+          for test in [state, publication, merge, publish]:
+              run(test)
+
+          controls = [
+              ('src/group/dispatch.rs', '\n            && !self.sessions.confirmed_stopped(&reset.old_provider_session_id).await', '',
+               state, 'one replacement after confirmed stop; already closed: true'),
+              ('src/writer/comment.rs', 'database_id: comment.id.to_string(),\n                    node_id: comment.node_id.clone(),',
+               'database_id: "not-the-remote-id".into(),\n                    node_id: comment.node_id.clone(),',
+               publication, 'not-the-remote-id'),
+          ]
+          for filename, before, after, test, marker in controls:
+              path = Path(filename)
+              original = path.read_bytes()
+              try:
+                  text = original.decode()
+                  assert text.count(before) == 1, f'ambiguous mutation: {filename}'
+                  path.write_text(text.replace(before, after))
+                  run(test, marker)
+              finally:
+                  path.write_bytes(original)
+                  assert path.read_bytes() == original
+
+          baseline = '9d838b9d8443e520da9b6b9229e151bf88b576de'
+          originals = {Path(name): Path(name).read_bytes() for name in
+                       ['src/platform/objects.rs', 'src/platform/objects/commands.rs']}
+          try:
+              for path in originals:
+                  path.write_bytes(subprocess.check_output(['git', 'show', f'{baseline}:{path}']))
+              run(merge, 'merge completion must commit atomically with its command receipt')
+              run(publish, 'publication must commit atomically with its command receipt')
+          finally:
+              for path, original in originals.items():
+                  path.write_bytes(original)
+                  assert path.read_bytes() == original
+          subprocess.run(['git', 'diff', '--exit-code', '--', 'src'], check=True)
+          for test in [state, publication, merge, publish]:
+              run(test)
