@@ -11,13 +11,12 @@ verdicts explicit. Running a helper is not acceptance: every release candidate
 must satisfy [`docs/10-prd/acceptance.md`](../../docs/10-prd/acceptance.md)
 through real GitHub Work Items and a clean packaged installation.
 
-`00_clean_install.sh` is the Rust foundation gate. It unpacks the release
-artifact, scrubs Python/PDM/Cargo from the binary's `PATH`, exercises only the
-public CLI, verifies schema 0→1, schema 1→1 with a no-op re-apply, and
-schema-newer refusal, and uses the adjacent
-bounded OTLP/HTTP capture helper to observe sampling. Its direct SQLite write is
-limited to constructing declared migration-compatibility fixtures; it does not
-inject product events or count as workflow acceptance.
+`00_clean_install.sh` is the packaged binary check run by CI. It exercises the
+public CLI with a clean environment, checks database creation, upgrades schema
+1 to schema 2 while retaining existing data, confirms a no-op reapply, and
+checks refusal of newer and foreign databases. The adjacent loopback OTLP
+capture helper checks trace sampling. SQLite access constructs and inspects
+migration fixtures.
 
 `05_instances.sh` is the multi-instance layout gate. It builds on the packaged
 binary, constructs a temporary `BRAID_USER_HOME` with two registered

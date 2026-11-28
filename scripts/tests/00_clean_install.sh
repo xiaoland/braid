@@ -25,7 +25,7 @@ runtime="$temporary_root/runtime"
 mkdir -p "$runtime/state/backups" "$runtime/provider" "$runtime/workspace"
 private_key="$runtime/github-app.pem"
 secrets_file="$runtime/secrets.toml"
-printf '%s\n' 'diagnostic placeholder; no GitHub API call is made in Slice 0' > "$private_key"
+printf '%s\n' 'diagnostic placeholder for the intentionally unready instance' > "$private_key"
 touch "$secrets_file"
 
 write_config() {
@@ -178,30 +178,24 @@ test "$backup_count_after" = "$((backup_count_before + 1))"
 run_clean "$braid" migrate apply --config "$v1_config"
 backup_count_final=$(find "$runtime/state/backups" -type f -name '*.sqlite3' | wc -l | tr -d ' ')
 test "$backup_count_final" = "$backup_count_after"
-v1_schema=$(run_clean "$braid" status --config "$v1_config" --json | /usr/bin/sed -n 's/.*"config_schema": \([0-9][0-9]*\).*/\1/p')
-test "$v1_schema" = "2"
+test "$(/usr/bin/sqlite3 "$v1" 'SELECT MAX(version) FROM schema_migrations;')" = "2"
 /usr/bin/sqlite3 "$v1" \
     "SELECT 1 FROM associations WHERE issue_node_id='ISSUE_NODE' AND pr_node_id='PR_NODE' AND active=1;" \
     | /usr/bin/grep -q '^1$'
 /usr/bin/sqlite3 "$v1" \
     "SELECT 1 FROM canonical_objects WHERE node_id='COMMENT_NODE' AND lifecycle='active';" \
     | /usr/bin/grep -q '^1$'
-test "$(/usr/bin/sqlite3 "$v1" "SELECT count(*) FROM issue_context_sources;")" = "0"
-if /usr/bin/sqlite3 "$v1" "SELECT issue_content_digest FROM associations LIMIT 1;" \
-    >"$temporary_root/removed-column.out" 2>&1; then
-    echo "schema 11 retained the obsolete association digest column" >&2
-    exit 1
-fi
+/usr/bin/sqlite3 "$v1" 'SELECT kind, detail FROM events LIMIT 0;'
 
 newer="$runtime/state/newer.sqlite3"
-/usr/bin/sqlite3 "$newer" 'CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (12,"future","0000000000000000000000000000000000000000000000000000000000000000","future");'
+/usr/bin/sqlite3 "$newer" 'CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (3,"future","0000000000000000000000000000000000000000000000000000000000000000","future");'
 newer_config="$temporary_root/newer.toml"
 write_config "$newer_config" "$newer" 1.0 43189
 if run_clean "$braid" migrate plan --config "$newer_config" > "$temporary_root/newer.out" 2>&1; then
     echo "schema-newer fixture was accepted unexpectedly" >&2
     exit 1
 fi
-/usr/bin/grep -q 'schema 12 is newer' "$temporary_root/newer.out"
+/usr/bin/grep -q 'schema 3 is newer' "$temporary_root/newer.out"
 
 foreign="$runtime/state/foreign.sqlite3"
 /usr/bin/sqlite3 "$foreign" 'CREATE TABLE prototype_state(id INTEGER PRIMARY KEY);'
@@ -239,4 +233,4 @@ else
     exit 1
 fi
 
-echo "clean-install Slice 0 diagnostics passed"
+echo "clean-install diagnostics passed"

@@ -17,9 +17,11 @@ braid --version
 - [`gh`](https://cli.github.com/) installed and authenticated with an account
   that can create GitHub Apps for the target owner (user or organization).
 - A repository where you will install the App.
+- The selected runtime executable, [Pi](https://pi.dev/) or
+  [Codex](https://github.com/openai/codex).
 - For the Pi provider: a DeepSeek API key exported as `DEEPSEEK_API_KEY` (or
   the environment variable configured with `--api-key-environment`) *only at
-  setup time*.
+  setup time). An existing user-level provider secret also works.
 
 ## Bootstrap
 
@@ -41,6 +43,8 @@ Options:
   the user-level secrets file, so the env var is only needed at setup time.
 - `--user-home <DIR>` — defaults to `~/.braid` (or `BRAID_USER_HOME`).
 - `--instance <KEY>` — defaults to the repository owner.
+- `--runtime-executable <PATH>` — use an explicit Pi or Codex executable
+  instead of automatic discovery.
 
 `braid setup` performs these steps:
 
@@ -48,15 +52,15 @@ Options:
 2. Resolves the Braid user home (`~/.braid` by default) and instance key
    (owner by default).
 3. Generates a random webhook secret.
-4. Reads the provider API key from the environment variable named by
-   `--api-key-environment`.
-5. Builds a GitHub App Manifest with the permissions Braid needs
+4. Builds a GitHub App Manifest with the permissions Braid needs
    (`contents:write`, `issues:write`, `pull_requests:write`, `metadata:read`).
-6. Starts a temporary local HTTP callback server.
-7. Opens a browser to `github.com/settings/apps/new` (or the organization
+5. Starts a temporary local HTTP callback server.
+6. Opens a browser to `github.com/settings/apps/new` (or the organization
    variant) with the manifest pre-filled.
-8. Captures the browser redirect and exchanges the code for the App's
+7. Captures the browser redirect and exchanges the code for the App's
    private key, slug, and ID.
+8. Verifies the selected runtime and resolves provider credentials from the
+   existing provider secret or the configured environment variable.
 9. Writes files under `~/.braid`:
    - `registry.toml` — the instance registry (SSoT for `BRAID_INSTANCE`
      resolution).
@@ -75,9 +79,10 @@ environment variable. `BRAID_WEBHOOK_SECRET` is no longer required.
 After setup:
 
 1. Install the App on your repository by visiting the printed install URL.
-2. Run diagnostics:
+2. Initialize the instance database and run diagnostics.
 
    ```shell
+   braid migrate apply --instance <KEY>
    braid doctor --instance <KEY>
    ```
 
@@ -95,9 +100,10 @@ The tunnel receives GitHub webhooks and routes them to Braid's local ingress.
 ## Activating Braid on an Issue
 
 Braid activates through a **trusted `@braid` mention**: a visible `@braid` in
-an issue comment from a repository MAINTAIN/ADMIN actor wakes the Issue Agent
-(after the Quiet Window). Braid acknowledges the mention with an `eyes`
-reaction.
+an issue comment from a repository MAINTAIN/ADMIN actor bypasses the Quiet
+Window and event threshold. Braid acknowledges durable receipt with `eyes`.
+See the [scheduling contract](../10-prd/scheduling.md) for provider acceptance
+and terminal reactions.
 
 Native Issue assignment is a GitHub-side *Agent App* provisioning (the same
 capability that makes Copilot assignable), not a permission an ordinary

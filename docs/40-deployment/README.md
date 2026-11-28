@@ -11,7 +11,7 @@ It runs without Python, PDM, Cargo, or a source checkout. Linux x86_64 is the
 next target. Runtime prerequisites remain explicit:
 
 - Git and `gh` for Agent workflows;
-- pinned Codex executable and authenticated provider home;
+- the configured Codex or Pi executable and its credentials;
 - Wrangler for the free Quick Tunnel acceptance path;
 - GitHub App ID/private key/webhook secret and installation;
 - optional OTLP endpoint; full campaign acceptance requires one.
@@ -40,8 +40,9 @@ names. The main sections are:
 - log format and bounded health/status settings.
 
 `braid config check` prints the effective non-secret declaration and validates
-its static invariants. `braid doctor` runs filesystem, SQLite, GitHub, Codex
-schema, Git/gh, OTLP, and Wrangler precondition probes. Profiles expose
+its static invariants. `braid doctor` probes filesystem, SQLite, GitHub,
+Git/gh, OTLP, Wrangler, and the configured adapters and credentials. For Codex
+it also checks the app-server schema. Profiles expose
 their effective mapped provider settings through `braid profile inspect`.
 
 ## Filesystem Layout
@@ -109,18 +110,15 @@ retained span preserved all five controlled full-payload attributes.
 
 ## Startup and Supervision
 
-Startup is ordered:
+Braid validates the configuration and database schema before acquiring the
+runtime owner lease. It recovers pending writes and checks the GitHub App
+installation before starting loopback ingress and health. Supervised workers
+handle scheduling, GitHub writes and reconciliation, and provider session
+recovery. `serve --transport-only` skips the provider workers.
 
-1. parse/validate config and secrets;
-2. acquire process/runtime owner lease;
-3. verify/apply permitted DB migrations;
-4. probe installed Codex version/schema and GitHub App installation;
-5. start OTLP exporters and loopback health/ingress;
-6. start Codex adapter and reconcile persisted sessions/turns/outbox;
-7. start canonical GitHub reconciliation;
-8. optionally start Wrangler, verify a signed public ping through the returned
-   URL, then update the GitHub App webhook;
-9. mark repository ready for assignment/turn claims.
+With `--tunnel`, Braid verifies the signed public probe before updating the
+App webhook and marking startup ready. Provider availability is reported
+through health as the configured adapters connect.
 
 The provider adapter reconnects and resumes compatible sessions where the
 provider contract makes that safe. Any other supervised worker exit makes

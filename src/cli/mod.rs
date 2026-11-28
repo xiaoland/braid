@@ -277,7 +277,7 @@ struct GhPrEnsure {
 pub(crate) struct SetupArguments {
     #[arg(value_name = "OWNER/REPOSITORY")]
     pub(crate) repository: String,
-    #[arg(long, value_name = "pi|codex", default_value = "pi")]
+    #[arg(long, value_name = "pi|codex", default_value = "pi", value_parser = ["pi", "codex"])]
     pub(crate) provider: String,
     #[arg(long, value_name = "MODEL", default_value = "deepseek-chat")]
     pub(crate) model: String,
@@ -287,10 +287,8 @@ pub(crate) struct SetupArguments {
     pub(crate) instance: Option<String>,
     #[arg(long, value_name = "DIR", env = "BRAID_USER_HOME", default_value = "~/.braid")]
     pub(crate) user_home: PathBuf,
-    #[arg(long, value_name = "PATH", conflicts_with = "runtime_api_url")]
+    #[arg(long, value_name = "PATH")]
     pub(crate) runtime_executable: Option<PathBuf>,
-    #[arg(long, value_name = "URL", conflicts_with = "runtime_executable")]
-    pub(crate) runtime_api_url: Option<String>,
     #[arg(
         long,
         help = "Skip opening a browser; print manifest values and manual instructions instead"

@@ -82,7 +82,7 @@ pub async fn serve(config: Config, quick_tunnel: bool, provider_enabled: bool) -
         .get("issues")
         .is_some_and(|permission| permission == "write" || permission == "admin")
     {
-        bail!("Slice 2 requires GitHub App Issues: write for Braid-owned reactions");
+        bail!("GitHub App requires Issues: write for Braid-owned reactions");
     }
     let secret = config
         .webhook_secret()

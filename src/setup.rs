@@ -33,14 +33,11 @@ use crate::config::{
 use crate::config::{LlmAllowance, LlmModel, LlmProvider};
 use crate::home::{InstanceEntry, UserHome, allocate_server_ports, validate_instance_key};
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct AppConversion {
     id: u64,
     slug: String,
-    name: String,
     pem: String,
-    webhook_secret: String,
     html_url: String,
 }
 
@@ -223,7 +220,7 @@ pub async fn run(arguments: SetupArguments) -> Result<()> {
     println!("Wrote provider secret to: {}", provider_secret_path.display());
     println!("\nNext, install the App on {}:\n{}\n", arguments.repository, install_url(&app.slug));
     println!(
-        "Then run:\n  braid doctor --instance {instance_key}\n  braid serve --instance {instance_key} --tunnel\n"
+        "Then run:\n  braid migrate apply --instance {instance_key}\n  braid doctor --instance {instance_key}\n  braid serve --instance {instance_key} --tunnel\n"
     );
     println!(
         "Once serving, activate Braid on an issue with a visible @braid comment from a \
@@ -307,7 +304,7 @@ fn print_manual_guide(
     println!(
         "\nFinally, install the App on {repository}:\n\
            https://github.com/apps/braid-of-{owner}/installations/new\n\n\
-         Then run `braid doctor --instance {instance_key}` and\n\
+         Run `braid migrate apply --instance {instance_key}`, `braid doctor --instance {instance_key}`, and\n\
          `braid serve --instance {instance_key} --tunnel` (the tunnel step pushes\n\
          the webhook URL and secret to the App).\n"
     );
@@ -441,9 +438,6 @@ fn write_secret(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 async fn select_runtime(arguments: &SetupArguments) -> Result<RuntimeEntry> {
-    if let Some(api_url) = &arguments.runtime_api_url {
-        return discovery::from_api_url(&arguments.provider, api_url.clone());
-    }
     if let Some(executable) = &arguments.runtime_executable {
         return discovery::from_executable(&arguments.provider, executable).await;
     }
@@ -653,11 +647,6 @@ fn build_config(
     Ok(config)
 }
 
-/// Prepare the instance-scoped provider home so the runtime can actually
-/// authenticate. Codex isolates `CODEX_HOME` per instance, so its global
-/// credentials do not apply: import `~/.codex/auth.json` when present,
-/// otherwise print explicit login instructions. Pi authenticates through the
-/// persisted provider API key and needs no home bootstrap.
 /// The instance source checkout: one Git clone of the configured repository,
 /// shared by all Profiles as the worktree provisioning source. Clone when
 /// missing or empty; never overwrite a non-Git directory.
@@ -684,6 +673,8 @@ fn ensure_source_checkout(source: &Path, repository: &str, git: &Path) -> Result
     Ok(())
 }
 
+/// Populate the instance's Codex home from `~/.codex/auth.json` or print login
+/// instructions. Pi uses the configured API key.
 fn bootstrap_provider_home(home: &Path, adapter_type: &str) -> Result<()> {
     fs::create_dir_all(home)
         .with_context(|| format!("cannot create provider home {}", home.display()))?;
@@ -735,7 +726,6 @@ mod tests {
             instance: None,
             user_home: PathBuf::from("/tmp/braid-setup-test"),
             runtime_executable: None,
-            runtime_api_url: None,
             no_browser: false,
         }
     }
