@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        owner: [unassignment]
+        owner: [unassignment, ops-extra]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
