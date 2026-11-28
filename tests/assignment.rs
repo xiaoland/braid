@@ -1,4 +1,8 @@
-use std::{fs, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+};
 
 fn braid() -> Command {
     Command::new(env!("CARGO_BIN_EXE_braid"))
@@ -12,8 +16,7 @@ fn stdout(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-#[test]
-fn assignment_reactivation_queues_one_wake_and_preserves_the_blocked_generation() {
+fn blocked_issue() -> (PathBuf, rusqlite::Connection) {
     let temporary =
         std::env::temp_dir().join(format!("braid-assignment-reactivate-{}", uuid::Uuid::now_v7()));
     fs::create_dir_all(&temporary).expect("create test directory");
@@ -38,13 +41,23 @@ fn assignment_reactivation_queues_one_wake_and_preserves_the_blocked_generation(
         )
         .expect("seed blocked assignment");
 
+    (temporary, connection)
+}
+
+fn reactivate(temporary: &Path) -> Output {
+    braid()
+        .args(["assignment", "reactivate", "1", "--kind", "issue", "--config"])
+        .arg(temporary.join("config.toml"))
+        .output()
+        .expect("reactivate blocked assignment")
+}
+
+#[test]
+fn assignment_reactivation_queues_one_wake_and_preserves_the_blocked_generation() {
+    let (temporary, connection) = blocked_issue();
     let mut first_receipt = None;
     for _ in 0..2 {
-        let output = braid()
-            .args(["assignment", "reactivate", "1", "--kind", "issue", "--config"])
-            .arg(&config)
-            .output()
-            .expect("reactivate blocked assignment");
+        let output = reactivate(&temporary);
         assert!(
             output.status.success(),
             "stdout:\n{}\nstderr:\n{}",
@@ -91,5 +104,50 @@ fn assignment_reactivation_queues_one_wake_and_preserves_the_blocked_generation(
         |row| Ok((row.get(0)?, row.get(1)?)),
     ).unwrap();
     assert_eq!(assignment, (1, "blocked".into()));
+    fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn reactivation_refuses_closed_items_unblocked_history_and_a_live_successor() {
+    let (temporary, connection) = blocked_issue();
+    connection.execute(
+        "INSERT INTO assignments(assignment_id,work_item_node_id,generation,lifecycle,assigned_at)
+         VALUES ('successor','issue-1',2,'retired','2026-01-02T00:00:00Z')",
+        [],
+    ).unwrap();
+    let busy = "owner/repository#1 already has a materializing, active, or finalizing assignment";
+    for (state, history, successor, reason) in [
+        ("closed", "blocked", "retired", "cannot reactivate owner/repository#1 while it is closed"),
+        (
+            "open",
+            "retired",
+            "retired",
+            "owner/repository#1 has no blocked assignment to reactivate",
+        ),
+        ("open", "blocked", "materializing", busy),
+        ("open", "blocked", "active", busy),
+        ("open", "blocked", "finalizing", busy),
+    ] {
+        connection
+            .execute("UPDATE work_items SET state=?1 WHERE node_id='issue-1'", [state])
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE assignments SET lifecycle=CASE generation WHEN 1 THEN ?1 ELSE ?2 END",
+                [history, successor],
+            )
+            .unwrap();
+        let result = reactivate(&temporary);
+        assert!(!result.status.success(), "{state}/{history}/{successor}: {}", stdout(&result));
+        assert!(stderr(&result).contains(reason), "{}", stderr(&result));
+        let durable: (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM events), (SELECT COUNT(*) FROM wake_batches)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(durable, (0, 0), "{state}/{history}/{successor} must not queue work");
+    }
     fs::remove_dir_all(temporary).unwrap();
 }

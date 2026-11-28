@@ -123,7 +123,8 @@ classified as Agent-origin.
   worker 和空闲 worker 使用同一停止流程。内建平台直接处理不可撤回的撤销事件。
   Group 在关闭期间继续接收原有 turn 的终态。平台撤权暂时失败时，已经收到的终态与
   错误仍须持久化。原生停止和平台撤权均已确认后，Group 才将该代记为 `retired`；
-  此时仍缺 provider 终态的 turn 记为 `unknown`。重新指派创建新一代及新会话。
+  此时仍缺 provider 终态的 turn 记为 `unknown`，并按该 Profile 的配置发布执行状态。
+  该代未完成的 Context reset 保留在历史中，不再创建会话或阻止有限 run 完成。重新指派创建新一代及新会话。
 - Issue/PR close or PR merge never interrupts the current turn. The lifecycle
   event grants exactly one Finalization Turn after the current terminal, or
   immediately when idle. Afterwards closed Issue and closed-unmerged PR groups

@@ -810,6 +810,8 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let resumed = Arc::new(tokio::sync::Notify::new());
+        let requested_after_close = Arc::clone(&resumed);
         let app = Router::new()
             .route(
                 "/api/platform/repository",
@@ -822,7 +824,13 @@ mod tests {
             )
             .route(
                 "/api/platform/events",
-                get(|| async {
+                get(move |axum::extract::Query(query): axum::extract::Query<HashMap<String, u64>>| {
+                    let resumed = Arc::clone(&resumed);
+                    async move {
+                    if query["after"] == 1 {
+                        resumed.notify_one();
+                        return Json(serde_json::json!({"events": [], "nextAfter": 1, "lastSequence": 1}));
+                    }
                     Json(serde_json::json!({"events": [{
                     "sequence": 1, "event": {
                         "delivery_guid": "local:1", "event_name": "local",
@@ -835,6 +843,7 @@ mod tests {
                         "known": true, "raw_payload": []
                     }
                 }], "nextAfter": 1, "lastSequence": 1}))
+                    }
                 }),
             )
             .route(
@@ -881,6 +890,9 @@ mod tests {
         })
         .await
         .expect("feed reception must survive a failed execution restore");
+        tokio::time::timeout(Duration::from_secs(3), requested_after_close.notified())
+            .await
+            .expect("intake must keep polling from the durable cursor during fence failure");
         let events =
             store.work_item_lifecycle_candidates("test-space".into(), "issue".into(), 1).unwrap();
         assert_eq!(events[0].action, "closed");
