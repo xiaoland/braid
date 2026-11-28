@@ -122,7 +122,7 @@ fn ledger_errors_distinguish_retryable_contention_and_actor_loss_from_invalid_wr
 async fn a_published_request_recovers_delivery_without_replaying_fenced_mutations() {
     let f = Fixture::new(true);
     let receipt = request(&f, 7);
-    let remote = Arc::new(Mutex::new(Remote { create_pr: true, ..Remote::default() }));
+    let remote = Arc::new(Mutex::new(Remote { pr_missing: true, ..Remote::default() }));
     let (github, http) = server(remote.clone(), true).await;
     f.drain(github.clone()).await;
     assert_eq!(f.receipt(&receipt.request_id).lifecycle, "applied");
@@ -160,7 +160,7 @@ async fn a_published_request_recovers_delivery_without_replaying_fenced_mutation
 async fn a_followup_comment_reuses_the_original_managed_implementation_identity() {
     let f = Fixture::new(true);
     let original = request(&f, 7);
-    let remote = Arc::new(Mutex::new(Remote { create_pr: true, ..Remote::default() }));
+    let remote = Arc::new(Mutex::new(Remote { pr_missing: true, ..Remote::default() }));
     let (github, http) = server(remote.clone(), true).await;
     f.drain(github.clone()).await;
     legacy_gap(&f, &original);
@@ -247,7 +247,7 @@ async fn an_unpublished_request_still_requires_its_original_source_authority() {
     let f = Fixture::new(true);
     let receipt = request(&f, 7);
     replace_source(&f);
-    let remote = Arc::new(Mutex::new(Remote { create_pr: true, ..Remote::default() }));
+    let remote = Arc::new(Mutex::new(Remote { pr_missing: true, ..Remote::default() }));
     let (github, http) = server(remote.clone(), true).await;
     f.drain(github).await;
     assert_rejected(

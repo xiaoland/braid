@@ -131,9 +131,8 @@ struct Remote {
     authority: Authority,
     closing_issue: Option<u64>,
     pr_body: Option<String>,
-    create_pr: bool,
+    pr_missing: bool,
     target_kind: TargetKind,
-    pr_created: bool,
     head_created: bool,
     comments: Vec<Value>,
     comment_reads: usize,
@@ -179,7 +178,7 @@ async fn server(
         .route("/repos/owner/repository/issues/comments/8",get(move||{let remote=continuation.clone();async move{let number=if remote.lock().unwrap().authority==Authority::OtherIssue {2}else{1};Json(json!({"id":8,"node_id":"followup-comment","html_url":format!("https://github.com/owner/repository/issues/{number}#issuecomment-8"),"issue_url":format!("https://api.github.com/repos/owner/repository/issues/{number}"),"body":"continue current implementation","created_at":"now","updated_at":"now"}))}}))
         .route("/repos/owner/repository/issues/2",get(||async{Json(json!({"id":2,"node_id":"other-issue","number":2,"title":"Other issue","state":"open","html_url":"https://github.com/owner/repository/issues/2"}))}))
         .route("/repos/owner/repository", get(|| async { Json(json!({"default_branch":"main"})) }))
-        .route("/repos/owner/repository/pulls", get({ let pr=pr.clone(); let remote=remote.clone(); move || { let mut pr=pr.clone(); let remote=remote.clone(); async move { let state=remote.lock().unwrap(); if let Some(body)=&state.pr_body {pr["body"]=json!(body);} Json(if state.create_pr && !state.pr_created {json!([])} else {json!([pr])}) } }}).post({ let pr=pr.clone(); let remote=remote.clone(); move |Json(body): Json<Value>| {let pr=pr.clone(); let remote=remote.clone(); async move { let mut state=remote.lock().unwrap(); state.pr_requests.push(body); state.pr_created=true; state.writes+=1; Json(pr) }}}))
+        .route("/repos/owner/repository/pulls", get({ let pr=pr.clone(); let remote=remote.clone(); move || { let mut pr=pr.clone(); let remote=remote.clone(); async move { let state=remote.lock().unwrap(); if let Some(body)=&state.pr_body {pr["body"]=json!(body);} Json(if state.pr_missing {json!([])} else {json!([pr])}) } }}).post({ let pr=pr.clone(); let remote=remote.clone(); move |Json(body): Json<Value>| {let pr=pr.clone(); let remote=remote.clone(); async move { let mut state=remote.lock().unwrap(); state.pr_requests.push(body); state.pr_missing=false; state.writes+=1; Json(pr) }}}))
         .route("/repos/owner/repository/git/ref/heads/main",get(|| async {Json(json!({"ref":"refs/heads/main","object":{"sha":"base"}}))}))
         .route("/repos/owner/repository/git/ref/heads/head",get({let remote=remote.clone(); move || {let remote=remote.clone(); async move {
             use axum::response::IntoResponse as _;
@@ -406,7 +405,7 @@ async fn initial_ensure_bootstrap_pr_association_and_restart_do_not_duplicate_mu
     assert_eq!(source.profile_id, "issue-codex");
     assert_eq!(source.role, "issue_agent");
     let remote = Arc::new(Mutex::new(Remote {
-        create_pr: true,
+        pr_missing: true,
         authority: Authority::AssociationUnavailable,
         ..Remote::default()
     }));
