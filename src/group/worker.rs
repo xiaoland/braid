@@ -211,18 +211,24 @@ impl GroupDriver<'_> {
         let terminal = active.as_deref_mut().and_then(RunningAgentTurn::terminal_after_close);
         if (stop.is_ok() || terminal.is_some())
             && self.store.settle_unassignment(change, terminal.clone(), stop.is_ok())?
-            && let (Some(active), Some(terminal)) = (active, terminal)
-            && matches!(
-                terminal.outcome,
-                crate::agent_session::TurnOutcome::Failed
-                    | crate::agent_session::TurnOutcome::Unknown
-            )
+            && let Some(active) = active
         {
-            self.enqueue_turn_error(
-                &active.claim,
-                terminal.outcome.lifecycle(),
-                terminal.error.as_deref().unwrap_or("provider did not supply a terminal reason"),
+            use crate::agent_session::TurnOutcome;
+            let (outcome, reason) = terminal.as_ref().map_or(
+                (TurnOutcome::Unknown, crate::store::MISSING_TERMINAL),
+                |terminal| {
+                    (
+                        terminal.outcome,
+                        terminal
+                            .error
+                            .as_deref()
+                            .unwrap_or("provider did not supply a terminal reason"),
+                    )
+                },
             );
+            if matches!(outcome, TurnOutcome::Failed | TurnOutcome::Unknown) {
+                self.enqueue_turn_error(&active.claim, outcome.lifecycle(), reason);
+            }
         }
         stop.map_err(Into::into)
     }

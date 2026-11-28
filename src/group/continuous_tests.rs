@@ -493,6 +493,70 @@ async fn persisted_idle_reset_uses_only_confirmed_native_stop_after_restart() {
 }
 
 #[tokio::test]
+async fn retired_reset_history_cannot_replace_an_execution_or_block_a_finite_run() {
+    for blocked in [false, true] {
+        let f = Fixture::new(true);
+        let mut config = f.config.clone();
+        config.scheduler.quiet_seconds = 0;
+        let captured = Arc::new(Captured::default());
+        let (github, http) = issue_context_server("Current contract").await;
+        let collaboration = CollaborationBackend::GitHub(github);
+        let spec = GroupSpec::new(GroupKind::Issue, &config, &f.store, "owner/repository").unwrap();
+        let driver = worker::GroupDriver {
+            store: &f.store,
+            config: &config,
+            collaboration: &collaboration,
+            spec: &spec,
+            sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
+        };
+        driver
+            .sessions
+            .resume("provider".into(), spec.profile.clone(), "instructions".into())
+            .await
+            .unwrap();
+        let policy = SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 };
+        f.store.ingest_event(revision(), policy).unwrap();
+        let reset = f
+            .store
+            .begin_context_reset(None, "issue".into(), "issue-codex".into())
+            .unwrap()
+            .unwrap();
+        if blocked {
+            f.store
+                .fail_context_reset(reset.reset_id.clone(), "old context is unavailable".into())
+                .unwrap();
+        }
+        let before = f.store.execution_progress().unwrap();
+        assert!(before.unresolved_reset);
+        assert_eq!(before.blocked_reset.as_deref(), blocked.then_some(reset.reset_id.as_str()));
+        let mut revoke = revision();
+        revoke.delivery_guid = "assignment-removed-during-reset".into();
+        revoke.identity = crate::store::ChangeIdentity::Occurrence;
+        revoke.kind = EventKind::Unassign;
+        revoke.action = Some("unassigned".into());
+        revoke.requires_attention = false;
+        revoke.cross_surface_invalidation = false;
+        let event = f.store.ingest_event(revoke, policy).unwrap().event_id.unwrap();
+        driver.settle_idle_unassignment(event).await.unwrap();
+        let after = f.store.runtime_status().unwrap();
+        assert_eq!(after.agent_groups[0].assignment_lifecycle, "retired");
+        assert_eq!(
+            after.context_resets[0].lifecycle,
+            if blocked { "blocked" } else { "materializing" }
+        );
+        assert!(
+            !driver.materialize_next_context_reset().await,
+            "a retired generation cannot start replacement execution"
+        );
+        assert!(captured.memory.lock().unwrap().is_empty());
+        let progress = f.store.execution_progress().unwrap();
+        assert!(progress.blocked_reset.is_none(), "a historical reset cannot block a finite run");
+        assert!(!progress.unresolved_reset, "retired reset history is no longer outstanding work");
+        http.abort();
+    }
+}
+
+#[tokio::test]
 async fn failed_idle_stop_keeps_the_handle_and_blocks_replacement() {
     let f = Fixture::new(true);
     let captured = Arc::new(Captured::default());
@@ -683,12 +747,12 @@ async fn stopping_native_execution_does_not_wait_for_execution_fence() {
     http.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn builtin_turn_runs_without_writer_service_and_cannot_mint_after_reassignment() {
     builtin_running_unassignment(crate::agent_session::TurnOutcome::Completed, None).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_preserves_a_failed_turn_during_unassignment_while_the_platform_fence_is_offline() {
     builtin_running_unassignment(
         crate::agent_session::TurnOutcome::Failed,
@@ -1000,5 +1064,15 @@ async fn worker_stops_a_running_unassigned_issue_only_after_its_quiet_window() {
     assert_eq!(captured.inputs.lock().unwrap().len(), 1);
     shutdown.send(true).unwrap();
     worker.await.unwrap().unwrap();
+    let status: String = f
+        .db()
+        .query_row(
+            "SELECT body FROM operational_status_facts WHERE assignment_id='assignment'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("an unobserved turn terminal must publish the configured operational status");
+    assert!(status.contains("unknown"));
+    assert!(status.contains("unassignment did not observe the active turn terminal"));
     http.abort();
 }

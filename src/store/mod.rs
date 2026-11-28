@@ -28,7 +28,9 @@ mod builtin_execution;
 mod run_progress;
 mod unassignment;
 pub use builtin_execution::BuiltinExecutionCommand;
-pub(crate) use unassignment::{ObservedTurnTerminal, Unassignment, UnassignmentTarget};
+pub(crate) use unassignment::{
+    MISSING_TERMINAL, ObservedTurnTerminal, Unassignment, UnassignmentTarget,
+};
 mod runs;
 pub use runs::RunCommand;
 mod gh_writes;
@@ -4428,12 +4430,12 @@ fn settle_unassignment(
     if unconfirmed {
         return Err(StoreError::InvalidData("unassignment lacks a confirmed native stop".into()));
     }
-    transaction.execute(
+    let missing_terminals = transaction.execute(
         "UPDATE turns SET lifecycle='unknown',ended_at=?2,
-         error=coalesce(error || char(10),'') || 'unassignment did not observe the active turn terminal'
+         error=coalesce(error || char(10),'') || ?3
          WHERE lifecycle IN ('starting','running')
            AND session_id IN (SELECT session_id FROM provider_sessions WHERE agent_id=?1)",
-        params![agent_id, now],
+        params![agent_id, now, MISSING_TERMINAL],
     )?;
     transaction.execute(
         "UPDATE provider_sessions SET lifecycle='retired'
@@ -4461,7 +4463,7 @@ fn settle_unassignment(
         [event_id],
     )?;
     transaction.commit()?;
-    Ok(recorded_terminal)
+    Ok(recorded_terminal || missing_terminals > 0)
 }
 
 fn ignore_assignment_event(database: &Path, event_id: &str) -> Result<(), StoreError> {
@@ -4852,7 +4854,7 @@ fn ready_context_reset(
              JOIN agent_instances ai ON ai.agent_id=cr.agent_id
              JOIN assignments a ON a.assignment_id=ai.assignment_id
              JOIN work_items w ON w.node_id=a.work_item_node_id
-             WHERE cr.lifecycle='materializing' AND w.kind=?1 AND ai.profile_id=?2
+             WHERE cr.lifecycle='materializing' AND a.lifecycle!='retired' AND w.kind=?1 AND ai.profile_id=?2
              ORDER BY cr.created_at,cr.reset_id LIMIT 1",
             params![work_item_kind, profile_id],
             |row| row.get::<_, String>(0),

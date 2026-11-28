@@ -42,19 +42,20 @@ pub(super) fn execution(database: &Path) -> Result<ExecutionProgress, StoreError
             },
         )
         .optional()?;
-    let blocked_reset = tx
+    // Resets remain historical evidence after their generation has been retired.
+    let pending_reset = tx
         .query_row(
-            "SELECT reset_id FROM context_resets WHERE lifecycle='blocked'
-             ORDER BY created_at,reset_id LIMIT 1",
+            "SELECT CASE WHEN cr.lifecycle='blocked' THEN cr.reset_id END
+         FROM context_resets cr JOIN agent_instances ai ON ai.agent_id=cr.agent_id
+         JOIN assignments a ON a.assignment_id=ai.assignment_id
+         WHERE cr.lifecycle!='applied' AND a.lifecycle!='retired'
+         ORDER BY (cr.lifecycle='blocked') DESC,cr.created_at,cr.reset_id LIMIT 1",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, Option<String>>(0),
         )
         .optional()?;
-    let unresolved_reset = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM context_resets WHERE lifecycle!='applied')",
-        [],
-        |row| row.get(0),
-    )?;
+    let unresolved_reset = pending_reset.is_some();
+    let blocked_reset = pending_reset.flatten();
     tx.commit()?;
     Ok(ExecutionProgress { blocked_group, blocked_reset, unresolved_reset })
 }

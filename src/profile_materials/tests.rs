@@ -126,17 +126,28 @@ async fn failed_home_binding_stops_the_installed_execution_before_returning() {
     let receipt = fs::read(execution.path().join("execution-stop.json"));
     if receipt.is_err() {
         // Reclaim only this test's execution when an old/broken adapter abandons it.
-        let cleanup = std::process::Command::new(install.join("bin/node"))
-            .arg(install.join("managed.mjs"))
-            .args(["cleanup", "--execution-dir"])
-            .arg(execution.path())
-            .arg("--execution-id")
-            .arg(&id)
-            .output()
-            .unwrap();
-        assert!(cleanup.status.success());
-        let cleanup: Value = serde_json::from_slice(&cleanup.stdout).unwrap();
-        assert_eq!(cleanup["status"], "stopped", "{cleanup}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let cleanup = tokio::process::Command::new(install.join("bin/node"))
+                .arg(install.join("managed.mjs"))
+                .args(["cleanup", "--execution-dir"])
+                .arg(execution.path())
+                .arg("--execution-id")
+                .arg(&id)
+                .output()
+                .await
+                .unwrap();
+            assert!(cleanup.status.success());
+            let cleanup: Value = serde_json::from_slice(&cleanup.stdout).unwrap();
+            if cleanup["status"] == "stopped" {
+                break;
+            }
+            // Child exit and OS marker inspection can overlap on the abandoned execution.
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test teardown could not confirm stop: {cleanup}"
+            );
+        }
     }
     fs::remove_dir_all(root).unwrap();
     assert!(
@@ -162,14 +173,18 @@ async fn startup_rejection_retains_an_unconfirmed_physical_shutdown() {
     let root = std::env::temp_dir().join(format!("braid-pi-exit-{}", uuid::Uuid::now_v7()));
     fs::create_dir_all(&root).unwrap();
     let executable = root.join("pi");
-    fs::write(&executable, r#"#!/usr/bin/env python3
-import json, sys
-command = json.loads(sys.stdin.readline())
-assert command["type"] == "new_session"
-print(json.dumps({"id":command["id"], "success":False, "error":"session creation rejected"}), flush=True)
-assert not sys.stdin.read()
-sys.exit(29)
-"#).unwrap();
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+IFS= read -r request || exit 20
+case "$request" in *'"new_session"'*) ;; *) exit 21 ;; esac
+id=$(printf '%s' "$request" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+printf '{"id":%s,"success":false,"error":"session creation rejected"}\n' "$id"
+if IFS= read -r extra; then exit 22; fi
+exit 29
+"#,
+    )
+    .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
     let config = configuration(&root, CredentialKind::None, Some(&executable), None);
     let profile = config.profiles[0].clone();

@@ -891,7 +891,9 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(turns, 0);
-        halt.send(true).unwrap();
+        if halt.send(true).is_err() {
+            panic!("runtime exited before the requested stop: {:#?}", runtime.await);
+        }
         let error = runtime.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("execution fence remains unconfirmed"), "{error:#}");
         http.abort();

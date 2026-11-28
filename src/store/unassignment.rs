@@ -2,6 +2,8 @@ use super::{StoreError, open_read_only, require_current_schema};
 use rusqlite::{OptionalExtension as _, params};
 use std::path::Path;
 
+pub(crate) const MISSING_TERMINAL: &str = "unassignment did not observe the active turn terminal";
+
 pub(crate) enum UnassignmentTarget {
     Event(String),
     RunningTurn(String),
