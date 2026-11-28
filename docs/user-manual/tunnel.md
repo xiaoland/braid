@@ -23,7 +23,8 @@ Braid performs these steps automatically:
 3. Parses the tunnel output to obtain a public HTTPS URL such as
    `https://<random>.trycloudflare.com`.
 4. Appends `/webhook` to form the public webhook endpoint.
-5. Sends a signed `ping` probe to that endpoint to confirm GitHub can reach it.
+5. Sends a signed `ping` through that endpoint to verify it reaches Braid's
+   ingress and passes signature verification.
 6. Once reachable, updates the GitHub App's webhook URL to the public endpoint
    and confirms it by reading the App configuration.
 7. Local runtime and reconciliation can operate while the public endpoint recovers.

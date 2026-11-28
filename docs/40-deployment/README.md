@@ -76,6 +76,7 @@ Everything below is scoped by trust boundary:
     config.toml                 # Harness config, schema version 3 (GitHub v2 still readable)
     github-app.pem              # GitHub App private key
     secrets.toml                # webhook secret
+    source/                     # repository checkout used to provision worktrees
     state/
       braid.sqlite3
       backups/

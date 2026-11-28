@@ -106,6 +106,8 @@ Options:
   `--llm-credential-file <PATH>` (unless `none`) declare its credential.
 - `--user-home <DIR>` — defaults to `~/.braid` (or `BRAID_USER_HOME`).
 - `--instance <KEY>` — defaults to the repository owner.
+- `--runtime-executable <PATH>` — use an explicit runtime executable instead
+  of automatic discovery.
 
 `braid setup` performs these steps:
 
@@ -165,7 +167,8 @@ The tunnel receives GitHub webhooks and routes them to Braid's local ingress.
 Braid activates through a **trusted `@braid` mention**: a visible `@braid` in
 an issue comment from a repository MAINTAIN/ADMIN actor wakes the Issue Agent
 without waiting for the Quiet Window. Braid acknowledges the mention with an `eyes`
-reaction.
+reaction. See the [scheduling contract](../10-prd/scheduling.md) for provider
+acceptance and terminal reactions.
 
 Native Issue assignment is a GitHub-side *Agent App* provisioning (the same
 capability that makes Copilot assignable), not a permission an ordinary
