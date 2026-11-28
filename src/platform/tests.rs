@@ -247,7 +247,7 @@ async fn object_authority_changes_invalidate_grants_even_when_grant_rows_cannot_
             "CREATE TRIGGER publication_offline BEFORE UPDATE ON platform_grants
          BEGIN SELECT RAISE(ABORT, 'grant update unavailable'); END;",
         )
-        .unwrap()
+        .unwrap();
     };
     let epoch_path = "/api/platform/grants?clientId=harness&itemNumber=1&actor=worker";
     let unscoped = fixture.mint(1, "unscoped", 0, None).await;

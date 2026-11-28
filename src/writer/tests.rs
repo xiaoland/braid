@@ -471,7 +471,8 @@ async fn initial_ensure_bootstrap_pr_association_and_restart_do_not_duplicate_mu
     fixture.due();
     let (github, task) = server(remote.clone(), true).await;
     fixture.drain(github).await;
-    assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
+    let result = fixture.receipt(&receipt.request_id);
+    assert_eq!(result.lifecycle, "applied", "{result:?}");
     let delivered =
         fixture.store.implementation_request_receipt(receipt.intent_id).unwrap().unwrap();
     assert!(delivered.activation_delivered);

@@ -309,8 +309,15 @@ fn verify_payload_records(
     };
     let mut payload_events = 0;
     for record in log_records {
+        let serialized = serde_json::to_string(&record).unwrap();
+        if !retained {
+            assert!(
+                !serialized.contains(SENTINEL),
+                "unsampled payload exported in OTLP log record"
+            );
+        }
         assert!(
-            !serde_json::to_string(&record).unwrap().contains(RESPONSE_SENTINEL),
+            !serialized.contains(RESPONSE_SENTINEL),
             "collector response recursed into OTLP logs"
         );
         let fields: std::collections::BTreeMap<_, _> = record

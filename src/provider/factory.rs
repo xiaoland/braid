@@ -67,7 +67,7 @@ impl SessionFactory for CodexSessions {
             instructions,
             Some(context),
         )
-        .await?;
+        .await;
         created(session).await
     }
 
@@ -78,8 +78,7 @@ impl SessionFactory for CodexSessions {
         instructions: String,
     ) -> Result<CreatedSession, SessionError> {
         let session =
-            ProviderAgentSession::resume(self.connection().await?, profile, instructions, id)
-                .await?;
+            ProviderAgentSession::resume(self.connection().await?, profile, instructions, id).await;
         created(session).await
     }
 }
@@ -114,8 +113,9 @@ impl SessionFactory for PiSessions {
     ) -> Result<CreatedSession, SessionError> {
         let provider = Arc::new(PiProvider::connect(&self.config));
         let session =
-            ProviderAgentSession::start(provider, profile, instructions, Some(context)).await?;
-        created(session).await
+            ProviderAgentSession::start(provider.clone(), profile, instructions, Some(context))
+                .await;
+        finish_pi_session(&provider, session).await
     }
 
     async fn resume(
@@ -125,12 +125,34 @@ impl SessionFactory for PiSessions {
         instructions: String,
     ) -> Result<CreatedSession, SessionError> {
         let provider = Arc::new(PiProvider::connect(&self.config));
-        let session = ProviderAgentSession::resume(provider, profile, instructions, id).await?;
-        created(session).await
+        let session =
+            ProviderAgentSession::resume(provider.clone(), profile, instructions, id).await;
+        finish_pi_session(&provider, session).await
     }
 }
 
-async fn created(session: Arc<ProviderAgentSession>) -> Result<CreatedSession, SessionError> {
+// The factory owns this physical process until a usable session is handed to the group.
+// Startup and Context persistence can fail after the native launcher has spawned.
+async fn finish_pi_session(
+    provider: &PiProvider,
+    session: Result<Arc<ProviderAgentSession>, SessionError>,
+) -> Result<CreatedSession, SessionError> {
+    let error = match created(session).await {
+        Ok(created) => return Ok(created),
+        Err(error) => error,
+    };
+    match provider.close_failed_construction().await {
+        Ok(()) => Err(error),
+        Err(cleanup) => Err(SessionError::Unknown(format!(
+            "{error}; Pi startup shutdown unconfirmed: {cleanup}"
+        ))),
+    }
+}
+
+async fn created(
+    session: Result<Arc<ProviderAgentSession>, SessionError>,
+) -> Result<CreatedSession, SessionError> {
+    let session = session?;
     let id = session
         .thread_id()
         .await

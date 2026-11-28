@@ -361,15 +361,9 @@ impl PiProvider {
         Err(ProviderError::Protocol(message))
     }
 
-    async fn reject_startup(&self, thread_id: &str, error: ProviderError) -> ProviderError {
-        match self.close_session(thread_id, true).await {
-            Ok(()) => {
-                ProviderError::Protocol(format!("Pi Profile resource handshake failed: {error}"))
-            }
-            Err(cleanup) => ProviderError::Unknown(format!(
-                "Pi Profile resource handshake failed: {error}; owned session shutdown failed: {cleanup}"
-            )),
-        }
+    pub(super) async fn close_failed_construction(&self) -> Result<(), ProviderError> {
+        let thread_id = self.thread_id.lock().await.clone();
+        self.close_session(&thread_id, true).await
     }
 
     async fn verify_profile_resources(
@@ -431,7 +425,7 @@ impl AgentProvider for PiProvider {
         Self::success_or_protocol(&result, "new_session")?;
 
         let state_resp = Self::request(&mut state, json!({"type": "get_state"})).await?;
-        validate_started_runtime(&mut state, &state_resp).await?;
+        validate_started_runtime(&state, &state_resp)?;
         let session_file = state_resp
             .get("data")
             .and_then(|data| data.get("sessionFile"))
@@ -449,11 +443,7 @@ impl AgentProvider for PiProvider {
             Some(required_string(&state_resp["data"], "sessionId", "Pi get_state")?);
         *self.thread_id.lock().await = session_file.to_owned();
 
-        if let Err(error) = Self::verify_profile_resources(&mut state, profile, session_file).await
-        {
-            drop(state);
-            return Err(self.reject_startup(session_file, error).await);
-        }
+        Self::verify_profile_resources(&mut state, profile, session_file).await?;
 
         Ok(ProviderSession { thread_id: session_file.to_owned() })
     }
@@ -501,17 +491,14 @@ impl AgentProvider for PiProvider {
         state.process = None;
         self.spawn(&mut state, profile, profile.workspace(), Some(thread_id))?;
         let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
-        validate_started_runtime(&mut state, &native).await?;
+        validate_started_runtime(&state, &native)?;
         let resumed_path = required_string(&native["data"], "sessionFile", "Pi get_state")?;
         if Path::new(&resumed_path) != Path::new(thread_id) {
             return Err(ProviderError::Protocol("Pi resumed a different session path".into()));
         }
         let native_id = required_string(&native["data"], "sessionId", "Pi get_state")?;
         state.native_session_id = Some(native_id.clone());
-        if let Err(error) = Self::verify_profile_resources(&mut state, profile, thread_id).await {
-            drop(state);
-            return Err(self.reject_startup(thread_id, error).await);
-        }
+        Self::verify_profile_resources(&mut state, profile, thread_id).await?;
         if let Some(initial) = pending.as_mut() {
             if has_history && initial.native_session_id != native_id {
                 return Err(ProviderError::Protocol(
@@ -537,29 +524,12 @@ impl AgentProvider for PiProvider {
     async fn start_turn(
         &self,
         _thread_id: &str,
-        profile: &Profile,
+        _profile: &Profile,
         event_references: &str,
     ) -> Result<ProviderTurn, ProviderError> {
         let mut state = self.state.lock().await;
-        let did_spawn = state.process.is_none();
-        if did_spawn {
-            let session = state.session.clone();
-            self.spawn(&mut state, profile, profile.workspace(), session.as_deref())?;
-        }
-
         let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
         validate_managed_state(&state, &native)?;
-        if did_spawn {
-            let native_thread_id = state.session.clone().ok_or_else(|| {
-                ProviderError::Protocol("Pi physical startup has no native session identity".into())
-            })?;
-            if let Err(error) =
-                Self::verify_profile_resources(&mut state, profile, &native_thread_id).await
-            {
-                drop(state);
-                return Err(self.reject_startup(&native_thread_id, error).await);
-            }
-        }
         if native_is_busy(&native)? {
             return Err(ProviderError::Deferred(
                 "Pi is streaming, compacting or has queued input".into(),
@@ -1021,38 +991,18 @@ fn validate_managed_state(state: &PiState, response: &Value) -> Result<(), Provi
     Ok(())
 }
 
-async fn validate_started_runtime(
-    state: &mut PiState,
-    response: &Value,
-) -> Result<(), ProviderError> {
-    let validation = validate_managed_state(state, response).and_then(|()| {
-        if let Some(execution) =
-            state.process.as_ref().and_then(|process| process.execution.as_ref())
-        {
-            let managed = execution.state(response)?;
-            if matches!(managed.status, runtime::ManagedStatus::Unknown) {
-                return Err(ProviderError::Protocol(format!(
-                    "Pi managed execution is unavailable at startup: {}",
-                    managed.reason.as_deref().unwrap_or("native returned unknown without a reason")
-                )));
-            }
-        }
-        Ok(())
-    });
-    let Err(error) = validation else { return Ok(()) };
-    let mut reasons = vec![error.to_string()];
-    if let Some(process) = state.process.as_mut() {
-        drop(process.writer.take());
-        if let Err(error) = wait_for_pi_child(process, "", None, "rejected_runtime").await {
-            reasons.push(error.to_string());
-        }
-        if let Some(execution) = &process.execution
-            && let Err(error) = execution.cleanup().await
-        {
-            reasons.push(error.to_string());
+fn validate_started_runtime(state: &PiState, response: &Value) -> Result<(), ProviderError> {
+    if let Some(execution) = state.process.as_ref().and_then(|process| process.execution.as_ref()) {
+        let managed =
+            execution.state(response).map_err(|error| ProviderError::Unknown(error.to_string()))?;
+        if matches!(managed.status, runtime::ManagedStatus::Unknown) {
+            return Err(ProviderError::Unknown(format!(
+                "Pi managed execution is unavailable at startup: {}",
+                managed.reason.as_deref().unwrap_or("native returned unknown without a reason")
+            )));
         }
     }
-    Err(ProviderError::Unknown(reasons.join("; ")))
+    Ok(())
 }
 
 /// Render the Braid OAuth credential into Pi's `auth.json` in the session

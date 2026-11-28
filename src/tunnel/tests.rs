@@ -196,34 +196,48 @@ async fn wait_for_process_state(pid: u32, expected: &str) {
 
 #[tokio::test]
 async fn signed_probe_requires_ingress_acceptance_not_an_arbitrary_http_success() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use crate::{
+        producer::{IngressState, webhook_handler},
+        store::{SchedulerPolicy, StoreActor},
     };
-    let counter = Arc::new(AtomicUsize::new(0));
-    let state = counter.clone();
-    let app = axum::Router::new().route(
-        "/webhook",
-        axum::routing::post(move || {
-            let counter = state.clone();
-            async move {
-                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
-                    axum::http::StatusCode::OK
-                } else {
-                    axum::http::StatusCode::ACCEPTED
-                }
-            }
-        }),
-    );
+    use axum::{http::StatusCode, routing::post};
+    use std::sync::Arc;
+    let root = std::env::temp_dir().join(format!("braid-tunnel-probe-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&root).unwrap();
+    let database = root.join("probe.sqlite3");
+    let store = StoreActor::start(database.clone(), root.join("backups")).unwrap();
+    store.apply().unwrap();
+    let app = axum::Router::new()
+        .route("/proxy", post(|| async { StatusCode::OK }))
+        .route("/webhook", post(webhook_handler))
+        .with_state(Arc::new(IngressState {
+            store: Arc::new(store),
+            policy: SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 },
+            repositories: vec!["owner/repo".into()],
+            webhook_secret: Arc::new(b"secret".to_vec()),
+            handle: "braid".into(),
+            app_actor_node_id: "APP".into(),
+            app_actor_login: "braid[bot]".into(),
+            agent_actor_node_ids: vec![],
+        }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/webhook", listener.local_addr().unwrap());
+    let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let error = signed_public_probe_once(&url, b"secret", "owner/repo", "repo")
+    let error = signed_public_probe_once(&format!("{base}/proxy"), b"secret", "owner/repo", "R1")
         .await
         .unwrap_err()
         .to_string();
     assert!(error.contains("HTTP 200 OK, expected 202"), "{error}");
-    signed_public_probe_once(&url, b"secret", "owner/repo", "repo").await.unwrap();
-    assert_eq!(counter.load(Ordering::SeqCst), 2);
+    signed_public_probe_once(&format!("{base}/webhook"), b"secret", "owner/repo", "R1")
+        .await
+        .unwrap();
+    let count: i64 = rusqlite::Connection::open(database).unwrap().query_row(
+        "SELECT COUNT(*) FROM deliveries WHERE event_name='ping' AND repository_node_id='R1' AND repository_name='owner/repo' AND delivery_guid != ''",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(count, 1, "signed ping must be durably admitted for the selected repository");
     server.abort();
+    let _ = server.await;
+    std::fs::remove_dir_all(root).unwrap();
 }

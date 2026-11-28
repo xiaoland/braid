@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import test from 'node:test';
+import { pathToFileURL } from 'node:url';
 
 // Install once with --plugins background, then run against that candidate.
 // This is a distribution test; the regular source tests need no npm install.
@@ -97,4 +98,35 @@ test('installed background-only Pi opens a fresh session, serves tools and close
   assert.equal(offline.scope, 'execution');
   assert.equal(offline.coverage, 'registered-process-groups-and-inherited-execution-markers');
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(directory, 'execution-stop.json'), 'utf8')), offline);
+});
+
+test('installed background bash reports an unverified stop even when the command exits zero', async t => {
+  const install = fs.realpathSync(process.env.BRAID_TEST_PI_INSTALL);
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'braid-pi-tool-')));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const directory = path.join(root, 'execution');
+  const id = randomUUID();
+  t.mock.property(process, 'env', {
+    HOME: root, PATH: '/usr/bin:/bin', PI_OFFLINE: '1',
+    BRAID_NATIVE_EXECUTION_ID: id, BRAID_NATIVE_EXECUTION_DIR: directory,
+  });
+  await import(pathToFileURL(path.join(install, 'managed.mjs')));
+  const sdk = await import(pathToFileURL(path.join(install, 'node_modules/@earendil-works/pi-coding-agent/dist/index.js')));
+  const plugin = path.join(install, 'node_modules/pi-background-bash/extensions/background-bash.ts');
+  const { extensions, errors } = await sdk.discoverAndLoadExtensions([plugin], root, root);
+  assert.deepEqual(errors, []);
+  const bash = extensions.find(extension => extension.tools.has('bash')).tools.get('bash').definition;
+  const invoke = () => bash.execute('foreground', { command: 'printf completed' }, undefined, undefined, { cwd: root });
+  const result = await invoke();
+  assert.deepEqual(result.content, [{ type: 'text', text: 'completed' }]);
+
+  // A damaged registration prevents proving scope even after this new command exits.
+  fs.writeFileSync(path.join(directory, 'processes/damaged.json'), '{}');
+  await assert.rejects(invoke, /Managed bash cleanup is unknown: Invalid native ownership record: damaged\.json/);
+  const terminal = fs.readdirSync(path.join(directory, 'terminals'))
+    .map(file => JSON.parse(fs.readFileSync(path.join(directory, 'terminals', file), 'utf8')))
+    .find(record => record.terminal.status === 'unknown');
+  assert.equal(terminal.execution_id, id);
+  assert.equal(terminal.close.exit_code, 0);
+  assert.match(terminal.terminal.reason, /Invalid native ownership record: damaged\.json/);
 });
