@@ -89,17 +89,7 @@ async fn prepare_plan(
     store
         .prepare_implementation_request(NewImplementationRequest {
             root_intent_id: root,
-            write: NewGhWriteIntent {
-                request_key: format!("pr_ensure\0{}\0{}", repository, request.comment_id),
-                operation: "pr_ensure",
-                repository: repository.to_string(),
-                target: accepted.target.clone(),
-                profile_id: profile.id.clone(),
-                role: "PR Implementation Agent".into(),
-                payload: accepted.payload.clone(),
-                source: accepted.source.clone(),
-                request_digest: helpers::digest(&accepted.payload),
-            },
+            intent_id: accepted.intent_id.clone(),
             comment_database_id: request.comment_id,
             comment_node_id: comment.node_id,
             issue_node_id: issue.node_id,

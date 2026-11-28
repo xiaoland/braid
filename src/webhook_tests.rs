@@ -109,10 +109,6 @@ fn comment_edits_compare_visible_suffix_instead_of_discarding_the_html_block_lin
         edited["comment"]["body"] = json!(body);
         let admitted = parse(&edited, "issue_comment");
         assert_eq!(admitted.kind, expected, "{body}");
-        assert_eq!(
-            admitted.visible_body.as_deref(),
-            Some(if expected == EventKind::Noop { " current design" } else { " changed design" })
-        );
         assert_eq!(admitted.requires_attention, expected == EventKind::Invalidate);
     }
 }

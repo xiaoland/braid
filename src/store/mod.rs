@@ -829,7 +829,7 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub fn advance_scheduler(&self) -> Result<u64, StoreError> {
+    pub fn advance_scheduler(&self) -> Result<(), StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
             .send(Command::AdvanceScheduler(reply))
@@ -1638,7 +1638,7 @@ enum Command {
     ),
     MentionCandidates(String, usize, Sender<Result<Vec<MentionCandidate>, StoreError>>),
     ResolveMention(String, bool, SchedulerPolicy, Sender<Result<(), StoreError>>),
-    AdvanceScheduler(Sender<Result<u64, StoreError>>),
+    AdvanceScheduler(Sender<Result<(), StoreError>>),
     RuntimeStatus(Sender<Result<RuntimeStoreStatus, StoreError>>),
     ExecutionProgress(Sender<Result<run_progress::ExecutionProgress, StoreError>>),
     PublicationProgress(Sender<Result<run_progress::PublicationProgress, StoreError>>),
@@ -3134,16 +3134,16 @@ fn resolve_mention(
     Ok(())
 }
 
-fn advance_scheduler(database: &Path) -> Result<u64, StoreError> {
+fn advance_scheduler(database: &Path) -> Result<(), StoreError> {
     require_current_schema(database)?;
     let connection = open_read_write(database)?;
     configure_connection(&connection)?;
-    let changed = connection.execute(
+    connection.execute(
         "UPDATE wake_batches SET lifecycle='runnable',updated_at=?1
          WHERE lifecycle='pending' AND quiet_deadline<=?1",
         [now_rfc3339()],
     )?;
-    Ok(u64::try_from(changed).expect("SQLite change count fits u64"))
+    Ok(())
 }
 
 fn runtime_status(database: &Path) -> Result<RuntimeStoreStatus, StoreError> {

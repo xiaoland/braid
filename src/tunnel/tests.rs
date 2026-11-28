@@ -9,28 +9,6 @@ async fn start_fake_tunnel(executable: &Path) -> Result<QuickTunnel, TunnelError
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn tunnel_not_found_is_detected_while_the_child_remains_alive() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let directory = std::env::temp_dir().join(format!("braid-tunnel-{}", Uuid::now_v7()));
-    std::fs::create_dir_all(&directory).unwrap();
-    let executable = directory.join("wrangler");
-    std::fs::write(&executable,"#!/bin/sh\nprintf '%s\\n' 'https://test.trycloudflare.com' 'Registered tunnel connection'\nprintf '%s\\n' 'ERR Unauthorized: Tunnel not found' >&2\nexec /usr/bin/tail -f /dev/null\n").unwrap();
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut tunnel = start_fake_tunnel(&executable).await.unwrap();
-    if tunnel.failure().is_none() {
-        tokio::time::timeout(Duration::from_secs(2), tunnel.failure.changed())
-            .await
-            .unwrap()
-            .unwrap();
-    }
-    assert_eq!(tunnel.failure(), Some("tunnel_not_found"));
-    assert!(!tunnel.has_exited().unwrap());
-    tunnel.stop().await.unwrap();
-    std::fs::remove_dir_all(directory).unwrap();
-}
-
-#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum Registration {
     Success,
@@ -45,7 +23,7 @@ fn tree_script(root: &std::path::Path, registration: Registration) -> std::path:
     let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
     let script = root.join("wrangler");
     let output = if matches!(registration, Registration::Success) {
-        "printf '%s\\n' 'https://tree.trycloudflare.com' 'Registered tunnel connection'"
+        "printf '%s\\n' 'https://tree.trycloudflare.com' 'Registered tunnel connection'; printf '%s\\n' 'ERR Unauthorized: Tunnel not found' >&2"
     } else {
         "printf '%s\\n' 'starting without a public URL'"
     };
@@ -60,7 +38,7 @@ fn tree_script(root: &std::path::Path, registration: Registration) -> std::path:
 
 #[cfg(unix)]
 #[tokio::test]
-async fn stopping_a_tunnel_reaps_the_owned_wrapper_and_grandchild_group() {
+async fn a_live_tunnel_reports_loss_of_registration_and_stops_its_process_group() {
     use nix::{
         errno::Errno,
         sys::signal::{kill, killpg},
@@ -68,13 +46,21 @@ async fn stopping_a_tunnel_reaps_the_owned_wrapper_and_grandchild_group() {
     };
     let root = std::env::temp_dir().join(format!("braid-tunnel-tree-{}", Uuid::now_v7()));
     let script = tree_script(&root, Registration::Success);
-    let tunnel = start_fake_tunnel(&script).await.unwrap();
+    let mut tunnel = start_fake_tunnel(&script).await.unwrap();
     let group = Pid::from_raw(i32::try_from(tunnel.child.id().unwrap()).unwrap());
     let leaf = Pid::from_raw(
         std::fs::read_to_string(root.join("leaf.pid")).unwrap().trim().parse().unwrap(),
     );
     assert_ne!(group, getpgrp(), "the Tunnel must not share Braid's process group");
     assert!(kill(leaf, None).is_ok());
+    if tunnel.failure().is_none() {
+        tokio::time::timeout(Duration::from_secs(2), tunnel.failure.changed())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(tunnel.failure(), Some("tunnel_not_found"));
+    assert!(!tunnel.has_exited().unwrap());
     tunnel.stop().await.unwrap();
     assert_eq!(killpg(group, None), Err(Errno::ESRCH));
     assert_eq!(kill(leaf, None), Err(Errno::ESRCH));

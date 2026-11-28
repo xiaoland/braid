@@ -25,7 +25,7 @@ fn comment(body: &str) -> CommentSnapshot {
         deleted: false,
     }
 }
-fn processed(o: &context::CanonicalObservation) -> CanonicalObjectState {
+pub(super) fn processed(o: &context::CanonicalObservation) -> CanonicalObjectState {
     CanonicalObjectState {
         node_id: o.object_node_id.clone(),
         database_id: Some(o.database_id.clone()),

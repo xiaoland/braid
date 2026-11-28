@@ -25,24 +25,6 @@ fn comment(node: &str, body: &str) -> CommentSnapshot {
         deleted: false,
     }
 }
-fn stored(o: &context::CanonicalObservation) -> crate::store::CanonicalObjectState {
-    crate::store::CanonicalObjectState {
-        node_id: o.object_node_id.clone(),
-        database_id: Some(o.database_id.clone()),
-        object_kind: o.object_kind.into(),
-        version: o.version.clone(),
-        digest: o.digest.clone(),
-        lifecycle: if matches!(o.object_kind, "issue" | "pr") {
-            o.work_item_state.to_ascii_lowercase()
-        } else {
-            o.lifecycle.into()
-        },
-        author_node_id: o.author_node_id.clone(),
-        author_login: o.author_login.clone(),
-        metadata_digest: o.metadata_digest.clone(),
-        root_fields: o.root_fields(),
-    }
-}
 fn scope(c: &CanonicalContext) -> ReconcileScope {
     let o = context::canonical_observations(c).remove(0);
     ReconcileScope {
@@ -89,7 +71,10 @@ fn seed(f: &Fixture, c: &CanonicalContext) {
     f.store
         .commit_observation(ObservationCommit {
             basis: f.store.begin_observation(root).unwrap(),
-            current: context::canonical_observations(c).iter().map(stored).collect(),
+            current: context::canonical_observations(c)
+                .iter()
+                .map(super::semantic_contract::processed)
+                .collect(),
             events: vec![],
             policy: SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 },
         })

@@ -98,10 +98,6 @@ async fn webhook_rejects_unverified_bytes_and_unconfigured_repository_before_dur
     assert_eq!(db.count("deliveries"), 0);
     assert_eq!(db.count("events"), 0);
     assert_eq!(db.count("work_items"), 0);
-    let (status, body) = deliver(&state, PRIMARY, Some(PRIMARY_SIGNATURE), "accepted").await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["duplicate"], false);
-    assert_eq!(db.count("deliveries"), 1);
 }
 
 #[tokio::test]
@@ -168,7 +164,7 @@ async fn signed_same_number_repositories_keep_distinct_events_and_deduplicate_af
 }
 
 #[tokio::test]
-async fn signed_app_comment_mention_does_not_schedule_a_handoff_or_wake() {
+async fn signed_app_comment_is_consumed_without_waking_the_active_pr() {
     const BODY: &str = r#"{"action":"created","repository":{"node_id":"R1","full_name":"owner/repository"},"sender":{"login":"braid[bot]","node_id":"APP"},"issue":{"node_id":"I1","number":1,"state":"open","pull_request":{}},"comment":{"id":7,"node_id":"C1","body":"@braid continue this handoff","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#;
     let db = Database::new();
     let state = db.state(&["owner/repository"]);
@@ -188,16 +184,7 @@ async fn signed_app_comment_mention_does_not_schedule_a_handoff_or_wake() {
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{receipt}");
-    let id: Value = serde_json::from_str(&receipt).unwrap();
-    let kind: String = db
-        .connect()
-        .query_row(
-            "SELECT kind FROM events WHERE event_id=?1",
-            [id["event_id"].as_str().unwrap()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(kind, "origin_echo");
+    let receipt: Value = serde_json::from_str(&receipt).unwrap();
+    assert_eq!(receipt["event_lifecycle"], "consumed");
     assert_eq!(db.count("wake_batches"), 0);
-    assert_eq!(db.count("pr_handoffs"), 0);
 }

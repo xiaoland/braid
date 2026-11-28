@@ -5,10 +5,10 @@ use crate::group::{
 };
 use tokio::{sync::mpsc, time::Duration};
 
-fn health(ingress: &str) -> Health {
+fn health() -> Health {
     Health::new(HealthSnapshot {
         ready: false,
-        ingress: ingress.into(),
+        ingress: "builtin".into(),
         repository: "owner/one, owner/two".into(),
         tunnel: "disabled",
         webhook_url: None,
@@ -21,50 +21,58 @@ fn health(ingress: &str) -> Health {
     })
 }
 
-async fn aggregate(reports: &[(&str, GroupKind, Option<&str>)]) -> HealthSnapshot {
-    let health = health("github");
-    let (sender, receiver) = mpsc::channel(8);
-    for &(repository, group, error) in reports {
-        sender
-            .send(ProviderReport {
+#[tokio::test]
+async fn provider_availability_tracks_each_group_and_preserves_the_outage_start() {
+    use ProviderAvailability::{Connected, Starting, Unavailable};
+
+    let (_stop, shutdown) = watch::channel(false);
+    let (reports, receiver) = mpsc::channel(8);
+    let (availability, mut status) = watch::channel(Starting);
+    let tracker = tokio::spawn(track_provider_availability(4, receiver, availability, shutdown));
+    let send = |repository: &str, group: GroupKind, error: Option<&str>| {
+        reports
+            .try_send(ProviderReport {
                 repository: repository.into(),
                 group,
                 error: error.map(str::to_owned),
             })
+            .unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        send("owner/one", Issue, Some("offline"));
+        let Unavailable { since: first_failure, .. } =
+            *status.wait_for(|s| matches!(s, Unavailable { .. })).await.unwrap()
+        else {
+            unreachable!()
+        };
+        send("owner/one", Pr, None);
+        send("owner/one", Issue, Some("retry"));
+        let retry = status
+            .wait_for(|s| matches!(s, Unavailable { error, .. } if error == "retry"))
             .await
             .unwrap();
-    }
-    drop(sender);
-    let (_stop, shutdown) = watch::channel(false);
-    let (availability, provider_status) = watch::channel(ProviderAvailability::Starting);
-    tokio::join!(
-        track_provider_availability(4, receiver, availability, shutdown.clone()),
-        provider_health_worker(health.clone(), provider_status, shutdown),
-    );
-    health.snapshot()
-}
+        assert!(matches!(*retry, Unavailable { since, .. } if since == first_failure));
+        drop(retry);
 
-#[tokio::test]
-async fn health_tracks_each_repository_and_kind_independently() {
-    let mut reports = vec![("owner/one", Issue, None), ("owner/one", Pr, None)];
-    assert_eq!(aggregate(&reports).await.provider, "starting");
-    reports.extend([("owner/two", Issue, None), ("owner/two", Pr, None)]);
-    assert_eq!(aggregate(&reports).await.provider, "connected");
-
-    reports[0].2 = Some("first repository unavailable");
-    let failed = aggregate(&reports).await;
-    assert_eq!(failed.provider, "unavailable");
-    assert_eq!(failed.last_error.as_deref(), Some("first repository unavailable"));
-
-    reports.push(("owner/one", Issue, None));
-    let recovered = aggregate(&reports).await;
-    assert_eq!(recovered.provider, "connected");
+        send("owner/one", Issue, None);
+        status.wait_for(|s| matches!(s, Starting)).await.unwrap();
+        send("owner/two", Issue, None);
+        send("owner/two", Pr, None);
+        status.wait_for(|s| matches!(s, Connected)).await.unwrap();
+    })
+    .await
+    .expect("provider availability must advance without an operator health consumer");
+    send("owner/one", Issue, Some("still offline"));
+    send("owner/two", Pr, None);
+    drop(reports);
+    tracker.await.unwrap();
+    assert!(matches!(&*status.borrow(), Unavailable { error, .. } if error == "still offline"));
 }
 
 #[tokio::test]
 async fn provider_recovery_clears_its_own_diagnostic_and_preserves_another_workers_error() {
     for other_error in [None, Some("reconciliation failed")] {
-        let health = health("builtin");
+        let health = health();
         let (_stop, shutdown) = watch::channel(false);
         let (availability, reports) = watch::channel(ProviderAvailability::Starting);
         let worker = tokio::spawn(provider_health_worker(health.clone(), reports, shutdown));
@@ -89,65 +97,8 @@ async fn provider_recovery_clears_its_own_diagnostic_and_preserves_another_worke
         drop(availability);
         worker.await.unwrap();
         let recovered = health.snapshot();
+        assert_eq!(recovered.provider, "connected");
         assert!(recovered.ready);
         assert_eq!(recovered.last_error.as_deref(), other_error);
     }
-}
-
-#[tokio::test]
-async fn provider_control_advances_while_health_projection_is_paused() {
-    let health = health("builtin");
-    let earlier_snapshot = health.snapshot();
-    let (_stop, shutdown) = watch::channel(false);
-    let (reports, receiver) = mpsc::channel(1);
-    let (availability, mut control) = watch::channel(ProviderAvailability::Starting);
-    let tracker =
-        tokio::spawn(track_provider_availability(1, receiver, availability, shutdown.clone()));
-    let projection = provider_health_worker(health.clone(), control.clone(), shutdown);
-
-    let send = |error: Option<&str>| {
-        reports.send(ProviderReport {
-            repository: "owner/one".into(),
-            group: Issue,
-            error: error.map(str::to_owned),
-        })
-    };
-    tokio::time::timeout(Duration::from_secs(2), async {
-        send(Some("first failure")).await.unwrap();
-        control.changed().await.unwrap();
-        let initial_failure = match &*control.borrow() {
-            ProviderAvailability::Unavailable { since, error } => {
-                assert_eq!(error, "first failure");
-                *since
-            }
-            status => panic!("expected unavailable, got {status:?}"),
-        };
-        for _ in 0..3 {
-            send(Some("retry failure")).await.unwrap();
-            control.changed().await.unwrap();
-            match &*control.borrow() {
-                ProviderAvailability::Unavailable { since, error } => {
-                    assert_eq!(*since, initial_failure);
-                    assert_eq!(error, "retry failure");
-                }
-                status => panic!("expected unavailable during recovery, got {status:?}"),
-            }
-        }
-        send(None).await.unwrap();
-        control.changed().await.unwrap();
-        assert!(matches!(*control.borrow(), ProviderAvailability::Connected));
-    })
-    .await
-    .unwrap();
-
-    assert_eq!(health.snapshot().provider, "starting");
-    drop(reports);
-    tracker.await.unwrap();
-    projection.await;
-    let latest = health.snapshot();
-    assert_eq!(latest.provider, "connected");
-    assert!(latest.ready);
-    assert_eq!(latest.last_error, None);
-    assert_eq!(earlier_snapshot.provider, "starting");
-    assert!(!earlier_snapshot.ready);
 }

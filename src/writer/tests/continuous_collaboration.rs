@@ -170,27 +170,22 @@ fn independent_pr_ensures_deliver_two_activations_and_retry_one_identity() {
     let owner =
         f.store.acquire_runtime_lease("runtime".into(), "activation-test".into(), 3600).unwrap();
     for number in [9, 10] {
-        let payload = serde_json::to_string(&AcceptedRequest::Ensure {
-            comment_id: number,
-            head: Some(format!("head-{number}")),
-            profile: profile.clone(),
-        })
+        let receipt = ensure_pull_request(
+            &f.config,
+            &f.store,
+            PullRequestEnsureRequest {
+                invocation: Invocation::Operator,
+                repository: "owner/repository".parse().unwrap(),
+                comment_id: number,
+                head: Some(format!("head-{number}")),
+            },
+        )
         .unwrap();
         let plan = f
             .store
             .prepare_implementation_request(NewImplementationRequest {
                 root_intent_id: None,
-                write: NewGhWriteIntent {
-                    request_key: format!("ensure-{number}"),
-                    operation: "pr_ensure",
-                    repository: "owner/repository".into(),
-                    target: format!("https://github.com/owner/repository/issues/comments/{number}"),
-                    profile_id: profile.id.clone(),
-                    role: "Operator".into(),
-                    request_digest: helpers::digest(&payload),
-                    payload,
-                    source: None,
-                },
+                intent_id: receipt.intent_id,
                 comment_database_id: number,
                 comment_node_id: format!("comment-{number}"),
                 issue_node_id: "item".into(),

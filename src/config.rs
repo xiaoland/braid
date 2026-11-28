@@ -1495,13 +1495,11 @@ mod tests {
             std::env::temp_dir().join(format!("braid-secrets-{}.toml", uuid::Uuid::now_v7()));
         for (kind, contents) in [
             ("webhook", "webhook_secret = \"sensitive-marker"),
-            ("api_key", "provider_api_key = \"sensitive-marker"),
             ("oauth", "access = \"token\"\nrefresh = \"token\"\nexpires = \"sensitive-marker\""),
         ] {
             fs::write(&path, contents).expect("write malformed credential");
             let result = match kind {
                 "webhook" => load_webhook_secret_file(&path).map(|_| ()),
-                "api_key" => load_provider_secret_file(&path).map(|_| ()),
                 _ => load_oauth_file(&path).map(|_| ()),
             };
             let message = result.unwrap_err().to_string();

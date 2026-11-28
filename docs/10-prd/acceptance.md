@@ -57,9 +57,10 @@ node --test native/pi/tests/*.test.mjs
 ```
 
 `agent-build` 是本机编译串行入口；CI 直接运行相同 Cargo 命令。局部迭代可加
-`--bin braid <模块名>::` 或 `--test <文件名>` 筛选。Linux CI 另运行
-`cargo test --locked --bin braid --features opentelemetry-otlp/internal-logs telemetry::tests`，
-实际启用 SDK 内部错误诊断，验证 Collector 返回的敏感正文不会进入普通日志。
+`--bin braid <模块名>::` 或 `--test <文件名>` 筛选。Linux CI 另启用
+`opentelemetry-otlp/internal-logs`，单独复跑
+`telemetry::tests::telemetry_isolates_collector_rejection_bodies_from_ordinary_diagnostics`，
+验证 SDK 开启内部诊断时，Collector 返回的敏感正文仍不会进入普通日志。
 这不改变发行 binary 的 feature。标为 ignored 的 `telemetry_child` 只供父测试
 用独立子进程调用，父测试负责检查退出状态与所有输出；不能单独计作通过。
 
@@ -74,9 +75,10 @@ BRAID_BINARY=/absolute/path/to/braid CHROME_BIN=/absolute/path/to/chromium \
 ```
 
 Pi 安装或 Rust 适配器变更时，Linux CI 复用本轮编译并按 lock 安装 background
-插件，启动安装包中的 Node/Pi，以真实 RPC 读取状态、运行工具、关闭执行并离线
-检查回执。随后故意让真实会话的材料绑定写入失败，核对 Rust 工厂返回前已为该执行留下停止证据。安装步骤需要访问发行站点和 npm，模型未参与。其它插件组合和含模型
-会话各自单独记录。修改打包入口和包内材料的 PR 以及实际发行均在两个目标平台运行
+插件。Node 验证安装包中的真实 RPC、工具执行和 EOF 退出。Rust 工厂用例使材料绑定
+在原生启动后失败，并读取工厂返回前留在该执行目录的停止回执。安装步骤需要访问发行
+站点和 npm。其它插件组合和含模型会话各自单独记录。修改打包入口和包内材料的 PR
+以及实际发行均在两个目标平台运行
 `scripts/verify-package.sh DIST RELEASE_TAG RUST_TARGET`；它从校验和指定的
 归档中运行 binary，核对版本、示例配置及迁移后重开的数据库。
 

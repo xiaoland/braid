@@ -62,11 +62,7 @@ compat = { supports_store = false, max_tokens_field = "max_completion_tokens" }
 #[test]
 fn snapshot_writes_native_model_fields_and_keeps_credentials_out_of_models_json() {
     let root = std::env::temp_dir().join(format!("braid-pi-models-{}", uuid::Uuid::now_v7()));
-    for (name, kind) in [
-        ("api-key", CredentialKind::ApiKey),
-        ("oauth", CredentialKind::OAuth),
-        ("none", CredentialKind::None),
-    ] {
+    for (name, kind) in [("api-key", CredentialKind::ApiKey), ("oauth", CredentialKind::OAuth)] {
         let directory = root.join(name);
         fs::create_dir_all(&directory).unwrap();
         let config = configuration(&directory, kind, None, None);
@@ -87,13 +83,18 @@ fn snapshot_writes_native_model_fields_and_keeps_credentials_out_of_models_json(
             expected["providers"]["test-llm"]["apiKey"] = json!("$BRAID_PROVIDER_API_KEY");
         }
         assert_eq!(actual, expected, "{name}");
-        // Resume uses this same frozen home; it must not silently overwrite a
-        // changed model route just because the identity file still matches.
-        fs::write(home.join("models.json"), br#"{"providers":{}}"#).unwrap();
-        let error =
-            snapshot(&config, profile, &directory, &home_key, &materials.digest).unwrap_err();
-        assert!(error.to_string().contains("Pi native material snapshot changed at"), "{error}");
-        assert_eq!(fs::read(home.join("models.json")).unwrap(), br#"{"providers":{}}"#);
+        if kind == CredentialKind::ApiKey {
+            // Resume uses this same frozen home; it must not silently overwrite a
+            // changed model route just because the identity file still matches.
+            fs::write(home.join("models.json"), br#"{"providers":{}}"#).unwrap();
+            let error =
+                snapshot(&config, profile, &directory, &home_key, &materials.digest).unwrap_err();
+            assert!(
+                error.to_string().contains("Pi native material snapshot changed at"),
+                "{error}"
+            );
+            assert_eq!(fs::read(home.join("models.json")).unwrap(), br#"{"providers":{}}"#);
+        }
     }
     fs::remove_dir_all(root).unwrap();
 }

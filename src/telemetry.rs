@@ -417,7 +417,7 @@ pub fn emit_provider_payload(
     native_turn: Option<&str>,
     stream: &str,
     payload: &str,
-) -> bool {
+) {
     let span = observation_span(native_thread, native_turn);
     let correlated = span.is_some();
     let generation = evidence_health().runtime_generation;
@@ -476,7 +476,6 @@ pub fn emit_provider_payload(
             "sampled complete provider evidence"
         );
     }
-    sampled
 }
 
 /// Cleanup has an execution identity, not a fabricated provider session/turn.

@@ -66,8 +66,7 @@ pub fn record(
 mod tests {
     use super::*;
 
-    fn database() -> Connection {
-        let db = Connection::open_in_memory().unwrap();
+    fn database(db: Connection) -> Connection {
         db.execute_batch("CREATE TABLE repositories(node_id TEXT,name_with_owner TEXT);
           CREATE TABLE work_items(node_id TEXT,repository_node_id TEXT,kind TEXT,number INTEGER,state TEXT,observed_at INTEGER);
           CREATE TABLE assignments(work_item_node_id TEXT,lifecycle TEXT);
@@ -86,22 +85,28 @@ mod tests {
     }
 
     #[test]
-    fn hot_cold_observations_and_finalization() {
-        let db = database();
+    fn traversal_deadlines_survive_observations_and_restart() {
+        let path = std::env::temp_dir()
+            .join(format!("braid-reconciliation-{}.sqlite", uuid::Uuid::now_v7()));
+        let db = database(Connection::open(&path).unwrap());
         for id in ["open", "closed", "final"] {
             record(&db, id, 100, true).unwrap();
         }
         db.execute("UPDATE work_items SET observed_at=500", []).unwrap();
+        drop(db);
+        let db = Connection::open(&path).unwrap();
         assert!(due_ids(&db, 159).is_empty());
         assert_eq!(due_ids(&db, 160), ["final", "open"]);
         assert_eq!(due_ids(&db, 1900), ["closed", "final", "open"]);
         db.execute("UPDATE assignments SET lifecycle='retired'", []).unwrap();
         assert_eq!(due_ids(&db, 160), ["open"]);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn assignment_facts_and_repository_rotation() {
-        let db = database();
+        let db = database(Connection::open_in_memory().unwrap());
         db.execute_batch("INSERT INTO repositories VALUES('other','o/other');
             INSERT INTO work_items(node_id,repository_node_id,kind,number,state) VALUES('other','other','issue',4,'CLOSED');
             INSERT INTO assignments VALUES('closed','materializing');").unwrap();
@@ -134,7 +139,7 @@ mod tests {
 
     #[test]
     fn failed_traversal_backs_off_without_losing_the_last_success() {
-        let db = database();
+        let db = database(Connection::open_in_memory().unwrap());
         // This closed item has never succeeded. Its failure cannot delay other
         // items, start the cold interval, or retry before the hot interval.
         record(&db, "closed", 100, false).unwrap();
@@ -153,27 +158,5 @@ mod tests {
         record(&db, "open", 1900, false).unwrap();
         assert!(!due_ids(&db, 1959).iter().any(|id| id == "open"));
         assert!(due_ids(&db, 1960).iter().any(|id| id == "open"));
-    }
-
-    #[test]
-    fn success_survives_connection_restart() {
-        let path = std::env::temp_dir()
-            .join(format!("braid-reconciliation-{}.sqlite", uuid::Uuid::now_v7()));
-        let db = database();
-        let mut backup = Connection::open(&path).unwrap();
-        rusqlite::backup::Backup::new(&db, &mut backup)
-            .unwrap()
-            .run_to_completion(100, std::time::Duration::ZERO, None)
-            .unwrap();
-        drop(backup);
-        {
-            let reopened = Connection::open(&path).unwrap();
-            record(&reopened, "closed", 100, true).unwrap();
-        }
-        let reopened = Connection::open(&path).unwrap();
-        assert!(!due(&reopened, 1899, 60).unwrap().iter().any(|w| w.node_id == "closed"));
-        assert!(due(&reopened, 1900, 60).unwrap().iter().any(|w| w.node_id == "closed"));
-        drop(reopened);
-        std::fs::remove_file(path).unwrap();
     }
 }

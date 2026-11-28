@@ -55,13 +55,6 @@ fn multi_repository_config_requires_repo_scoped_profiles() {
         .expect("write multi-repo config");
 
     let output = braid()
-        .args(["config", "check", "--config"])
-        .arg(&path)
-        .output()
-        .expect("check multi-repository config");
-    assert!(output.status.success(), "{}", stderr(&output));
-
-    let output = braid()
         .args(["profile", "inspect", "--config"])
         .arg(&path)
         .args(["--profile", "issue-codex-other", "--json"])

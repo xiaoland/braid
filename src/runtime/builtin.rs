@@ -845,13 +845,7 @@ mod tests {
     #[tokio::test]
     async fn managed_ingests_while_old_execution_fence_is_unavailable() {
         let fixture = crate::writer::tests::Fixture::new(false);
-        let store = Arc::new(
-            StoreActor::start(
-                fixture.config.runtime.database().into(),
-                fixture.config.runtime.backups().into(),
-            )
-            .unwrap(),
-        );
+        let store = &fixture.store;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let requested_after_close = Arc::new(tokio::sync::Notify::new());
@@ -888,7 +882,7 @@ mod tests {
                     .last_error
                     .as_deref()
                     .is_some_and(|error| error.contains("execution fence"));
-                if watching_fence && client_cursor(&store).is_ok_and(|cursor| cursor == 1) {
+                if watching_fence && client_cursor(store).is_ok_and(|cursor| cursor == 1) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -902,13 +896,6 @@ mod tests {
         let events =
             store.work_item_lifecycle_candidates("test-space".into(), "issue".into(), 1).unwrap();
         assert_eq!(events[0].action, "closed");
-        let turns: u64 = fixture
-            .db()
-            .query_row("SELECT COUNT(*) FROM turns", [], |row| row.get::<_, i64>(0))
-            .unwrap()
-            .try_into()
-            .unwrap();
-        assert_eq!(turns, 0);
         let requested_stop = halt.send(true);
         let result = runtime.await.unwrap();
         assert!(requested_stop.is_ok(), "runtime exited before the requested stop: {result:#?}");

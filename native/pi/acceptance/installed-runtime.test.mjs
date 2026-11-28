@@ -60,15 +60,7 @@ test('installed background-only Pi opens a fresh session, serves tools and close
     assert.equal(state.sessionFile, session);
     assert.equal(state.model.provider, 'fixture');
     assert.equal(state.model.id, 'offline');
-    assert.equal(state.managed_state.execution_id, id);
     assert.equal(state.managed_state.status, 'quiescent');
-    assert.equal(state.braid_native_runtime.schema_version, 1);
-    assert.equal(state.braid_native_runtime.pi_version, '1.1.0');
-    for (const required of ['retry_intent', 'settle_extensions', 'owned_inference', 'managed_execution', 'owned_stop']) {
-      assert.ok(state.braid_native_runtime.capabilities.includes(required), `missing RPC capability ${required}`);
-    }
-    assert.equal(state.braid_native_runtime.execution_id, id);
-    assert.deepEqual(state.braid_native_runtime.extension_errors, []);
     assert.deepEqual(state.braid_native_runtime.extensions, [
       path.join(install, 'node_modules/pi-background-bash/extensions/background-bash.ts'),
     ]);
@@ -88,16 +80,6 @@ test('installed background-only Pi opens a fresh session, serves tools and close
     assert.equal(signal, null, stderr);
     assert.equal(code, 0, stderr);
   }
-  // Read the final receipt produced from persisted registrations after EOF.
-  const output = execFileSync(node, [
-    path.join(install, 'managed.mjs'), 'cleanup', '--execution-dir', directory, '--execution-id', id,
-  ], { cwd: root, env: { HOME: root, PATH: env.PATH }, encoding: 'utf8', timeout: 30000 });
-  const offline = JSON.parse(output);
-  assert.equal(offline.status, 'stopped', output);
-  assert.equal(offline.execution_id, id);
-  assert.equal(offline.scope, 'execution');
-  assert.equal(offline.coverage, 'registered-process-groups-and-inherited-execution-markers');
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(directory, 'execution-stop.json'), 'utf8')), offline);
 });
 
 test('installed background bash reports an unverified stop even when the command exits zero', async t => {

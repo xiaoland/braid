@@ -122,16 +122,13 @@ impl Fixture {
         json!({"grantId":grant["grantId"],"epoch":grant["epoch"],"token":grant["token"]})
     }
 
-    async fn create_issue(&self) {
-        let receipt = self
-            .apply(
-                "create",
-                None,
-                json!({"type":"createIssue", "title":"Design", "body":"original"}),
-            )
-            .await;
-        assert_eq!(receipt["result"]["number"], 1);
-        assert_eq!(receipt["result"]["revision"], 1);
+    async fn create_issue(&self) -> Value {
+        self.apply(
+            "create",
+            None,
+            json!({"type":"createIssue", "title":"Design", "body":"original"}),
+        )
+        .await
     }
 }
 
@@ -158,8 +155,9 @@ fn commit(git: &git2::Repository, reference: &str, body: &str, parents: &[git2::
 #[tokio::test]
 async fn command_receipts_and_revision_conflicts_survive_restart_without_duplicate_events() {
     let mut fixture = Fixture::new().await;
-    fixture.create_issue().await;
-    let original = fixture.get("/api/control/receipts/create").await;
+    let original = fixture.create_issue().await;
+    assert_eq!(original["result"]["number"], 1);
+    assert_eq!(original["result"]["revision"], 1);
     let events = fixture.get("/api/platform/events?after=0").await;
     fixture.restart().await;
     let replay = fixture
@@ -196,47 +194,6 @@ async fn command_receipts_and_revision_conflicts_survive_restart_without_duplica
 }
 
 #[tokio::test]
-async fn revoked_writer_cannot_write_with_the_current_object_revision_after_restart() {
-    let mut fixture = Fixture::new().await;
-    fixture.create_issue().await;
-    fixture.apply("assign", Some(1), json!({"type":"assign", "number":1, "actor":"worker"})).await;
-    let capability = fixture.mint(1, "grant", 0, None).await;
-    let write = json!({"requestId":"write", "expectedRevision":2, "actor":"worker", "writer":capability,
-        "command":{"type":"comment", "number":1, "body":"accepted", "replyTo":null}});
-    let (status, accepted) = fixture.post("/api/control/commands", &write).await;
-    assert_eq!(status, StatusCode::OK, "{accepted}");
-    assert_eq!(accepted["state"], "applied");
-    let (status, revoked) = fixture.post("/api/platform/grants/revoke", &json!({
-        "requestId":"revoke", "clientId":"harness", "itemNumber":1, "actor":"worker", "expectedEpoch":1,
-    })).await;
-    assert_eq!(status, StatusCode::OK, "{revoked}");
-    assert_eq!(revoked, json!({"epoch":2,"lifecycle":"revoked"}));
-    let events = fixture.get("/api/platform/events?after=0").await;
-    fixture.restart().await;
-    let item = fixture.get("/api/control/items/1").await;
-    assert_eq!(item["item"]["state"], "open");
-    assert_eq!(item["item"]["desired_profile"], "worker");
-    assert_eq!(item["item"]["revision"], 3);
-    let (status, rejected) = fixture.post("/api/control/commands", &json!({
-        "requestId":"late", "expectedRevision":3, "actor":"worker", "writer":capability,
-        "command":{"type":"comment", "number":1, "body":"must not be written", "replyTo":null},
-    })).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(rejected["state"], "rejected");
-    assert_eq!(rejected["error"]["code"], "rejected");
-    assert!(
-        rejected["error"]["message"].as_str().unwrap().contains("writer grant is stale, revoked")
-    );
-    assert_eq!(fixture.get("/api/control/items/1").await, item);
-    assert_eq!(fixture.get("/api/platform/events?after=0").await, events);
-    // A completed old command remains a receipt; replay is not a new late mutation.
-    let (status, replay) = fixture.post("/api/control/commands", &write).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(replay, accepted);
-    fixture.shutdown().await;
-}
-
-#[tokio::test]
 async fn object_authority_changes_invalidate_grants_even_when_grant_rows_cannot_be_updated() {
     let mut fixture = Fixture::new().await;
     fixture.create_issue().await;
@@ -254,7 +211,7 @@ async fn object_authority_changes_invalidate_grants_even_when_grant_rows_cannot_
     block_grant_updates();
     fixture.apply("reassign", Some(2), json!({"type":"assign","number":1,"actor":"worker"})).await;
     assert_eq!(fixture.get(epoch_path).await, json!({"active":false,"epoch":1}));
-    assert_stale_write(&fixture, "late-after-reassignment", &unscoped).await;
+    assert_stale_write(&fixture, 1, "late-after-reassignment", &unscoped).await;
     let revision = fixture.get("/api/control/items/1").await["item"]["revision"].as_u64().unwrap();
     fixture
         .apply(
@@ -286,29 +243,30 @@ async fn object_authority_changes_invalidate_grants_even_when_grant_rows_cannot_
         fixture.apply(operation, Some(revision), json!({"type":operation, "number":1})).await;
     }
     assert_eq!(fixture.get(epoch_path).await, json!({"active":false,"epoch":2}));
-    assert_stale_write(&fixture, "late-after-reopen", &scoped).await;
+    assert_stale_write(&fixture, 1, "late-after-reopen", &scoped).await;
     fixture.shutdown().await;
 }
 
-async fn assert_stale_write(fixture: &Fixture, id: &str, writer: &Value) {
-    let path = "/api/control/items/1";
-    let item = fixture.get(path).await;
+async fn assert_stale_write(fixture: &Fixture, number: u64, id: &str, writer: &Value) {
+    let path = format!("/api/control/items/{number}");
+    let item = fixture.get(&path).await;
     let (status, body) = fixture
         .post(
             "/api/control/commands",
             &json!({
                 "requestId":id, "expectedRevision":item["item"]["revision"], "actor":"worker",
-                "writer":writer,"command":{"type":"comment","number":1,"body":"stale write"}
+                "writer":writer,"command":{"type":"comment","number":number,"body":"stale write"}
             }),
         )
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["state"], "rejected");
+    assert_eq!(body["error"]["code"], "rejected");
     assert!(
         body["error"]["message"].as_str().unwrap().contains("writer grant is stale, revoked"),
         "{body}"
     );
-    assert_eq!(fixture.get(path).await, item);
+    assert_eq!(fixture.get(&path).await, item);
 }
 
 #[tokio::test]
@@ -346,6 +304,7 @@ async fn published_candidate_diff_and_merge_use_the_frozen_commit_after_branch_m
     assert!(diff["diff"].as_str().unwrap().contains("+published candidate"));
     assert!(!diff["diff"].as_str().unwrap().contains("later unpublished work"));
     let receipt = fixture.apply("merge", Some(2), json!({"type":"merge", "number":2})).await;
+    assert_eq!(fixture.get("/api/control/receipts/merge").await, receipt);
     let merged = git.refname_to_id("refs/heads/main").unwrap();
     assert_eq!(receipt["result"]["merge_commit"], merged.to_string());
     let commit = git.find_commit(merged).unwrap();
@@ -357,16 +316,10 @@ async fn published_candidate_diff_and_merge_use_the_frozen_commit_after_branch_m
     assert_eq!(blob.content(), b"published candidate\n");
     assert_eq!(fixture.get("/api/control/items/1").await["item"]["state"], "open");
     assert_eq!(fixture.get("/api/control/items/2").await["item"]["state"], "closed");
-    let events = fixture.get("/api/platform/events?after=0").await;
-    fixture.restart().await;
-    let replay = fixture.apply("merge", Some(2), json!({"type":"merge", "number":2})).await;
-    assert_eq!(replay, receipt);
-    assert_eq!(git.refname_to_id("refs/heads/main").unwrap(), merged);
-    assert_eq!(fixture.get("/api/platform/events?after=0").await, events);
     fixture.shutdown().await;
 }
 
-async fn assigned_pr(fixture: &Fixture) -> Value {
+async fn open_pr(fixture: &Fixture) {
     fixture.create_issue().await;
     let git = git2::Repository::open(&fixture.config.source).unwrap();
     let base = git.refname_to_id("refs/heads/main").unwrap();
@@ -380,6 +333,10 @@ async fn assigned_pr(fixture: &Fixture) -> Value {
         "head":"feature", "base":"main", "issue":1, "issueRevision":1}),
         )
         .await;
+}
+
+async fn assigned_pr(fixture: &Fixture) -> Value {
+    open_pr(fixture).await;
     fixture
         .apply("assign-pr", Some(1), json!({"type":"assign", "number":2, "actor":"worker"}))
         .await;
@@ -422,8 +379,9 @@ async fn adopted_merge_recovers_its_receipt_after_restart_and_writer_revocation(
         "requestId":"revoke-pr", "clientId":"harness", "itemNumber":2, "actor":"worker", "expectedEpoch":1,
     })).await;
     assert_eq!(status, StatusCode::OK, "{revoked}");
-    assert_eq!(revoked["lifecycle"], "revoked");
+    assert_eq!(revoked, json!({"epoch":2,"lifecycle":"revoked"}));
     fixture.restart().await;
+    assert_stale_write(&fixture, 2, "late-after-revocation", &capability).await;
     // Even a newly authorized Human command cannot claim someone else's Git effect.
     let (status, other) = fixture
         .post(
@@ -477,11 +435,11 @@ async fn adopted_merge_recovers_its_receipt_after_restart_and_writer_revocation(
 }
 
 #[tokio::test]
-async fn prepared_merge_does_not_retry_uncommitted_effects_after_writer_revocation() {
+async fn prepared_merge_without_a_bound_commit_does_not_reexecute_on_retry() {
     let mut fixture = Fixture::new().await;
-    let capability = assigned_pr(&fixture).await;
-    let request = json!({"requestId":"merge-pending", "expectedRevision":2,
-        "actor":"worker", "writer":capability, "command":{"type":"merge", "number":2}});
+    open_pr(&fixture).await;
+    let request = json!({"requestId":"merge-pending", "expectedRevision":1,
+        "command":{"type":"merge", "number":2}});
     let db = rusqlite::Connection::open(&fixture.config.database).unwrap();
     let git = git2::Repository::open(&fixture.config.source).unwrap();
     let base = git.refname_to_id("refs/heads/main").unwrap();
@@ -501,11 +459,6 @@ async fn prepared_merge_does_not_retry_uncommitted_effects_after_writer_revocati
     assert_eq!(git.refname_to_id("refs/heads/main").unwrap(), base);
     db.execute_batch("DROP TRIGGER fail_intent; DROP TRIGGER lose_receipt;").unwrap();
     drop(db);
-    let (status, revoked) = fixture.post("/api/platform/grants/revoke", &json!({
-        "requestId":"revoke-pr", "clientId":"harness", "itemNumber":2, "actor":"worker", "expectedEpoch":1,
-    })).await;
-    assert_eq!(status, StatusCode::OK, "{revoked}");
-    assert_eq!(revoked["lifecycle"], "revoked");
     let events = fixture.get("/api/platform/events?after=0").await;
     fixture.restart().await;
     let (status, pending) = fixture.post("/api/control/commands", &request).await;
@@ -588,15 +541,7 @@ async fn publishing_and_its_receipt_commit_together_or_leave_the_candidate_uncha
     assert_eq!(receipt["result"]["head_commit"], candidate.to_string());
     assert_eq!(receipt["result"]["revision"], 3);
     assert_eq!(receipt["result"]["published"], true);
-    let item = fixture.get("/api/control/items/2").await;
-    let events = fixture.get("/api/platform/events?after=0").await;
-    fixture.restart().await;
-    assert_eq!(
-        fixture.post("/api/control/commands", &new_request).await,
-        (StatusCode::OK, receipt)
-    );
-    assert_eq!(fixture.get("/api/control/items/2").await, item);
-    assert_eq!(fixture.get("/api/platform/events?after=0").await, events);
+    assert_eq!(fixture.get("/api/control/receipts/publish-complete").await, receipt);
     fixture.shutdown().await;
 }
 

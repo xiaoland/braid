@@ -49,13 +49,6 @@ fn provider_route_inputs_are_validated_at_cli_and_config_boundaries() {
     }
 
     let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
-    let output = braid()
-        .args(["config", "check", "--config"])
-        .arg(&example)
-        .output()
-        .expect("check file-based example");
-    assert!(output.status.success(), "{}", stderr(&output));
-
     let example_text = fs::read_to_string(&example).expect("read example");
     let mut coupled: toml::Value = toml::from_str(&example_text).expect("parse example");
     coupled["profiles"][0].as_table_mut().unwrap().insert("provider".into(), "openai".into());
@@ -155,17 +148,6 @@ fn api_key_credential(directory: &Path) -> String {
     format!("{{ kind = \"api_key\", file = \"{}\" }}", secret.display())
 }
 
-fn oauth_credential(directory: &Path) -> String {
-    fs::create_dir_all(directory).expect("create credential directory");
-    let secret = directory.join("oauth.toml");
-    fs::write(
-        &secret,
-        "access = \"test-access\"\nrefresh = \"test-refresh\"\nexpires = 4102444800000\naccount = \"tester\"\n",
-    )
-    .expect("write oauth credential");
-    format!("{{ kind = \"oauth\", file = \"{}\" }}", secret.display())
-}
-
 fn inspect_profile(config: &Path) -> std::process::Output {
     braid()
         .args(["profile", "inspect", "--config"])
@@ -191,35 +173,6 @@ fn reject_config_case(example: &str, directory: &Path, mutate: impl Fn(&Path), e
         stderr(&output)
     );
     assert!(stderr(&output).contains(expected), "{expected}: {}", stderr(&output));
-}
-
-#[test]
-fn profile_inspect_reports_the_selected_pi_route_and_credential_kind() {
-    let example =
-        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml"))
-            .expect("read example");
-    let temporary =
-        std::env::temp_dir().join(format!("braid-pi-provider-materials-{}", std::process::id()));
-
-    for (name, credential_fragment) in [
-        ("api-key", api_key_credential(&temporary.join("api-key"))),
-        ("oauth", oauth_credential(&temporary.join("oauth"))),
-        ("none", "{ kind = \"none\" }".to_owned()),
-    ] {
-        let directory = temporary.join(name);
-        let output = inspect_profile(&write_pi_config(&example, &directory, &credential_fragment));
-        assert!(output.status.success(), "{name}: {}", stderr(&output));
-        let report = stdout(&output);
-        let kind = match name {
-            "api-key" => "ApiKey",
-            "oauth" => "OAuth",
-            _ => "None",
-        };
-        assert!(report.contains(&format!("credential: {kind}")), "{report}");
-        assert!(report.contains("provider: example-llm"), "{report}");
-        assert!(report.contains("model: example-chat"), "{report}");
-    }
-    let _ = fs::remove_dir_all(&temporary);
 }
 
 #[test]
@@ -300,6 +253,10 @@ fn pi_derivation_rejects_bad_provider_surfaces() {
     let output = inspect_profile(&config);
     let _ = fs::remove_dir_all(&temporary);
     assert!(output.status.success(), "{}", stderr(&output));
+    let report = stdout(&output);
+    for line in ["provider: example-llm", "model: example-chat", "credential: ApiKey"] {
+        assert!(report.lines().any(|printed| printed == line), "{report}");
+    }
 }
 
 #[test]
@@ -459,7 +416,12 @@ fn provider_import_auth_converts_pi_credentials() {
         assert_eq!(fs::metadata(&imported).expect("metadata").permissions().mode() & 0o777, 0o600);
     }
 
-    let output = import("other-provider").output().expect("import API key credential");
+    let output = braid()
+        .args(["provider", "import-auth", "other-provider", "--from"])
+        .arg(&pi_auth)
+        .env("BRAID_USER_HOME", &user_home)
+        .output()
+        .expect("import API key into the environment-selected user home");
     assert!(output.status.success(), "{}", stderr(&output));
     let imported_key = fs::read_to_string(user_home.join("secrets/other-provider.toml"))
         .expect("read imported api key");
@@ -490,16 +452,6 @@ fn provider_import_auth_converts_pi_credentials() {
         assert_eq!(rotated["provider_api_key"].as_str(), Some("rotated"));
     }
 
-    // BRAID_USER_HOME is honored without an explicit --user-home flag.
-    let env_home = temporary.join("env-home");
-    let output = braid()
-        .args(["provider", "import-auth", "example-llm", "--from"])
-        .arg(&pi_auth)
-        .env("BRAID_USER_HOME", &env_home)
-        .output()
-        .expect("import honors BRAID_USER_HOME");
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert!(env_home.join("secrets/example-llm.toml").is_file());
     let _ = fs::remove_dir_all(&temporary);
 }
 

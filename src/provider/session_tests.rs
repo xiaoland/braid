@@ -1,14 +1,10 @@
 use super::*;
 use crate::provider::{ProviderSession, ProviderTurn};
-use tokio::sync::{mpsc, oneshot};
-
-type StartReply = oneshot::Sender<Result<ProviderTurn, ProviderError>>;
 
 /// Only the external provider is controlled. The production adapter owns
 /// notification ordering, deduplication, availability and stop confirmation.
 struct ControlledProvider {
     notifications: broadcast::Sender<ProviderNotification>,
-    starts: mpsc::Sender<StartReply>,
 }
 
 #[async_trait::async_trait]
@@ -37,11 +33,9 @@ impl AgentProvider for ControlledProvider {
         &self,
         _: &str,
         _: &Profile,
-        _: &str,
+        input: &str,
     ) -> Result<ProviderTurn, ProviderError> {
-        let (reply, response) = oneshot::channel();
-        self.starts.send(reply).await.unwrap();
-        response.await.unwrap()
+        Ok(ProviderTurn { turn_id: format!("native-{input}") })
     }
     async fn steer(&self, _: &str, _: &str, _: &str) -> Result<(), ProviderError> {
         unreachable!("this fixture does not steer")
@@ -51,10 +45,8 @@ impl AgentProvider for ControlledProvider {
     }
 }
 
-async fn fixture()
--> (Arc<ControlledProvider>, Arc<ProviderAgentSession>, mpsc::Receiver<StartReply>) {
-    let (starts, requests) = mpsc::channel(1);
-    let provider = Arc::new(ControlledProvider { notifications: broadcast::channel(32).0, starts });
+async fn fixture() -> (Arc<ControlledProvider>, Arc<ProviderAgentSession>) {
+    let provider = Arc::new(ControlledProvider { notifications: broadcast::channel(32).0 });
     let config: crate::config::Config =
         toml::from_str(include_str!("../../config.example.toml")).unwrap();
     let session = ProviderAgentSession::start(
@@ -65,18 +57,11 @@ async fn fixture()
     )
     .await
     .unwrap();
-    (provider, session, requests)
+    (provider, session)
 }
 
-async fn start(
-    session: &Arc<ProviderAgentSession>,
-    requests: &mut mpsc::Receiver<StartReply>,
-    turn: &str,
-) {
-    let sender = session.clone();
-    let sending = tokio::spawn(async move { sender.send_user_msg("input".into(), false).await });
-    requests.recv().await.unwrap().send(Ok(ProviderTurn { turn_id: turn.into() })).unwrap();
-    assert_eq!(sending.await.unwrap().unwrap(), SendResult::Started);
+async fn start(session: &ProviderAgentSession, turn: &str) {
+    assert_eq!(session.send_user_msg(turn.into(), false).await.unwrap(), SendResult::Started);
 }
 
 async fn next(events: &mut broadcast::Receiver<SessionEvent>) -> SessionEvent {
@@ -88,26 +73,26 @@ async fn next(events: &mut broadcast::Receiver<SessionEvent>) -> SessionEvent {
 
 #[tokio::test]
 async fn stale_and_duplicate_notifications_cannot_settle_the_next_turn() {
-    let (provider, session, mut requests) = fixture().await;
+    let (provider, session) = fixture().await;
     let mut events = session.events();
-    start(&session, &mut requests, "first").await;
+    start(&session, "first").await;
     assert!(
-        matches!(next(&mut events).await, SessionEvent::TurnStarted { provider_turn_id } if provider_turn_id == "first")
+        matches!(next(&mut events).await, SessionEvent::TurnStarted { provider_turn_id } if provider_turn_id == "native-first")
     );
     let completed = ProviderNotification::TurnCompleted {
         thread_id: "thread".into(),
-        turn_id: "first".into(),
+        turn_id: "native-first".into(),
         status: "completed".into(),
         error: None,
     };
     provider.notifications.send(completed.clone()).unwrap();
     assert!(
-        matches!(next(&mut events).await, SessionEvent::TurnTerminal { provider_turn_id, outcome: TurnOutcome::Completed, error: None } if provider_turn_id == "first")
+        matches!(next(&mut events).await, SessionEvent::TurnTerminal { provider_turn_id, outcome: TurnOutcome::Completed, error: None } if provider_turn_id == "native-first")
     );
 
-    start(&session, &mut requests, "second").await;
+    start(&session, "second").await;
     assert!(
-        matches!(next(&mut events).await, SessionEvent::TurnStarted { provider_turn_id } if provider_turn_id == "second")
+        matches!(next(&mut events).await, SessionEvent::TurnStarted { provider_turn_id } if provider_turn_id == "native-second")
     );
     // The final current terminal is a stream barrier: all earlier frames have
     // been consumed when it arrives, so absence checks do not race the listener.
@@ -116,14 +101,14 @@ async fn stale_and_duplicate_notifications_cannot_settle_the_next_turn() {
         .notifications
         .send(ProviderNotification::TurnStarted {
             thread_id: "thread".into(),
-            turn_id: "first".into(),
+            turn_id: "native-first".into(),
         })
         .unwrap();
     provider
         .notifications
         .send(ProviderNotification::TurnCompleted {
             thread_id: "another-thread".into(),
-            turn_id: "second".into(),
+            turn_id: "native-second".into(),
             status: "completed".into(),
             error: None,
         })
@@ -132,13 +117,13 @@ async fn stale_and_duplicate_notifications_cannot_settle_the_next_turn() {
         .notifications
         .send(ProviderNotification::TurnCompleted {
             thread_id: "thread".into(),
-            turn_id: "second".into(),
+            turn_id: "native-second".into(),
             status: "failed".into(),
             error: Some("provider rejected the model".into()),
         })
         .unwrap();
     assert!(
-        matches!(next(&mut events).await, SessionEvent::TurnTerminal { provider_turn_id, outcome: TurnOutcome::Failed, error: Some(error) } if provider_turn_id == "second" && error == "provider rejected the model")
+        matches!(next(&mut events).await, SessionEvent::TurnTerminal { provider_turn_id, outcome: TurnOutcome::Failed, error: Some(error) } if provider_turn_id == "native-second" && error == "provider rejected the model")
     );
     assert!(matches!(events.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
     session.close().await.unwrap();
@@ -147,10 +132,10 @@ async fn stale_and_duplicate_notifications_cannot_settle_the_next_turn() {
 #[tokio::test]
 async fn disconnect_latches_unavailability_and_does_not_prove_an_active_turn_stopped() {
     for active in [false, true] {
-        let (provider, session, mut requests) = fixture().await;
+        let (provider, session) = fixture().await;
         let mut events = session.events();
         if active {
-            start(&session, &mut requests, "running").await;
+            start(&session, "running").await;
             assert!(matches!(next(&mut events).await, SessionEvent::TurnStarted { .. }));
         }
         provider.notifications.send(ProviderNotification::Disconnected).unwrap();
@@ -163,7 +148,7 @@ async fn disconnect_latches_unavailability_and_does_not_prove_an_active_turn_sto
         .unwrap();
         if active {
             assert!(
-                matches!(next(&mut events).await, SessionEvent::TurnTerminal { provider_turn_id, outcome: TurnOutcome::Unknown, error: Some(error) } if provider_turn_id == "running" && error == "provider disconnected")
+                matches!(next(&mut events).await, SessionEvent::TurnTerminal { provider_turn_id, outcome: TurnOutcome::Unknown, error: Some(error) } if provider_turn_id == "native-running" && error == "provider disconnected")
             );
             let error = session.close().await.unwrap_err();
             assert!(

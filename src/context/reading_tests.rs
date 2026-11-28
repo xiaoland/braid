@@ -168,19 +168,17 @@ async fn single_page_bill_and_multipage_output_equivalence() {
         assert_eq!(ops.lock().unwrap().len(), 5);
         assert_eq!(ops.lock().unwrap().iter().filter(|op| op.ends_with("Core")).count(), 2);
         assert_eq!(single["body"], "Full body");
+        let comments = single[if pr { "conversation" } else { "comments" }].as_array().unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0]["node_id"], "C1");
+        assert_eq!(comments[0]["body"], "First comment");
+        assert_eq!(comments[1]["node_id"], "C2");
+        assert_eq!(comments[1]["body"], "Complete comment body");
         task.abort();
+
         let (client, ops, task) = server(pr, true, false, None).await;
         let multi = materialize(&client, pr).await.unwrap();
-        for snapshot in [&single, &multi] {
-            let comments =
-                snapshot[if pr { "conversation" } else { "comments" }].as_array().unwrap();
-            assert_eq!(comments.len(), 2);
-            assert_eq!(comments[0]["node_id"], "C1");
-            assert_eq!(comments[0]["body"], "First comment");
-            assert_eq!(comments[1]["node_id"], "C2");
-            assert_eq!(comments[1]["body"], "Complete comment body");
-        }
-        assert_eq!(single, multi);
+        assert_eq!(multi, single);
         assert_eq!(ops.lock().unwrap().len(), 6);
         task.abort();
     }
@@ -193,15 +191,15 @@ async fn drift_discards_and_retries_whole_snapshot_and_partial_errors_fail() {
         assert_eq!(snapshot["updated_at"], "1");
         assert_eq!(ops.lock().unwrap().len(), 10);
         task.abort();
-        let (client, ops, task) = server(pr, false, false, Some("partial")).await;
-        let error = materialize(&client, pr).await.unwrap_err();
-        assert!(
-            matches!(error, ContextError::GitHub(GitHubError::GraphQl(ref message)) if message == "incomplete"),
-            "wrong failure: {error}"
-        );
-        assert_eq!(ops.lock().unwrap().len(), 3);
-        task.abort();
     }
+    let (client, ops, task) = server(false, false, false, Some("partial")).await;
+    let error = materialize(&client, false).await.unwrap_err();
+    assert!(
+        matches!(error, ContextError::GitHub(GitHubError::GraphQl(ref message)) if message == "incomplete"),
+        "wrong failure: {error}"
+    );
+    assert_eq!(ops.lock().unwrap().len(), 3);
+    task.abort();
 }
 
 #[tokio::test]

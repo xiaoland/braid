@@ -1,20 +1,18 @@
 use crate::{config, telemetry};
 
-use opentelemetry::trace::TraceContextExt as _;
+use axum::{
+    Router,
+    body::Bytes,
+    http::{StatusCode, Uri, header},
+    routing::post,
+};
 use opentelemetry_proto::tonic::collector::{
     logs::v1::ExportLogsServiceRequest, metrics::v1::ExportMetricsServiceRequest,
     trace::v1::ExportTraceServiceRequest,
 };
 use prost::Message as _;
-use std::{
-    io::{Read as _, Write as _},
-    process::Command,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-};
-use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+use std::sync::mpsc;
+use tokio::process::Command;
 
 const SENTINEL: &str = "PRIVATE_PAYLOAD_SENTINEL_";
 const RESPONSE_SENTINEL: &str = "PRIVATE_COLLECTOR_RESPONSE_SENTINEL";
@@ -56,34 +54,26 @@ fn telemetry_child() {
         profile_digest: "digest-test".into(),
     });
     telemetry::begin_turn("session-test", "turn-test");
+    telemetry::emit_provider_payload("pi", "session-test", None, "request", &payload);
     telemetry::bind_provider_turn("session-test", "native-turn-test");
-    for stream in ["request", "stdout", "stderr"] {
-        assert_eq!(
-            telemetry::emit_provider_payload(
-                "pi",
-                "session-test",
-                Some("native-turn-test"),
-                stream,
-                &payload
-            ),
-            std::env::var("BRAID_TEST_RETAIN").unwrap() == "1"
-        );
-    }
+    telemetry::emit_provider_payload(
+        "pi",
+        "session-test",
+        Some("native-turn-test"),
+        "stdout",
+        &payload,
+    );
     let root = tracing::info_span!("test.root");
-    let sampled = root.context().span().is_recording();
     {
         let _entered = root.enter();
-        assert_eq!(
-            telemetry::emit_payload_event(&telemetry::PayloadEvidence {
-                github_body: &payload,
-                github_summary: &format!("summary:{payload}"),
-                credential: &format!("credential:{payload}"),
-                provider_transcript: &format!("transcript:{payload}"),
-                webhook_payload: &format!("webhook:{payload}"),
-                local_path: &format!("/diagnostic/{payload}"),
-            }),
-            sampled
-        );
+        telemetry::emit_payload_event(&telemetry::PayloadEvidence {
+            github_body: &payload,
+            github_summary: &format!("summary:{payload}"),
+            credential: &format!("credential:{payload}"),
+            provider_transcript: &format!("transcript:{payload}"),
+            webhook_payload: &format!("webhook:{payload}"),
+            local_path: &format!("/diagnostic/{payload}"),
+        });
         telemetry::emit_provider_cleanup("execution-test", payload.as_bytes(), payload.as_bytes());
         // Evidence-target spans must not leak through fmt's inherited context.
         let secret = tracing::info_span!(target: "braid::evidence", "evidence.test", credential = payload.as_str());
@@ -95,146 +85,96 @@ fn telemetry_child() {
     guard.shutdown().unwrap();
 }
 
-#[test]
-fn telemetry_routes_complete_evidence_only_to_otlp() {
-    for format in ["text", "json"] {
-        for (ratio, incident, retained) in [("0", false, "0"), ("1", false, "1"), ("0", true, "1")]
-        {
-            verify(format, ratio, incident, retained, false, false, "trace");
-        }
-    }
-    verify("json", "1", false, "1", false, true, "trace");
+#[tokio::test]
+async fn telemetry_routes_complete_evidence_only_to_otlp() {
+    verify(Scenario::Runtime, "text", "0", StatusCode::OK, false).await;
+    verify(Scenario::Incident, "json", "0", StatusCode::OK, true).await;
 }
 
-// Also run with --features opentelemetry-otlp/internal-logs to exercise its raw
-// response_body diagnostic, which is disabled in the production feature set.
-#[test]
-fn telemetry_isolates_collector_rejection_bodies_from_ordinary_diagnostics() {
-    for format in ["text", "json"] {
-        for rust_log in ["debug", "trace", "trace,opentelemetry-otlp=trace,opentelemetry_sdk=trace"]
-        {
-            verify(format, "1", false, "1", true, true, rust_log);
-            verify(format, "1", false, "1", true, false, rust_log);
-        }
-    }
+// The internal-logs CI feature makes the SDK emit its raw rejection diagnostic.
+#[tokio::test]
+async fn telemetry_isolates_collector_rejection_bodies_from_ordinary_diagnostics() {
+    // A redirect without Location reaches OTLP's error diagnostic with the body intact.
+    verify(Scenario::Runtime, "json", "1", StatusCode::MULTIPLE_CHOICES, true).await;
+    verify(Scenario::Probe, "text", "1", StatusCode::MULTIPLE_CHOICES, true).await;
 }
 
-type Requests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scenario {
+    Runtime,
+    Incident,
+    Probe,
+}
 
-fn verify(
-    format: &str,
-    ratio: &str,
-    incident: bool,
-    retained: &str,
-    fail: bool,
-    probe: bool,
-    rust_log: &str,
-) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
+async fn verify(scenario: Scenario, format: &str, ratio: &str, status: StatusCode, retained: bool) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let requests: Requests = Arc::default();
-    let done = Arc::new(AtomicBool::new(false));
-    let received = Arc::clone(&requests);
-    let stop = Arc::clone(&done);
-    let server = std::thread::spawn(move || {
-        while !stop.load(Ordering::Relaxed) {
-            let Ok((mut socket, _)) = listener.accept() else {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-                continue;
-            };
-            socket.set_nonblocking(false).unwrap();
-            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-            let mut buffer = Vec::new();
-            let header_end = loop {
-                let mut chunk = [0; 8192];
-                let count = socket.read(&mut chunk).unwrap();
-                assert!(count > 0);
-                buffer.extend_from_slice(&chunk[..count]);
-                if let Some(offset) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-                    break offset + 4;
-                }
-            };
-            let headers = String::from_utf8_lossy(&buffer[..header_end]);
-            let path = headers.split_whitespace().nth(1).unwrap().to_owned();
-            let length: usize = headers
-                .lines()
-                .find_map(|line| {
-                    line.to_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(|value| value.trim().parse().unwrap())
-                })
-                .unwrap();
-            while buffer.len() < header_end + length {
-                let mut chunk = [0; 8192];
-                let count = socket.read(&mut chunk).unwrap();
-                assert!(count > 0);
-                buffer.extend_from_slice(&chunk[..count]);
+    let (received, requests) = mpsc::channel();
+    let probe = scenario == Scenario::Probe;
+    let app = Router::new().route(
+        "/v1/{signal}",
+        post(move |uri: Uri, body: Bytes| {
+            let status = if probe && uri.path() == "/v1/metrics" { StatusCode::OK } else { status };
+            received.send((uri.path().to_owned(), body.to_vec())).unwrap();
+            async move {
+                let response = if status.is_success() { "" } else { RESPONSE_SENTINEL };
+                (status, [(header::CONTENT_TYPE, "application/x-protobuf")], response)
             }
-            received.lock().unwrap().push((path, buffer[header_end..].to_vec()));
-            // reqwest rejects 4xx/5xx before OTLP can inspect the body. A 300
-            // without Location reaches OTLP's non-2xx StatusError diagnostic.
-            let status = if fail { "300 Multiple Choices" } else { "200 OK" };
-            // Rejections can echo credentials or the original evidence payload.
-            let response = if fail {
-                format!("{RESPONSE_SENTINEL}: credential={SENTINEL}echoed")
-            } else {
-                String::new()
-            };
-            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/x-protobuf\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
-        }
-    });
+        }),
+    );
+    let server = tokio::spawn(axum::serve(listener, app).into_future());
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args(["--ignored", "--exact", "telemetry::tests::telemetry_child", "--nocapture"])
         .env("BRAID_TEST_OTLP", &endpoint)
         .env("BRAID_TEST_FORMAT", format)
         .env("BRAID_TEST_RATIO", ratio)
-        .env("BRAID_TEST_INCIDENT", if incident { "1" } else { "0" })
-        .env("BRAID_TEST_RETAIN", retained)
+        .env("BRAID_TEST_INCIDENT", if scenario == Scenario::Incident { "1" } else { "0" })
         .env_remove("BRAID_TEST_PROBE")
-        .env("RUST_LOG", rust_log);
+        .env("RUST_LOG", "trace,opentelemetry-otlp=trace,opentelemetry_sdk=trace");
     if probe {
         command.env("BRAID_TEST_PROBE", "1");
     }
-    let output = command.output().unwrap();
-    done.store(true, Ordering::Relaxed);
-    server.join().unwrap();
+    let output = command.output().await.unwrap();
+    server.abort();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
-    assert!(!stderr.contains(SENTINEL), "payload leaked to {format} stderr ({rust_log})");
-    assert!(
-        !stderr.contains(RESPONSE_SENTINEL),
-        "collector response leaked to {format} stderr ({rust_log})"
-    );
+    assert!(!stderr.contains(SENTINEL), "payload leaked to {format} stderr");
+    assert!(!stderr.contains(RESPONSE_SENTINEL), "collector response leaked to {format} stderr");
     if !probe {
         assert!(stderr.contains("ordinary diagnostic after evidence"), "{stderr}");
     }
-    if fail {
+    if !status.is_success() {
         assert!(!stderr.contains("HttpClient.StatusError"), "{stderr}");
         assert!(!stderr.contains("opentelemetry_sdk"), "{stderr}");
         assert!(stderr.contains("stage=sdk_export outcome=failed"), "{stderr}");
         for signal in ["logs", "traces", "metrics"] {
-            assert!(stderr.contains(&format!("signal={signal}")), "{stderr}");
+            let failed = format!("signal={signal} stage=sdk_export outcome=failed");
+            assert_eq!(stderr.contains(&failed), !probe || signal != "metrics", "{stderr}");
         }
         if probe {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let result: serde_json::Value =
-                stdout.lines().find_map(|line| serde_json::from_str(line).ok()).unwrap();
-            let signals = result["signals"].as_array().unwrap();
-            assert_eq!(signals.len(), 3);
-            for signal in signals {
-                assert_eq!(signal["failed_batches"], 1);
-                assert!(signal["failed_records"].as_u64().unwrap() > 0);
-                assert_eq!(signal["successful_batches"], 0);
-                assert!(signal["queue_dropped_records"].is_null());
-            }
+            verify_probe(&output.stdout);
         }
     }
-    verify_otlp(&requests.lock().unwrap(), retained, probe);
+    verify_otlp(&requests.try_iter().collect::<Vec<_>>(), retained, probe);
 }
 
-fn verify_otlp(requests: &[(String, Vec<u8>)], ratio: &str, probe: bool) {
+fn verify_probe(output: &[u8]) {
+    let stdout = String::from_utf8_lossy(output);
+    let result: serde_json::Value =
+        stdout.lines().find_map(|line| serde_json::from_str(line).ok()).unwrap();
+    let signals = result["signals"].as_array().unwrap();
+    assert_eq!(signals.len(), 3);
+    for (signal, succeeded) in [("logs", false), ("traces", false), ("metrics", true)] {
+        let report = signals.iter().find(|report| report["signal"] == signal).unwrap();
+        assert_eq!(report["successful_batches"], u64::from(succeeded), "{signal}");
+        assert_eq!(report["failed_batches"], u64::from(!succeeded), "{signal}");
+        assert_eq!(report["failed_records"].as_u64().unwrap() > 0, !succeeded, "{signal}");
+        assert!(report["queue_dropped_records"].is_null(), "{signal}");
+    }
+}
+
+fn verify_otlp(requests: &[(String, Vec<u8>)], retained: bool, probe: bool) {
     let mut log_records = Vec::new();
     let mut span_ids = Vec::new();
     let mut metrics = Vec::new();
@@ -280,10 +220,19 @@ fn verify_otlp(requests: &[(String, Vec<u8>)], ratio: &str, probe: bool) {
             other => panic!("unexpected signal {other}"),
         }
     }
-    verify_payload_records(log_records, &span_ids, ratio == "1", probe);
-    if ratio == "0" {
+    if !retained {
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+
         assert!(span_ids.is_empty());
+        assert!(
+            log_records.iter().any(|record| matches!(
+                record.body.as_ref().and_then(|body| body.value.as_ref()),
+                Some(Value::StringValue(message)) if message == "session evidence sampling decision"
+            )),
+            "ordinary session observation must reach OTLP even with evidence sampling disabled"
+        );
     }
+    verify_payload_records(log_records, &span_ids, retained, probe);
     let counter = if probe { "braid.telemetry.probes" } else { "braid.runtime.transitions" };
     let metric = metrics
         .iter()
@@ -303,7 +252,7 @@ fn verify_payload_records(
 ) {
     let payload = format!("{SENTINEL}{}END", "x".repeat(100_000));
     let mut expected_streams: std::collections::BTreeSet<&str> = if retained && !probe {
-        ["request", "stdout", "stderr", "cleanup.stdout", "cleanup.stderr"].into()
+        ["request", "stdout", "cleanup.stdout", "cleanup.stderr"].into()
     } else {
         std::collections::BTreeSet::new()
     };

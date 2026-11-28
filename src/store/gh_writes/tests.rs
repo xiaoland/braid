@@ -51,34 +51,25 @@ fn invalid_data(error: &StoreError, expected: &str) {
 }
 
 #[test]
-fn offline_acceptance_is_atomic_idempotent_and_publicly_queryable() {
+fn failed_outbox_enqueue_rolls_back_the_accepted_intent() {
     let db = Database::new();
     let store = db.store();
-    let write = intent("comment_create");
-    let first = store.prepare_gh_write(write.clone()).unwrap();
-    assert!(first.request_id.starts_with("request-"));
-    assert_ne!(first.request_id, first.intent_id);
-    assert_eq!(first.request_id, store.prepare_gh_write(write.clone()).unwrap().request_id);
-    let mut conflict = write;
-    conflict.request_digest = "b".repeat(64);
-    invalid_data(
-        &store.prepare_gh_write(conflict).unwrap_err(),
-        "already used for a different payload",
+    db.connect()
+        .execute_batch(
+            "CREATE TRIGGER refuse_outbox BEFORE INSERT ON github_write_outbox
+         BEGIN SELECT RAISE(ABORT, 'outbox unavailable'); END;",
+        )
+        .unwrap();
+    let error = store.prepare_gh_write(intent("comment_create")).unwrap_err();
+    assert!(
+        matches!(error, StoreError::Sqlite(ref cause) if cause.to_string().contains("outbox unavailable")),
+        "{error}"
     );
     drop(store);
-    let reopened = db.store();
-    assert_eq!(
-        reopened.gh_write_receipt(first.request_id).unwrap().unwrap().intent_id,
-        first.intent_id
-    );
-    for table in ["write_intents", "github_write_outbox"] {
-        assert_eq!(
-            db.connect()
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-    }
+    let connection = db.connect();
+    let stranded: i64 =
+        connection.query_row("SELECT count(*) FROM write_intents", [], |row| row.get(0)).unwrap();
+    assert_eq!(stranded, 0, "a failed enqueue cannot leave a durable request");
 }
 
 #[test]
@@ -190,11 +181,10 @@ fn legacy_cli_pending_uncertain_sending_all_get_one_execution_obligation() {
 fn ensure_plan_and_progress_freeze_and_resume_without_replanning() {
     let db = Database::new();
     let store = db.store();
-    let write = intent("pr_ensure");
-    let receipt = store.prepare_gh_write(write.clone()).unwrap();
+    let receipt = store.prepare_gh_write(intent("pr_ensure")).unwrap();
     let mut plan = NewImplementationRequest {
         root_intent_id: None,
-        write,
+        intent_id: receipt.intent_id.clone(),
         comment_database_id: 7,
         comment_node_id: "comment".into(),
         issue_node_id: "issue".into(),
@@ -215,24 +205,18 @@ fn ensure_plan_and_progress_freeze_and_resume_without_replanning() {
     assert_eq!(frozen.head_ref, "head");
     assert_eq!(frozen.pr_profile_id, "profile");
     assert_eq!(first.bootstrap_authored_at, frozen.bootstrap_authored_at);
-    for stage in ["head_ready", "pull_request_ready", "associated", "activation_pending"] {
-        store
-            .record_implementation_progress(
-                receipt.intent_id.clone(),
-                ImplementationProgress {
-                    stage,
-                    bootstrap_commit_sha: None,
-                    pull_request_database_id: Some(88),
-                    pull_request_node_id: Some("pr".into()),
-                    pull_request_number: Some(9),
-                },
-            )
-            .unwrap();
-        let resumed =
-            store.implementation_request_receipt(receipt.intent_id.clone()).unwrap().unwrap();
-        assert_eq!(resumed.stage, stage);
-        assert_eq!(resumed.pull_request_number, Some(9));
-    }
+    store
+        .record_implementation_progress(
+            receipt.intent_id.clone(),
+            ImplementationProgress {
+                stage: "pull_request_ready",
+                bootstrap_commit_sha: None,
+                pull_request_database_id: Some(88),
+                pull_request_node_id: Some("pr".into()),
+                pull_request_number: Some(9),
+            },
+        )
+        .unwrap();
     invalid_data(
         &store
             .record_implementation_progress(
@@ -246,6 +230,6 @@ fn ensure_plan_and_progress_freeze_and_resume_without_replanning() {
                 },
             )
             .unwrap_err(),
-        "cannot move backward from activation_pending to planned",
+        "cannot move backward from pull_request_ready to planned",
     );
 }

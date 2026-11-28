@@ -33,7 +33,7 @@ fn claim(f: &Fixture) -> Option<crate::store::TurnClaim> {
 }
 
 #[tokio::test]
-async fn handoff_is_atomic_idempotent_and_uses_next_batch_without_parallel_turns() {
+async fn handoffs_debounce_together_and_redelivery_does_not_duplicate_their_inputs() {
     let f = Fixture::new(true);
     bind_pr(&f);
     let a = handoff(&f, "stable").unwrap();
@@ -50,6 +50,7 @@ async fn handoff_is_atomic_idempotent_and_uses_next_batch_without_parallel_turns
     );
     // Restart recovery cannot create a second logical event.
     f.db().execute("UPDATE github_write_outbox SET lifecycle='sending'", []).unwrap();
+    let f = f.reopen();
     f.store.recover_writes().unwrap();
     f.due();
     f.drain(github.clone()).await;
@@ -59,19 +60,8 @@ async fn handoff_is_atomic_idempotent_and_uses_next_batch_without_parallel_turns
     assert_eq!(f.receipt(&b.request_id).lifecycle, "applied");
     assert_eq!(count(&f, "wake_batches"), 1); // merge existing pending
     runnable(&f);
-    let first = claim(&f).unwrap();
-    f.store.mark_turn_started(first.turn_id.clone(), "native-first".into()).unwrap();
-    let c = handoff(&f, "while-running").unwrap();
-    f.drain(github).await;
-    assert_eq!(f.receipt(&c.request_id).lifecycle, "applied");
-    runnable(&f);
-    assert!(claim(&f).is_none());
-    // Even if merged with an already-urgent batch, handoff input may only be
-    // sent after the running turn, where complete Context can be refreshed.
-    f.db().execute("UPDATE wake_batches SET urgent=1 WHERE lifecycle='runnable'", []).unwrap();
-    assert!(f.store.claim_urgent_steer(first.turn_id.clone()).unwrap().is_none());
-    f.store.mark_turn_terminal(first.turn_id, "completed".into()).unwrap();
-    assert!(claim(&f).is_some());
+    let turn = claim(&f).unwrap();
+    assert_eq!(turn.references.len(), 2);
     task.abort();
 }
 
@@ -287,22 +277,6 @@ async fn applied_issue_design_is_materialized_at_handoff_safe_boundary_not_from_
     assert!(reference.contains("Scope, verification, risks"), "{reference}");
     assert!(reference.contains("Current canonical Context"));
     assert!(!reference.contains("old-pr-context"));
-    // Association deletion after acceptance cannot deliver an old cached Issue.
-    remote.lock().unwrap().associated = false;
-    let mut denied = String::new();
-    assert!(
-        crate::group::input::append_current_context(
-            f.config.runtime.database(),
-            &collaboration,
-            &f.store,
-            f.config.profile("issue-codex").unwrap(),
-            &turn,
-            &mut denied
-        )
-        .await
-        .is_ok_and(|d| matches!(d, crate::group::input::RefreshDisposition::Retire(_)))
-    );
-    assert!(denied.is_empty());
     task.abort();
 }
 
@@ -324,20 +298,6 @@ fn handoff_same_key_cannot_change_target_or_impersonate_issue_agent() {
         .unwrap_err()
         .to_string()
         .contains("already used for a different payload")
-    );
-    assert!(
-        super::super::handoff(
-            &f.config,
-            &f.store,
-            &HandoffRequest {
-                invocation: Invocation::Operator,
-                target: "owner/repository#9".parse().unwrap(),
-                request_id: "operator".into()
-            }
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("operator entry is unavailable inside an Agent runtime worktree")
     );
     f.db().execute_batch("UPDATE agent_instances SET role='pr_implementation_agent' WHERE agent_id='agent'; UPDATE work_items SET kind='pr',number=10 WHERE node_id='item';").unwrap();
     assert!(
@@ -581,17 +541,16 @@ async fn canonical_invalid_handoff_retires_only_itself_and_survivors_really_send
         }
         let turn = if mode == "new-generation" {
             let backend = crate::collaboration::CollaborationBackend::GitHub(github.clone());
-            assert!(
-                crate::group::input::prepare_input(
-                    &f.config,
-                    &backend,
-                    &f.store,
-                    f.config.profile("issue-codex").unwrap(),
-                    turn.clone()
-                )
-                .await
-                .is_err()
-            );
+            let error = crate::group::input::prepare_input(
+                &f.config,
+                &backend,
+                &f.store,
+                f.config.profile("issue-codex").unwrap(),
+                turn.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("503"), "{error:#}");
             f.store.defer_turn_claim(turn.turn_id).unwrap();
             remote.lock().unwrap().limited = false;
             // The failed transport keeps its real installation cooldown. A

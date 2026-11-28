@@ -216,6 +216,7 @@ async fn soft_pressure_reset_replaces_memory_and_delivers_input_with_publication
     );
     // Resetting an idle session is not an acknowledgement of the work input.
     assert_eq!(f.store.runtime_status().unwrap().batches.len(), 1);
+    f.store.advance_scheduler().unwrap();
     assert!(driver.start_next_agent_turn().await.is_none(), "ordinary revision must keep debounce");
     f.db().execute("UPDATE wake_batches SET quiet_deadline='2000-01-01T00:00:00Z' WHERE lifecycle='pending'",[]).unwrap();
     f.store.advance_scheduler().unwrap();
@@ -660,101 +661,6 @@ async fn rejected_steer_stops_retrying_while_unknown_steer_retains_its_input() {
     }
 }
 
-#[tokio::test]
-async fn stopping_native_execution_does_not_wait_for_execution_fence() {
-    use axum::{
-        Json, Router,
-        http::StatusCode,
-        routing::{get, post},
-    };
-    use tokio::sync::Notify;
-
-    let f = Fixture::new(false);
-    let store = Arc::new(
-        StoreActor::start(f.config.runtime.database().into(), f.config.runtime.backups().into())
-            .unwrap(),
-    );
-    let entered = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let routes = Router::new()
-        .route("/api/platform/repository", get(|| async {
-            Json(serde_json::json!({"repository":"test-space","spaceId":"space","executionFences":true,"nodeId":"local:test-space","defaultBranch":"main"}))
-        }))
-        .route("/api/platform/executions/fence", post({
-            let (entered, release) = (entered.clone(), release.clone());
-            move || {
-                let (entered, release) = (entered.clone(), release.clone());
-                async move {
-                    entered.notify_one();
-                    release.notified().await;
-                    (StatusCode::SERVICE_UNAVAILABLE, "fence service offline")
-                }
-            }
-        }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let http = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
-    let mut config = f.config.clone();
-    config.github = None;
-    config.builtin = Some(crate::config::BuiltinConfig {
-        repository: "test-space".into(),
-        endpoint: format!("http://{address}").parse().unwrap(),
-    });
-    let lease = store.acquire_runtime_lease("runtime".into(), "fixture".into(), 60).unwrap();
-    let collaboration = CollaborationBackend::Builtin(
-        crate::builtin::BuiltinClient::connect(&config, Arc::clone(&store))
-            .await
-            .unwrap()
-            .with_runtime(lease)
-            .unwrap(),
-    );
-    let spec = GroupSpec::new(GroupKind::Issue, &config, &store, "test-space").unwrap();
-    f.db().execute_batch(
-        "INSERT INTO repositories VALUES('local:test-space','test-space',1,'now');
-         INSERT INTO work_items(node_id,repository_node_id,kind,number,state,observed_at)
-           VALUES('fixture-item','local:test-space','issue',1,'open','now');
-         INSERT INTO assignments VALUES('fixture-assignment','fixture-item',1,'active','now',NULL);"
-    ).unwrap();
-    f.db().execute(
-        "INSERT INTO agent_instances(agent_id,assignment_id,profile_id,profile_revision,role,lifecycle)
-         SELECT 'fixture-agent','fixture-assignment',profile_id,revision,'issue','idle'
-         FROM profiles WHERE profile_id=?1",
-        [&spec.profile.id],
-    ).unwrap();
-    f.db().execute(
-        "INSERT INTO provider_sessions(session_id,agent_id,provider_kind,provider_session_id,
-          context_revision,instruction_revision,lifecycle,started_at,builtin_execution_id,builtin_execution_owner)
-         VALUES('fixture-session','fixture-agent','codex','provider','memory','instructions','idle','now',?1,'fixture')",
-        [uuid::Uuid::now_v7().to_string()],
-    ).unwrap();
-    let captured = Arc::new(Captured::default());
-    let driver = worker::GroupDriver {
-        store: &store,
-        config: &config,
-        collaboration: &collaboration,
-        spec: &spec,
-        sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
-    };
-    driver
-        .sessions
-        .resume("provider".into(), spec.profile.clone(), "instructions".into())
-        .await
-        .unwrap();
-
-    let (stop, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        tokio::join!(driver.quiesce_session("provider"), async {
-            entered.notified().await;
-            captured.closed.notified().await;
-            assert!(driver.sessions.confirmed_stopped("provider").await);
-            release.notify_one();
-        })
-    })
-    .await
-    .expect("native close must finish while the fence response is withheld");
-    assert!(stop.unwrap_err().to_string().contains("execution fence unconfirmed"));
-    http.abort();
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn builtin_turn_runs_without_writer_service_and_cannot_mint_after_reassignment() {
     builtin_running_unassignment(Some((crate::agent_session::TurnOutcome::Completed, None)), false)
@@ -814,14 +720,22 @@ async fn builtin_running_unassignment(
         backups: root.join("platform-backups"),
         listen: address.to_string(),
     };
-    let offline = Arc::new(AtomicBool::new(true));
+    let offline = Arc::new(AtomicBool::new(!restart));
     let fence_offline = Arc::new(AtomicBool::new(false));
+    // A missing terminal is the cold-recovery case. Hold the first fence response
+    // there so only the native side can produce the observed durable stop.
+    let fence_entered = Arc::new(tokio::sync::Notify::new());
+    let fence_response = Arc::new(tokio::sync::Semaphore::new(usize::from(terminal.is_some())));
     let routes = crate::platform::router(&platform).unwrap().layer(axum::middleware::from_fn({
         let offline = Arc::clone(&offline);
         let fence_offline = Arc::clone(&fence_offline);
+        let fence_entered = Arc::clone(&fence_entered);
+        let fence_response = Arc::clone(&fence_response);
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let offline = Arc::clone(&offline);
             let fence_offline = Arc::clone(&fence_offline);
+            let fence_entered = Arc::clone(&fence_entered);
+            let fence_response = Arc::clone(&fence_response);
             async move {
                 use axum::response::IntoResponse as _;
                 if request.uri().path().starts_with("/api/platform/grants")
@@ -832,6 +746,8 @@ async fn builtin_running_unassignment(
                 if request.uri().path() == "/api/platform/executions/fence"
                     && fence_offline.load(Ordering::Relaxed)
                 {
+                    fence_entered.notify_one();
+                    let _permit = fence_response.acquire().await.unwrap();
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 }
                 next.run(request).await
@@ -850,7 +766,8 @@ async fn builtin_running_unassignment(
     });
     let (mut store, mut client) = open_worker_runtime(&config, "fixture").await;
     let actor = "issue-codex";
-    let mut platform = PlatformObjects::open(&platform.database, &platform.repository).unwrap();
+    let platform_database = platform.database.clone();
+    let mut platform = PlatformObjects::open(&platform_database, &platform.repository).unwrap();
     let issue =
         platform.create_child_issue("Writer independence", "Read first", "human", None).unwrap();
     platform.assign(issue.number, Some(actor), "human").unwrap();
@@ -921,16 +838,19 @@ async fn builtin_running_unassignment(
     assert_eq!(captured.inputs.lock().unwrap().len(), 1);
     let writer =
         BuiltinWriterTurn { session_id, turn_id, item_number: issue.number, actor: actor.into() };
-    let offline_error = client.writer_grant(writer.clone()).await.unwrap_err();
-    assert!(offline_error.to_string().contains("503"), "{offline_error:#}");
+    if !restart {
+        let error = client.writer_grant(writer.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("503"), "{error:#}");
+    }
 
     // The old turn never minted a grant. Name equality must not revive it
     // after an unassign/reassign and before those events reach the Harness.
     platform.assign(issue.number, Some(actor), "human").unwrap();
-    offline.store(false, Ordering::Relaxed);
-    let error = client.writer_grant(writer.clone()).await.unwrap_err();
-    assert!(error.to_string().contains("writer authority changed"), "{error:#}");
-    offline.store(true, Ordering::Relaxed);
+    if !restart {
+        offline.store(false, Ordering::Relaxed);
+        let error = client.writer_grant(writer.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("writer authority changed"), "{error:#}");
+    }
     captured.close_terminal.lock().unwrap().clone_from(&terminal);
     fence_offline.store(true, Ordering::Relaxed);
     for pending in platform.events(cursor, 100).unwrap() {
@@ -959,13 +879,15 @@ async fn builtin_running_unassignment(
         (outcome, reason)
     } else {
         tokio::time::timeout(limit, async {
+            fence_entered.notified().await;
             while !f.db().query_row(
                 "SELECT execution_stopped_at IS NOT NULL FROM provider_sessions WHERE provider_session_id=?1",
                 [&writer.session_id], |row| row.get::<_, bool>(0),
             ).unwrap() {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-        }).await.expect("native stop must reach SQLite before a successful platform fence");
+        }).await.expect("native stop must reach SQLite while the fence response is withheld");
+        fence_response.add_permits(1);
         assert_eq!(turn_state().0, "running");
         (
             crate::agent_session::TurnOutcome::Unknown,
@@ -1030,9 +952,17 @@ async fn builtin_running_unassignment(
     assert_eq!(turn_state(), (outcome.lifecycle().to_owned(), reason));
     assert_eq!(*captured.close_attempts.lock().unwrap(), ["fresh-provider"]);
     assert_eq!(captured.memory.lock().unwrap().len(), 2);
-    client.fence_all_executions().await.unwrap();
-    let fenced = client.writer_grant(writer).await.unwrap_err();
-    assert!(fenced.to_string().contains("no current writer authority"));
+    if !restart {
+        let execution: (String, String) = f.db().query_row(
+            "SELECT client_id,builtin_execution_id FROM builtin_upstream,turns WHERE turn_id=?1",
+            [&writer.turn_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        let fenced: bool = rusqlite::Connection::open(&platform_database).unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM execution_fences WHERE client_id=?1 AND execution_id=?2)",
+            (&execution.0, &execution.1), |row| row.get(0),
+        ).unwrap();
+        assert!(fenced, "the platform must persist the old execution fence before replacement");
+    }
     shutdown.send(true).unwrap();
     worker.await.unwrap().unwrap();
     http.abort();

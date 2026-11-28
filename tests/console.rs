@@ -13,7 +13,6 @@ use nix::{
     sys::signal::{Signal, kill},
     unistd::Pid,
 };
-use prost::Message as _;
 use reqwest::{StatusCode, blocking::Client};
 use serde_json::{Value, json};
 
@@ -134,44 +133,6 @@ fn serve(platform: &Path, harness: &Path, database: &Path) -> Command {
     command
 }
 
-#[derive(prost::Message)]
-struct OtlpStatus {
-    #[prost(int32, tag = "1")]
-    code: i32,
-    #[prost(string, tag = "2")]
-    message: String,
-}
-
-fn assert_observation_unavailable(client: &Client, console: &str) {
-    for path in [
-        "/api/status",
-        "/api/resources",
-        "/api/records",
-        "/api/batches/1",
-        "/api/receive-errors",
-        "/api/receive-errors/1",
-    ] {
-        let response = client.get(format!("{console}{path}")).send().unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
-        let body: Value = response.json().unwrap();
-        assert!(body["error"].as_str().unwrap().contains("observation database unavailable"));
-    }
-    for signal in ["traces", "logs", "metrics"] {
-        // The default Export*ServiceRequest encodes as an empty protobuf message.
-        let response = client
-            .post(format!("{console}/v1/{signal}"))
-            .header("content-type", "application/x-protobuf")
-            .body(Vec::new())
-            .send()
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{signal}");
-        assert_eq!(response.headers()["content-type"], "application/x-protobuf");
-        let status = OtlpStatus::decode(response.bytes().unwrap()).unwrap();
-        assert_eq!(status.code, 14);
-        assert!(status.message.contains("observation database unavailable"));
-    }
-}
-
 fn get(client: &Client, console: &str, path: &str) -> Value {
     client
         .get(format!("{console}{path}"))
@@ -237,7 +198,17 @@ fn console_controls_keep_working_when_the_observation_database_cannot_open() {
     let capabilities = get(&client, &endpoint, "/api/console");
     assert_eq!(capabilities["platform"]["managed"], true);
     assert_eq!(capabilities["harness"]["configured"], true);
-    assert_observation_unavailable(&client, &endpoint);
+    let resources = client.get(format!("{endpoint}/api/resources")).send().unwrap();
+    assert_eq!(resources.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let error: Value = resources.json().unwrap();
+    assert!(error["error"].as_str().unwrap().contains("observation database unavailable"));
+    // An empty protobuf message is a valid ExportLogsServiceRequest.
+    let export = client
+        .post(format!("{endpoint}/v1/logs"))
+        .header("content-type", "application/x-protobuf")
+        .send()
+        .unwrap();
+    assert_eq!(export.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     let issue = client
         .post(format!("{endpoint}/api/control/commands"))

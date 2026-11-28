@@ -59,4 +59,6 @@ jobs:
           node --test tests/browser/draft.test.mjs
       - name: Verify OTLP internal diagnostics stay out of ordinary logs
         if: matrix.name == 'linux'
-        run: cargo test --locked --bin braid --features opentelemetry-otlp/internal-logs telemetry::tests
+        run: >-
+          cargo test --locked --bin braid --features opentelemetry-otlp/internal-logs
+          telemetry::tests::telemetry_isolates_collector_rejection_bodies_from_ordinary_diagnostics -- --exact

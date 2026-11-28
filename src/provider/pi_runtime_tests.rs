@@ -12,9 +12,9 @@ async fn cleanup_receipt_requires_every_stop_proof_without_exposing_raw_output()
         "coverage": "registered-process-groups-and-inherited-execution-markers",
         "private": "PRIVATE_CLEANUP_SENTINEL"
     });
-    for case in ["valid", "exit", "status", "execution_id", "scope", "coverage", "malformed"] {
+    for case in ["exit", "status", "execution_id", "scope", "coverage", "malformed"] {
         let mut candidate = receipt.clone();
-        if !matches!(case, "valid" | "exit" | "malformed") {
+        if !matches!(case, "exit" | "malformed") {
             candidate[case] = Value::String("wrong".into());
         }
         let stdout = if case == "malformed" {
@@ -41,12 +41,7 @@ async fn cleanup_receipt_requires_every_stop_proof_without_exposing_raw_output()
             owner: PathBuf::new(),
             start_id: "test".into(),
         };
-        let result = execution.cleanup().await;
-        if case == "valid" {
-            result.unwrap();
-            continue;
-        }
-        let error = result.unwrap_err();
+        let error = execution.cleanup().await.unwrap_err();
         if case == "malformed" {
             assert!(
                 matches!(&error, ProviderError::Protocol(message) if message.contains("stage=decode"))

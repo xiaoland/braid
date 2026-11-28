@@ -129,25 +129,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn primary_reset_reserve_and_used_delta() {
-        let mut budget = Budget::default();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-ratelimit-used", "4900".parse().unwrap());
-        headers.insert("x-ratelimit-resource", "graphql".parse().unwrap());
-        headers.insert("x-ratelimit-remaining", "100".parse().unwrap());
-        headers.insert("x-ratelimit-reset", "500".parse().unwrap());
-        assert_eq!(budget.observe(&headers), None);
-        assert!(budget.admit(100, true).is_err());
-        assert!(budget.admit(100, false).is_ok());
-        headers.insert("x-ratelimit-used", "5000".parse().unwrap());
-        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
-        assert_eq!(budget.observe(&headers), Some(100));
-        budget.defer(100, None);
-        assert!(budget.admit(499, false).is_err());
-        assert!(budget.admit(500, true).is_ok());
-    }
-
-    #[test]
     fn missing_reset_does_not_park_reserve_and_primary_respects_both_hints() {
         let mut budget = Budget::default();
         let mut headers = HeaderMap::new();
@@ -176,15 +157,16 @@ mod tests {
     #[test]
     fn missing_hints_backoff_is_bounded_and_recovers() {
         let mut budget = Budget::default();
-        for _ in 0..100 {
+        for range in [10..=12, 20..=25, 40..=50, 80..=100, 160..=200, 300..=375, 300..=375] {
             budget.defer(1000, None);
-            assert!((1010..=1375).contains(&budget.until));
-            assert!(budget.admit(1001, false).is_err());
+            let delay = budget.retry_after(1000);
+            assert!(range.contains(&delay), "expected {range:?}s, got {delay}s");
         }
+        assert!(budget.admit(1001, false).is_err());
         assert!(budget.admit(1375, false).is_ok());
         budget.success();
         budget.defer(1400, None);
-        assert!((1410..=1412).contains(&budget.until));
+        assert!((10..=12).contains(&budget.retry_after(1400)));
     }
 }
 

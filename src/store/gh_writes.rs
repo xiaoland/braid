@@ -45,7 +45,7 @@ pub struct GhWriteReceipt {
 #[derive(Debug, Clone)]
 pub struct NewImplementationRequest {
     pub root_intent_id: Option<String>,
-    pub write: NewGhWriteIntent,
+    pub intent_id: String,
     pub comment_database_id: u64,
     pub comment_node_id: String,
     pub issue_node_id: String,
@@ -176,57 +176,18 @@ pub(super) fn prepare_implementation_request(
     request: &NewImplementationRequest,
 ) -> Result<ImplementationRequestReceipt, StoreError> {
     require_current_schema(database)?;
-    validate_gh_write(&request.write)?;
-    if request.write.operation != "pr_ensure" || request.comment_database_id == 0 {
+    if request.comment_database_id == 0 {
         return Err(StoreError::InvalidData("invalid implementation request intent".into()));
     }
     let mut connection = open_read_write(database)?;
     configure_connection(&connection)?;
     let transaction = connection.transaction()?;
-    let existing = transaction
-        .query_row(
-            "SELECT intent_id,request_digest FROM write_intents WHERE request_key=?1",
-            [&request.write.request_key],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    let intent_id = if let Some((intent_id, digest)) = existing {
-        if digest != request.write.request_digest {
-            return Err(StoreError::InvalidData(format!(
-                "Implementation Request {} was already planned with different arguments",
-                request.comment_database_id
-            )));
-        }
-        intent_id
-    } else {
-        let intent_id = Uuid::now_v7().to_string();
-        let now = now_rfc3339();
-        transaction.execute(
-            "INSERT INTO write_intents(
-               intent_id,operation,request_digest,lifecycle,attempts,created_at,updated_at,
-               request_key,repository,target,profile_id,role,payload,source_binding
-             ) VALUES (?1,'pr_ensure',?2,'pending',0,?3,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![
-                intent_id,
-                request.write.request_digest,
-                now,
-                request.write.request_key,
-                request.write.repository,
-                request.write.target,
-                request.write.profile_id,
-                request.write.role,
-                request.write.payload,
-                request
-                    .write
-                    .source
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()
-                    .map_err(|e| StoreError::InvalidData(e.to_string()))?,
-            ],
-        )?;
-        intent_id
-    };
+    let intent_id = &request.intent_id;
+    let repository: String = transaction.query_row(
+        "SELECT repository FROM write_intents WHERE intent_id=?1 AND operation='pr_ensure'",
+        [intent_id],
+        |row| row.get(0),
+    )?;
     let now = now_rfc3339();
     let inserted = transaction.execute(
         "INSERT OR IGNORE INTO implementation_requests(
@@ -235,7 +196,7 @@ pub(super) fn prepare_implementation_request(
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'planned',?11)",
         params![
             intent_id,
-            request.write.repository,
+            repository,
             sqlite_u64(request.comment_database_id, "Implementation Request comment ID",)?,
             request.comment_node_id,
             request.issue_node_id,
@@ -250,7 +211,7 @@ pub(super) fn prepare_implementation_request(
     if inserted == 1
         && let Some(root) = &request.root_intent_id
     {
-        let valid: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM implementation_requests WHERE intent_id=?1 AND root_intent_id IS NULL AND repository=?2 AND issue_node_id=?3 AND head_ref=?4 AND base_ref=?5 AND pr_profile_id=?6 AND pull_request_node_id IS NOT NULL AND pull_request_number IS NOT NULL)",params![root,request.write.repository,request.issue_node_id,request.head_ref,request.base_ref,request.pr_profile_id],|r|r.get(0))?;
+        let valid: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM implementation_requests WHERE intent_id=?1 AND root_intent_id IS NULL AND repository=?2 AND issue_node_id=?3 AND head_ref=?4 AND base_ref=?5 AND pr_profile_id=?6 AND pull_request_node_id IS NOT NULL AND pull_request_number IS NOT NULL)",params![root,repository,request.issue_node_id,request.head_ref,request.base_ref,request.pr_profile_id],|r|r.get(0))?;
         if !valid {
             return Err(StoreError::InvalidData(
                 "continuation differs from the managed implementation identity".into(),
@@ -258,13 +219,11 @@ pub(super) fn prepare_implementation_request(
         }
         transaction.execute("UPDATE implementation_requests SET root_intent_id=?2,stage='activation_pending',bootstrap_authored_at=(SELECT bootstrap_authored_at FROM implementation_requests WHERE intent_id=?2),pull_request_database_id=(SELECT pull_request_database_id FROM implementation_requests WHERE intent_id=?2),pull_request_node_id=(SELECT pull_request_node_id FROM implementation_requests WHERE intent_id=?2),pull_request_number=(SELECT pull_request_number FROM implementation_requests WHERE intent_id=?2) WHERE intent_id=?1",params![intent_id,root])?;
     }
-    enqueue(&transaction, &intent_id)?;
-    let receipt =
-        implementation_request_receipt_on(&transaction, &intent_id)?.ok_or_else(|| {
-            StoreError::InvalidData(format!(
-                "implementation request {intent_id} disappeared during prepare"
-            ))
-        })?;
+    let receipt = implementation_request_receipt_on(&transaction, intent_id)?.ok_or_else(|| {
+        StoreError::InvalidData(format!(
+            "implementation request {intent_id} disappeared during prepare"
+        ))
+    })?;
     transaction.commit()?;
     Ok(receipt)
 }

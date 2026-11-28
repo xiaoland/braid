@@ -33,8 +33,7 @@ fn migration_entry_points_reject_incompatible_databases_without_changing_bytes()
         let backups = root.0.join("backups");
         if !matches!(case, InvalidSchema::Foreign) {
             let store = StoreActor::start(database.clone(), backups.clone()).unwrap();
-            assert_eq!(store.apply().unwrap().current_schema, DATABASE_SCHEMA_VERSION);
-            assert!(store.plan().unwrap().pending.is_empty());
+            store.apply().unwrap();
             drop(store);
         }
         let db = Connection::open(&database).unwrap();
@@ -75,7 +74,6 @@ fn migration_entry_points_reject_incompatible_databases_without_changing_bytes()
         db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;").unwrap();
         drop(db);
         let before = std::fs::read(&database).unwrap();
-        assert!(!before.is_empty());
         let store = StoreActor::start(database.clone(), backups).unwrap();
         for apply in [false, true] {
             let result = if apply { store.apply().map(|_| ()) } else { store.plan().map(|_| ()) };

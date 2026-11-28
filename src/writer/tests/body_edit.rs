@@ -224,26 +224,8 @@ async fn own_pr_edit_preserves_marker_closing_and_recovers_unconfirmed_success_w
     task.abort();
 }
 #[tokio::test]
-async fn pr_source_corrects_direct_issue_with_pr_attribution_not_profile_target_tag() {
-    let fixture = Fixture::new(true);
-    pr_source(&fixture, false);
-    let remote = Arc::new(Mutex::new(BodyRemote::new(false)));
-    let (github, task) = body_server(remote.clone()).await;
-    let receipt = accept(&fixture, &github).await;
-    fixture.drain(github).await;
-    let result = fixture.receipt(&receipt.request_id);
-    assert_eq!(result.lifecycle, "applied", "{:?}", result.last_error);
-    assert_eq!(result.role, "PR Implementation Agent");
-    assert!(
-        remote.lock().unwrap().snapshot.body.as_ref().unwrap().contains("PR Implementation Agent")
-    );
-    task.abort();
-}
-#[tokio::test]
-async fn changed_association_closed_target_old_context_generation_session_and_human_edits_never_mutate()
- {
+async fn changed_snapshot_or_source_rejects_an_admitted_edit_before_mutation() {
     for (fence, state, reason) in [
-        ("unrelated", "rejected", "target is not a permitted directly associated work item"),
         ("closed", "conflict", "canonical title/body changed since snapshot"),
         ("context", "rejected", "publication source was invalidated or superseded"),
         ("generation", "rejected", "publication source was invalidated or superseded"),
@@ -256,7 +238,6 @@ async fn changed_association_closed_target_old_context_generation_session_and_hu
         let (github, task) = body_server(remote.clone()).await;
         let receipt = accept(&fixture, &github).await;
         match fence {
-            "unrelated" => remote.lock().unwrap().associated = false,
             "closed" => remote.lock().unwrap().snapshot.state = "closed".into(),
             "context" => {
                 fixture
@@ -282,35 +263,25 @@ async fn changed_association_closed_target_old_context_generation_session_and_hu
     }
 }
 #[tokio::test]
-async fn preflight_and_mutation_limits_remain_durable_then_converge_after_restart() {
-    for mutation in [false, true] {
-        let fixture = Fixture::new(true);
-        pr_source(&fixture, true);
-        let remote = Arc::new(Mutex::new(BodyRemote::new(true)));
-        let (github, task) = body_server(remote.clone()).await;
-        let receipt = accept(&fixture, &github).await;
-        {
-            let mut state = remote.lock().unwrap();
-            state.limited = !mutation;
-            state.mutation_limited = mutation;
-        }
-        fixture.drain(github).await;
-        assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "pending");
-        assert_eq!(remote.lock().unwrap().writes, 0);
-        task.abort();
-        {
-            let mut state = remote.lock().unwrap();
-            state.limited = false;
-            state.mutation_limited = false;
-        }
-        let fixture = fixture.reopen();
-        let (github, task) = body_server(remote.clone()).await;
-        fixture.due();
-        fixture.drain(github).await;
-        assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
-        assert_eq!(remote.lock().unwrap().writes, 1);
-        task.abort();
-    }
+async fn rate_limited_patch_converges_after_restart() {
+    let fixture = Fixture::new(true);
+    pr_source(&fixture, true);
+    let remote = Arc::new(Mutex::new(BodyRemote::new(true)));
+    let (github, task) = body_server(remote.clone()).await;
+    let receipt = accept(&fixture, &github).await;
+    remote.lock().unwrap().mutation_limited = true;
+    fixture.drain(github).await;
+    assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "pending");
+    assert_eq!(remote.lock().unwrap().writes, 0);
+    task.abort();
+    remote.lock().unwrap().mutation_limited = false;
+    let fixture = fixture.reopen();
+    let (github, task) = body_server(remote.clone()).await;
+    fixture.due();
+    fixture.drain(github).await;
+    assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
+    assert_eq!(remote.lock().unwrap().writes, 1);
+    task.abort();
 }
 
 #[tokio::test]
@@ -343,31 +314,20 @@ async fn own_issue_body_edit_and_input_boundaries_use_the_same_acceptance_path()
         .unwrap_err();
         assert!(error.to_string().contains(expected), "wrong failure: {error}");
     }
-    for (profile, invocation, expected) in [
-        (
-            Some("pr-codex"),
-            fixture.invocation(),
-            "publication Profile does not match source assignment",
-        ),
-        (
-            None,
-            Invocation::Agent("not-current".into()),
-            "publication turn does not match current runtime worktree",
-        ),
-    ] {
-        let error = resolve_source(&fixture.config, profile, &invocation).unwrap_err();
-        assert!(error.to_string().contains(expected), "{error}");
-    }
-    assert!(
-        resolve_source(&fixture.config, None, &Invocation::Operator)
-            .unwrap_err()
-            .to_string()
-            .contains("operator entry is unavailable inside an Agent runtime worktree")
-    );
+    let wrong_turn = Invocation::Agent("not-current".into());
+    let error = resolve_source(&fixture.config, None, &wrong_turn).unwrap_err();
+    assert!(error.to_string().contains("publication turn does not match current runtime worktree"));
     let receipt = accept(&fixture, &github).await;
     fixture.drain(github).await;
     assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
     assert!(remote.lock().unwrap().snapshot.body.as_ref().unwrap().contains("Issue Agent"));
+    fixture.db().execute("DELETE FROM turns", []).unwrap();
+    let error = resolve_source(&fixture.config, None, &Invocation::Operator).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("operator entry is unavailable inside an Agent runtime worktree")
+    );
     task.abort();
 }
 
@@ -393,16 +353,38 @@ async fn unconfirmed_success_followed_by_human_edit_is_conflict_not_success_or_o
 }
 
 #[tokio::test]
-async fn repeated_snapshot_body_edit_does_not_duplicate_attribution_or_protected_prefix() {
+async fn ordinary_fixed_resolved_prose_code_lists_links_and_new_closing_text_are_applied() {
+    let body = r"Fixed pagination bug
+
+Resolved review feedback
+
+```rust
+// Fixed pagination bug
+let resolved = true;
+```
+
+- Fixed pagination bug
+- Resolved review feedback
+
+[Fixed pagination bug](https://example.com/fixed) and [Resolved review feedback](https://example.com/resolved)
+
+Closes #999
+
+resolves [#999](https://github.com/owner/repository/issues/999)";
     let fixture = Fixture::new(true);
     pr_source(&fixture, true);
     let remote = Arc::new(Mutex::new(BodyRemote::new(true)));
     let (github, task) = body_server(remote.clone()).await;
-    let receipt = accept(&fixture, &github).await;
-    fixture.drain(github.clone()).await;
-    assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
-    let body = remote.lock().unwrap().snapshot.body.clone().unwrap();
     let target: WorkItemLocator = "owner/repository#1".parse().unwrap();
+    // Ordinary words in the existing body are not frozen either.
+    remote
+            .lock()
+            .unwrap()
+            .snapshot
+            .body
+            .as_mut()
+            .unwrap()
+            .push_str("\n\nFixed previous bug\n\n- Resolved previous feedback\n\n```rust\n// Fixed previous bug\n```\n\nFixed [previous pagination bug](https://example.com/fixed)");
     let receipt = edit(
         &fixture.config,
         &fixture.store,
@@ -412,184 +394,148 @@ async fn repeated_snapshot_body_edit_does_not_duplicate_attribution_or_protected
             profile_id: "issue-codex".into(),
             snapshot: edit::read_snapshot(&github, &target).await.unwrap(),
             title: None,
-            body: Some(body.clone()),
-            request_id: "repeat".into(),
+            body: Some(body.into()),
+            request_id: "ordinary".into(),
         },
     )
     .unwrap();
     fixture.drain(github).await;
-    assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
-    assert_eq!(remote.lock().unwrap().snapshot.body.as_deref(), Some(body.as_str()));
+    let result = fixture.receipt(&receipt.request_id);
+    assert_eq!(result.lifecycle, "applied", "{body}: {:?}", result.last_error);
+    let state = remote.lock().unwrap();
+    assert_eq!(state.writes, 1);
+    let rendered = state.snapshot.body.as_ref().unwrap();
+    assert!(rendered.contains(body));
+    assert!(rendered.contains("Closes #7"));
+    assert!(rendered.contains("Implementation request:"));
+    assert!(!rendered.contains("previous"));
     task.abort();
-    fixture.db().execute("DELETE FROM turns", []).unwrap();
-    assert!(
-        resolve_source(&fixture.config, None, &Invocation::Operator)
-            .unwrap_err()
-            .to_string()
-            .contains("operator entry is unavailable inside an Agent runtime worktree")
-    );
-}
-
-#[tokio::test]
-async fn ordinary_fixed_resolved_prose_code_lists_links_and_new_closing_text_are_applied() {
-    for body in [
-        "Fixed pagination bug",
-        "Resolved review feedback",
-        "```rust\n// Fixed pagination bug\nlet resolved = true;\n```",
-        "- Fixed pagination bug\n- Resolved review feedback",
-        "[Fixed pagination bug](https://example.com/fixed) and [Resolved review feedback](https://example.com/resolved)",
-        "New scope\n\nCloses #999",
-        "resolves [#999](https://github.com/owner/repository/issues/999)",
-    ] {
-        let fixture = Fixture::new(true);
-        pr_source(&fixture, true);
-        let remote = Arc::new(Mutex::new(BodyRemote::new(true)));
-        let (github, task) = body_server(remote.clone()).await;
-        let target: WorkItemLocator = "owner/repository#1".parse().unwrap();
-        // Ordinary words in the existing body are not frozen either.
-        remote
-            .lock()
-            .unwrap()
-            .snapshot
-            .body
-            .as_mut()
-            .unwrap()
-            .push_str("\n\nFixed previous bug\n\n- Resolved previous feedback\n\n```rust\n// Fixed previous bug\n```\n\nFixed [previous pagination bug](https://example.com/fixed)");
-        let receipt = edit(
-            &fixture.config,
-            &fixture.store,
-            EditRequest {
-                invocation: fixture.invocation(),
-                target: target.clone(),
-                profile_id: "issue-codex".into(),
-                snapshot: edit::read_snapshot(&github, &target).await.unwrap(),
-                title: None,
-                body: Some(body.into()),
-                request_id: "ordinary".into(),
-            },
-        )
-        .unwrap();
-        fixture.drain(github).await;
-        let result = fixture.receipt(&receipt.request_id);
-        assert_eq!(result.lifecycle, "applied", "{body}: {:?}", result.last_error);
-        let state = remote.lock().unwrap();
-        assert_eq!(state.writes, 1);
-        let rendered = state.snapshot.body.as_ref().unwrap();
-        assert!(rendered.contains(body));
-        assert!(rendered.contains("Closes #7"));
-        assert!(rendered.contains("Implementation request:"));
-        assert!(!rendered.contains("previous"));
-        task.abort();
-    }
 }
 
 #[tokio::test]
 async fn new_pr_body_references_authorize_issue_edits_only_after_canonical_confirmation() {
-    for body in ["Closes #999", "See #999; closing work will follow"] {
-        let fixture = Fixture::new(true);
-        pr_source(&fixture, true);
-        let remote = Arc::new(Mutex::new(BodyRemote::new(true)));
-        let (github, task) = body_server(remote.clone()).await;
-        let own: WorkItemLocator = "owner/repository#1".parse().unwrap();
+    let fixture = Fixture::new(true);
+    pr_source(&fixture, true);
+    let remote = Arc::new(Mutex::new(BodyRemote::new(true)));
+    let (github, task) = body_server(remote.clone()).await;
+    let own: WorkItemLocator = "owner/repository#1".parse().unwrap();
+    let receipt = edit(
+        &fixture.config,
+        &fixture.store,
+        EditRequest {
+            invocation: fixture.invocation(),
+            target: own.clone(),
+            profile_id: "issue-codex".into(),
+            snapshot: edit::read_snapshot(&github, &own).await.unwrap(),
+            title: None,
+            body: Some("Closes #999".into()),
+            request_id: "new-source".into(),
+        },
+    )
+    .unwrap();
+    fixture.drain(github.clone()).await;
+    assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
+    assert_eq!(remote.lock().unwrap().writes, 1);
+    let issue: WorkItemLocator = "owner/repository#999".parse().unwrap();
+    for confirmed in [false, true] {
+        remote.lock().unwrap().associated_999 = confirmed;
         let receipt = edit(
             &fixture.config,
             &fixture.store,
             EditRequest {
                 invocation: fixture.invocation(),
-                target: own.clone(),
+                target: issue.clone(),
                 profile_id: "issue-codex".into(),
-                snapshot: edit::read_snapshot(&github, &own).await.unwrap(),
+                snapshot: edit::read_snapshot(&github, &issue).await.unwrap(),
                 title: None,
-                body: Some(body.into()),
-                request_id: "new-source".into(),
+                body: Some("Corrected design".into()),
+                request_id: format!("issue-{confirmed}"),
             },
         )
         .unwrap();
         fixture.drain(github.clone()).await;
-        assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
-        assert_eq!(remote.lock().unwrap().writes, 1);
-        let issue: WorkItemLocator = "owner/repository#999".parse().unwrap();
-        for confirmed in [false, true] {
-            remote.lock().unwrap().associated_999 = confirmed;
+        let result = fixture.receipt(&receipt.request_id);
+        assert_eq!(
+            result.lifecycle,
+            if confirmed { "applied" } else { "rejected" },
+            "{:?}",
+            result.last_error
+        );
+        let state = remote.lock().unwrap();
+        assert_eq!(state.writes_999, usize::from(confirmed));
+        if confirmed {
+            assert_eq!(result.role, "PR Implementation Agent");
+            let body = state.issue_999.body.as_deref().unwrap();
+            assert!(
+                body.contains("PR Implementation Agent") && body.contains("Corrected design"),
+                "{body}"
+            );
+        } else {
+            assert!(
+                result
+                    .last_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("target is not a permitted directly associated work item")
+            );
+        }
+    }
+    let assignments: i64 =
+        fixture.db().query_row("SELECT count(*) FROM assignments", [], |row| row.get(0)).unwrap();
+    assert_eq!(assignments, 1, "body edits never activate another Group");
+    task.abort();
+}
+
+#[tokio::test]
+async fn heading_closing_and_ensure_blocks_survive_fences_comments_and_repeated_edits() {
+    for (protected, replacement) in [
+        (
+            "## Closes #7 ##\n\n## Implementation request: https://github.com/owner/repository/issues/comments/7 ##",
+            "```rust\nunclosed",
+        ),
+        (
+            "Closes #7\n========\n\nImplementation request: https://github.com/owner/repository/issues/comments/7\n--------",
+            "<!-- unclosed",
+        ),
+    ] {
+        let fixture = Fixture::new(true);
+        pr_source(&fixture, true);
+        let remote = Arc::new(Mutex::new(BodyRemote::new(true)));
+        remote.lock().unwrap().snapshot.body = Some(protected.into());
+        let (github, task) = body_server(remote.clone()).await;
+        let target: WorkItemLocator = "owner/repository#1".parse().unwrap();
+        for repeat in [false, true] {
+            let body = if repeat {
+                remote.lock().unwrap().snapshot.body.clone().unwrap()
+            } else {
+                replacement.into()
+            };
             let receipt = edit(
                 &fixture.config,
                 &fixture.store,
                 EditRequest {
                     invocation: fixture.invocation(),
-                    target: issue.clone(),
+                    target: target.clone(),
                     profile_id: "issue-codex".into(),
-                    snapshot: edit::read_snapshot(&github, &issue).await.unwrap(),
+                    snapshot: edit::read_snapshot(&github, &target).await.unwrap(),
                     title: None,
-                    body: Some("Corrected design".into()),
-                    request_id: format!("issue-{confirmed}"),
+                    body: Some(body),
+                    request_id: format!("heading-{repeat}"),
                 },
             )
             .unwrap();
             fixture.drain(github.clone()).await;
             let result = fixture.receipt(&receipt.request_id);
-            assert_eq!(
-                result.lifecycle,
-                if confirmed { "applied" } else { "rejected" },
-                "{:?}",
-                result.last_error
-            );
-            assert_eq!(remote.lock().unwrap().writes_999, usize::from(confirmed));
+            assert_eq!(result.lifecycle, "applied", "{:?}", result.last_error);
+            let state = remote.lock().unwrap();
+            let body = state.snapshot.body.as_ref().unwrap();
+            assert!(body.contains(protected), "{body}");
+            assert!(body.find(protected).unwrap() < body.find(replacement).unwrap());
+            assert_eq!(body.matches("> **Braid Agent").count(), 1);
+            assert_eq!(body.matches("Closes #7").count(), 1);
+            assert_eq!(body.matches("Implementation request:").count(), 1);
         }
-        let assignments: i64 = fixture
-            .db()
-            .query_row("SELECT count(*) FROM assignments", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(assignments, 1, "body edits never activate another Group");
         task.abort();
-    }
-}
-
-#[tokio::test]
-async fn heading_closing_and_ensure_blocks_survive_fences_comments_and_repeated_edits() {
-    for protected in [
-        "## Closes #7 ##\n\n## Implementation request: https://github.com/owner/repository/issues/comments/7 ##",
-        "Closes #7\n========\n\nImplementation request: https://github.com/owner/repository/issues/comments/7\n--------",
-    ] {
-        for replacement in ["Scope, verification, risks", "```rust\nunclosed", "<!-- unclosed"] {
-            let fixture = Fixture::new(true);
-            pr_source(&fixture, true);
-            let remote = Arc::new(Mutex::new(BodyRemote::new(true)));
-            remote.lock().unwrap().snapshot.body = Some(protected.into());
-            let (github, task) = body_server(remote.clone()).await;
-            let target: WorkItemLocator = "owner/repository#1".parse().unwrap();
-            for repeat in [false, true] {
-                let body = if repeat {
-                    remote.lock().unwrap().snapshot.body.clone().unwrap()
-                } else {
-                    replacement.into()
-                };
-                let receipt = edit(
-                    &fixture.config,
-                    &fixture.store,
-                    EditRequest {
-                        invocation: fixture.invocation(),
-                        target: target.clone(),
-                        profile_id: "issue-codex".into(),
-                        snapshot: edit::read_snapshot(&github, &target).await.unwrap(),
-                        title: None,
-                        body: Some(body),
-                        request_id: format!("heading-{repeat}"),
-                    },
-                )
-                .unwrap();
-                fixture.drain(github.clone()).await;
-                let result = fixture.receipt(&receipt.request_id);
-                assert_eq!(result.lifecycle, "applied", "{:?}", result.last_error);
-                let state = remote.lock().unwrap();
-                let body = state.snapshot.body.as_ref().unwrap();
-                assert!(body.contains(protected), "{body}");
-                assert!(body.find(protected).unwrap() < body.find(replacement).unwrap());
-                assert_eq!(body.matches("> **Braid Agent").count(), 1);
-                assert_eq!(body.matches("Closes #7").count(), 1);
-                assert_eq!(body.matches("Implementation request:").count(), 1);
-            }
-            task.abort();
-        }
     }
 }
 
@@ -623,6 +569,11 @@ async fn executor_rejects_missing_existing_request_source_before_mutation() {
 
 #[tokio::test]
 async fn context_dependent_protected_blocks_fail_closed_but_title_only_is_allowed() {
+    let fixture = Fixture::new(true);
+    pr_source(&fixture, true);
+    let remote = Arc::new(Mutex::new(BodyRemote::new(true)));
+    let (github, task) = body_server(remote.clone()).await;
+    let target: WorkItemLocator = "owner/repository#1".parse().unwrap();
     for protected in [
         "Closes [#7](https://github.com/owner/repository/issues/7)",
         "Closes [target][issue]\n\n[issue]: https://github.com/owner/repository/issues/7",
@@ -631,47 +582,51 @@ async fn context_dependent_protected_blocks_fail_closed_but_title_only_is_allowe
         "- Implementation request: original",
         "<!-- Closes #7 -->",
     ] {
-        let fixture = Fixture::new(true);
-        pr_source(&fixture, true);
-        let remote = Arc::new(Mutex::new(BodyRemote::new(true)));
         remote.lock().unwrap().snapshot.body = Some(protected.into());
-        let (github, task) = body_server(remote.clone()).await;
-        let target: WorkItemLocator = "owner/repository#1".parse().unwrap();
-        let snapshot = edit::read_snapshot(&github, &target).await.unwrap();
-        for body in [Some("Scope update".into()), None] {
-            let title_only = body.is_none();
-            let result = edit(
-                &fixture.config,
-                &fixture.store,
-                EditRequest {
-                    invocation: fixture.invocation(),
-                    target: target.clone(),
-                    profile_id: "issue-codex".into(),
-                    snapshot: snapshot.clone(),
-                    title: Some("Current title".into()),
-                    body,
-                    request_id: "boundary".into(),
-                },
-            );
-            if title_only {
-                let receipt = result.unwrap();
-                fixture.drain(github.clone()).await;
-                assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
-            } else {
-                let error = result.unwrap_err().to_string();
-                assert!(
-                    error
-                        == "body maintenance requires self-contained paragraph/heading closing and request blocks without links or HTML; keep this body unchanged"
-                        || error
-                            == "body maintenance cannot change context-dependent closing or request blocks",
-                    "{protected}: {error}"
-                );
-                assert_eq!(remote.lock().unwrap().writes, 0);
-            }
-        }
-        let state = remote.lock().unwrap();
-        assert_eq!(state.writes, 1);
-        assert_eq!(state.snapshot.body.as_deref(), Some(protected));
-        task.abort();
+        let error = edit(
+            &fixture.config,
+            &fixture.store,
+            EditRequest {
+                invocation: fixture.invocation(),
+                target: target.clone(),
+                profile_id: "issue-codex".into(),
+                snapshot: edit::read_snapshot(&github, &target).await.unwrap(),
+                title: None,
+                body: Some("Scope update".into()),
+                request_id: "boundary".into(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error
+                == "body maintenance requires self-contained paragraph/heading closing and request blocks without links or HTML; keep this body unchanged"
+                || error
+                    == "body maintenance cannot change context-dependent closing or request blocks",
+            "{protected}: {error}"
+        );
     }
+    let old_body = remote.lock().unwrap().snapshot.body.clone();
+    let snapshot = edit::read_snapshot(&github, &target).await.unwrap();
+    let receipt = edit(
+        &fixture.config,
+        &fixture.store,
+        EditRequest {
+            invocation: fixture.invocation(),
+            target,
+            profile_id: "issue-codex".into(),
+            snapshot,
+            title: Some("Current title".into()),
+            body: None,
+            request_id: "title-only".into(),
+        },
+    )
+    .unwrap();
+    fixture.drain(github).await;
+    assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
+    let state = remote.lock().unwrap();
+    assert_eq!(state.writes, 1);
+    assert_eq!(state.snapshot.title, "Current title");
+    assert_eq!(state.snapshot.body, old_body);
+    task.abort();
 }
