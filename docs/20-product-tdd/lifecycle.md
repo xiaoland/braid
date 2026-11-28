@@ -4,6 +4,10 @@ This document owns the mechanical transition model from GitHub canonical
 changes to Context replacement, provider turns, reactions, and shutdown.
 Product interpretation remains with the Agent.
 
+Local 对象写入生成同一组内部事件，经持久事件桥接进入现有调度。关闭、重开、
+撤销指派及 Context 更换复用本合同；本地空间不因所有对象关闭而结束。对象与
+事件身份带独立 Local namespace，不将本地数据库当作 GitHub 当前正文权威。
+
 ## Agent Group Lifecycle
 
 Each Work Item/Profile pair has an Assignment Generation and one state:
@@ -16,7 +20,7 @@ Each Work Item/Profile pair has an Assignment Generation and one state:
 | `debouncing` | Wake Events are accumulating against one quiet deadline/count. |
 | `running` | One provider turn is active. |
 | `reset_pending` | Current Context was invalidated; old output is fenced while interruption/terminal converges. |
-| `sleeping` | Closed/unassigned lifecycle retained for possible reopen/reassignment policy. |
+| `sleeping` | Closed lifecycle retained for a possible reopen. |
 | `retired` | Merged PR or superseded generation; no automatic resume. |
 | `blocked` | Complete Context, Profile, provider, worktree, or external authority is unavailable. |
 
@@ -41,11 +45,11 @@ names alone:
 | Previously absent included scalar/set value added | Wake | Add reference; debounce/count. |
 | Comment/thread unminimized or unresolved | Wake | Restored body enters Context; debounce/count. |
 | PR synchronize, checks terminal, reviewer request change, or other excluded implementation fact | Wake reference | Does not enter Context; debounce/count. |
-| Existing visible body/title/description edited or cleared | Hard Invalidation | Replace Context; continue only if a turn was interrupted. |
-| Included scalar replaced/cleared or set member removed | Hard Invalidation | Same. Dedicated close/unassign rules take precedence. |
-| Comment/review deleted or minimized; review thread resolved | Hard Invalidation | Remove body, retain lifecycle metadata, replace Context. |
+| Existing visible body/title/description edited or cleared | Hard Invalidation + attention | Fence/replace Context; retain one ordinary input when idle, coalesce one continuation when running. |
+| Included scalar replaced/cleared or set member removed | Hard Invalidation + attention | Same. Dedicated close/unassign rules take precedence. |
+| Comment/review deleted or minimized; review thread resolved | Hard Invalidation + attention | Remove stale body, retain metadata and an input to consider the revision. |
 | Direct Issue↔PR association graph changes | Hard Invalidation for affected PR groups; addition also Wake | Rebuild full direct graph. |
-| Non-Agent edit to an open direct Associated Issue description | Cross-surface Hard Invalidation | Debounce edits, then interrupt/fence active PR and replace Context. |
+| Non-Agent edit to an open direct Associated Issue description | Cross-surface Hard Invalidation + attention | Debounce, fence/replace active PR Context; an idle active PR also retains the input. |
 | Other included direct Associated Issue change | Dependency Dirty plus Wake when Human-origin | No active PR interruption; rematerialize before next PR turn. |
 | Closed Associated Issue body/comment change | No PR effect | Content is excluded until reopen. |
 | Correlated Braid App Agent write, or write by the Profile's configured stable GitHub node identity | Agent-origin | Update canonical ledger; no wake/reset of originating group. |
@@ -58,7 +62,10 @@ Each group has one pending batch. A Wake Event starts/resets a 30-second Quiet
 Window and increments the unsuperseded Wake count. The batch becomes runnable
 when no Wake arrives for 30 seconds or the count reaches eight. Both values are
 Profile-overridable. Lifecycle/invalidation refs can join the batch without
-turning into Wake Events.
+turning into Wake Events. `requires_attention` separately records whether a
+revision still owes ordinary input delivery; consuming an invalidation for
+Context replacement does not consume that batch. It never activates a dormant
+or closed responsibility.
 
 A Trusted Braid Mention is an exact configured handle in visible Markdown prose
 from a current repository `MAINTAIN` or `ADMIN` actor. Code spans/blocks,
@@ -83,7 +90,8 @@ canonical diff
   -> create fresh physical Provider Session
   -> inject complete current GitHub Context
   -> if an active turn was interrupted: start one continuation turn with refs
-     else: return idle unless the batch independently contains Wake/urgent input
+     else: preserve the ordinary attention batch and its original quiet deadline
+  -> dispatch at most one turn with current Context when that batch is runnable
 ```
 
 Output emitted after fencing is retained in provider/telemetry evidence but is
@@ -100,15 +108,24 @@ Title/label/project changes with the same visible body,
 HTML-comment-only edits, closed Issues, inactive edges, and inactive PR Agent
 Groups do not create this invalidation. The derived reference enters the PR's
 ordinary Quiet Window/count batch; the Wrapper never infers semantic urgency
-from the edited prose.
+from the edited prose. Other relevant source revisions with unchanged visible
+body create an ordinary dependency Wake, not an interruption.
+
+Origin is established by this action's verified actor or by an exact correlated
+publication version/content. Creator identity and a retained Braid attribution
+block cannot establish who made an edit. Unknown edit origin is not silently
+classified as Agent-origin.
 
 ## Assignment and Terminal Lifecycle
 
-- In native Agent App assignment mode, Issue unassignment starts/resets the
-  same Quiet Window. Once settled, Braid safely interrupts an active turn,
-  archives its physical session, and moves the generation to `sleeping`.
-  Reassignment starts a new generation/session. Ordinary-App mention fallback
-  does not fabricate assign/unassign lifecycle events.
+- GitHub 原生指派模式按 Quiet Window 合并 Issue 撤销指派事件。窗口到期后，
+  Group 重读当前 assignees。若仍已指派则消费这次事件。确认撤销时，正在执行的
+  worker 和空闲 worker 使用同一停止流程。内建平台直接处理不可撤回的撤销事件。
+  Group 在关闭期间继续接收原有 turn 的终态。平台撤权暂时失败时，已经收到的终态与
+  错误仍须持久化。原生停止和平台撤权均已确认后，Group 才将该代记为 `retired`；
+  此时仍缺 provider 终态的 turn 记为 `unknown`，并按该 Profile 的配置发布执行状态。
+  若原生停止已保存而撤销尚未完成，重启的 worker 沿原顺序结算撤销并确认平台 fence，
+  保留已观察的终态，不恢复旧物理会话。该代未完成的 Context reset 保留在历史中，不再创建会话或阻止有限 run 完成。重新指派创建新一代及新会话。
 - Issue/PR close or PR merge never interrupts the current turn. The lifecycle
   event grants exactly one Finalization Turn after the current terminal, or
   immediately when idle. Afterwards closed Issue and closed-unmerged PR groups
@@ -117,6 +134,11 @@ from the edited prose.
   needed, and queues one normal debounced Wake turn.
 - Delivery duplicates and events received while sleeping cannot grant a second
   Finalization Turn.
+- GitHub reconciliation keeps closed roots hot while their Assignment is still
+  materializing, active, or finalizing. Only terminal history without a live
+  Assignment moves to the 30-minute recovery interval. Installation budget
+  pressure delays canonical reads and is exposed as degraded/delayed health;
+  it introduces no new Agent Group lifecycle state (see `github.md`).
 
 ## Reaction State
 
@@ -132,18 +154,36 @@ the exact Trusted Braid Mention comment owns a turn cycle:
 | transport/provider outcome unknown | `eyes`, `rocket` plus Operational Status Comment |
 
 Ordinary turns never receive `rocket`, `+1`, or `confused`. Braid manages only
-its own App reactions and never removes Human reactions. Reaction writes are
-desired-state outbox operations; target deletion produces a tombstone, not a
-replacement comment.
+its own App reactions. Event admission records `eyes` with the exact reaction
+target. Native start, terminal, and Context reset record their feedback with the
+corresponding turn transition. The publisher consumes those durable requests and
+owns the outbox attempts and receipts. An accepted event and a recorded turn
+transition remain available during an outbox failure. A reset retains the
+request to clear `rocket` before its remote ID is known, so a late successful
+receipt can still be removed. Target deletion produces a tombstone.
 
 ## Provider and Transport Unknown
 
 连接丢失只证明旧执行结果未知，不能据此生成成功/失败 reaction。Core 将旧 turn
-记为 Unknown 并 fence 旧会话，发布 Operational Status；随后物化完整当前 Context，
-保留 assignment 和 worktree，将已接收输入重新送入调度。它不会盲目重发未知结果的
-provider RPC，也不承诺任意外部副作用 exactly-once。历史 Unknown 记录不因恢复成功消失。
-若断连发生在已经 interrupting 的 Context reset 中，Unknown 同样使 reset 进入
-materializing，继续既有 continuation 规则，不能让 reset 永久等待。
+记为 Unknown 并发布 Operational Status。账本 fence 不能阻止旧执行通过 Git、GitHub
+或 shell 继续产生副作用；替代执行启动前必须取得 adapter 的停止成功结果。停止失败
+或无法确认时保留旧句柄和现场，将工作项阻断并公开原因，不重发结果未知的原生 RPC。
+成功取得 adapter 的原生停止回执后，Harness 按原会话持久保存停止事实。Context
+reset 或 reopen 可以凭原句柄取得新回执，或在冷启动后使用为旧会话保存的回执。
+进入 reset_pending 或 idle 本身不能证明停止。同一物理会话恢复前先清除旧停止
+记录。内建平台封禁旧执行代次与原生停止分别尝试并确认，两项都成立才允许替代。
+重放只接续 canonical Event References，旧执行已发生的外部副作用继续保留。
+
+Context reset 可以记录待物化状态，但只有旧执行停止成功才创建替代会话。Pi 锁定材料先
+收口 owned 执行，再释放 stdin 管道句柄以发送 EOF，等待父进程退出并核对离线后代清理
+回执；外部基础 Pi 等待原生 abort 和父进程退出。Unix 管道的
+异步 shutdown 不会关闭该句柄，不能代替释放。进程观测记录实际 PID、原生会话、
+runtime generation、退出状态或具体等待错误；失败后的强制清理保留原失败和清理
+结果，不将父进程退出追认为工具停止成功。单独杀父进程不证明其工具已停止。
+Core idle 表示 turn 与 Wake batch 状态，不能推导插件后台结果已消费或进程静止；
+managed 执行状态由 Pi 材料独立记录，生命周期边界见 [provider 合同](app-server.md)。
+Codex 保留共享连接，等待目标 turn 的真实终态；连接丢失或通知缺失时不杀其它健康
+会话来换取恢复。停止不能撤销已经发出的外部请求或收回脱离原生管理的后台服务。
 
 ## AgentSession Event Stream
 
@@ -158,6 +198,11 @@ event stream, not raw provider notifications. Each active session yields a
 
 Delivery semantics are part of the contract:
 
+普通 Failed 与 Unknown 都沿配置的 Operational Status surface 发布故障记录，包含
+对应 turn、原生会话和具体原因。完整错误先存入 `turns.error`，再生成有界公开摘要；
+公开内容移除配置中实际使用的 provider key，本地原始错误仍属于敏感运行材料。
+数据库 schema 3 通过新增迁移保存该字段，旧的已发布迁移保持不变。
+
 - **Exactly-once per fact.** One `TurnStarted`, then exactly one
   `TurnTerminal` — including session death, where the adapter synthesizes
   `Unknown` for the in-flight turn before going quiet. There is no second
@@ -170,7 +215,7 @@ Delivery semantics are part of the contract:
   Core 使用句柄的 latched `is_unavailable()`，包括 idle 与晚订阅情形。
   一个句柄失效不触发全局 epoch，也不重建健康的同类会话。
 - **持久化恢复兜底。** 恢复缺失/失效句柄之前，Group 将遗留的 starting/running
-  turn 记为 Unknown。只向具备可用句柄的 opaque session ID 领取 runnable turn；
+  turn 记为 Unknown 并阻断缺少停止依据的恢复。只向具备可用句柄的 opaque session ID 领取 runnable turn；
   不可用会话的输入保留待处理，不占住其他可用会话。
 
 Responsibilities do not overlap:
@@ -179,13 +224,35 @@ Responsibilities do not overlap:
   debounce, batching, urgency, and retry — an unsent batch simply remains
   runnable.
 - **`AgentSession`** only dispatches: idle, it starts a new turn; running and
-  `steering`, it forwards the steer; running and not steering, it drops the
-  message. It never queues; redelivery is the queue's job. `interrupt()` is
-  the control-plane sibling of steering — an immediate operation on the
-  observed in-flight turn that carries termination rather than input; the
-  terminal still arrives via the event stream.
+  `steering`, it forwards input only to the expected active turn; running and
+  not steering, it defers without accepting the message. It never queues;
+  redelivery is the queue's job. The adapter handles native interruption as part
+  of confirming session shutdown.
 - **Group** 决定 Work Item 的物化、恢复、Context replacement、睡眠和退役，
   `SessionManager` 只索引中立句柄。替换完整 Context 不等于创建新的逻辑 Agent；
   adapter 的物理 ID 是可替换的执行绑定。
 - **Adapter** 管理进程、连接、物理会话和通知翻译，不读取 GitHub、不操作业务 store。
-  Group 释放旧句柄时，adapter 清理其资源；Codex 共享连接和 Pi 独立进程都服从同一契约。
+  Group 释放旧句柄时，adapter 必须报告停止是否成功；失败不删除句柄、不启动替代执行。
+  Codex 共享连接和 Pi 独立进程都服从同一契约。
+
+## 有限 root 运行
+
+`run` 复用 built-in workers、provider、执行封禁与 shutdown，独立的 Harness ledger
+隔离当前 run 与常驻 serve 的旧指派。平台原子保存父子 Issue，固定 root 的 run ID、Harness client 身份和交付 ref，
+并据此扩展协调 writer 的范围；执行身份和终态仍归 Harness，平台没有第二份运行工作图。
+仅注册 run root 的关闭会立即撤销整个后代范围 grants，普通 serve 的对象关系保持原合同。
+
+有限 run 的 Issue 指派保留真实 wake 批次，直接授权设计工作；普通 serve 指派仍只创建空闲会话。新会话在首轮认领前先处理已排队的 Context reset，reset 不消费独立的指派输入。
+
+root 的职责只在 run 中显式注入。子项生命周期、候选发布、讨论和设计更新回流到祖先；讨论和设计通知只携带对象及变化类型，不复制正文。
+以 writer 对象识别自身回流，不能用 profile 判断，因为 root 与子项可能共用 profile。普通 Agent 评论
+仍不要求公开应答或制造新一轮循环。统一准入在认领 turn 之前取得许可，并持续持有至
+真实 terminal、reset 或停止；限制的是在途 Braid turns，不是物理会话总数。
+
+运行准备、事件摄取和开放 root 的轮询使用平台 SQLite 范围查询，读取成员和注册身份。
+root 开放时静默不形成终态。root 关闭后关闭执行准入，再读取包含交付 ref 和合并事实的
+报告，依据对象及未决写入决定 completed 或具体 blocked。交付 Git 读取失败保留明确
+诊断。终态使用执行封禁与原生停止屏障确认收尾。
+failed、stopped、blocked 与完成分开，停止确认不完整禁止覆盖执行。输入及执行
+相关的解析配置绑定 run ID。遥测配置可为该次执行单独调整，保留原始冻结文件；
+接续不得借同一身份更换需求、创建重复 root 或隐式接管无关工作。

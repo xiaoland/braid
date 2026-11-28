@@ -1,6 +1,12 @@
-//! Operator-facing health snapshot. Leaf module shared by the runtime health
+//! Operator-facing health snapshot. Shared by the runtime health
 //! server (writer of `ready`/ingress fields, reader for `/health`) and the
 //! workers (writers of provider/reconciliation/tunnel fields).
+
+use std::sync::{Arc, Mutex, PoisonError};
+
+use tokio::sync::watch;
+
+use crate::group::availability::ProviderAvailability;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HealthSnapshot {
@@ -9,77 +15,66 @@ pub struct HealthSnapshot {
     pub repository: String,
     pub tunnel: &'static str,
     pub webhook_url: Option<String>,
+    pub webhook_sync: &'static str,
+    pub tunnel_verified_at: Option<String>,
+    pub tunnel_error: Option<String>,
     pub reconciliation: &'static str,
     pub provider: &'static str,
     pub last_error: Option<String>,
 }
 
-/// Per-driver observations are aggregated before publishing provider health.
-pub(crate) struct ProviderHealthUpdate {
-    pub(crate) group: &'static str,
-    pub(crate) error: Option<String>,
+#[derive(Clone)]
+pub(crate) struct Health(Arc<Mutex<HealthSnapshot>>);
+
+impl Health {
+    pub(crate) fn new(initial: HealthSnapshot) -> Self {
+        Self(Arc::new(Mutex::new(initial)))
+    }
+
+    /// Return an owned copy for formatting and serialization.
+    pub(crate) fn snapshot(&self) -> HealthSnapshot {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Update fields in one short, synchronous critical section without I/O.
+    pub(crate) fn update<T>(&self, apply: impl FnOnce(&mut HealthSnapshot) -> T) -> T {
+        apply(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
 }
 
 pub(crate) async fn provider_health_worker(
-    health: std::sync::Arc<tokio::sync::RwLock<HealthSnapshot>>,
-    mut reports: tokio::sync::mpsc::Receiver<ProviderHealthUpdate>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    health: Health,
+    mut availability: watch::Receiver<ProviderAvailability>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut observations = std::collections::BTreeMap::new();
     let mut prior_error = None;
     loop {
-        let report = tokio::select! {
+        tokio::select! {
             biased;
             _ = shutdown.changed() => return,
-            report = reports.recv() => match report { Some(report) => report, None => return },
-        };
-        observations.insert(report.group, report.error);
-        let error = observations.values().find_map(Clone::clone);
-        let mut current = health.write().await;
-        current.provider = if error.is_some() {
-            "unavailable"
-        } else if observations.len() == 2 {
-            "connected"
-        } else {
-            "starting"
-        };
-        if error.is_some() || current.last_error == prior_error {
-            current.last_error.clone_from(&error);
+            changed = availability.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
         }
+        let (provider, error) = match &*availability.borrow_and_update() {
+            ProviderAvailability::Starting => ("starting", None),
+            ProviderAvailability::Connected => ("connected", None),
+            ProviderAvailability::Unavailable { error, .. } => ("unavailable", Some(error.clone())),
+        };
+        health.update(|current| {
+            current.provider = provider;
+            if current.ingress == "builtin" {
+                current.ready = provider == "connected";
+            }
+            if error.is_some() || current.last_error == prior_error {
+                current.last_error.clone_from(&error);
+            }
+        });
         prior_error = error;
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use tokio::sync::{RwLock, mpsc, watch};
-
-    #[tokio::test]
-    async fn sibling_success_does_not_clear_failure() {
-        let health = Arc::new(RwLock::new(HealthSnapshot {
-            ready: true,
-            ingress: String::new(),
-            repository: String::new(),
-            tunnel: "disabled",
-            webhook_url: None,
-            reconciliation: "ready",
-            provider: "starting",
-            last_error: None,
-        }));
-        let (sender, receiver) = mpsc::channel(8);
-        let (shutdown, signal) = watch::channel(false);
-        let worker = tokio::spawn(provider_health_worker(Arc::clone(&health), receiver, signal));
-        sender
-            .send(ProviderHealthUpdate { group: "issue", error: Some("issue failed".into()) })
-            .await
-            .unwrap();
-        sender.send(ProviderHealthUpdate { group: "pr", error: None }).await.unwrap();
-        drop(sender);
-        worker.await.unwrap();
-        assert_eq!(health.read().await.provider, "unavailable");
-        assert_eq!(health.read().await.last_error.as_deref(), Some("issue failed"));
-        drop(shutdown);
-    }
-}
+mod tests;

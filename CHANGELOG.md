@@ -3,6 +3,160 @@
 All notable changes to Braid are recorded here. The project follows Semantic
 Versioning once release artifacts are published.
 
+## [Unreleased]
+
+### Added
+
+- `braid gh status` 可按公开 request ID 查询发布回执。CLI 本地接收与唯一 outbox
+  执行义务原子落库；前置读取限流、CLI 退出及服务重启后仍能继续收敛，结果不确定时
+  先核对远端，避免重复评论或 PR。
+- `braid gh pr|issue read/edit` 通过 canonical snapshot 维护标题和正文；PR Agent
+  可修正当前直接关联的开放 Issue，仍保留 PR 角色归因。编辑检查已读版本并保护已识别
+  的 ensure/closing 来源；不声称 GitHub 支持原子 CAS 或关系集合恒定。
+- `braid gh pr handoff` 显式交付 Issue 新设计到已有关联 PR 的下一安全边界，按稳定
+  request ID 去重并绑定目标 generation；不创建 Group、不打断当前 turn，也不从
+  App 评论或 `@braid` 推断交接。已失效的交接输入不再阻塞同批合法输入或 Finalization。
+
+### Changed
+
+- 持续协作合同改为：有效职责内的相关外部修订既更新记忆，也保留待处理输入。
+  空闲时不再只换 session 后静默结束；运行中与 continuation 合并，不额外并行。
+  所有新 turn 在安全边界取得完整当前 Context，读取失败保留批次并公开等待原因。
+- `braid gh pr ensure` 的 applied 回执必须绑定该请求、该 PR 的持久 activation 事件；
+  `gh status` 单独显示 activation 交付状态，不把 PR 存在或交付成功当作实现完成。
+  历史缺失的 activation 仅按已固定 PR 的原授权恢复，不从任意关联激活旧任务。
+- Agent 的 `braid gh` 写命令必须携带当前 runtime 输入提供的 `--source-turn`；
+  `--profile` 不能替换 source 身份。人工调用使用显式 `--operator`，且不能在已登记
+  Agent worktree 内降级为人工身份。旧脚本需按新 help 更新。
+- 完整采样证据仅进入专用 OTLP logs，不再复制到普通 Text/JSON journal 或 trace
+  events。启用 payload 留存的后端必须接收 logs，并明确访问、保留和销毁策略。
+  新增仅供短期 loopback 验证的 Collector→LGTM 模板，无默认二次抽样；SDK 导出统计
+  不等于持久存储确认，未知丢弃数不显示为零。
+- GraphQL 增加 operation、前后台、配额窗口和真实返回 cost 归因；REST/App-token
+  不在该统计覆盖内。完整 Context 首屏静态合并后，无项目、关联或线程的单页 mock
+  HTTP 账单由 Issue 13→5、PR 10→5；保留分页和前后 marker，不推断线上 points 同降。
+- `status` 分开显示原始 runnable 数、durable 领取资格及当前/历史代；物理 provider
+  可用性仍明确未知，不因对象 closed/merged 就删除可能合法的 Finalization。
+- Harness schema 升至 **14**；配置 schema 保持 3。处理基线与普通 Context 投影分开，
+  完整观察的事件和基线原子提交；发生身份与版本身份分开，接单复用记录可追溯。
+  升级前须停止旧 runtime 并执行带备份的迁移。旧 binary 不能打开升级后的账本；回滚需停止新 runtime，
+  将升级前备份恢复到独立 runtime 目录，不支持 down migration。
+
+### Fixed
+
+- 修复多仓库健康状态覆盖与 mention 权限故障互相阻塞；失败轮次重放保留完整事件引用，
+  明确拒绝的 steer 不再重复发送，Context replacement/reopen 校验原 Profile revision。
+- 修复 worktree 仓库身份验证、超时子进程清理和 Tunnel 停止失败的传播；删除无用 Provider 转发层。
+- 安装在创建 App 前完成本地预检，保留 GitHub 返回的 webhook secret，头像下载移出 async executor；
+  凭据解析错误不输出秘密，强制导入收紧文件权限。修正首次迁移与 Pi 参数指引。
+- 发布统一使用打包脚本，按所选 tag 构建并校验版本，支持外置 target 目录；CI 与发布改用仍受支持的 macOS 15 runner。
+- Console 分页保持已应用筛选，导航保留未提交的 run 草稿，并同步运行表单边界。
+- 已确认接手或正常终止的新 generation 会收敛旧 Operational Status：沿原 comment
+  展示最后确认时间与明确的历史/接替关系，不把旧 blocked generation 伪装成复活，
+  也不声称代码、review 或产品完成。唯一 outbox 从持久账本补偿重启，发送中旧 create
+  的回执不会丢失，uncertain 先对账再更新；重复故障与旧代晚到不会产生重复 comment。
+- Operational Status 的展示过滤不再被当作删除证据；完整成员集合与 Agent 投影分开。
+  本地 tombstone 不是上游 updatedAt，当前正向完整观察可安全纠正；读取前事件栅栏
+  防止提交期间的新 delete 被旧快照覆盖，冲突会说明 node、版本、状态和来源。
+- 已固定 PR 的未交付 ensure 可恢复原职责，不因旧 Source Context 替换而永久丢失；
+  任何远端写入仍受原 Source fence 约束。后续评论显式复用受管 head 时续接原请求，
+  不因新 marker 创建重复 PR；关闭、移除关联或已有撤销/阻塞历史仍严格拒绝。
+- doctor 增加只读 Session 材料/指令兼容性预检，候选配置不匹配或回退后仍 blocked
+  会明确失败，不改既有 generation，也不把文件完整性验证误称默认 gh/Git 认证已验证。
+- 普通 Context／关联 PR 读取不再提前消费 Issue 的变更；stale 判定不再依赖可被读取
+  覆盖的投影。无版本的反复恢复不会撞键，隐藏 HTML／时间变化不会制造语义工作。
+  Human 保留旧 Braid 署名的编辑也不再被误判为 OriginEcho。
+- Quick Tunnel 独立监督明确失效、签名入口和 App URL，同步或重建失败持续暴露降级；
+  不靠重启 Agent 自愈。Unix 候选单独拥有 wrapper/cloudflared 进程组，失败构造和停止
+  收口附属树；停止未确认时阻断新候选。health 不是进程存活的别名。
+- Pi 原生入口保留普通 gh 原有配置定位，避免 execution-local XDG 目录隐藏凭据；
+  Git 的 gh credential helper 继承同一路径，不复制凭据。新材料须独立安装并验证 manifest。
+- GitHub 巡检不再每分钟完整重读所有历史 Work Item：OPEN 或仍有存活 Assignment
+  的条目默认 60 秒，已完成收尾的终态历史项 30 分钟。Schema 8 独立记录完整成功与
+  尝试时钟，失败不导致每 5 秒本地检查都重新联网；跨仓库按最久未尝试优先，单项
+  失败不阻断后续对象，成功项不因其他项失败或重启反复读取。升级需要迁移数据库。
+- GraphQL 请求统一采集 installation 预算并共享准入/冷却。后台保留前台余量，遵守
+  reset/Retry-After，缺提示限流和网络错误有界退避、到期自动探测；首次限流即保留
+  写入重试资格。已准入请求含响应解析限时 30 秒；关闭隐式 transport 重试，REST
+  429 仍交由持久写入队列恢复。派生客户端共享自动刷新 token 缓存，而不是复制缓存。
+  此机制不协调进程外消费者，不自动解除业务 blocked，也不声称已测得线上节省量。
+
+## [0.3.3] - 2026-10-13
+
+### Changed
+
+- Runtime adapter 与 LLM provider 解耦：`setup`/`init` 使用 `--adapter`
+  选择 Pi/Codex；Pi 需要显式 `--llm-provider` 和 `--model`，仅使用 API key
+  的 route 才需要 `--api-key-file`。Codex 继续使用隔离 provider home，不再
+  生成或引用伪造的 LLM API key 文件。Braid 不再生成硬编码 reasoning、协议
+  或费用配方。
+- Provider 凭据改为显式 `credential = { kind = "api_key" | "oauth" | "none", file }`
+  声明，文件为 Braid schema（`provider_api_key` 或 OAuth token set），不是任何
+  runtime 的文件格式。Pi adapter 在材料化时转换：`api_key` 注入
+  `BRAID_PROVIDER_API_KEY`，`oauth` 渲染 session home 的 `auth.json`，`none`
+  显式 keyless。凭据为静态秘密，内容 hash 进入 Profile 有效版本。
+- 新增 `braid provider import-auth` 一次性把 Pi 原生 `auth.json` 转换进 Braid
+  secrets；runtime home 中的 `auth.json` 一律拒绝并指向该工具。
+- Pi 的 `models.json` 改为由 Pi adapter 从 `llm_providers` 声明派生：`base_url`、
+  可选 `api` 与 `[[llm_providers.models]]` 能力元数据按声明渲染，`apiKey` 仅在
+  `credential.kind = "api_key"` 时出现。模板或 runtime home 中的 `models.json`
+  在 schema 3 被明确拒绝；schema 2 保持旧模板路径可读。
+- `setup`/`init` 不再支持 `--api-key-environment`/`api_key_environment` 与
+  `--api-key-file`/`api_key_file`（schema 3）；改用
+  `--llm-credential-kind` 与 `--llm-credential-file`。schema 2 的旧字段继续
+  惰性兼容。Pi 原生材料统一引用 Braid 管理的进程内 `BRAID_PROVIDER_API_KEY`，
+  旧配置须显式迁移，不会自动导入旧环境变量。
+- 一个 GitHub instance 可以服务多个显式配置的 repository。GitHub App、
+  webhook、进程与 runtime catalogs 共享；Profile、workspace、调度、worktree、
+  mention、outbox、reconcile 和 `pr ensure` 均按 repository 路由。多仓库配置
+  中每个 Profile 必须声明 repository 和显式 workspace，`braid gh pr ensure`
+  必须显式 `--repository`。
+- `setup --no-browser` 改为可完成的 headless 两段流程：保留 pending setup
+  draft，随后用完整 `--callback-url` 完成 App conversion 和 instance 写入；
+  state 不匹配会拒绝。setup 默认 webhook 事件补齐 `issue_dependencies` 和
+  `pull_request_review_thread`，Linux 下不再硬编码 Homebrew `gh` 路径。
+- 新增 `braid assignment reactivate`：对已 blocked 的 open Work Item 显式
+  排队新的 activation generation；不会静默恢复不兼容 Profile session。
+- Release workflow 同时构建 macOS arm64 和 Linux x86_64 预编译产物；doctor
+  的不可达 OTLP endpoint 降级为可选警告，不再阻断本机 runtime readiness。
+
+### Fixed
+
+- dogfood 修复：新增 repository 的首次 reconcile 不再因 repositories 行缺失
+  触发外键失败（begin 时 upsert），无 tracked work item 的仓库跳过空转周期，
+  且任一仓库的 reconcile 失败不再中止其他仓库。
+- GitHub 连接建立改为每步 30 秒有界超时并携带操作上下文，网络故障时启动
+  不再静默挂起数分钟；App webhook 恢复与隧道修复同样有界，systemd 停止
+  不再因断网挂起。
+- `braid profile inspect` 明确标注 models.json 由 `llm_providers` 声明派生，
+  runtime home / template 标签收窄为 settings/agents 来源。
+
+本版本不新增数据库 migration；配置 schema 保持 3。使用旧环境变量字段或
+在 schema 3 的非 Pi Profile 上声明 provider 的配置会被明确拒绝；schema 2
+Codex 配置中的旧 provider 标签及 LLM 协议/费用元数据仅作为惰性迁移字段读取。
+
+## [Unreleased pre-0.3.3]
+
+- 有限 run 的 Issue 指派保留真实执行输入，首次轮次前处理已有 Context reset；普通 serve 指派仍保持空闲会话合同。
+- 受控 Pi background Bash 使用非登录 shell，原生入口移除 BASH_ENV/ENV，工具路径与缓存由实例明确提供。
+- 内建协作的 Harness ledger 写命令先取得 IMMEDIATE 事务准入，纯读仍为 DEFERRED；绑定错误保留账本路径与 SQLite extended code。
+
+- 新增与常驻 `serve` 并列的 `braid run`：从顶层 root Issue 或 description 驱动自主拆分、指派、PR 实现与交付，首版接入独立 built-in 平台。
+- 平台原子保存父子 Issue，冻结 run/client/交付分支边界；范围关闭和 pending 授权撤销保留停止门控。Console 通过共享接口控制 run，支持原输入接续与独立终态展示。
+- Harness schema 7 保存有限运行身份和结果，平台 schema 3 增加任务树与范围授权。配置 schema 保持 3，旧迁移不改写。
+
+- 内建协作平台与 GitHub 作为 Harness 的同层上游。平台独立配置、schema、对象库
+  与 HTTP API，不再依赖 Harness 会话表或 `local` 运行模式。
+- Web Console 属于整个 Braid，集成 OTLP 三信号原始证据与可视化，直接控制任一
+  上游的 Harness，并可便捷托管独立平台；停止 Harness 不关闭平台或 Collector。
+- Harness 自存上游事件游标及写入授权。平台 grant、对象 revision、命令回执与
+  Git 候选意图保留并发和停止边界，过期执行不能继续发布。
+- 配置 schema 3 使用互斥 `[github]` / `[builtin]`；原 GitHub schema 2 配置可继续
+  读取。旧 `[local]` 必须停止后显式导入平台，保留原对象身份、历史与回执。
+- Harness 数据库 schema 6 曾增加接入状态，平台 schema 独立演进。旧迁移保持不可变，
+  新版本使用前须迁移，旧二进制不能读取更新后的 Harness 数据库。
+- 修复输入接纳、首次 Context 持久化、完整错误保存与停止证明不足时的恢复门控。
+
 ## [0.3.2] - 2026-09-19
 
 ### Changed
@@ -333,6 +487,10 @@ Versioning once release artifacts are published.
   `40_context_lifecycle.sh` for the collapsed schema version 1.
 
 ## [Unreleased]
+
+- 新增与常驻 `serve` 并列的 `braid run`：从顶层 root Issue 或 description 驱动自主拆分、指派、PR 实现与交付，首版接入独立 built-in 平台。
+- 平台原子保存父子 Issue，冻结 run/client/交付分支边界；范围关闭和 pending 授权撤销保留停止门控。Console 通过共享接口控制 run，支持原输入接续与独立终态展示。
+- Harness schema 7 保存有限运行身份和结果，平台 schema 3 增加任务树与范围授权。配置 schema 保持 3，旧迁移不改写。
 
 ### Changed
 

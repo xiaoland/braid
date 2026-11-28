@@ -1,7 +1,8 @@
 # Braid Project Instructions
 
-This repository implements Braid: GitHub Issue and pull-request state become the
-durable working memory of local Coding Agents. Apply these instructions only in
+This repository implements Braid: collaboration Issue and pull-request state become
+the durable working memory of Coding Agents. GitHub and the built-in platform are
+peer upstreams; the Web Console belongs to Braid as a whole. Apply these instructions only in
 this repository; do not modify user-scope Agent instructions.
 
 ## Knowledge Owners
@@ -20,6 +21,9 @@ this repository; do not modify user-scope Agent instructions.
 - Project vocabulary: `docs/10-prd/glossary.md`
 - Volatile task control: `tasks/`; retain at most one active packet and delete
   it when the task closes after promoting binding truth.
+- Optional collaboration method: `skills/README.md` lists independent skills
+  with name, description and file path. Discover and read them on demand; do not
+  inline skill bodies into prompts or make them a runtime prerequisite.
 
 ## GitHub Working Memory Protocol
 
@@ -64,6 +68,13 @@ this repository; do not modify user-scope Agent instructions.
 - Product acceptance is real black-box GitHub-to-Agent behavior. Compile,
   formatting, lint, protocol probes, and diagnostic scripts support delivery
   but do not substitute for `docs/10-prd/acceptance.md`.
+- Route regressions through the owner of the decision. Use the built binary for
+  CLI, process and browser contracts, and the existing binary unit target for
+  private Rust modules. Importing source files into integration tests registers
+  their unit tests again under a different executable.
+- A restart claim needs a durable write and a fresh reader. Assert the reason for
+  rejection with otherwise valid prerequisites. When retiring a fixture, check
+  its callers outside tests and remove any accessors needed solely by that fixture.
 - The Agent may make coherent verified commits in this repository without
   per-commit approval. Pushes, releases, external GitHub mutations, and changes
   outside this repository retain their own authority gates.

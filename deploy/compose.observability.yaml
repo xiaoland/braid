@@ -1,0 +1,24 @@
+# Disposable local verification, NOT a public or production Grafana deployment.
+# No host mounts or persistent volumes. `down -v` destroys this evidence store.
+services:
+  lgtm:
+    image: grafana/otel-lgtm:0.11.0
+    ports:
+      - "127.0.0.1:3300:3000"
+    environment:
+      ENABLE_LOGS_ALL: "false"
+    volumes:
+      - ./loki.observability.yaml:/otel-lgtm/loki-config.yaml:ro
+    networks: [observability]
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.161.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.example.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "127.0.0.1:14318:4318"
+      - "127.0.0.1:18888:8888"
+    depends_on: [lgtm]
+    networks: [observability]
+networks:
+  observability: {}

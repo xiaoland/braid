@@ -1,0 +1,652 @@
+[
+  {
+    "path": "QA.json",
+    "bytes": 2963,
+    "sha256": "9b6ce8b8fe55ea0c7bfb5388c713e69e78db03f614ce35867a3d05f43382b8eb"
+  },
+  {
+    "path": "README.md",
+    "bytes": 2977,
+    "sha256": "8ddea8aa448f161180774503a54db9336f2c6bb5922116890fe1d0ec9b8d5fbf"
+  },
+  {
+    "path": "actual-size-preview.png",
+    "bytes": 35308,
+    "sha256": "e5bcf2f6f8bb71fdf38c0278ad94d91c3787a65a616b09e25fc9c948501062f4"
+  },
+  {
+    "path": "build_pack.py",
+    "bytes": 3398,
+    "sha256": "9345d72285a6f2c7a064e4ce9ad5000557e79728ce9161ff8e5f556e8eae4ab6"
+  },
+  {
+    "path": "independent-review.json",
+    "bytes": 493,
+    "sha256": "11aa6c7a72df239e758f5136a591d4f5eb14ffb119f8f333d4fb55cae7a0d82c"
+  },
+  {
+    "path": "png/braid-black-on-transparent/braid-black-on-transparent-1024.png",
+    "bytes": 37336,
+    "sha256": "96c6d0c894611e2e11dff5f851eb9f9ed83075d2d8acafd909f57369c27e3693"
+  },
+  {
+    "path": "png/braid-black-on-transparent/braid-black-on-transparent-128.png",
+    "bytes": 3532,
+    "sha256": "21cb06dc6fed9fc76d97ed6aa37d26dd02b8bc7b2a0bb0878736937196502d74"
+  },
+  {
+    "path": "png/braid-black-on-transparent/braid-black-on-transparent-16.png",
+    "bytes": 433,
+    "sha256": "42a4f8de091c444255a96478aed324dc3e0a5869f7bb53e1fcf55721e2f7a3f8"
+  },
+  {
+    "path": "png/braid-black-on-transparent/braid-black-on-transparent-20.png",
+    "bytes": 527,
+    "sha256": "8e206c387c978967a5f8a00910cb6394f59a5fa68bb3664edf6d2235d67befd3"
+  },
+  {
+    "path": "png/braid-black-on-transparent/braid-black-on-transparent-24.png",
+    "bytes": 606,
+    "sha256": "28d7938611af53340b97474291c8f7951d162bba54085dcd5a4f7c3861d368db"
+  },
+  {
+    "path": "png/braid-black-on-transparent/braid-black-on-transparent-256.png",
+    "bytes": 7737,
+    "sha256": "6871be08c1afcb230d56154f27f70cdb0dde9880ae0ae73f289ad1b0db22ff00"
+  },
+  {
+    "path": "png/braid-black-on-transparent/braid-black-on-transparent-32.png",
+    "bytes": 826,
+    "sha256": "401edf5226d89974e641d3bbd57be48eddbe248d390c0874f2a9d584ecd2ea5a"
+  },
+  {
+    "path": "png/braid-black-on-transparent/braid-black-on-transparent-48.png",
+    "bytes": 1137,
+    "sha256": "581007a4d2c793f2258b884b31cbbf07b2764ca1fc789f15bddb19b4555a832c"
+  },
+  {
+    "path": "png/braid-black-on-transparent/braid-black-on-transparent-512.png",
+    "bytes": 16936,
+    "sha256": "d9d94168160b2ea62b52d0439e7d4e7658efa37463e2ee795ff3fd960b87c84d"
+  },
+  {
+    "path": "png/braid-black-on-transparent/braid-black-on-transparent-64.png",
+    "bytes": 1604,
+    "sha256": "47d156742f05b77bb65e621856050302dde9035ebbacc337921e1813a1da6865"
+  },
+  {
+    "path": "png/braid-black-on-white/braid-black-on-white-1024.png",
+    "bytes": 49780,
+    "sha256": "c7bc5432a89397ddefacaba27b86f0fa95e08a6ebb6098bfaf0dd0790f4ca1ca"
+  },
+  {
+    "path": "png/braid-black-on-white/braid-black-on-white-128.png",
+    "bytes": 4575,
+    "sha256": "893da788dc4bda4f3d4bbfa008a110793faca50d4c35d02e4513476e0b5ae9a7"
+  },
+  {
+    "path": "png/braid-black-on-white/braid-black-on-white-16.png",
+    "bytes": 586,
+    "sha256": "15259102343fb12d2176b5447895f32ffd0aaca9f300f4b613dd310e8050bca4"
+  },
+  {
+    "path": "png/braid-black-on-white/braid-black-on-white-20.png",
+    "bytes": 722,
+    "sha256": "6567ecf9d1819755c1fcd2112b76252b65b214ed63611b8198f1815a74dc6674"
+  },
+  {
+    "path": "png/braid-black-on-white/braid-black-on-white-24.png",
+    "bytes": 852,
+    "sha256": "98c2194609fbcfc3626470eada4208a03c8c38ca09171ce5016648ec9edee63a"
+  },
+  {
+    "path": "png/braid-black-on-white/braid-black-on-white-256.png",
+    "bytes": 10188,
+    "sha256": "307dbcf5f471838e106cc3e4fbb96ba1c4c93bf43f8d73246456459dfcc1d82b"
+  },
+  {
+    "path": "png/braid-black-on-white/braid-black-on-white-32.png",
+    "bytes": 1151,
+    "sha256": "3ef78e9674a4bda3d7787d046010e6a3aa873376dc4735205e2a0d9d254943cf"
+  },
+  {
+    "path": "png/braid-black-on-white/braid-black-on-white-48.png",
+    "bytes": 1581,
+    "sha256": "3db2185e21fc6d616328962615f938b13f1fe9d051ce64c92d2b98b38bbac119"
+  },
+  {
+    "path": "png/braid-black-on-white/braid-black-on-white-512.png",
+    "bytes": 22408,
+    "sha256": "d5a39dca9551f18c5ef39f6f343421ea1b3aeec03f1ce6b3b9889be846953abc"
+  },
+  {
+    "path": "png/braid-black-on-white/braid-black-on-white-64.png",
+    "bytes": 2221,
+    "sha256": "63235dfae19fd09eaad2dacd0cd5411a4649607b302b288edc5c21e8e47945da"
+  },
+  {
+    "path": "png/braid-color-on-badge/braid-color-on-badge-1024.png",
+    "bytes": 98226,
+    "sha256": "d9646977744bd13fcb2f4d183ec08ddebd3092b922ce2dfb57853348c1abf3f8"
+  },
+  {
+    "path": "png/braid-color-on-badge/braid-color-on-badge-128.png",
+    "bytes": 7561,
+    "sha256": "af6d9c76b2c00ce7f4bdc0d975b6bfa2cbe36bc43ac9f949404ac29b5b993a28"
+  },
+  {
+    "path": "png/braid-color-on-badge/braid-color-on-badge-16.png",
+    "bytes": 745,
+    "sha256": "a8f7f5c9bcc247df57ff63017292cdaea9d65c9115e26084108e23c975d613f0"
+  },
+  {
+    "path": "png/braid-color-on-badge/braid-color-on-badge-20.png",
+    "bytes": 987,
+    "sha256": "13be3ba4c659419bf7b24c1561f53f16e2accb6fce3ba1b969f9eccc59e0eabc"
+  },
+  {
+    "path": "png/braid-color-on-badge/braid-color-on-badge-24.png",
+    "bytes": 1217,
+    "sha256": "792e700358adbb34f75c72ff71c573b00d86d41e631f6a31fcbe88f95737c52d"
+  },
+  {
+    "path": "png/braid-color-on-badge/braid-color-on-badge-256.png",
+    "bytes": 17575,
+    "sha256": "521712a5b1afac415e1e41b2b8f467df596cfe3d01fba7c3c2ff275a115c229d"
+  },
+  {
+    "path": "png/braid-color-on-badge/braid-color-on-badge-32.png",
+    "bytes": 1705,
+    "sha256": "21ae32139d9bad085f1de78b655f5c0b639d69f5bfdc6deb85eb528c3f01f136"
+  },
+  {
+    "path": "png/braid-color-on-badge/braid-color-on-badge-48.png",
+    "bytes": 2414,
+    "sha256": "09858e9ef8ea5c9243278faa8cfa10a76f143bcc5d5d0e90bcb9676bd0d0ca80"
+  },
+  {
+    "path": "png/braid-color-on-badge/braid-color-on-badge-512.png",
+    "bytes": 41094,
+    "sha256": "82d5510e5142ec1c70ae0f50f809b71a78b9803952df0338523ad86b87c04524"
+  },
+  {
+    "path": "png/braid-color-on-badge/braid-color-on-badge-64.png",
+    "bytes": 3409,
+    "sha256": "d7378eeebd392e5a128d4843c66245de7855fc3cbb048dc775ec7be0725d6576"
+  },
+  {
+    "path": "png/braid-color-on-black/braid-color-on-black-1024.png",
+    "bytes": 89804,
+    "sha256": "1e7685263bf116332b6146125faff3adfd6b9db940edb63ecdfd8abc3f351917"
+  },
+  {
+    "path": "png/braid-color-on-black/braid-color-on-black-128.png",
+    "bytes": 6760,
+    "sha256": "3698c55402a45e250d60c13ddac05c6b40d88958589ce3d42a0311130cb3cea8"
+  },
+  {
+    "path": "png/braid-color-on-black/braid-color-on-black-16.png",
+    "bytes": 694,
+    "sha256": "fec088b2c2ed97c2de8aa499264a346ffe5527ae8fd686e3773f182f8f2c8c4b"
+  },
+  {
+    "path": "png/braid-color-on-black/braid-color-on-black-20.png",
+    "bytes": 889,
+    "sha256": "485e9d0e89fa897d8ecfc959b0dd35dd8bc947f2a642282f315299d6673005c8"
+  },
+  {
+    "path": "png/braid-color-on-black/braid-color-on-black-24.png",
+    "bytes": 1094,
+    "sha256": "9697c798080c8c59e76dc026549d9aad06bafc7ac445d9167a09622cf651e5e2"
+  },
+  {
+    "path": "png/braid-color-on-black/braid-color-on-black-256.png",
+    "bytes": 15741,
+    "sha256": "c4dfc44d242efaf93c297bed4f3ae80727fc73a65d8e05bde5ba19da37681973"
+  },
+  {
+    "path": "png/braid-color-on-black/braid-color-on-black-32.png",
+    "bytes": 1529,
+    "sha256": "d23481bddbc66c8319b82ee603eb06179357e559cf8e5d7895124d5e2bcc3bb0"
+  },
+  {
+    "path": "png/braid-color-on-black/braid-color-on-black-48.png",
+    "bytes": 2136,
+    "sha256": "84caf1de70c6720d337a6bfe18b6e870ebc746598d5e04033df00d18234ea496"
+  },
+  {
+    "path": "png/braid-color-on-black/braid-color-on-black-512.png",
+    "bytes": 37326,
+    "sha256": "a114b8f0856851c35c64939c14b3e9f588c5601d8dd064bd816383f2d4c4ad9f"
+  },
+  {
+    "path": "png/braid-color-on-black/braid-color-on-black-64.png",
+    "bytes": 3036,
+    "sha256": "a4265b4ba9f99c55c620b6720d712f4e4843aa117c8f01a4d1020e5e73b1c1d4"
+  },
+  {
+    "path": "png/braid-color-on-transparent/braid-color-on-transparent-1024.png",
+    "bytes": 86581,
+    "sha256": "3e02235271ab44163517d27e54a0101e2bbcac58705b8879fff635ab038c6b28"
+  },
+  {
+    "path": "png/braid-color-on-transparent/braid-color-on-transparent-128.png",
+    "bytes": 6678,
+    "sha256": "9b59d1c8103d2f29816f45654a631e317818e8a2df5c1886700db4b6d74323d0"
+  },
+  {
+    "path": "png/braid-color-on-transparent/braid-color-on-transparent-16.png",
+    "bytes": 671,
+    "sha256": "0af9654e1e515bd37614868d74b12e09f6df6513fd68734f413706a5b415813f"
+  },
+  {
+    "path": "png/braid-color-on-transparent/braid-color-on-transparent-20.png",
+    "bytes": 855,
+    "sha256": "c90ac6dad0c0c9113d2a2084aee0cb949cb9ead1a3093f4d77153bc467df488c"
+  },
+  {
+    "path": "png/braid-color-on-transparent/braid-color-on-transparent-24.png",
+    "bytes": 1052,
+    "sha256": "8dc42b1ece609ce7cbe1dff4eb7fd6a328fffd2a531c92f95c7be77ef70ea4d0"
+  },
+  {
+    "path": "png/braid-color-on-transparent/braid-color-on-transparent-256.png",
+    "bytes": 15378,
+    "sha256": "0c33f618461128993fdd5ea0816045a871dac6732d0df72371c9da80629700e6"
+  },
+  {
+    "path": "png/braid-color-on-transparent/braid-color-on-transparent-32.png",
+    "bytes": 1459,
+    "sha256": "4880253e54b88d8d21d99714ee9c7aa2d6b7f4a481e4c40f5619c7cd2ece66e0"
+  },
+  {
+    "path": "png/braid-color-on-transparent/braid-color-on-transparent-48.png",
+    "bytes": 2078,
+    "sha256": "47ee3eb89902b3d77f964128ee52f0800da05c3b4590c4f92856e8d5daad2c50"
+  },
+  {
+    "path": "png/braid-color-on-transparent/braid-color-on-transparent-512.png",
+    "bytes": 36218,
+    "sha256": "c2089878bcc24a1165f09881e6e8c4102e319a83e9fc30807c5faf0f596b4fdc"
+  },
+  {
+    "path": "png/braid-color-on-transparent/braid-color-on-transparent-64.png",
+    "bytes": 2958,
+    "sha256": "1675060f4d6c1b93e42986cdf9140f8438942a69edc8a09df4b7c2ce1de304e5"
+  },
+  {
+    "path": "png/braid-color-on-white/braid-color-on-white-1024.png",
+    "bytes": 83820,
+    "sha256": "75a64a518a8cd04193f3fc51c63abbc38d00d19a12186fde40a00508eefb11b4"
+  },
+  {
+    "path": "png/braid-color-on-white/braid-color-on-white-128.png",
+    "bytes": 6181,
+    "sha256": "223872f689be16c03700389fb2101f731ee0bdf4b9b3b3ee95ca6b9f967689d1"
+  },
+  {
+    "path": "png/braid-color-on-white/braid-color-on-white-16.png",
+    "bytes": 632,
+    "sha256": "ef728196b3b95b3b3ac242ace2aa14b01696799ae3a02c9494293427cd626ecf"
+  },
+  {
+    "path": "png/braid-color-on-white/braid-color-on-white-20.png",
+    "bytes": 809,
+    "sha256": "a3af910b6497db25abe819dfd879292981ee0b33ada28a4b3e912015ff5afb1a"
+  },
+  {
+    "path": "png/braid-color-on-white/braid-color-on-white-24.png",
+    "bytes": 994,
+    "sha256": "cc454d31cd3f84b33562cbbd6bb41650c92f0694e5f09e0213b276ff9b3376f3"
+  },
+  {
+    "path": "png/braid-color-on-white/braid-color-on-white-256.png",
+    "bytes": 14435,
+    "sha256": "4658119abab046ff5f5721b8b380c75fab16b4d8ed3e7ba107df8232d92bb069"
+  },
+  {
+    "path": "png/braid-color-on-white/braid-color-on-white-32.png",
+    "bytes": 1402,
+    "sha256": "a7d7fce1bcc0e9e0cf423b58925d5b7436eed34175bd61505be8c12e46534a44"
+  },
+  {
+    "path": "png/braid-color-on-white/braid-color-on-white-48.png",
+    "bytes": 1976,
+    "sha256": "dc66504675b47b14966f7d6c7160c25de35618b42099b46233e0277b6797d848"
+  },
+  {
+    "path": "png/braid-color-on-white/braid-color-on-white-512.png",
+    "bytes": 34552,
+    "sha256": "bffd6b511c20d13a25d2d380e34692d212a12a5c48383535d095a329e0be1396"
+  },
+  {
+    "path": "png/braid-color-on-white/braid-color-on-white-64.png",
+    "bytes": 2731,
+    "sha256": "12b71d020cc82e4aaeb4da712ca8eabf225ef393f70b1fdd660faf169b760871"
+  },
+  {
+    "path": "png/braid-white-on-black/braid-white-on-black-1024.png",
+    "bytes": 49945,
+    "sha256": "ee5dd59412cb282f80ec99b3b84a643f7657089931648552f70eaceae9279168"
+  },
+  {
+    "path": "png/braid-white-on-black/braid-white-on-black-128.png",
+    "bytes": 4381,
+    "sha256": "8faece00526fd8dfde96e70c801d2daed84926d05ad4fdcfec08a6b860252051"
+  },
+  {
+    "path": "png/braid-white-on-black/braid-white-on-black-16.png",
+    "bytes": 584,
+    "sha256": "faf3e138a49b0e45519bc2fde34ead01fe7e27e438609e2c83e8031b88e56242"
+  },
+  {
+    "path": "png/braid-white-on-black/braid-white-on-black-20.png",
+    "bytes": 710,
+    "sha256": "3e3700ca6049a3d7b173811aa02e22e12941e33b5678a22e0603ba4dd24e9bd2"
+  },
+  {
+    "path": "png/braid-white-on-black/braid-white-on-black-24.png",
+    "bytes": 846,
+    "sha256": "ee29215f63579c9ed9dc2ca5aee122a79820fe60aa0ec0924f56cc4cd4bf3871"
+  },
+  {
+    "path": "png/braid-white-on-black/braid-white-on-black-256.png",
+    "bytes": 9832,
+    "sha256": "75ecfbb16b261014b77ed259e4a63eac8c9e52a7ee56a1139997696265348588"
+  },
+  {
+    "path": "png/braid-white-on-black/braid-white-on-black-32.png",
+    "bytes": 1144,
+    "sha256": "48ad338b8671b8ee64c3e27e76bdc448023afcd73338da0c962c8552b71bfedf"
+  },
+  {
+    "path": "png/braid-white-on-black/braid-white-on-black-48.png",
+    "bytes": 1574,
+    "sha256": "e0c63bff6b94418c82ee1debf4637f9273e1c1b809e6193f5636c062c717606a"
+  },
+  {
+    "path": "png/braid-white-on-black/braid-white-on-black-512.png",
+    "bytes": 22355,
+    "sha256": "428447dfdc1abb4929764a1f751eae081c7029135d5994a0cd2032c3a031bd88"
+  },
+  {
+    "path": "png/braid-white-on-black/braid-white-on-black-64.png",
+    "bytes": 2178,
+    "sha256": "8952f6f5cd3572272cf8c5dbfe15d6dd8ecfb5f738315d99a5d8dfa9cc0c06e2"
+  },
+  {
+    "path": "png/braid-white-on-transparent/braid-white-on-transparent-1024.png",
+    "bytes": 34021,
+    "sha256": "d8f91112ec7707cc5b5831eb8091a52ffa9cdd7260a1ab8c53eef025aa05f31a"
+  },
+  {
+    "path": "png/braid-white-on-transparent/braid-white-on-transparent-128.png",
+    "bytes": 3518,
+    "sha256": "cd6147316fb7b99922e139e58fab404419d4407159d0db8250ab1dad938c7dca"
+  },
+  {
+    "path": "png/braid-white-on-transparent/braid-white-on-transparent-16.png",
+    "bytes": 434,
+    "sha256": "cf4b85e2295b713c47a1b763fe468367dca6dd91ce2ea8e63c73bbc88b183504"
+  },
+  {
+    "path": "png/braid-white-on-transparent/braid-white-on-transparent-20.png",
+    "bytes": 531,
+    "sha256": "2076f57a0a54a807c55877ab38d3be8d95a45180e20326139d71fc6c05eeb9ad"
+  },
+  {
+    "path": "png/braid-white-on-transparent/braid-white-on-transparent-24.png",
+    "bytes": 629,
+    "sha256": "4c328e56f8ba5055dc1bef67938619529c7d0fee536b9d0acdd899a96bfb3277"
+  },
+  {
+    "path": "png/braid-white-on-transparent/braid-white-on-transparent-256.png",
+    "bytes": 7259,
+    "sha256": "68d8f2b6b0c8a286e07f9f2f0d379cf9db40e1d3ccd57f85d0cd7b7a5b5c29a8"
+  },
+  {
+    "path": "png/braid-white-on-transparent/braid-white-on-transparent-32.png",
+    "bytes": 839,
+    "sha256": "bcfc6a532b5e3eda8cad7e85d22b9178e992f9bab8a71bd908649d328a7bb044"
+  },
+  {
+    "path": "png/braid-white-on-transparent/braid-white-on-transparent-48.png",
+    "bytes": 1231,
+    "sha256": "2f3d7859ca91ef1a3b8e780fa12e0f65c407f41c4ca8d3dc515339b239c54757"
+  },
+  {
+    "path": "png/braid-white-on-transparent/braid-white-on-transparent-512.png",
+    "bytes": 15598,
+    "sha256": "8125459292efadce7079a995bbdd93c931a3e41be156ec8d4ce979b1cd67d851"
+  },
+  {
+    "path": "png/braid-white-on-transparent/braid-white-on-transparent-64.png",
+    "bytes": 1672,
+    "sha256": "74f54e1a74b1c2ea6f33b91663c4ac57e105c4659950dfecfe0756c9caf6fa6d"
+  },
+  {
+    "path": "preview.png",
+    "bytes": 270750,
+    "sha256": "44b4d13409bde52c478a5f90d15a905228ae2c3bbdefb75f42cec81fbf0d800a"
+  },
+  {
+    "path": "qa.py",
+    "bytes": 2498,
+    "sha256": "d4b9b3e13203591e299739ffaee48a48581839c2c9ea014a1c9cad7392cb2bb9"
+  },
+  {
+    "path": "source/approved-monochrome.svg",
+    "bytes": 1296,
+    "sha256": "fba1bc550d2b64b96bc52a926e54553713341391aa6d48cf8af9c85fd7047eae"
+  },
+  {
+    "path": "source/color-v2-hashes.json",
+    "bytes": 6126,
+    "sha256": "02e1cb5e0c1764145330338324741074c01fbc3aeeeda25c4ef464a6ada1270a"
+  },
+  {
+    "path": "source/original-hd.png",
+    "bytes": 998750,
+    "sha256": "3b5dd92845f1d039375581c7010c65bc52084387d0a0a76bbfdee9805eeaf885"
+  },
+  {
+    "path": "svg/optical/128/braid-black-on-transparent.svg",
+    "bytes": 1539,
+    "sha256": "05309dc06ab4e6d5f4c7a451aba2045d4d6c78a5dc12fa73b8e55ee39c88dbec"
+  },
+  {
+    "path": "svg/optical/128/braid-black-on-white.svg",
+    "bytes": 1534,
+    "sha256": "a3094a9b43d9b6bdebffb780dfdb880403d769dfd28ba9c419a61a89fdfb1028"
+  },
+  {
+    "path": "svg/optical/128/braid-white-on-black.svg",
+    "bytes": 1534,
+    "sha256": "1ddcf1d1da70196e6a166e5e42d3498e42e7e484da0e353de842e3a3d806a6ba"
+  },
+  {
+    "path": "svg/optical/128/braid-white-on-transparent.svg",
+    "bytes": 1539,
+    "sha256": "d7efde2af31692a7e93febf008ada2971d802686587f44f98a4fd831ba3e1dc7"
+  },
+  {
+    "path": "svg/optical/16/braid-black-on-transparent.svg",
+    "bytes": 1641,
+    "sha256": "25f47ee99fec3be95676468757e2e7a0a1d9ec7e1c319154a4d0779e0f7bfc49"
+  },
+  {
+    "path": "svg/optical/16/braid-black-on-white.svg",
+    "bytes": 1636,
+    "sha256": "a71077ff6d0e428d96bdf02c8210e70342b3261bd2a4d0d41b6662ae4cc349dd"
+  },
+  {
+    "path": "svg/optical/16/braid-white-on-black.svg",
+    "bytes": 1636,
+    "sha256": "2d9084f9d40596476feb270eaf0da0000c39a2b06bdbefd136f2e24a2032c1a0"
+  },
+  {
+    "path": "svg/optical/16/braid-white-on-transparent.svg",
+    "bytes": 1641,
+    "sha256": "738b65e0918804c59cf6791f3d4fedc9d666fe2878b35a49d6054722da0aac14"
+  },
+  {
+    "path": "svg/optical/20/braid-black-on-transparent.svg",
+    "bytes": 1641,
+    "sha256": "d10f622d46d0efd82fe646555415b92382e1446841c8a0af1ad4a6f51c3e85af"
+  },
+  {
+    "path": "svg/optical/20/braid-black-on-white.svg",
+    "bytes": 1636,
+    "sha256": "a9d43ece46ea91b025505430be5dd6b2ebfedc9545d1566ce1364d1691c79d47"
+  },
+  {
+    "path": "svg/optical/20/braid-white-on-black.svg",
+    "bytes": 1636,
+    "sha256": "af1fdf88a37d8a460406183b077d948dce940aeeabfe19d6c6c7ebbd2773b44b"
+  },
+  {
+    "path": "svg/optical/20/braid-white-on-transparent.svg",
+    "bytes": 1641,
+    "sha256": "5772726a4f81ac52160c82a609c04bb08e69c8f0456949d204b397e69cffcdba"
+  },
+  {
+    "path": "svg/optical/24/braid-black-on-transparent.svg",
+    "bytes": 1641,
+    "sha256": "25ae0c7c66aee30bc477cf517e54ae54e3082e0dea845b045436170eee3a3264"
+  },
+  {
+    "path": "svg/optical/24/braid-black-on-white.svg",
+    "bytes": 1636,
+    "sha256": "8c54254a155c98cc75905fcf72c7d259fa80d59748b5b8cdc310d7121c742e57"
+  },
+  {
+    "path": "svg/optical/24/braid-white-on-black.svg",
+    "bytes": 1636,
+    "sha256": "9c731be70a70f14d5fa0e2965416be1acef74c41fcde79207f89c52f2d192931"
+  },
+  {
+    "path": "svg/optical/24/braid-white-on-transparent.svg",
+    "bytes": 1641,
+    "sha256": "63db0994f4930cd93aa4718015041671d8fac54b5f8dec7586be8bede8f34cf1"
+  },
+  {
+    "path": "svg/optical/32/braid-black-on-transparent.svg",
+    "bytes": 1641,
+    "sha256": "7f2b8f6af8816d8263640657490d98c4047014928b4819611608fe2d36b6d36e"
+  },
+  {
+    "path": "svg/optical/32/braid-black-on-white.svg",
+    "bytes": 1636,
+    "sha256": "d4b02dd7bc25442d55767d190dd2f4a81274bd031eccfd4829ba6c6e0d2aa5bb"
+  },
+  {
+    "path": "svg/optical/32/braid-white-on-black.svg",
+    "bytes": 1636,
+    "sha256": "3433dfe1b9ec5c26a7cd7852049258b2cd6f99446345aa3878a73380358ad494"
+  },
+  {
+    "path": "svg/optical/32/braid-white-on-transparent.svg",
+    "bytes": 1641,
+    "sha256": "854372571049fa862d8b7a68804333ce3c71e7006ca8db3f6e46eec4cda60a93"
+  },
+  {
+    "path": "svg/optical/48/braid-black-on-transparent.svg",
+    "bytes": 1540,
+    "sha256": "3eeace77b0c4bcaac0902d81b636b07c9b8a161ce541f4d8e976413bf96a198b"
+  },
+  {
+    "path": "svg/optical/48/braid-black-on-white.svg",
+    "bytes": 1535,
+    "sha256": "5486589e2efbd312c0925b01e41b82bf6d95a0b380b6eca66e8622c07dd68938"
+  },
+  {
+    "path": "svg/optical/48/braid-white-on-black.svg",
+    "bytes": 1535,
+    "sha256": "ae8e446f1fdecbae05c702b195ef7b2ffe817436675850d22182dcb826aeb400"
+  },
+  {
+    "path": "svg/optical/48/braid-white-on-transparent.svg",
+    "bytes": 1540,
+    "sha256": "a834c93dd4349ed18f7dff4e7feca1a9b4bcd4572521c359dcb878e35bbfc824"
+  },
+  {
+    "path": "svg/optical/64/braid-black-on-transparent.svg",
+    "bytes": 1540,
+    "sha256": "74a6e7f5fa744266ab09267601609abab9ae2b809398a053021127b8bd3221eb"
+  },
+  {
+    "path": "svg/optical/64/braid-black-on-white.svg",
+    "bytes": 1535,
+    "sha256": "01adb5c036f209153d575935d524721f22f006d3279ad441f40368551756cc7c"
+  },
+  {
+    "path": "svg/optical/64/braid-white-on-black.svg",
+    "bytes": 1535,
+    "sha256": "bc4a20a76d2c8a46aca422dda622507554b127e73edf758b40defa04c8285148"
+  },
+  {
+    "path": "svg/optical/64/braid-white-on-transparent.svg",
+    "bytes": 1540,
+    "sha256": "bf6fdc2340885c008b212cee445887c1f7bfcb63d9ed8f9f125894cac48984f9"
+  },
+  {
+    "path": "svg/small-optical-color/braid-color-on-badge.svg",
+    "bytes": 5718,
+    "sha256": "ff1cefae1e9c61ee7fbdc6b839978fafaedeeb7b81d23f8c74400dd8e8d66195"
+  },
+  {
+    "path": "svg/small-optical-color/braid-color-on-black.svg",
+    "bytes": 5714,
+    "sha256": "5941928507ffed66985ecafc0b2856eb93b08356ee366d239213aa033ee53b19"
+  },
+  {
+    "path": "svg/small-optical-color/braid-color-on-transparent.svg",
+    "bytes": 5665,
+    "sha256": "525ac3ab514b3e4412a7659f4c93efc4a2831c1221ea9cd148547d3402ec502b"
+  },
+  {
+    "path": "svg/small-optical-color/braid-color-on-white.svg",
+    "bytes": 5714,
+    "sha256": "ef0014b04086b01be892d4defe733aac529b15d6dc66936505545fe91ce28024"
+  },
+  {
+    "path": "svg/standard/braid-black-on-transparent.svg",
+    "bytes": 1423,
+    "sha256": "a8d188708010d935bf2cea690229cd823d5b23cba654211cbcdcc1f735953697"
+  },
+  {
+    "path": "svg/standard/braid-black-on-white.svg",
+    "bytes": 1418,
+    "sha256": "d86847d26ea10ce0b3e09159f8f2af8c0d6d9fe0166ed88ce6c18ebf2f255eb1"
+  },
+  {
+    "path": "svg/standard/braid-color-on-badge.svg",
+    "bytes": 5944,
+    "sha256": "359e13c2f2fef532cc81166dad7688f3b4d0e44fcc6fe3fcd88377ffc7ccf839"
+  },
+  {
+    "path": "svg/standard/braid-color-on-black.svg",
+    "bytes": 5940,
+    "sha256": "ca6aa4f0e05fa1e254d244954b50d25664115c9797eec0fe745a321aedaf35ed"
+  },
+  {
+    "path": "svg/standard/braid-color-on-transparent.svg",
+    "bytes": 5891,
+    "sha256": "350631de9f7ed979804e8fe88ba6f9beef3d8d48c0b843082c3cf07a937828f3"
+  },
+  {
+    "path": "svg/standard/braid-color-on-white.svg",
+    "bytes": 5940,
+    "sha256": "1feb017e13ff124ac8897e6f5546cf39ebb344254aedff8bc067bc2b3523471a"
+  },
+  {
+    "path": "svg/standard/braid-white-on-black.svg",
+    "bytes": 1418,
+    "sha256": "7c1843b2d373f5bab365589157211d17ed060960923b7f3fce3c0f04504842ea"
+  },
+  {
+    "path": "svg/standard/braid-white-on-transparent.svg",
+    "bytes": 1423,
+    "sha256": "5a07d8fcd53fb0939eee4c19cd02122f0a9f0b8352b2f06814e733175b8b43ec"
+  }
+]

@@ -11,7 +11,7 @@ use crate::{
     github::{GitHubClient, GitHubError, RepositoryName, WorkItemLocator},
     store::{
         AssociatedWorkItem, AssociationSet, CanonicalComment, CanonicalCommentSet, DeletedComment,
-        StoreActor, StoreError,
+        OperationalCommentCandidate, StoreActor, StoreError,
     },
 };
 
@@ -38,13 +38,13 @@ pub enum ContextError {
     InvalidPageSize(usize),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Actor {
     pub node_id: String,
     pub login: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItemReference {
     pub node_id: String,
     pub repository_node_id: String,
@@ -62,30 +62,35 @@ impl WorkItemReference {
             WorkItemKind::Issue => "Issue",
             WorkItemKind::PullRequest => "PR",
         };
-        format!("GitHub {noun}: {}#{}", self.repository, self.number)
+        format!(
+            "{} {noun}: {}#{}",
+            surface_name(&self.repository_node_id),
+            self.repository,
+            self.number
+        )
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkItemKind {
     Issue,
     PullRequest,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectEntry {
     pub title: String,
     pub fields: Vec<ProjectField>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectField {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommentSnapshot {
     pub node_id: String,
     pub database_id: String,
@@ -94,6 +99,8 @@ pub struct CommentSnapshot {
     pub author: Option<Actor>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub last_edited_at: Option<String>,
     pub body: Option<String>,
     pub minimized: bool,
     pub minimized_reason: Option<String>,
@@ -101,8 +108,45 @@ pub struct CommentSnapshot {
     pub deleted: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Edit attribution returned with the same canonical title and body.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RootEditEvidence {
+    pub(crate) last_edited_at: Option<String>,
+    pub(crate) editor: Option<EditActor>,
+    pub(crate) title_history: Option<TitleHistory>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct EditActor {
+    pub(crate) id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct TitleHistory {
+    pub(crate) nodes: Vec<Option<TitleRename>>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TitleRename {
+    pub(crate) id: String,
+    pub(crate) actor: Option<EditActor>,
+    pub(crate) created_at: String,
+    pub(crate) previous_title: String,
+    pub(crate) current_title: String,
+}
+
+impl RootEditEvidence {
+    pub(crate) fn latest_title_rename(&self) -> Option<&TitleRename> {
+        self.title_history.as_ref()?.nodes.last()?.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssueSnapshot {
+    #[serde(skip)]
+    pub(crate) root_edits: RootEditEvidence,
     pub node_id: String,
     pub database_id: String,
     pub repository_node_id: String,
@@ -129,7 +173,7 @@ pub struct IssueSnapshot {
     pub comments: Vec<CommentSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewSnapshot {
     pub node_id: String,
     pub database_id: String,
@@ -142,7 +186,7 @@ pub struct ReviewSnapshot {
     pub minimized_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewThreadSnapshot {
     pub node_id: String,
     pub path: String,
@@ -155,8 +199,10 @@ pub struct ReviewThreadSnapshot {
     pub comments: Vec<CommentSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequestSnapshot {
+    #[serde(skip)]
+    pub(crate) root_edits: RootEditEvidence,
     pub node_id: String,
     pub database_id: String,
     pub repository_node_id: String,
@@ -182,14 +228,14 @@ pub struct PullRequestSnapshot {
     pub review_threads: Vec<ReviewThreadSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CanonicalContext {
     Issue(IssueSnapshot),
     PullRequest(PullRequestSnapshot),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextPressure {
     Normal,
@@ -197,7 +243,7 @@ pub enum ContextPressure {
     Hard,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderedContext {
     pub text: String,
     pub revision: String,
@@ -207,6 +253,9 @@ pub struct RenderedContext {
 
 #[derive(Debug, Clone)]
 pub struct CanonicalObservation {
+    /// Original authorship is usable only when the API proves no subsequent edit.
+    pub unedited_creation: bool,
+    pub created_at: Option<String>,
     pub work_item_node_id: String,
     pub work_item_kind: &'static str,
     pub work_item_number: u64,
@@ -223,8 +272,40 @@ pub struct CanonicalObservation {
     pub author_login: Option<String>,
     pub body: Option<String>,
     pub visible_body: Option<String>,
+    /// Exact title content returned by the source.
+    pub title: Option<String>,
+    pub metadata_digest: Option<String>,
+    pub(crate) root_edits: RootEditEvidence,
 }
 
+impl CanonicalObservation {
+    pub(crate) fn root_fields(&self) -> Option<crate::store::ObservedRootFields> {
+        if !matches!(self.object_kind, "issue" | "pr") {
+            return None;
+        }
+        Some(crate::store::ObservedRootFields {
+            title_digest: root_field_digest(self.title.as_deref()?),
+            body_digest: root_field_digest(self.body.as_deref()?),
+            title_event_id: self.root_edits.latest_title_rename().map(|rename| rename.id.clone()),
+        })
+    }
+
+    /// Versioned wire evidence is distinct from visible semantic equality.
+    pub(crate) fn version_digest(&self) -> String {
+        if matches!(self.object_kind, "issue" | "pr") {
+            crate::store::publication_digest(
+                &self.object_node_id,
+                &self.version,
+                self.title.as_deref(),
+                self.body.as_deref().unwrap_or(""),
+            )
+        } else {
+            object_digest(&self.object_node_id, &self.version, self.body.as_deref())
+        }
+    }
+}
+
+#[tracing::instrument(skip_all, fields(repository = %locator.repository, work_item = locator.number, resource = "graphql"))]
 pub async fn materialize_issue(
     client: &GitHubClient,
     locator: &WorkItemLocator,
@@ -242,6 +323,7 @@ pub async fn materialize_issue(
     Err(ContextError::Drift(locator.to_string()))
 }
 
+#[tracing::instrument(skip_all, fields(repository = %locator.repository, work_item = locator.number, resource = "graphql"))]
 pub async fn materialize_pull_request(
     client: &GitHubClient,
     locator: &WorkItemLocator,
@@ -308,17 +390,24 @@ pub fn render_complete(
 pub fn reconcile_local_state(
     context: &mut CanonicalContext,
     store: &StoreActor,
+    github_app_actor_node_id: Option<&str>,
 ) -> Result<(), ContextError> {
     match context {
-        CanonicalContext::Issue(issue) => reconcile_issue_comments(issue, store),
+        CanonicalContext::Issue(issue) => {
+            reconcile_issue_comments(issue, store, github_app_actor_node_id)
+        }
         CanonicalContext::PullRequest(pull_request) => {
             let work_item_digest = pull_request_root_digest(pull_request);
             let work_item_state = pull_request_work_item_state(pull_request);
             for issue in &mut pull_request.associated_issues {
-                reconcile_issue_comments(issue, store)?;
+                reconcile_issue_comments(issue, store, github_app_actor_node_id)?;
             }
-            let excluded = store.operational_status_comment_ids(pull_request.node_id.clone())?;
-            pull_request.conversation.retain(|comment| !excluded.contains(&comment.node_id));
+            let excluded = discussion_roles(
+                store,
+                &pull_request.node_id,
+                &pull_request.conversation,
+                github_app_actor_node_id,
+            )?;
             let mut tombstones = store.reconcile_comments(comment_set(
                 &pull_request.repository_node_id,
                 &pull_request.repository,
@@ -331,6 +420,8 @@ pub fn reconcile_local_state(
                 "pr_comment",
                 &pull_request.conversation,
             ))?;
+            // Projection exclusions are not evidence of upstream deletion.
+            pull_request.conversation.retain(|comment| !excluded.contains(&comment.node_id));
             tombstones.retain(|comment| !excluded.contains(&comment.node_id));
             extend_tombstones(
                 &mut pull_request.conversation,
@@ -457,6 +548,8 @@ pub fn canonical_observations(context: &CanonicalContext) -> Vec<CanonicalObserv
 
 fn issue_observation(issue: &IssueSnapshot) -> CanonicalObservation {
     CanonicalObservation {
+        unedited_creation: false,
+        created_at: None,
         work_item_node_id: issue.node_id.clone(),
         work_item_kind: "issue",
         work_item_number: issue.number,
@@ -473,11 +566,16 @@ fn issue_observation(issue: &IssueSnapshot) -> CanonicalObservation {
         author_login: issue.author.as_ref().map(|author| author.login.clone()),
         body: Some(issue.body.clone()),
         visible_body: Some(filter_html_comments(&issue.body)),
+        title: Some(issue.title.clone()),
+        root_edits: issue.root_edits.clone(),
+        metadata_digest: Some(issue_metadata_digest(issue)),
     }
 }
 
 fn pull_request_observation(pull_request: &PullRequestSnapshot) -> CanonicalObservation {
     CanonicalObservation {
+        unedited_creation: false,
+        created_at: None,
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
@@ -494,6 +592,9 @@ fn pull_request_observation(pull_request: &PullRequestSnapshot) -> CanonicalObse
         author_login: pull_request.author.as_ref().map(|author| author.login.clone()),
         body: Some(pull_request.body.clone()),
         visible_body: Some(filter_html_comments(&pull_request.body)),
+        title: Some(pull_request.title.clone()),
+        root_edits: pull_request.root_edits.clone(),
+        metadata_digest: Some(pull_request_metadata_digest(pull_request)),
     }
 }
 
@@ -510,6 +611,8 @@ fn review_observation(
         "active"
     };
     CanonicalObservation {
+        unedited_creation: false,
+        created_at: None,
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
@@ -519,13 +622,16 @@ fn review_observation(
         object_node_id: review.node_id.clone(),
         database_id: review.database_id.clone(),
         object_kind: "review",
-        digest: object_digest(&review.node_id, &version, Some(&review.body)),
+        digest: review_semantic_digest(review, false),
         version,
         lifecycle,
         author_node_id: review.author.as_ref().map(|author| author.node_id.clone()),
         author_login: review.author.as_ref().map(|author| author.login.clone()),
         body: Some(review.body.clone()),
         visible_body: Some(filter_html_comments(&review.body)),
+        title: None,
+        root_edits: RootEditEvidence::default(),
+        metadata_digest: Some(review_semantic_digest(review, true)),
     }
 }
 
@@ -544,6 +650,8 @@ fn review_thread_observation(
         thread.comments.iter().map(|comment| comment.updated_at.as_str()).max().unwrap_or("")
     );
     CanonicalObservation {
+        unedited_creation: false,
+        created_at: None,
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
@@ -553,13 +661,16 @@ fn review_thread_observation(
         object_node_id: thread.node_id.clone(),
         database_id: String::new(),
         object_kind: "review_thread",
-        digest: object_digest(&thread.node_id, &version, None),
+        digest: thread_semantic_digest(thread, false),
         version,
         lifecycle,
         author_node_id: thread.resolved_by.as_ref().map(|author| author.node_id.clone()),
         author_login: thread.resolved_by.as_ref().map(|author| author.login.clone()),
         body: None,
         visible_body: None,
+        title: None,
+        root_edits: RootEditEvidence::default(),
+        metadata_digest: Some(thread_semantic_digest(thread, true)),
     }
 }
 
@@ -570,6 +681,8 @@ fn observation(
 ) -> CanonicalObservation {
     let (version, digest, lifecycle) = comment_identity(comment);
     CanonicalObservation {
+        unedited_creation: unedited_comment(comment),
+        created_at: Some(comment.created_at.clone()),
         work_item_node_id: issue.node_id.clone(),
         work_item_kind: "issue",
         work_item_number: issue.number,
@@ -586,6 +699,9 @@ fn observation(
         author_login: comment.author.as_ref().map(|author| author.login.clone()),
         body: comment.body.clone(),
         visible_body: comment.body.as_deref().map(filter_html_comments),
+        title: None,
+        root_edits: RootEditEvidence::default(),
+        metadata_digest: Some(comment_semantic_digest(comment, true)),
     }
 }
 
@@ -596,6 +712,8 @@ fn pr_observation(
 ) -> CanonicalObservation {
     let (version, digest, lifecycle) = comment_identity(comment);
     CanonicalObservation {
+        unedited_creation: unedited_comment(comment),
+        created_at: Some(comment.created_at.clone()),
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
@@ -612,6 +730,9 @@ fn pr_observation(
         author_login: comment.author.as_ref().map(|author| author.login.clone()),
         body: comment.body.clone(),
         visible_body: comment.body.as_deref().map(filter_html_comments),
+        title: None,
+        root_edits: RootEditEvidence::default(),
+        metadata_digest: Some(comment_semantic_digest(comment, true)),
     }
 }
 
@@ -623,7 +744,7 @@ fn comment_identity(comment: &CommentSnapshot) -> (String, String, &'static str)
         lifecycle,
         comment.minimized_reason.as_deref().unwrap_or_default()
     );
-    let digest = object_digest(&comment.node_id, &version, comment.body.as_deref());
+    let digest = comment_semantic_digest(comment, false);
     (version, digest, lifecycle)
 }
 
@@ -643,13 +764,54 @@ fn object_digest(node_id: &str, version: &str, body: Option<&str>) -> String {
     hex::encode(digest.finalize())
 }
 
+fn comment_semantic_digest(comment: &CommentSnapshot, metadata_only: bool) -> String {
+    let mut visible = comment.clone();
+    visible.updated_at.clear();
+    visible.last_edited_at = None;
+    visible.body = if metadata_only || visible.minimized {
+        None
+    } else {
+        visible.body.as_deref().map(filter_html_comments)
+    };
+    hex::encode(Sha256::digest(serde_json::to_vec(&visible).expect("typed comment serializes")))
+}
+
+fn review_semantic_digest(review: &ReviewSnapshot, metadata_only: bool) -> String {
+    let mut visible = review.clone();
+    visible.updated_at.clear();
+    visible.body = if metadata_only || visible.minimized {
+        String::new()
+    } else {
+        filter_html_comments(&visible.body)
+    };
+    hex::encode(Sha256::digest(serde_json::to_vec(&visible).expect("typed review serializes")))
+}
+
+fn thread_semantic_digest(thread: &ReviewThreadSnapshot, metadata_only: bool) -> String {
+    let mut visible = thread.clone();
+    visible.comments.clear();
+    if metadata_only {
+        visible.resolved = false;
+        visible.resolved_by = None;
+    }
+    hex::encode(Sha256::digest(serde_json::to_vec(&visible).expect("typed thread serializes")))
+}
+
+fn unedited_comment(comment: &CommentSnapshot) -> bool {
+    comment.last_edited_at.is_none()
+        && comment.created_at == comment.updated_at
+        && !comment.minimized
+        && !comment.pinned
+}
+
 fn reconcile_issue_comments(
     issue: &mut IssueSnapshot,
     store: &StoreActor,
+    github_app_actor_node_id: Option<&str>,
 ) -> Result<(), ContextError> {
     let work_item_digest = issue_root_digest(issue);
-    let excluded = store.operational_status_comment_ids(issue.node_id.clone())?;
-    issue.comments.retain(|comment| !excluded.contains(&comment.node_id));
+    let excluded =
+        discussion_roles(store, &issue.node_id, &issue.comments, github_app_actor_node_id)?;
     let mut tombstones = store.reconcile_comments(comment_set(
         &issue.repository_node_id,
         &issue.repository,
@@ -662,6 +824,7 @@ fn reconcile_issue_comments(
         "issue_comment",
         &issue.comments,
     ))?;
+    issue.comments.retain(|comment| !excluded.contains(&comment.node_id));
     tombstones.retain(|comment| !excluded.contains(&comment.node_id));
     extend_tombstones(&mut issue.comments, tombstones, &issue.repository, issue.number);
     store.reconcile_associations(AssociationSet {
@@ -684,6 +847,29 @@ fn reconcile_issue_comments(
             .collect(),
     })?;
     Ok(())
+}
+
+fn discussion_roles(
+    store: &StoreActor,
+    work_item_node_id: &str,
+    comments: &[CommentSnapshot],
+    github_app_actor_node_id: Option<&str>,
+) -> Result<BTreeSet<String>, StoreError> {
+    let Some(trusted_app) = github_app_actor_node_id else { return Ok(BTreeSet::new()) };
+    let candidates = comments
+        .iter()
+        .filter(|comment| !comment.deleted)
+        .filter_map(|comment| {
+            OperationalCommentCandidate::from_discussion(
+                trusted_app,
+                comment.author.as_ref().map(|actor| actor.node_id.as_str()),
+                &comment.node_id,
+                comment.body.as_deref(),
+                &comment.created_at,
+            )
+        })
+        .collect();
+    store.reconcile_operational_comment_roles(work_item_node_id.into(), candidates)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -732,6 +918,10 @@ fn comment_set(
     }
 }
 
+pub(crate) fn root_field_digest(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
 fn root_projection_digest(node_id: &str, projection: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"braid-root-projection-v1\0");
@@ -758,6 +948,37 @@ fn pull_request_root_digest(pull_request: &PullRequestSnapshot) -> String {
     let mut projection = String::new();
     render_pull_request(&mut projection, &root);
     root_projection_digest(&root.node_id, &projection)
+}
+
+fn issue_metadata_digest(issue: &IssueSnapshot) -> String {
+    let mut metadata = issue.clone();
+    metadata.body.clear();
+    metadata.title.clear();
+    metadata.comments.clear();
+    let mut projection = String::new();
+    render_issue(&mut projection, &metadata, true);
+    root_projection_digest(&metadata.node_id, &projection)
+}
+
+fn pull_request_metadata_digest(pr: &PullRequestSnapshot) -> String {
+    let mut metadata = pr.clone();
+    metadata.body.clear();
+    metadata.title.clear();
+    metadata.associated_issues.clear();
+    metadata.conversation.clear();
+    metadata.reviews.clear();
+    metadata.review_threads.clear();
+    let mut projection = String::new();
+    render_pull_request(&mut projection, &metadata);
+    // Native graph identity is relevant even when the PR's updatedAt and body
+    // did not move. Associated bodies have their own source-change contract.
+    for issue in &pr.associated_issues {
+        for value in [&issue.node_id, &issue.repository, &issue.state] {
+            projection.push('\0');
+            projection.push_str(value);
+        }
+    }
+    root_projection_digest(&metadata.node_id, &projection)
 }
 
 fn extend_tombstones(
@@ -791,6 +1012,7 @@ fn deleted_comment(
             .map(|login| Actor { node_id: comment.author_node_id.unwrap_or_default(), login }),
         created_at: comment.created_at,
         updated_at: comment.updated_at,
+        last_edited_at: None,
         body: None,
         minimized: false,
         minimized_reason: None,
@@ -799,8 +1021,20 @@ fn deleted_comment(
     }
 }
 
+fn surface_name(repository_node_id: &str) -> &'static str {
+    if repository_node_id.starts_with("local:") { "Braid" } else { "GitHub" }
+}
+
 fn render_issue(output: &mut String, issue: &IssueSnapshot, complete: bool) {
-    push_line(output, &format!("# GitHub Issue: {}#{}", issue.repository, issue.number));
+    push_line(
+        output,
+        &format!(
+            "# {} Issue: {}#{}",
+            surface_name(&issue.repository_node_id),
+            issue.repository,
+            issue.number
+        ),
+    );
     push_line(output, &issue.title);
     output.push('\n');
     push_state(output, &issue.state, issue.state_reason.as_deref());
@@ -832,13 +1066,22 @@ fn render_issue(output: &mut String, issue: &IssueSnapshot, complete: bool) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_pull_request(output: &mut String, pull_request: &PullRequestSnapshot) {
     for issue in &pull_request.associated_issues {
         let complete = !issue.state.eq_ignore_ascii_case("closed");
         render_issue(output, issue, complete);
         output.push_str("\n---\n\n");
     }
-    push_line(output, &format!("# GitHub PR: {}#{}", pull_request.repository, pull_request.number));
+    push_line(
+        output,
+        &format!(
+            "# {} PR: {}#{}",
+            surface_name(&pull_request.repository_node_id),
+            pull_request.repository,
+            pull_request.number
+        ),
+    );
     push_line(output, &pull_request.title);
     output.push('\n');
     push_line(output, &format!("State: {}", pull_request.state.to_ascii_lowercase()));
@@ -1089,7 +1332,7 @@ pub fn filter_html_comments(markdown: &str) -> String {
             _ => false,
         };
         if is_comment && let Some(range) = source_range(markdown, &line_offsets, data.sourcepos) {
-            ranges.push(range);
+            comment_ranges(markdown, range, &mut ranges);
         }
     }
     if ranges.is_empty() {
@@ -1114,6 +1357,44 @@ pub fn filter_html_comments(markdown: &str) -> String {
     }
     visible.push_str(&markdown[cursor..]);
     visible
+}
+
+// A CommonMark HTML block includes the rest of its closing line. Remove the
+// comments inside that block, not visible text following the closing delimiter.
+fn comment_ranges(markdown: &str, (start, end): (usize, usize), ranges: &mut Vec<(usize, usize)>) {
+    let source = &markdown[start..end];
+    let bytes = source.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor..].starts_with(b"<!--") {
+            let comment_end = source[cursor + 4..]
+                .find("-->")
+                .map_or(bytes.len(), |offset| cursor + 4 + offset + 3);
+            ranges.push((start + cursor, start + comment_end));
+            cursor = comment_end;
+        } else if bytes[cursor] == b'<'
+            && (bytes.get(cursor + 1).is_some_and(u8::is_ascii_alphabetic)
+                || bytes.get(cursor + 1) == Some(&b'/')
+                    && bytes.get(cursor + 2).is_some_and(u8::is_ascii_alphabetic))
+        {
+            // A comment delimiter in an HTML attribute is literal attribute
+            // content. Skip the tag while respecting its quoted values.
+            let mut quote = None;
+            cursor += 1;
+            while cursor < bytes.len() {
+                let byte = bytes[cursor];
+                cursor += 1;
+                match (quote, byte) {
+                    (None, b'>') => break,
+                    (None, b'\'' | b'"') => quote = Some(byte),
+                    (Some(delimiter), _) if byte == delimiter => quote = None,
+                    _ => {}
+                }
+            }
+        } else {
+            cursor += 1;
+        }
+    }
 }
 
 fn line_offsets(markdown: &str) -> Vec<usize> {
@@ -1172,6 +1453,8 @@ struct IssueTypeRaw {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct IssueCoreRaw {
+    #[serde(flatten)]
+    root_edits: RootEditEvidence,
     id: String,
     #[serde(rename = "fullDatabaseId")]
     full_database_id: String,
@@ -1192,6 +1475,8 @@ struct IssueCoreRaw {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct PullRequestCoreRaw {
+    #[serde(flatten)]
+    root_edits: RootEditEvidence,
     id: String,
     #[serde(rename = "fullDatabaseId")]
     full_database_id: String,
@@ -1344,11 +1629,20 @@ struct ConnectionVariables<'a> {
 }
 
 const ISSUE_CORE_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!){
+query IssueCore($owner:String!,$name:String!,$number:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){
     id nameWithOwner
     issue(number:$number){
       id fullDatabaseId number title body state stateReason updatedAt
+      lastEditedAt
+      editor{... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}}
+      titleHistory:timelineItems(last:2,itemTypes:[RENAMED_TITLE_EVENT]){
+        nodes{... on RenamedTitleEvent{
+          id createdAt previousTitle currentTitle
+          actor{... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}}
+        }}
+      }
       author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}}
       issueType{name}
       milestone{title}
@@ -1358,11 +1652,20 @@ query($owner:String!,$name:String!,$number:Int!){
 }"#;
 
 const PR_CORE_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!){
+query PrCore($owner:String!,$name:String!,$number:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){
     id nameWithOwner
     pullRequest(number:$number){
       id fullDatabaseId number title body state isDraft merged updatedAt
+      lastEditedAt
+      editor{... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}}
+      titleHistory:timelineItems(last:2,itemTypes:[RENAMED_TITLE_EVENT]){
+        nodes{... on RenamedTitleEvent{
+          id createdAt previousTitle currentTitle
+          actor{... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}}
+        }}
+      }
       author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}}
       baseRefName headRefName headRepository{id nameWithOwner}
       milestone{title}
@@ -1371,35 +1674,40 @@ query($owner:String!,$name:String!,$number:Int!){
 }"#;
 
 const ISSUE_ASSIGNEES_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query IssueAssignees($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){issue(number:$number){
     items:assignees(first:$pageSize,after:$cursor){nodes{id login} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const ISSUE_LABELS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query IssueLabels($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){issue(number:$number){
     items:labels(first:$pageSize,after:$cursor){nodes{name} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const ISSUE_PROJECTS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query IssueProjects($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){issue(number:$number){
     items:projectItems(first:$pageSize,after:$cursor){nodes{id project{title}} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const PR_PROJECTS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query PrProjects($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){pullRequest(number:$number){
     items:projectItems(first:$pageSize,after:$cursor){nodes{id project{title}} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const PROJECT_FIELD_VALUES_QUERY: &str = r#"
-query($id:ID!,$cursor:String,$pageSize:Int!){
+query ProjectFieldValues($id:ID!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   node(id:$id){... on ProjectV2Item{
     items:fieldValues(first:$pageSize,after:$cursor){
       nodes{
@@ -1434,35 +1742,40 @@ query($id:ID!,$cursor:String,$pageSize:Int!){
 }"#;
 
 const ISSUE_LINKED_BRANCHES_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query IssueLinkedBranches($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){issue(number:$number){
     items:linkedBranches(first:$pageSize,after:$cursor){nodes{id ref{name repository{id nameWithOwner}}} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const ISSUE_SUB_ISSUES_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query IssueSubIssues($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){issue(number:$number){
     items:subIssues(first:$pageSize,after:$cursor){nodes{id number title state stateReason repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const ISSUE_BLOCKED_BY_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query IssueBlockedBy($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){issue(number:$number){
     items:blockedBy(first:$pageSize,after:$cursor){nodes{id number title state stateReason repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const ISSUE_BLOCKING_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query IssueBlocking($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){issue(number:$number){
     items:blocking(first:$pageSize,after:$cursor){nodes{id number title state stateReason repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const ISSUE_ASSOCIATED_PRS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query IssueAssociatedPrs($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){issue(number:$number){
     items:closedByPullRequestsReferences(first:$pageSize,after:$cursor,includeClosedPrs:true){
       nodes{id number title state repository{id nameWithOwner}}
@@ -1472,7 +1785,8 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
 }"#;
 
 const ISSUE_COMMENTS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query IssueComments($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){issue(number:$number){
     items:comments(first:$pageSize,after:$cursor){nodes{
       id fullDatabaseId author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}} createdAt updatedAt lastEditedAt
@@ -1482,7 +1796,8 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
 }"#;
 
 const ISSUE_DUPLICATES_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query IssueDuplicates($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){issue(number:$number){
     items:timelineItems(first:$pageSize,after:$cursor,itemTypes:[MARKED_AS_DUPLICATE_EVENT]){
       nodes{... on MarkedAsDuplicateEvent{
@@ -1496,21 +1811,24 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
 }"#;
 
 const PR_ASSIGNEES_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query PrAssignees($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){pullRequest(number:$number){
     items:assignees(first:$pageSize,after:$cursor){nodes{id login} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const PR_LABELS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query PrLabels($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){pullRequest(number:$number){
     items:labels(first:$pageSize,after:$cursor){nodes{name} pageInfo{hasNextPage endCursor}}
   }}
 }"#;
 
 const PR_ASSOCIATED_ISSUES_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query PrAssociatedIssues($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){pullRequest(number:$number){
     items:closingIssuesReferences(first:$pageSize,after:$cursor){
       nodes{id number title state stateReason repository{id nameWithOwner}}
@@ -1520,7 +1838,8 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
 }"#;
 
 const PR_COMMENTS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query PrComments($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){pullRequest(number:$number){
     items:comments(first:$pageSize,after:$cursor){nodes{
       id fullDatabaseId author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}} createdAt updatedAt lastEditedAt
@@ -1530,7 +1849,8 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
 }"#;
 
 const PR_REVIEWS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query PrReviews($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){pullRequest(number:$number){
     items:reviews(first:$pageSize,after:$cursor){nodes{
       id fullDatabaseId author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}} state createdAt submittedAt updatedAt
@@ -1540,7 +1860,8 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
 }"#;
 
 const PR_REVIEW_THREADS_QUERY: &str = r#"
-query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+query PrReviewThreads($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   repository(owner:$owner,name:$name){pullRequest(number:$number){
     items:reviewThreads(first:$pageSize,after:$cursor){nodes{
       id path line startLine isResolved isCollapsed isOutdated
@@ -1550,7 +1871,8 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!){
 }"#;
 
 const REVIEW_THREAD_COMMENTS_QUERY: &str = r#"
-query($id:ID!,$cursor:String,$pageSize:Int!){
+query ReviewThreadComments($id:ID!,$cursor:String,$pageSize:Int!){
+  rateLimit{cost}
   node(id:$id){... on PullRequestReviewThread{
     items:comments(first:$pageSize,after:$cursor){nodes{
       id fullDatabaseId author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}} createdAt updatedAt lastEditedAt
@@ -1699,6 +2021,8 @@ struct CommentRaw {
     body: String,
     #[serde(rename = "isMinimized")]
     is_minimized: bool,
+    #[serde(rename = "lastEditedAt")]
+    last_edited_at: Option<String>,
     #[serde(rename = "minimizedReason")]
     minimized_reason: Option<String>,
     #[serde(rename = "isPinned", default)]
@@ -1715,6 +2039,7 @@ impl CommentRaw {
             author: self.author.map(Into::into),
             created_at: self.created_at,
             updated_at: self.updated_at,
+            last_edited_at: self.last_edited_at,
             body: (!self.is_minimized).then_some(self.body),
             minimized: self.is_minimized,
             minimized_reason: self.minimized_reason,
@@ -1927,6 +2252,17 @@ async fn paginate_issue<T: for<'de> Deserialize<'de>>(
     query: &str,
     connection: &'static str,
 ) -> Result<Vec<T>, ContextError> {
+    paginate_issue_seeded(client, locator, page_size, query, connection, None).await
+}
+
+async fn paginate_issue_seeded<T: for<'de> Deserialize<'de>>(
+    client: &GitHubClient,
+    locator: &WorkItemLocator,
+    page_size: usize,
+    query: &str,
+    connection: &'static str,
+    mut first: Option<Connection<T>>,
+) -> Result<Vec<T>, ContextError> {
     let mut output = Vec::new();
     let mut cursor: Option<String> = None;
     let mut seen = BTreeSet::new();
@@ -1938,12 +2274,18 @@ async fn paginate_issue<T: for<'de> Deserialize<'de>>(
             cursor: cursor.as_deref(),
             page_size,
         };
-        let data: IssueConnectionData<T> = client.graphql(query, &variables).await?;
-        let page = data
-            .repository
-            .and_then(|repository| repository.issue)
-            .ok_or_else(|| ContextError::Missing { kind: "Issue", target: locator.to_string() })?
-            .items;
+        let page = if let Some(page) = first.take() {
+            page
+        } else {
+            let data: IssueConnectionData<T> = client.graphql(query, &variables).await?;
+            data.repository
+                .and_then(|repository| repository.issue)
+                .ok_or_else(|| ContextError::Missing {
+                    kind: "Issue",
+                    target: locator.to_string(),
+                })?
+                .items
+        };
         output.extend(page.nodes);
         if !page.page_info.has_next_page {
             return Ok(output);
@@ -1976,6 +2318,17 @@ async fn paginate_pr<T: for<'de> Deserialize<'de>>(
     query: &str,
     connection: &'static str,
 ) -> Result<Vec<T>, ContextError> {
+    paginate_pr_seeded(client, locator, page_size, query, connection, None).await
+}
+
+async fn paginate_pr_seeded<T: for<'de> Deserialize<'de>>(
+    client: &GitHubClient,
+    locator: &WorkItemLocator,
+    page_size: usize,
+    query: &str,
+    connection: &'static str,
+    mut first: Option<Connection<T>>,
+) -> Result<Vec<T>, ContextError> {
     let mut output = Vec::new();
     let mut cursor: Option<String> = None;
     let mut seen = BTreeSet::new();
@@ -1987,12 +2340,15 @@ async fn paginate_pr<T: for<'de> Deserialize<'de>>(
             cursor: cursor.as_deref(),
             page_size,
         };
-        let data: PullRequestConnectionData<T> = client.graphql(query, &variables).await?;
-        let page = data
-            .repository
-            .and_then(|repository| repository.pull_request)
-            .ok_or_else(|| ContextError::Missing { kind: "PR", target: locator.to_string() })?
-            .items;
+        let page = if let Some(page) = first.take() {
+            page
+        } else {
+            let data: PullRequestConnectionData<T> = client.graphql(query, &variables).await?;
+            data.repository
+                .and_then(|repository| repository.pull_request)
+                .ok_or_else(|| ContextError::Missing { kind: "PR", target: locator.to_string() })?
+                .items
+        };
         output.extend(page.nodes);
         if !page.page_info.has_next_page {
             return Ok(output);
@@ -2067,6 +2423,20 @@ async fn read_issue_snapshot(
     page_size: usize,
 ) -> Result<IssueSnapshot, ContextError> {
     let core = marker.core;
+    let data: IssueFirstData = client
+        .graphql(
+            ISSUE_FIRST_PAGES_QUERY,
+            &serde_json::json!({
+                "owner": locator.repository.owner, "name": locator.repository.name,
+                "number": locator.number, "pageSize": page_size, "cursor": null,
+                "projects": client.projects_v2_enabled(),
+            }),
+        )
+        .await?;
+    let first = data
+        .repository
+        .and_then(|r| r.object)
+        .ok_or_else(|| ContextError::Missing { kind: "Issue", target: locator.to_string() })?;
     let (
         assignees,
         labels,
@@ -2079,51 +2449,92 @@ async fn read_issue_snapshot(
         comments,
         duplicate_events,
     ) = tokio::try_join!(
-        paginate_issue::<ActorRaw>(client, locator, page_size, ISSUE_ASSIGNEES_QUERY, "assignees"),
-        paginate_issue::<LabelRaw>(client, locator, page_size, ISSUE_LABELS_QUERY, "labels"),
-        read_issue_project_items(client, locator, page_size),
-        paginate_issue::<LinkedBranchRaw>(
+        paginate_issue_seeded::<ActorRaw>(
+            client,
+            locator,
+            page_size,
+            ISSUE_ASSIGNEES_QUERY,
+            "assignees",
+            Some(first.assignees)
+        ),
+        paginate_issue_seeded::<LabelRaw>(
+            client,
+            locator,
+            page_size,
+            ISSUE_LABELS_QUERY,
+            "labels",
+            Some(first.labels)
+        ),
+        async {
+            if client.projects_v2_enabled() {
+                paginate_issue_seeded::<ProjectRaw>(
+                    client,
+                    locator,
+                    page_size,
+                    ISSUE_PROJECTS_QUERY,
+                    "project items",
+                    first.project_items,
+                )
+                .await
+            } else {
+                Ok(Vec::new())
+            }
+        },
+        paginate_issue_seeded::<LinkedBranchRaw>(
             client,
             locator,
             page_size,
             ISSUE_LINKED_BRANCHES_QUERY,
-            "linked branches"
+            "linked branches",
+            Some(first.linked_branches)
         ),
-        paginate_issue::<ReferenceRaw>(
+        paginate_issue_seeded::<ReferenceRaw>(
             client,
             locator,
             page_size,
             ISSUE_SUB_ISSUES_QUERY,
-            "sub-issues"
+            "sub-issues",
+            Some(first.sub_issues)
         ),
-        paginate_issue::<ReferenceRaw>(
+        paginate_issue_seeded::<ReferenceRaw>(
             client,
             locator,
             page_size,
             ISSUE_BLOCKED_BY_QUERY,
-            "blocked-by"
+            "blocked-by",
+            Some(first.blocked_by)
         ),
-        paginate_issue::<ReferenceRaw>(
+        paginate_issue_seeded::<ReferenceRaw>(
             client,
             locator,
             page_size,
             ISSUE_BLOCKING_QUERY,
-            "blocking"
+            "blocking",
+            Some(first.blocking)
         ),
-        paginate_issue::<ReferenceRaw>(
+        paginate_issue_seeded::<ReferenceRaw>(
             client,
             locator,
             page_size,
             ISSUE_ASSOCIATED_PRS_QUERY,
-            "associated pull requests"
+            "associated pull requests",
+            Some(first.associated_prs)
         ),
-        paginate_issue::<CommentRaw>(client, locator, page_size, ISSUE_COMMENTS_QUERY, "comments"),
-        paginate_issue::<DuplicateEventRaw>(
+        paginate_issue_seeded::<CommentRaw>(
+            client,
+            locator,
+            page_size,
+            ISSUE_COMMENTS_QUERY,
+            "comments",
+            Some(first.comments)
+        ),
+        paginate_issue_seeded::<DuplicateEventRaw>(
             client,
             locator,
             page_size,
             ISSUE_DUPLICATES_QUERY,
-            "duplicate events"
+            "duplicate events",
+            Some(first.duplicate_events)
         ),
     )?;
 
@@ -2173,6 +2584,7 @@ async fn read_issue_snapshot(
     });
 
     Ok(IssueSnapshot {
+        root_edits: core.root_edits,
         node_id: core.id,
         database_id: core.full_database_id,
         repository_node_id: marker.repository.id,
@@ -2208,25 +2620,83 @@ async fn read_pr_snapshot(
     page_size: usize,
 ) -> Result<PullRequestSnapshot, ContextError> {
     let core = marker.core;
+    let data: PrFirstData = client
+        .graphql(
+            PR_FIRST_PAGES_QUERY,
+            &serde_json::json!({
+                "owner": locator.repository.owner, "name": locator.repository.name,
+                "number": locator.number, "pageSize": page_size, "cursor": null,
+                "projects": client.projects_v2_enabled(),
+            }),
+        )
+        .await?;
+    let first = data
+        .repository
+        .and_then(|r| r.object)
+        .ok_or_else(|| ContextError::Missing { kind: "Pr", target: locator.to_string() })?;
     let (assignees, labels, project_items, associated_issue_refs, comments, reviews, threads) = tokio::try_join!(
-        paginate_pr::<ActorRaw>(client, locator, page_size, PR_ASSIGNEES_QUERY, "assignees"),
-        paginate_pr::<LabelRaw>(client, locator, page_size, PR_LABELS_QUERY, "labels"),
-        read_pr_project_items(client, locator, page_size),
-        paginate_pr::<ReferenceRaw>(
+        paginate_pr_seeded::<ActorRaw>(
+            client,
+            locator,
+            page_size,
+            PR_ASSIGNEES_QUERY,
+            "assignees",
+            Some(first.assignees)
+        ),
+        paginate_pr_seeded::<LabelRaw>(
+            client,
+            locator,
+            page_size,
+            PR_LABELS_QUERY,
+            "labels",
+            Some(first.labels)
+        ),
+        async {
+            if client.projects_v2_enabled() {
+                paginate_pr_seeded::<ProjectRaw>(
+                    client,
+                    locator,
+                    page_size,
+                    PR_PROJECTS_QUERY,
+                    "project items",
+                    first.project_items,
+                )
+                .await
+            } else {
+                Ok(Vec::new())
+            }
+        },
+        paginate_pr_seeded::<ReferenceRaw>(
             client,
             locator,
             page_size,
             PR_ASSOCIATED_ISSUES_QUERY,
-            "associated issues"
+            "associated issues",
+            Some(first.associated_issue_refs)
         ),
-        paginate_pr::<CommentRaw>(client, locator, page_size, PR_COMMENTS_QUERY, "conversation"),
-        paginate_pr::<ReviewRaw>(client, locator, page_size, PR_REVIEWS_QUERY, "reviews"),
-        paginate_pr::<ReviewThreadRaw>(
+        paginate_pr_seeded::<CommentRaw>(
+            client,
+            locator,
+            page_size,
+            PR_COMMENTS_QUERY,
+            "conversation",
+            Some(first.comments)
+        ),
+        paginate_pr_seeded::<ReviewRaw>(
+            client,
+            locator,
+            page_size,
+            PR_REVIEWS_QUERY,
+            "reviews",
+            Some(first.reviews)
+        ),
+        paginate_pr_seeded::<ReviewThreadRaw>(
             client,
             locator,
             page_size,
             PR_REVIEW_THREADS_QUERY,
-            "review threads"
+            "review threads",
+            Some(first.threads)
         ),
     )?;
 
@@ -2328,6 +2798,7 @@ async fn read_pr_snapshot(
     });
 
     Ok(PullRequestSnapshot {
+        root_edits: core.root_edits,
         node_id: core.id,
         database_id: core.full_database_id,
         repository_node_id: marker.repository.id,
@@ -2383,30 +2854,6 @@ async fn materialize_projects(
     Ok(projects)
 }
 
-async fn read_issue_project_items(
-    client: &GitHubClient,
-    locator: &WorkItemLocator,
-    page_size: usize,
-) -> Result<Vec<ProjectRaw>, ContextError> {
-    if client.projects_v2_enabled() {
-        paginate_issue(client, locator, page_size, ISSUE_PROJECTS_QUERY, "project items").await
-    } else {
-        Ok(Vec::new())
-    }
-}
-
-async fn read_pr_project_items(
-    client: &GitHubClient,
-    locator: &WorkItemLocator,
-    page_size: usize,
-) -> Result<Vec<ProjectRaw>, ContextError> {
-    if client.projects_v2_enabled() {
-        paginate_pr(client, locator, page_size, PR_PROJECTS_QUERY, "project items").await
-    } else {
-        Ok(Vec::new())
-    }
-}
-
 fn project_field(value: ProjectFieldRaw) -> Result<Option<ProjectField>, ContextError> {
     let (field, value) = match value {
         ProjectFieldRaw::Text { field, text } => (field, text),
@@ -2460,7 +2907,7 @@ fn project_field(value: ProjectFieldRaw) -> Result<Option<ProjectField>, Context
         }
         ProjectFieldRaw::User { field, users } => {
             ensure_nested_complete(&users.page_info, "project user values", &field.name)?;
-            let mut values = users.into_nodes_logins();
+            let mut values = users.nodes.into_iter().map(|user| user.login).collect::<Vec<_>>();
             values.sort();
             (field, (!values.is_empty()).then(|| values.join(", ")))
         }
@@ -2478,16 +2925,6 @@ fn project_field(value: ProjectFieldRaw) -> Result<Option<ProjectField>, Context
     Ok(value
         .filter(|value| !value.is_empty())
         .map(|value| ProjectField { name: field.name, value }))
-}
-
-trait LoginConnectionExt {
-    fn into_nodes_logins(self) -> Vec<String>;
-}
-
-impl LoginConnectionExt for Connection<LoginRaw> {
-    fn into_nodes_logins(self) -> Vec<String> {
-        self.nodes.into_iter().map(|user| user.login).collect()
-    }
 }
 
 fn ensure_nested_complete(
@@ -2515,3 +2952,110 @@ fn sort_references(references: &mut [WorkItemReference]) {
         left.repository.cmp(&right.repository).then(left.number.cmp(&right.number))
     });
 }
+
+const ISSUE_FIRST_PAGES_QUERY: &str = r#"
+query IssueFirstPages($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!,$projects:Boolean!){
+ rateLimit{cost}
+ repository(owner:$owner,name:$name){issue(number:$number){
+assignees:assignees(first:$pageSize,after:$cursor){nodes{id login} pageInfo{hasNextPage endCursor}}
+labels:labels(first:$pageSize,after:$cursor){nodes{name} pageInfo{hasNextPage endCursor}}
+project_items:projectItems(first:$pageSize,after:$cursor) @include(if:$projects){nodes{id project{title}} pageInfo{hasNextPage endCursor}}
+linked_branches:linkedBranches(first:$pageSize,after:$cursor){nodes{id ref{name repository{id nameWithOwner}}} pageInfo{hasNextPage endCursor}}
+sub_issues:subIssues(first:$pageSize,after:$cursor){nodes{id number title state stateReason repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}
+blocked_by:blockedBy(first:$pageSize,after:$cursor){nodes{id number title state stateReason repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}
+blocking:blocking(first:$pageSize,after:$cursor){nodes{id number title state stateReason repository{id nameWithOwner}} pageInfo{hasNextPage endCursor}}
+associated_prs:closedByPullRequestsReferences(first:$pageSize,after:$cursor,includeClosedPrs:true){
+      nodes{id number title state repository{id nameWithOwner}}
+      pageInfo{hasNextPage endCursor}
+    }
+comments:comments(first:$pageSize,after:$cursor){nodes{
+      id fullDatabaseId author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}} createdAt updatedAt lastEditedAt
+      body isMinimized minimizedReason isPinned
+    } pageInfo{hasNextPage endCursor}}
+duplicate_events:timelineItems(first:$pageSize,after:$cursor,itemTypes:[MARKED_AS_DUPLICATE_EVENT]){
+      nodes{... on MarkedAsDuplicateEvent{
+        id
+        duplicate{__typename ... on Issue{id number title state stateReason repository{id nameWithOwner}} ... on PullRequest{id number title state repository{id nameWithOwner}}}
+        canonical{__typename ... on Issue{id number title state stateReason repository{id nameWithOwner}} ... on PullRequest{id number title state repository{id nameWithOwner}}}
+      }}
+      pageInfo{hasNextPage endCursor}
+    }
+}}}
+"#;
+#[derive(Deserialize)]
+struct IssueFirstPages {
+    assignees: Connection<ActorRaw>,
+    labels: Connection<LabelRaw>,
+    #[serde(default)]
+    project_items: Option<Connection<ProjectRaw>>,
+    linked_branches: Connection<LinkedBranchRaw>,
+    sub_issues: Connection<ReferenceRaw>,
+    blocked_by: Connection<ReferenceRaw>,
+    blocking: Connection<ReferenceRaw>,
+    associated_prs: Connection<ReferenceRaw>,
+    comments: Connection<CommentRaw>,
+    duplicate_events: Connection<DuplicateEventRaw>,
+}
+#[derive(Deserialize)]
+struct IssueFirstData {
+    repository: Option<IssueFirstRepository>,
+}
+#[derive(Deserialize)]
+struct IssueFirstRepository {
+    #[serde(rename = "issue")]
+    object: Option<IssueFirstPages>,
+}
+
+const PR_FIRST_PAGES_QUERY: &str = r#"
+query PrFirstPages($owner:String!,$name:String!,$number:Int!,$cursor:String,$pageSize:Int!,$projects:Boolean!){
+ rateLimit{cost}
+ repository(owner:$owner,name:$name){pullRequest(number:$number){
+assignees:assignees(first:$pageSize,after:$cursor){nodes{id login} pageInfo{hasNextPage endCursor}}
+labels:labels(first:$pageSize,after:$cursor){nodes{name} pageInfo{hasNextPage endCursor}}
+project_items:projectItems(first:$pageSize,after:$cursor) @include(if:$projects){nodes{id project{title}} pageInfo{hasNextPage endCursor}}
+associated_issue_refs:closingIssuesReferences(first:$pageSize,after:$cursor){
+      nodes{id number title state stateReason repository{id nameWithOwner}}
+      pageInfo{hasNextPage endCursor}
+    }
+comments:comments(first:$pageSize,after:$cursor){nodes{
+      id fullDatabaseId author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}} createdAt updatedAt lastEditedAt
+      body isMinimized minimizedReason isPinned
+    } pageInfo{hasNextPage endCursor}}
+reviews:reviews(first:$pageSize,after:$cursor){nodes{
+      id fullDatabaseId author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}} state createdAt submittedAt updatedAt
+      body isMinimized minimizedReason
+    } pageInfo{hasNextPage endCursor}}
+threads:reviewThreads(first:$pageSize,after:$cursor){nodes{
+      id path line startLine isResolved isCollapsed isOutdated
+      resolvedBy{id login}
+    } pageInfo{hasNextPage endCursor}}
+}}}
+"#;
+#[derive(Deserialize)]
+struct PrFirstPages {
+    assignees: Connection<ActorRaw>,
+    labels: Connection<LabelRaw>,
+    #[serde(default)]
+    project_items: Option<Connection<ProjectRaw>>,
+    associated_issue_refs: Connection<ReferenceRaw>,
+    comments: Connection<CommentRaw>,
+    reviews: Connection<ReviewRaw>,
+    threads: Connection<ReviewThreadRaw>,
+}
+#[derive(Deserialize)]
+struct PrFirstData {
+    repository: Option<PrFirstRepository>,
+}
+#[derive(Deserialize)]
+struct PrFirstRepository {
+    #[serde(rename = "pullRequest")]
+    object: Option<PrFirstPages>,
+}
+
+#[cfg(test)]
+#[path = "context/reading_tests.rs"]
+mod reading_tests;
+
+#[cfg(test)]
+#[path = "context/filter_tests.rs"]
+mod filter_tests;

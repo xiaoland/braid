@@ -27,6 +27,8 @@ pub struct WorktreeRequest<'a> {
     pub target: &'a Path,
     pub repository: &'a str,
     pub remote: &'a str,
+    /// Local collaboration resolves refs from the source checkout without a network remote.
+    pub local_only: bool,
     /// System `git` executable used for the network fetch: it honors the
     /// operator's credential helpers and proxy configuration, which libgit2
     /// does not.
@@ -45,18 +47,20 @@ pub struct ProvisionedWorktree {
 
 pub fn provision(request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, WorktreeError> {
     let source = tokio::task::block_in_place(|| canonical_repository(request.source))?;
-    let remote_url = tokio::task::block_in_place(|| {
-        let repo = Repository::open(&source)?;
-        let remote = repo.find_remote(request.remote)?;
-        Ok::<String, WorktreeError>(remote.url()?.to_owned())
-    })?;
-    if normalized_github_repository(&remote_url).as_deref()
-        != Some(&request.repository.to_ascii_lowercase())
-    {
-        return Err(WorktreeError::Git(format!(
-            "remote {} does not identify GitHub repository {}",
-            request.remote, request.repository
-        )));
+    if !request.local_only {
+        let remote_url = tokio::task::block_in_place(|| {
+            let repo = Repository::open(&source)?;
+            let remote = repo.find_remote(request.remote)?;
+            Ok::<String, WorktreeError>(remote.url()?.to_owned())
+        })?;
+        if normalized_github_repository(&remote_url).as_deref()
+            != Some(&request.repository.to_ascii_lowercase())
+        {
+            return Err(WorktreeError::Git(format!(
+                "remote {} does not identify GitHub repository {}",
+                request.remote, request.repository
+            )));
+        }
     }
     exclude_private_notes(request, &source)?;
     if request.target.exists() {
@@ -87,11 +91,14 @@ pub fn provision(request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, W
             Ok(())
         };
         let remote_ref = format!("refs/remotes/{}/{}", request.remote, request.head_ref);
-        git(&[
-            "fetch",
-            request.remote,
-            &format!("+refs/heads/{0}:{1}", request.head_ref, remote_ref),
-        ])?;
+        if !request.local_only {
+            git(&[
+                "fetch",
+                request.remote,
+                &format!("+refs/heads/{0}:{1}", request.head_ref, remote_ref),
+            ])?;
+        }
+        let start_ref = if request.local_only { request.head_ref } else { &remote_ref };
         // libgit2's worktree add rejects remote-tracking references
         // ("reference is not a branch"); the system git creates the
         // generation-scoped local branch and the worktree in one step.
@@ -104,7 +111,7 @@ pub fn provision(request: &WorktreeRequest<'_>) -> Result<ProvisionedWorktree, W
                 .ok_or_else(|| WorktreeError::Git("worktree target path is not UTF-8".into()))?,
             "-B",
             request.local_branch,
-            &remote_ref,
+            start_ref,
         ])?;
         Ok::<(), WorktreeError>(())
     })?;
@@ -167,6 +174,16 @@ fn verify_existing(
     }
     let branch = tokio::task::block_in_place(|| {
         let repo = Repository::open(request.target)?;
+        let source_repo = Repository::open(source)?;
+        let canonical_common_dir = |repo: &Repository| {
+            repo.commondir().canonicalize().map_err(|source| WorktreeError::Io {
+                path: repo.commondir().to_path_buf(),
+                source,
+            })
+        };
+        if canonical_common_dir(&repo)? != canonical_common_dir(&source_repo)? {
+            return Err(WorktreeError::TargetConflict(request.target.to_path_buf()));
+        }
         let head = repo.head()?;
         Ok::<String, WorktreeError>(head.shorthand()?.to_owned())
     })?;
@@ -196,7 +213,7 @@ fn canonical_repository(path: &Path) -> Result<PathBuf, WorktreeError> {
         })
 }
 
-fn normalized_github_repository(remote: &str) -> Option<String> {
+pub(crate) fn normalized_github_repository(remote: &str) -> Option<String> {
     let path = remote
         .strip_prefix("https://github.com/")
         .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
@@ -204,3 +221,6 @@ fn normalized_github_repository(remote: &str) -> Option<String> {
     let repository = path.strip_suffix(".git").unwrap_or(path).trim_matches('/');
     (repository.split('/').count() == 2).then(|| repository.to_ascii_lowercase())
 }
+
+#[cfg(test)]
+mod tests;

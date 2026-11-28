@@ -1,7 +1,8 @@
 use std::{
+    collections::HashSet,
     io::BufRead as _,
     path::{Path, PathBuf},
-    process::Output,
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -31,12 +32,16 @@ pub async fn discover(adapter_type: &str) -> Result<Vec<DiscoveredRuntime>> {
     };
 
     let mut found = Vec::new();
+    let mut seen = HashSet::new();
     for (executable, source) in candidates {
         if !executable.is_file() {
             continue;
         }
+        if !seen.insert(executable.canonicalize().unwrap_or_else(|_| executable.clone())) {
+            continue;
+        }
         match version_line(&executable).await {
-            Ok(version) if !version.is_empty() => {
+            Ok(version) => {
                 found.push(DiscoveredRuntime {
                     adapter_type: adapter_type.to_owned(),
                     version,
@@ -44,7 +49,6 @@ pub async fn discover(adapter_type: &str) -> Result<Vec<DiscoveredRuntime>> {
                     source,
                 });
             }
-            Ok(_) => {}
             Err(error) => {
                 tracing::debug!(%error, path = %executable.display(), "ignoring candidate");
             }
@@ -54,11 +58,11 @@ pub async fn discover(adapter_type: &str) -> Result<Vec<DiscoveredRuntime>> {
 }
 
 /// Verify a discovered or manually supplied runtime and return a populated
-/// `RuntimeEntry`. For Codex this runs the schema handshake; for Pi it just
-/// re-runs --version.
+/// `RuntimeEntry`. For Codex this runs the schema handshake; for Pi it records an adjacent locked material manifest when present.
 pub async fn verify(runtime: DiscoveredRuntime) -> Result<RuntimeEntry> {
     if runtime.adapter_type == "codex" {
         let temp_config = CodexConfig {
+            braid_config_path: None,
             executable: runtime.executable.clone(),
             home: runtime.executable.parent().map_or_else(PathBuf::new, Path::to_path_buf),
             version: runtime.version.clone(),
@@ -72,6 +76,7 @@ pub async fn verify(runtime: DiscoveredRuntime) -> Result<RuntimeEntry> {
             version: identity.version,
             executable: runtime.executable,
             api_url: None,
+            native_runtime: None,
             home: Some(temp_config.home),
             stable_schema_sha256: Some(identity.stable_schema_sha256),
             experimental_schema_sha256: Some(identity.experimental_schema_sha256),
@@ -79,11 +84,17 @@ pub async fn verify(runtime: DiscoveredRuntime) -> Result<RuntimeEntry> {
     }
 
     if runtime.adapter_type == "pi" {
+        let native_runtime = runtime
+            .executable
+            .parent()
+            .map(|directory| directory.join("runtime-manifest.json"))
+            .filter(|manifest| manifest.is_file());
         return Ok(RuntimeEntry {
             adapter_type: runtime.adapter_type,
             version: runtime.version,
             executable: runtime.executable,
             api_url: None,
+            native_runtime,
             home: None,
             stable_schema_sha256: None,
             experimental_schema_sha256: None,
@@ -99,13 +110,15 @@ pub async fn from_executable(adapter_type: &str, executable: &Path) -> Result<Ru
     if !executable.is_file() {
         bail!("executable does not exist: {}", executable.display());
     }
-    let version = version_line(executable)
+    let executable = std::path::absolute(executable)
+        .with_context(|| format!("cannot resolve runtime executable {}", executable.display()))?;
+    let version = version_line(&executable)
         .await
         .with_context(|| format!("cannot run {} --version", executable.display()))?;
     verify(DiscoveredRuntime {
         adapter_type: adapter_type.to_owned(),
         version,
-        executable: executable.to_path_buf(),
+        executable,
         source: "--runtime-executable".to_owned(),
     })
     .await
@@ -113,11 +126,15 @@ pub async fn from_executable(adapter_type: &str, executable: &Path) -> Result<Ru
 
 pub fn install_hint(adapter_type: &str) -> String {
     match adapter_type {
-        "pi" => "Install the Pi CLI from https://pi.dev/ and re-run `braid setup`.".to_owned(),
-        "codex" => {
-            "Install the Codex CLI from https://github.com/openai/codex and re-run `braid setup`."
-                .to_owned()
-        }
+        "pi" => "Install the Pi CLI:\n\
+            npm install -g @earendil-works/pi-coding-agent\n\
+            # Managed plugins: see native/pi/README.md\n\
+            # Then re-run `braid setup`."
+            .to_owned(),
+        "codex" => "Install the Codex CLI:\n\
+            npm install -g @openai/codex\n\
+            # Then re-run `braid setup`."
+            .to_owned(),
         other => format!("No install instructions for adapter_type {other:?}"),
     }
 }
@@ -149,14 +166,19 @@ fn codex_candidates() -> Vec<(PathBuf, String)> {
 }
 
 async fn version_line(executable: &Path) -> Result<String> {
-    let output = run(executable, &["--version"]).await?;
-    Ok(output.stdout.lines().map_while(Result::ok).next().unwrap_or_default().trim().to_owned())
-}
-
-async fn run(executable: &Path, args: &[&str]) -> Result<Output> {
-    Command::new(executable)
-        .args(args)
-        .output()
-        .await
-        .with_context(|| format!("cannot spawn {}", executable.display()))
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new(executable).arg("--version").kill_on_drop(true).output(),
+    )
+    .await
+    .with_context(|| format!("{} --version timed out", executable.display()))?
+    .with_context(|| format!("cannot spawn {}", executable.display()))?;
+    if !output.status.success() {
+        bail!("{} --version exited with {}", executable.display(), output.status);
+    }
+    let version = output.stdout.lines().next().transpose()?.unwrap_or_default().trim().to_owned();
+    if version.is_empty() {
+        bail!("{} --version returned no version", executable.display());
+    }
+    Ok(version)
 }

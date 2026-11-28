@@ -2,11 +2,12 @@
 use super::*;
 
 pub fn require_configured_repository(config: &Config, target: &WorkItemLocator) -> Result<()> {
-    if target.repository.to_string() != config.github.repository {
+    let target_repository = target.repository.to_string();
+    if !config.github_repositories().contains(&target_repository.as_str()) {
         bail!(
-            "target repository {} does not match configured repository {}",
+            "target repository {} is not configured for this instance (configured: {})",
             target.repository,
-            config.github.repository
+            config.github_repositories().join(", ")
         );
     }
     Ok(())
@@ -17,6 +18,22 @@ pub fn role_for_target(profile: &Profile, kind: &str) -> Result<&'static str> {
         "issue" if profile.has_tag("issue") => Ok("Issue Agent"),
         "pr" if profile.has_tag("pr") => Ok("PR Implementation Agent"),
         _ => bail!("Profile {:?} is not tagged for {kind}", profile.id),
+    }
+}
+
+pub fn publication_role(
+    profile: &Profile,
+    source: Option<&crate::store::publication_source::PublicationSource>,
+    kind: &str,
+) -> Result<&'static str> {
+    match source.map(|source| source.role.as_str()) {
+        Some("issue_agent") => Ok("Issue Agent"),
+        Some("pr_implementation_agent") => Ok("PR Implementation Agent"),
+        Some(_) => bail!("unknown publication source role"),
+        None => {
+            role_for_target(profile, kind)?;
+            Ok("Operator")
+        }
     }
 }
 
@@ -45,11 +62,19 @@ pub async fn unique_request_pull_request(
     base: &str,
     marker: &str,
 ) -> Result<Option<PullRequest>, GitHubError> {
-    let pull_requests = github.open_pull_requests_for_head(head, base).await?;
+    let pull_requests = github.pull_requests_for_head(head, base).await?;
+    if pull_requests.len() >= 100 {
+        return Err(GitHubError::Ambiguous(
+            "implementation request PR recovery exceeds one complete page".into(),
+        ));
+    }
     match pull_requests.as_slice() {
         [] => Ok(None),
         [pull_request]
-            if pull_request.body.as_deref().is_some_and(|body| body.contains(marker)) =>
+            if pull_request
+                .body
+                .as_deref()
+                .is_some_and(|body| body.lines().any(|line| line.trim() == marker)) =>
         {
             Ok(Some(pull_request.clone()))
         }
@@ -57,9 +82,9 @@ pub async fn unique_request_pull_request(
             "head {head:?} already belongs to unrelated PR #{}",
             pull_request.number
         ))),
-        _ => Err(GitHubError::GraphQl(format!(
-            "head {head:?} resolves to multiple open pull requests"
-        ))),
+        _ => {
+            Err(GitHubError::Ambiguous(format!("head {head:?} resolves to multiple pull requests")))
+        }
     }
 }
 
@@ -83,9 +108,11 @@ pub async fn wait_for_native_association(
 }
 
 pub async fn ensure_head(
+    config: &Config,
     github: &GitHubClient,
     store: &StoreActor,
     receipt: &ImplementationRequestReceipt,
+    mutation_possible: &mut bool,
 ) -> Result<(), GitHubError> {
     let base = github.git_reference(&receipt.base_ref).await?.ok_or_else(|| {
         GitHubError::GraphQl(format!("base ref {:?} does not exist", receipt.base_ref))
@@ -99,6 +126,8 @@ pub async fn ensure_head(
     let parent_commit = github.git_commit(parent).await?;
     let message =
         format!("chore(braid): initialize implementation request {}", receipt.comment_database_id);
+    check_source(config, &receipt.write)?;
+    *mutation_possible = true;
     let bootstrap = github
         .create_git_commit(
             &message,
@@ -107,6 +136,7 @@ pub async fn ensure_head(
             &receipt.bootstrap_authored_at,
         )
         .await?;
+    check_source(config, &receipt.write)?;
     let mutation = if head.is_some() {
         github.update_git_reference(&receipt.head_ref, &bootstrap.sha).await
     } else {
@@ -155,7 +185,7 @@ fn record_head_ready(
         .map_err(|error| store_as_github_error(&error))
 }
 
-pub fn record_pr_activation(
+pub async fn record_pr_activation(
     config: &Config,
     github: &GitHubClient,
     store: &StoreActor,
@@ -163,184 +193,102 @@ pub fn record_pr_activation(
     pull_request: &PullRequest,
 ) -> Result<(), GitHubError> {
     let repository = &github.identity().repository;
-    let reference = format!(
-        "Implementation Request comment {repository}#issuecomment-{} ensured GitHub PR {repository}#{}.",
-        receipt.comment_database_id, pull_request.number,
-    );
+    let selected = config
+        .pr_profile_for_repository(repository)
+        .map_err(|error| GitHubError::GraphQl(error.to_string()))?;
+    if selected.id != receipt.pr_profile_id {
+        return Err(GitHubError::GraphQl("configured PR Profile changed since acceptance; refusing to switch activation identity".into()));
+    }
+    if let Ok(AcceptedRequest::Ensure { profile, .. }) =
+        serde_json::from_str(&receipt.write.payload)
+        && serde_json::to_string(&profile).ok() != serde_json::to_string(selected).ok()
+    {
+        return Err(GitHubError::GraphQl(
+            "PR Profile revision changed since acceptance; refusing to switch activation identity"
+                .into(),
+        ));
+    }
+    let issue_basis = store
+        .begin_observation(receipt.issue_node_id.clone())
+        .map_err(|e| store_as_github_error(&e))?;
+    let target_basis = store
+        .begin_observation(pull_request.node_id.clone())
+        .map_err(|e| store_as_github_error(&e))?;
+    let target = github.pull_request(pull_request.number).await?;
+    let issue = github.issue_or_pull_request(receipt.issue_number).await?;
+    if target.node_id != pull_request.node_id
+        || target.head.reference != receipt.head_ref
+        || target.base.reference != receipt.base_ref
+        || !target.state.eq_ignore_ascii_case("open")
+        || issue.node_id != receipt.issue_node_id
+        || issue.kind() != "issue"
+        || !issue.state.eq_ignore_ascii_case("open")
+    {
+        return Err(GitHubError::GraphQl(
+            "published implementation no longer has its authorized open source and target".into(),
+        ));
+    }
+    if !github
+        .pull_request_closing_issues(target.number)
+        .await?
+        .iter()
+        .any(|edge| edge.repository == *repository && edge.number == receipt.issue_number)
+    {
+        return Err(GitHubError::GraphQl(
+            "published implementation lost its canonical Issue association".into(),
+        ));
+    }
+    let owner =
+        receipt.write.execution_owner.clone().ok_or_else(|| {
+            GitHubError::GraphQl("activation delivery has no runtime owner".into())
+        })?;
     store
-        .ingest_event(
-            IngressEvent {
-                delivery_guid: format!(
-                    "braid-pr-ensure-{repository}-{}",
-                    receipt.comment_database_id
-                ),
-                event_name: "braid".into(),
-                action: Some("pr_ensure".into()),
-                repository_node_id: github.identity().repository_node_id.clone(),
-                repository: repository.clone(),
-                work_item_node_id: Some(pull_request.node_id.clone()),
-                work_item_kind: Some("pr"),
-                work_item_number: Some(pull_request.number),
-                work_item_state: Some(pull_request.state.clone()),
-                object_node_id: None,
-                object_version: None,
-                object_digest: None,
-                visible_body: None,
-                actor_node_id: Some(github.identity().actor_node_id.clone()),
-                actor_login: Some(github.identity().actor_login.clone()),
-                kind: crate::store::EventKind::Assign,
-                detail: Some("pr_ensure"),
-                cross_surface_invalidation: false,
-                origin: "braid",
-                reference,
-                mention_candidate: false,
-                reaction_target: None,
-                known: true,
-                raw_payload: Vec::new(),
-            },
-            SchedulerPolicy {
+        .accept_pr_activation(crate::store::PrActivation {
+            intent_id: receipt.write.intent_id.clone(),
+            repository_node: github.identity().repository_node_id.clone(),
+            pr_node: target.node_id,
+            pr_number: target.number,
+            policy: SchedulerPolicy {
                 quiet_seconds: config.scheduler.quiet_seconds,
                 event_threshold: config.scheduler.event_threshold,
             },
-        )
-        .map(|_| ())
-        .map_err(|error| store_as_github_error(&error))
-}
-
-pub enum Claim {
-    Owned(GhWriteReceipt),
-    Done(GhWriteReceipt),
-}
-
-pub async fn claim_or_wait(store: &StoreActor, intent_id: &str) -> Result<Claim> {
-    for _ in 0..CLAIM_POLLS {
-        let receipt = store
-            .gh_write_receipt(intent_id.to_owned())?
-            .context("Braid write state disappeared while waiting for convergence")?;
-        match receipt.lifecycle.as_str() {
-            "applied" => return Ok(Claim::Done(receipt)),
-            "rejected" | "conflict" | "ambiguous" => {
-                bail!(
-                    "braid gh {} for {} is {}: {}",
-                    receipt.operation,
-                    receipt.target,
-                    receipt.lifecycle,
-                    receipt.last_error.as_deref().unwrap_or("no detail")
-                );
+            owner,
+            issue_basis,
+            target_basis,
+        })
+        .map_err(|error| match error {
+            crate::store::StoreError::ObservationChanged { .. }
+            | crate::store::StoreError::Sqlite(_)
+            | crate::store::StoreError::ActorUnavailable
+            | crate::store::StoreError::ActorStopped => {
+                GitHubError::ConvergencePending(format!("activation delivery must retry: {error}"))
             }
-            "pending" | "uncertain" | "sending" => {
-                if store.claim_gh_write(intent_id.to_owned())? {
-                    let claimed = store
-                        .gh_write_receipt(intent_id.to_owned())?
-                        .context("claimed Braid write state disappeared")?;
-                    return Ok(Claim::Owned(claimed));
-                }
-            }
-            lifecycle => bail!("unsupported braid gh write lifecycle {lifecycle:?}"),
-        }
-        tokio::time::sleep(CLAIM_POLL_INTERVAL).await;
-    }
-    bail!("timed out waiting for a concurrent braid gh write to converge")
+            _ => store_as_github_error(&error),
+        })
 }
 
 pub struct RemoteWrite {
     pub database_id: String,
     pub node_id: String,
-    pub url: String,
 }
-
 pub enum WriteFailure {
     GitHub(GitHubError),
     Ambiguous(String),
 }
-
-impl WriteFailure {
-    pub fn is_unavailable(&self) -> bool {
-        matches!(self, Self::GitHub(error) if error.is_unavailable())
-    }
-}
-
-impl std::fmt::Display for WriteFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::GitHub(error) => error.fmt(formatter),
-            Self::Ambiguous(message) => formatter.write_str(message),
-        }
-    }
-}
-
 impl From<GitHubError> for WriteFailure {
     fn from(error: GitHubError) -> Self {
         Self::GitHub(error)
     }
 }
-
-pub type WriteResult = Result<RemoteWrite, WriteFailure>;
-
-pub fn settle_write(store: &StoreActor, intent_id: &str, result: WriteResult) -> Result<()> {
-    match result {
-        Ok(remote) => store.finish_gh_write(
-            intent_id.to_owned(),
-            "applied",
-            Some(remote.database_id),
-            Some(remote.node_id),
-            Some(remote.url),
-            None,
-        )?,
-        Err(error) => {
-            let lifecycle = match error {
-                WriteFailure::Ambiguous(_) => "ambiguous",
-                WriteFailure::GitHub(_) if error.is_unavailable() => "uncertain",
-                WriteFailure::GitHub(_) => "rejected",
-            };
-            store.finish_gh_write(
-                intent_id.to_owned(),
-                lifecycle,
-                None,
-                None,
-                None,
-                Some(error.to_string()),
-            )?;
+impl std::fmt::Display for WriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GitHub(e) => e.fmt(f),
+            Self::Ambiguous(e) => f.write_str(e),
         }
     }
-    Ok(())
 }
-
-pub fn completed_receipt(store: &StoreActor, intent_id: &str) -> Result<GhWriteReceipt> {
-    let receipt = store
-        .gh_write_receipt(intent_id.to_owned())?
-        .context("Braid write state disappeared before completion")?;
-    if receipt.lifecycle == "applied" {
-        Ok(receipt)
-    } else {
-        bail!(
-            "braid gh {} for {} is {}: {}",
-            receipt.operation,
-            receipt.target,
-            receipt.lifecycle,
-            receipt.last_error.as_deref().unwrap_or("no detail")
-        )
-    }
-}
-
-pub fn completed_implementation_receipt(
-    store: &StoreActor,
-    intent_id: &str,
-) -> Result<ImplementationRequestReceipt> {
-    let receipt = store
-        .implementation_request_receipt(intent_id.to_owned())?
-        .context("Implementation Request state disappeared before completion")?;
-    if receipt.write.lifecycle == "applied" {
-        Ok(receipt)
-    } else {
-        bail!(
-            "braid gh pr ensure for Issue #{} is {}: {}",
-            receipt.issue_number,
-            receipt.write.lifecycle,
-            receipt.write.last_error.as_deref().unwrap_or("no detail")
-        )
-    }
-}
+pub type WriteResult = Result<RemoteWrite, WriteFailure>;
 
 pub fn bounded_title(issue_number: u64, title: &str) -> String {
     let title = title.chars().take(180).collect::<String>();
@@ -360,16 +308,7 @@ pub fn validate_request_id(request_id: &str) -> Result<()> {
 }
 
 pub fn validate_branch(branch: &str) -> Result<()> {
-    let invalid = branch.is_empty()
-        || branch.starts_with(['/', '.'])
-        || branch.ends_with(['/', '.'])
-        || branch.to_ascii_lowercase().ends_with(".lock")
-        || branch.contains("..")
-        || branch.contains("@{")
-        || branch.chars().any(|character| {
-            character.is_control() || character.is_whitespace() || "~^:?*[\\".contains(character)
-        });
-    if invalid {
+    if !git2::Reference::is_valid_name(&format!("refs/heads/{branch}")) {
         bail!("invalid Git branch name {branch:?}");
     }
     Ok(())
@@ -380,5 +319,18 @@ pub fn digest(value: &str) -> String {
 }
 
 pub fn store_as_github_error(error: &crate::store::StoreError) -> GitHubError {
-    GitHubError::GraphQl(format!("local durable state rejected PR convergence: {error}"))
+    use crate::store::StoreError;
+    let retryable = match error {
+        StoreError::ActorUnavailable | StoreError::ActorStopped => true,
+        StoreError::Sqlite(error) => matches!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        ),
+        _ => false,
+    };
+    if retryable {
+        GitHubError::ConvergencePending(format!("local durable state is unavailable: {error}"))
+    } else {
+        GitHubError::GraphQl(format!("local durable state rejected publication: {error}"))
+    }
 }

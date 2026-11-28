@@ -41,14 +41,13 @@ pub struct ActorPolicy<'a> {
     pub app_node_id: &'a str,
     pub app_login: &'a str,
     pub agent_node_ids: &'a [String],
-    pub agent_attributions: &'a [String],
 }
 
 pub fn parse_verified(
     headers: WebhookHeaders<'_>,
     body: &[u8],
     secret: &[u8],
-    configured_repository: &str,
+    configured_repositories: &[String],
     configured_handle: &str,
     actors: ActorPolicy<'_>,
 ) -> Result<IngressEvent, WebhookError> {
@@ -57,17 +56,17 @@ pub fn parse_verified(
     let event_name = headers.event.ok_or(WebhookError::MissingEvent)?;
     let payload: Payload = serde_json::from_slice(body)?;
     let repository = payload.repository.as_ref().ok_or(WebhookError::MissingRepository)?;
-    if repository.full_name != configured_repository {
+    if !configured_repositories.iter().any(|configured| configured == &repository.full_name) {
         return Err(WebhookError::WrongRepository {
             actual: repository.full_name.clone(),
-            expected: configured_repository.into(),
+            expected: configured_repositories.join(", "),
         });
     }
 
     let action = payload.action.clone();
-    let cross_surface_invalidation = event_name == "issues"
-        && action.as_deref() == Some("edited")
-        && payload.changes.as_ref().is_some_and(|changes| changes.body.is_some());
+    // The store compares the retained visible source once: body changes fence
+    // dependent PR memory; other relevant revisions only request attention.
+    let cross_surface_invalidation = event_name == "issues" && action.as_deref() == Some("edited");
     let actor_node_id = payload.sender.as_ref().and_then(|actor| actor.node_id.clone());
     let actor_login = payload.sender.as_ref().map(|actor| actor.login.clone());
     let body_text = payload
@@ -79,11 +78,13 @@ pub fn parse_verified(
         .or_else(|| payload.pull_request.as_ref().and_then(|pr| pr.body.as_deref()));
     let agent_origin = actor_node_id.as_deref() == Some(actors.app_node_id)
         || actor_login.as_deref() == Some(actors.app_login)
-        || actor_node_id.as_ref().is_some_and(|node_id| actors.agent_node_ids.contains(node_id))
-        || body_text.is_some_and(|body| has_agent_attribution(body, actors.agent_attributions));
+        || actor_node_id.as_ref().is_some_and(|node_id| actors.agent_node_ids.contains(node_id));
     let target = target(event_name, &payload, action.as_deref());
     let known = is_known_event(event_name);
-    let (mapped_kind, detail) = classify(event_name, action.as_deref());
+    let (mut mapped_kind, detail) = classify(event_name, action.as_deref());
+    if action.as_deref() == Some("edited") && unchanged_visible_edit(&payload, body_text) {
+        mapped_kind = EventKind::Noop;
+    }
     let kind = if agent_origin { EventKind::OriginEcho } else { mapped_kind };
     let mention_candidate = !agent_origin
         && matches!(action.as_deref(), Some("created" | "edited" | "opened"))
@@ -91,22 +92,17 @@ pub fn parse_verified(
     // An opening-body mention would otherwise classify as a consumed-at-ingest
     // noop and vanish before trusted-mention resolution can run; keep it
     // pending as a mention candidate (kind is truthful: it IS a mention).
-    let kind = if !agent_origin && mention_candidate && kind == EventKind::Noop {
+    let kind = if !agent_origin
+        && mention_candidate
+        && kind == EventKind::Noop
+        && action.as_deref() == Some("opened")
+    {
         EventKind::Mention
     } else {
         kind
     };
     let reaction_target = if !agent_origin && action.as_deref() == Some("created") {
-        match event_name {
-            "issue_comment" => payload.comment.as_ref().map(|comment| ReactionTarget {
-                kind: "issue_comment",
-                database_id: comment.id.to_string(),
-            }),
-            "pull_request_review_comment" => payload.comment.as_ref().map(|comment| {
-                ReactionTarget { kind: "review_comment", database_id: comment.id.to_string() }
-            }),
-            _ => None,
-        }
+        comment_reaction_target(event_name, &payload)
     } else {
         None
     };
@@ -115,14 +111,21 @@ pub fn parse_verified(
         target.object_version.as_deref(),
         target.object_body.as_deref(),
     ) {
-        (Some(node_id), Some(version), _) if matches!(event_name, "issues" | "pull_request") => {
-            target.work_item_state.as_deref().map(|state| root_digest(node_id, state, version))
+        (Some(node_id), Some(version), body) if matches!(event_name, "issues" | "pull_request") => {
+            let title = payload
+                .issue
+                .as_ref()
+                .and_then(|i| i.title.as_deref())
+                .or_else(|| payload.pull_request.as_ref().and_then(|p| p.title.as_deref()));
+            Some(crate::store::publication_digest(node_id, version, title, body.unwrap_or("")))
         }
         (Some(node_id), Some(version), body) => Some(object_digest(node_id, version, body)),
         _ => None,
     };
     let visible_body = target.object_body.as_deref().map(context::filter_html_comments);
+    let identity = change_identity(event_name, action.as_deref(), &target);
     Ok(IngressEvent {
+        identity,
         delivery_guid: delivery.into(),
         event_name: event_name.into(),
         action,
@@ -141,6 +144,8 @@ pub fn parse_verified(
         kind,
         detail,
         cross_surface_invalidation,
+        requires_attention: !agent_origin
+            && matches!(kind, EventKind::Wake | EventKind::Invalidate | EventKind::Mention),
         origin: if agent_origin { "agent" } else { "external" },
         reference: target.reference,
         mention_candidate,
@@ -148,6 +153,50 @@ pub fn parse_verified(
         known,
         raw_payload: body.to_vec(),
     })
+}
+
+fn change_identity(
+    event_name: &str,
+    action: Option<&str>,
+    target: &Target,
+) -> crate::store::ChangeIdentity {
+    if target.object_node_id.is_some()
+        && target.object_version.is_some()
+        && matches!(action, Some("created" | "edited" | "submitted" | "opened"))
+        && event_name != "pull_request_review_thread"
+    {
+        crate::store::ChangeIdentity::ObjectVersion
+    } else {
+        crate::store::ChangeIdentity::Occurrence
+    }
+}
+
+fn comment_reaction_target(event_name: &str, payload: &Payload) -> Option<ReactionTarget> {
+    let kind = match event_name {
+        "issue_comment" => "issue_comment",
+        "pull_request_review_comment" => "review_comment",
+        _ => return None,
+    };
+    Some(ReactionTarget { kind, database_id: payload.comment.as_ref()?.id.to_string() })
+}
+
+fn unchanged_visible_edit(payload: &Payload, body: Option<&str>) -> bool {
+    let Some(changes) = &payload.changes else {
+        return false;
+    };
+    if changes.body.is_none() && changes.title.is_none() {
+        return false;
+    }
+    let body_unchanged = changes.body.as_ref().is_none_or(|old| {
+        context::filter_html_comments(old.from.as_deref().unwrap_or(""))
+            == context::filter_html_comments(body.unwrap_or(""))
+    });
+    let title = payload
+        .issue
+        .as_ref()
+        .and_then(|i| i.title.as_deref())
+        .or_else(|| payload.pull_request.as_ref().and_then(|p| p.title.as_deref()));
+    body_unchanged && changes.title.as_ref().is_none_or(|old| old.from.as_deref() == title)
 }
 
 fn verify_signature(signature: &str, body: &[u8], secret: &[u8]) -> Result<(), WebhookError> {
@@ -373,19 +422,12 @@ fn object_digest(node_id: &str, version: &str, body: Option<&str>) -> String {
     hex::encode(digest.finalize())
 }
 
-fn root_digest(node_id: &str, state: &str, version: &str) -> String {
-    let mut digest = Sha256::new();
-    for value in [node_id, state, version] {
-        digest.update(value.as_bytes());
-        digest.update(b"\0");
-    }
-    hex::encode(digest.finalize())
-}
-
 pub fn has_visible_mention(markdown: &str, handle: &str) -> bool {
     let mention = if handle.starts_with('@') { handle.to_owned() } else { format!("@{handle}") };
+    // A CommonMark comment block can include visible prose after its closing delimiter.
+    let visible = markdown.contains("<!--").then(|| context::filter_html_comments(markdown));
     let arena = Arena::new();
-    let root = parse_document(&arena, markdown, &Options::default());
+    let root = parse_document(&arena, visible.as_deref().unwrap_or(markdown), &Options::default());
     let mut stack = root.children().collect::<Vec<_>>();
     while let Some(node) = stack.pop() {
         let data = node.data.borrow();
@@ -408,15 +450,6 @@ pub fn has_visible_mention(markdown: &str, handle: &str) -> bool {
         stack.extend(node.children());
     }
     false
-}
-
-pub fn has_agent_attribution(markdown: &str, attributions: &[String]) -> bool {
-    attributions.iter().any(|attribution| {
-        markdown == attribution
-            || markdown
-                .strip_prefix(attribution)
-                .is_some_and(|remaining| remaining.starts_with("\n\n"))
-    })
 }
 
 fn contains_exact_mention(text: &str, mention: &str) -> bool {
@@ -447,7 +480,13 @@ struct Payload {
 
 #[derive(Debug, Deserialize)]
 struct Changes {
-    body: Option<serde_json::Value>,
+    body: Option<TextChange>,
+    title: Option<TextChange>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TextChange {
+    from: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -464,6 +503,7 @@ struct Actor {
 
 #[derive(Debug, Deserialize)]
 struct Issue {
+    title: Option<String>,
     node_id: String,
     number: u64,
     state: String,
@@ -474,6 +514,7 @@ struct Issue {
 
 #[derive(Debug, Deserialize)]
 struct PullRequest {
+    title: Option<String>,
     node_id: String,
     number: u64,
     state: String,
@@ -506,3 +547,7 @@ struct ReviewThread {
     node_id: String,
     updated_at: Option<String>,
 }
+
+#[cfg(test)]
+#[path = "webhook_tests.rs"]
+mod tests;

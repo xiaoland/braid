@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::{
     sync::watch,
     time::{Duration, MissedTickBehavior},
@@ -7,22 +7,39 @@ use tokio::{
 use anyhow::Result;
 
 use crate::{
+    config::Config,
     github::{CreatedIssueComment, GitHubClient},
-    store::StoreActor,
+    store::{RuntimeLease, StoreActor},
 };
 
-pub(crate) async fn drain_one_write(store: &StoreActor, github: &GitHubClient) {
-    let write = match store.claim_github_write() {
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn drain_one_write(
+    store: &StoreActor,
+    github_clients: &HashMap<String, Arc<GitHubClient>>,
+    config: &Config,
+    owner: &RuntimeLease,
+) {
+    let write = match store.claim_github_write(owner.clone()) {
         Ok(write) => write,
         Err(error) => {
             tracing::error!(%error, "cannot claim GitHub write");
             return;
         }
     };
-    let Some(write) = write else { return };
+    let Some(mut write) = write else { return };
+    let Some(github) = github_clients.get(&write.repository) else {
+        let _ = store.finish_github_write(
+            write.clone(),
+            "rejected",
+            None,
+            None,
+            Some("write repository is not configured for this instance".into()),
+        );
+        return;
+    };
     if write.repository != github.identity().repository {
         let _ = store.finish_github_write(
-            write.intent_id,
+            write.clone(),
             "rejected",
             None,
             None,
@@ -30,60 +47,28 @@ pub(crate) async fn drain_one_write(store: &StoreActor, github: &GitHubClient) {
         );
         return;
     }
-    let recovered_comment = if write.operation == "comment_create" && write.lifecycle == "uncertain"
-    {
-        recover_uncertain_comment(github, &write).await
-    } else {
-        Ok(None)
-    };
-    let result = match recovered_comment {
-        Err(error) => Err(error),
-        Ok(Some(comment)) => Ok(comment),
-        Ok(None) => match write.operation.as_str() {
-            "reaction_add" => github
-                .add_reaction(&write.target_kind, &write.target_database_id, &write.content)
-                .await
-                .map(|id| AppliedWrite { database_id: Some(id.to_string()), node_id: None })
-                .map_err(OutboxWriteError::from),
-            "reaction_delete" => {
-                match write
-                    .remote_database_id
-                    .as_deref()
-                    .and_then(|value| value.parse::<u64>().ok())
-                {
-                    Some(reaction_id) => github
-                        .delete_reaction(&write.target_kind, &write.target_database_id, reaction_id)
-                        .await
-                        .map(|()| AppliedWrite {
-                            database_id: Some(reaction_id.to_string()),
-                            node_id: None,
-                        })
-                        .map_err(OutboxWriteError::from),
-                    None => bail_unknown_write("reaction_delete without a reaction ID"),
+    let mut mutation_possible = write.lifecycle == "uncertain";
+    let result = if write.operation == "agent_write" {
+        Box::pin(crate::writer::execute(config, store, github, &write, &mut mutation_possible))
+            .await
+            .map(|remote| AppliedWrite {
+                database_id: Some(remote.database_id),
+                node_id: Some(remote.node_id),
+            })
+            .map_err(|error| match error {
+                crate::writer::helpers::WriteFailure::GitHub(e) => OutboxWriteError::GitHub(e),
+                crate::writer::helpers::WriteFailure::Ambiguous(e) => {
+                    OutboxWriteError::Ambiguous(e)
                 }
-            }
-            "comment_create" => match write.target_database_id.parse::<u64>() {
-                Ok(issue_number) => github
-                    .create_issue_comment(issue_number, &write.content)
-                    .await
-                    .map(AppliedWrite::from)
-                    .map_err(OutboxWriteError::from),
-                Err(_) => Err(OutboxWriteError::GitHub(crate::github::GitHubError::GraphQl(
-                    "invalid status Issue number".into(),
-                ))),
-            },
-            "comment_update" => github
-                .update_issue_comment(&write.target_database_id, &write.content)
-                .await
-                .map(AppliedWrite::from)
-                .map_err(OutboxWriteError::from),
-            operation => bail_unknown_write(operation),
-        },
+            })
+    } else {
+        mutation_possible = true;
+        apply_github_write(github, &write).await
     };
     match result {
         Ok(remote_id) => {
             if let Err(error) = store.finish_github_write(
-                write.intent_id,
+                write.clone(),
                 "applied",
                 remote_id.database_id,
                 remote_id.node_id,
@@ -93,13 +78,38 @@ pub(crate) async fn drain_one_write(store: &StoreActor, github: &GitHubClient) {
             }
         }
         Err(error) => {
+            write.retry_after = github.write_retry_after().await;
+            if let OutboxWriteError::GitHub(crate::github::GitHubError::RateLimited {
+                retry_after,
+                ..
+            }) = &error
+            {
+                write.retry_after = write.retry_after.max(*retry_after);
+            }
             let lifecycle = match &error {
-                OutboxWriteError::Ambiguous(_) => "ambiguous",
-                OutboxWriteError::GitHub(error) if error.is_unavailable() => "uncertain",
+                OutboxWriteError::Ambiguous(_)
+                | OutboxWriteError::GitHub(crate::github::GitHubError::Ambiguous(_)) => "ambiguous",
+                OutboxWriteError::GitHub(error)
+                    if error.is_rate_limited() && write.lifecycle != "uncertain" =>
+                {
+                    "pending"
+                }
+                OutboxWriteError::GitHub(error) if error.is_unavailable() => {
+                    if mutation_possible {
+                        "uncertain"
+                    } else {
+                        "pending"
+                    }
+                }
+                OutboxWriteError::GitHub(crate::github::GitHubError::Http { status, .. })
+                    if *status == axum::http::StatusCode::CONFLICT =>
+                {
+                    "conflict"
+                }
                 OutboxWriteError::GitHub(_) => "rejected",
             };
             if let Err(store_error) = store.finish_github_write(
-                write.intent_id,
+                write.clone(),
                 lifecycle,
                 None,
                 None,
@@ -108,6 +118,54 @@ pub(crate) async fn drain_one_write(store: &StoreActor, github: &GitHubClient) {
                 tracing::error!(%store_error, "cannot record GitHub write failure");
             }
         }
+    }
+}
+
+async fn apply_github_write(
+    github: &GitHubClient,
+    write: &crate::store::PendingGitHubWrite,
+) -> Result<AppliedWrite, OutboxWriteError> {
+    if write.operation == "comment_create"
+        && write.lifecycle == "uncertain"
+        && let Some(comment) = recover_uncertain_comment(github, write).await?
+    {
+        return Ok(comment);
+    }
+    match write.operation.as_str() {
+        "reaction_add" => github
+            .add_reaction(&write.target_kind, &write.target_database_id, &write.content)
+            .await
+            .map(|id| AppliedWrite { database_id: Some(id.to_string()), node_id: None })
+            .map_err(OutboxWriteError::from),
+        "reaction_delete" => {
+            match write.remote_database_id.as_deref().and_then(|value| value.parse::<u64>().ok()) {
+                Some(reaction_id) => github
+                    .delete_reaction(&write.target_kind, &write.target_database_id, reaction_id)
+                    .await
+                    .map(|()| AppliedWrite {
+                        database_id: Some(reaction_id.to_string()),
+                        node_id: None,
+                    })
+                    .map_err(OutboxWriteError::from),
+                None => bail_unknown_write("reaction_delete without a reaction ID"),
+            }
+        }
+        "comment_create" => match write.target_database_id.parse::<u64>() {
+            Ok(issue_number) => github
+                .create_issue_comment(issue_number, &write.content)
+                .await
+                .map(AppliedWrite::from)
+                .map_err(OutboxWriteError::from),
+            Err(_) => Err(OutboxWriteError::GitHub(crate::github::GitHubError::GraphQl(
+                "invalid status Issue number".into(),
+            ))),
+        },
+        "comment_update" => github
+            .update_issue_comment(&write.target_database_id, &write.content)
+            .await
+            .map(AppliedWrite::from)
+            .map_err(OutboxWriteError::from),
+        operation => bail_unknown_write(operation),
     }
 }
 
@@ -127,6 +185,7 @@ pub(crate) async fn recover_uncertain_comment(
         .filter(|comment| {
             comment.body.as_deref() == Some(write.content.as_str())
                 && comment.created_at >= write.created_at
+                && comment.created_at <= write.recovery_until
                 && comment
                     .user
                     .as_ref()
@@ -185,15 +244,29 @@ pub(crate) fn bail_unknown_write(operation: &str) -> Result<AppliedWrite, Outbox
 /// Converge durable writes independently of ingress and scheduling latency.
 pub(crate) async fn outbox_worker(
     store: Arc<StoreActor>,
-    github: Arc<GitHubClient>,
+    github: Arc<HashMap<String, Arc<GitHubClient>>>,
+    config: Config,
+    owner: RuntimeLease,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut recovered = false;
     loop {
         tokio::select! {
             _ = shutdown.changed() => return,
-            _ = tick.tick() => drain_one_write(&store, &github).await,
+            _ = tick.tick() => {
+                if !recovered {
+                    match store.recover_writes() {
+                        Ok(_) => recovered = true,
+                        Err(error) => {
+                            tracing::error!(%error, "cannot recover GitHub outbox");
+                            continue;
+                        }
+                    }
+                }
+                drain_one_write(&store, &github, &config, &owner).await;
+            },
         }
     }
 }

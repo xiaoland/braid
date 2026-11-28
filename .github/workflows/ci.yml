@@ -10,13 +10,54 @@ permissions:
 
 jobs:
   rust:
-    runs-on: macos-15
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rust
+            os: macos-15
+            target: aarch64-apple-darwin
+          - name: linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install 1.93.0 --profile minimal --component clippy,rustfmt --target aarch64-apple-darwin
+        with:
+          fetch-depth: 2
+      - run: rustup toolchain install 1.93.0 --profile minimal --component clippy,rustfmt --target ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+      - run: node --test native/pi/tests/*.test.mjs
       - run: cargo fmt --check
-      - run: cargo check --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: |
-          archive=$(scripts/package.sh)
-          scripts/tests/00_clean_install.sh "$archive"
+      - run: cargo test --locked --all-targets
+      - name: Verify the installed Pi runtime and factory cleanup
+        if: matrix.name == 'linux'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          BRAID_TEST_PI_INSTALL: ${{ runner.temp }}/pi-background
+          PI_OFFLINE: '1'
+        run: |
+          if git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null &&
+             git diff --quiet "$BASE_SHA" HEAD -- native/pi src/config.rs src/provider src/profile_materials.rs src/profile_materials src/agent_session.rs Cargo.toml Cargo.lock .github/workflows/ci.yml; then
+            echo 'Installed Pi inputs unchanged'
+            exit 0
+          fi
+          node native/pi/install.mjs "$BRAID_TEST_PI_INSTALL" --plugins background
+          "$BRAID_TEST_PI_INSTALL/bin/node" --test native/pi/acceptance/installed-runtime.test.mjs
+          cargo test --locked --bin braid profile_materials::tests::failed_home_binding_stops_the_installed_execution_before_returning -- --ignored --exact
+      - name: Verify conflicting Console edits in two browser pages
+        if: matrix.name == 'linux'
+        env:
+          CHROME_BIN: /usr/bin/google-chrome
+        run: |
+          npm ci --prefix tests/browser --ignore-scripts
+          node --test tests/browser/draft.test.mjs
+      - name: Verify OTLP internal diagnostics stay out of ordinary logs
+        if: matrix.name == 'linux'
+        run: >-
+          cargo test --locked --bin braid --features opentelemetry-otlp/internal-logs
+          telemetry::tests::telemetry_isolates_collector_rejection_bodies_from_ordinary_diagnostics -- --exact

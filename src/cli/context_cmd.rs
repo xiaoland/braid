@@ -9,19 +9,23 @@ pub async fn context(command: ContextCommand) -> Result<()> {
     let config_path = arguments.source.resolve_config_path()?;
     let config = helpers::load(&config_path)?;
     let locator = arguments.target.parse::<WorkItemLocator>()?;
+    if !config.github_repositories().contains(&locator.repository.to_string().as_str()) {
+        bail!("repository {} is not configured for this instance", locator.repository);
+    }
     let profile = match arguments.profile.as_deref() {
         Some(profile) => config.profile(profile)?,
-        None if kind == "pr" => config.profile(&config.profile_selection.default_pr_profile)?,
-        None => config
-            .profiles
-            .iter()
-            .find(|profile| profile.has_tag("issue"))
-            .context("configuration has no Profile tagged issue")?,
+        None if kind == "pr" => {
+            config.pr_profile_for_repository(&locator.repository.to_string())?
+        }
+        None => config.issue_profile_for_repository(&locator.repository.to_string())?,
     };
+    if config.profile_repository(profile) != locator.repository.to_string() {
+        bail!("Profile {:?} does not serve {}", profile.id, locator.repository);
+    }
     if !profile.has_tag(kind) {
         bail!("Profile {:?} is not tagged {kind}", profile.id);
     }
-    let client = GitHubClient::connect(&config.github, &locator.repository)
+    let client = GitHubClient::connect(config.github()?, &locator.repository)
         .await
         .context("GitHub Context is unavailable")?;
     let mut canonical = if kind == "issue" {
@@ -34,7 +38,7 @@ pub async fn context(command: ContextCommand) -> Result<()> {
         )
     };
     let store = helpers::store(&config)?;
-    context::reconcile_local_state(&mut canonical, &store)?;
+    context::reconcile_local_state(&mut canonical, &store, Some(&client.identity().actor_node_id))?;
     let rendered = context::render(
         &canonical,
         profile.github_context_soft_ratio,

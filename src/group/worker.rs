@@ -1,5 +1,5 @@
 #![allow(clippy::large_futures)]
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use tokio::{
@@ -7,25 +7,23 @@ use tokio::{
     time::{Duration, MissedTickBehavior},
 };
 
-use super::{
-    SessionManager,
-    provider::{materialized_profile, operational_status_unknown_profile},
-};
+use super::{SessionManager, availability::ProviderReport, provider::materialized_profile};
 use crate::{
-    agent_session::SessionFactory,
+    agent_session::{SessionError, SessionFactory},
+    collaboration::CollaborationBackend,
     config::{Config, Profile},
     github::GitHubClient,
     store::{ProfileRecord, StoreActor, TurnClaim},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum GroupKind {
     Issue,
     Pr,
 }
 
 impl GroupKind {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Issue => "issue",
             Self::Pr => "pr",
@@ -37,6 +35,7 @@ pub(crate) struct GroupSpec {
     pub(super) kind: GroupKind,
     pub(super) profile: Profile,
     pub(super) profile_record: ProfileRecord,
+    pub(crate) repository: String,
 }
 
 impl GroupSpec {
@@ -44,26 +43,27 @@ impl GroupSpec {
         &self.profile.id
     }
 
-    pub(crate) fn new(kind: GroupKind, config: &Config, store: &StoreActor) -> Result<Self> {
+    pub(crate) fn new(
+        kind: GroupKind,
+        config: &Config,
+        store: &StoreActor,
+        repository: &str,
+    ) -> Result<Self> {
         let profile = match kind {
-            GroupKind::Issue => config
-                .profiles
-                .iter()
-                .find(|profile| profile.has_tag("issue"))
-                .context("configuration has no Issue Profile")?,
-            GroupKind::Pr => config.profile(&config.profile_selection.default_pr_profile)?,
+            GroupKind::Issue => config.issue_profile_for_repository(repository)?,
+            GroupKind::Pr => config.pr_profile_for_repository(repository)?,
         }
         .clone();
-        let profile_record = materialized_profile(&profile)?;
+        let profile_record = materialized_profile(config, &profile)?;
         store.register_profile(profile_record.clone())?;
-        Ok(Self { kind, profile, profile_record })
+        Ok(Self { kind, profile, profile_record, repository: repository.to_owned() })
     }
 }
 
 /// Shared logical driver; adapters own physical resources and the store owns durable identities.
 pub(super) struct GroupDriver<'a> {
     pub(super) store: &'a StoreActor,
-    pub(super) github: &'a GitHubClient,
+    pub(super) collaboration: &'a CollaborationBackend,
     pub(super) config: &'a Config,
     pub(super) spec: &'a GroupSpec,
     pub(super) sessions: SessionManager,
@@ -91,22 +91,251 @@ pub(crate) async fn agent_group_worker(
     config: Config,
     spec: GroupSpec,
     factory: Arc<dyn SessionFactory>,
-    reports: tokio::sync::mpsc::Sender<crate::health::ProviderHealthUpdate>,
+    reports: tokio::sync::mpsc::Sender<ProviderReport>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    agent_group_worker_backend(
+        store,
+        Arc::new(CollaborationBackend::GitHub(github)),
+        config,
+        spec,
+        factory,
+        reports,
+        shutdown,
+    )
+    .await
+}
+
+pub(crate) async fn agent_group_worker_backend(
+    store: Arc<StoreActor>,
+    collaboration: Arc<CollaborationBackend>,
+    config: Config,
+    spec: GroupSpec,
+    factory: Arc<dyn SessionFactory>,
+    reports: tokio::sync::mpsc::Sender<ProviderReport>,
     mut shutdown: watch::Receiver<bool>,
-) {
+) -> Result<()> {
     let driver = GroupDriver {
         store: &store,
-        github: &github,
+        collaboration: &collaboration,
         config: &config,
         spec: &spec,
         sessions: SessionManager::new(factory),
     };
     driver.drive(&reports, &mut shutdown).await;
-    driver.sessions.retain(&std::collections::HashSet::new()).await;
+    driver
+        .retain_sessions(&HashSet::new())
+        .await
+        .context("shutdown did not confirm all sessions quiesced")
 }
 
 impl GroupDriver<'_> {
-    async fn fence_running(&self, running: &mut Option<RunningAgentTurn>) {
+    async fn stop_execution(&self, id: &str) -> Result<bool, SessionError> {
+        let stopped = self.sessions.stop(id).await?;
+        if stopped {
+            self.store.set_provider_stop(id.into(), true).map_err(|error| {
+                SessionError::Failed(format!("cannot record native stop: {error}"))
+            })?;
+        }
+        Ok(stopped)
+    }
+
+    /// Closing a native process and fencing its execution authority each
+    /// have their own evidence. Both operations must be attempted even if
+    /// one authority is unavailable.
+    pub(super) async fn quiesce_session(&self, id: &str) -> Result<bool, SessionError> {
+        let (stop, fence) =
+            tokio::join!(self.stop_execution(id), self.collaboration.fence_session(id),);
+        match (stop, fence) {
+            (Ok(stopped), Ok(())) => Ok(stopped),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(SessionError::Failed(format!(
+                "execution fence unconfirmed for {id}: {error:#}"
+            ))),
+            (Err(stop), Err(fence)) => Err(SessionError::Failed(format!(
+                "{stop}; execution fence unconfirmed for {id}: {fence:#}"
+            ))),
+        }
+    }
+
+    pub(super) async fn require_quiesced(
+        &self,
+        id: &str,
+        recorded_stop: bool,
+    ) -> Result<(), SessionError> {
+        if self.quiesce_session(id).await? || recorded_stop {
+            Ok(())
+        } else {
+            Err(SessionError::Failed(
+                "old execution has no stop evidence after restart; replacement is blocked".into(),
+            ))
+        }
+    }
+
+    pub(super) async fn confirmed_unassignment(
+        &self,
+        target: crate::store::UnassignmentTarget,
+    ) -> Result<Option<crate::store::Unassignment>> {
+        let builtin = self.collaboration.is_builtin();
+        let quiet = if builtin { 0 } else { self.config.scheduler.quiet_seconds };
+        let Some(change) = self.store.due_unassignment(target, quiet)? else { return Ok(None) };
+        if !builtin {
+            let locator = crate::github::WorkItemLocator {
+                repository: change.repository.parse()?,
+                number: change.number,
+            };
+            let issue = self.collaboration.materialize_issue(&locator).await?;
+            if issue
+                .assignees
+                .iter()
+                .any(|actor| self.collaboration.assignee_matches(actor, &self.spec.profile.id))
+            {
+                self.store.ignore_assignment_event(change.event_id)?;
+                return Ok(None);
+            }
+        }
+        Ok(Some(change))
+    }
+
+    pub(super) async fn settle_unassignment(
+        &self,
+        change: &crate::store::Unassignment,
+        active: Option<&mut RunningAgentTurn>,
+    ) -> Result<()> {
+        let mut stop = Ok(());
+        for (session, stopped) in &change.sessions {
+            if let Err(error) = self.require_quiesced(session, *stopped).await {
+                stop = Err(error);
+            }
+        }
+        let terminal = active.and_then(RunningAgentTurn::terminal_after_close);
+        if (stop.is_ok() || terminal.is_some())
+            && self.store.settle_unassignment(change, terminal.clone(), stop.is_ok())?
+            && let Some((turn, session)) = &change.running_turn
+        {
+            use crate::agent_session::TurnOutcome;
+            let (outcome, reason) = terminal.as_ref().map_or(
+                (TurnOutcome::Unknown, crate::store::MISSING_TERMINAL),
+                |terminal| {
+                    (
+                        terminal.outcome,
+                        terminal
+                            .error
+                            .as_deref()
+                            .unwrap_or("provider did not supply a terminal reason"),
+                    )
+                },
+            );
+            if matches!(outcome, TurnOutcome::Failed | TurnOutcome::Unknown) {
+                self.enqueue_turn_error(turn, session, outcome.lifecycle(), reason);
+            }
+        }
+        stop.map_err(Into::into)
+    }
+
+    pub(super) async fn settle_idle_unassignment(&self, event: String) -> Result<()> {
+        if let Some(change) =
+            self.confirmed_unassignment(crate::store::UnassignmentTarget::Event(event)).await?
+        {
+            self.settle_unassignment(&change, None).await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn retain_sessions(
+        &self,
+        retained: &HashSet<String>,
+    ) -> Result<(), SessionError> {
+        let mut failure = None;
+        for id in self.sessions.obsolete(retained).await {
+            if let Err(error) = self.quiesce_session(&id).await {
+                tracing::error!(%error, provider_session = %id, "session quiescence unconfirmed");
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    pub(super) fn publish_turn_error(&self, claim: &TurnClaim, lifecycle: &str, reason: &str) {
+        if let Err(error) = self.store.record_turn_error(claim.turn_id.clone(), reason.to_owned()) {
+            tracing::error!(%error, turn = %claim.turn_id, "cannot retain complete turn error");
+        }
+        self.enqueue_turn_error(&claim.turn_id, &claim.provider_session_id, lifecycle, reason);
+    }
+
+    fn enqueue_turn_error(&self, turn_id: &str, session: &str, lifecycle: &str, reason: &str) {
+        if self.spec.profile.status_surfaces.is_empty() {
+            return;
+        }
+        if let Err(error) = self.store.enqueue_operational_status(
+            turn_id.into(),
+            super::provider::operational_status_turn_error(
+                self.config,
+                &self.spec.profile,
+                turn_id,
+                session,
+                lifecycle,
+                reason,
+            ),
+        ) {
+            tracing::error!(%error, turn = %turn_id, "cannot publish turn error status");
+        }
+    }
+
+    async fn shutdown_running(&self, running: &mut Option<RunningAgentTurn>) {
+        let Some(mut active) = running.take() else {
+            return;
+        };
+        let closed = self.quiesce_session(&active.claim.provider_session_id).await;
+        let terminal = active.terminal_after_close();
+        let (outcome, error) = terminal.map_or_else(
+            || {
+                (
+                    crate::agent_session::TurnOutcome::Unknown,
+                    Some("shutdown did not observe the active turn terminal".into()),
+                )
+            },
+            |terminal| (terminal.outcome, terminal.error),
+        );
+        if let Some(reset_id) = active.reset_id {
+            let _ = self.store.mark_context_reset_turn_terminal(
+                reset_id.clone(),
+                active.claim.turn_id.clone(),
+                outcome.lifecycle().into(),
+            );
+            if let Err(error) = &closed {
+                let reason = format!(
+                    "Context reset shutdown could not confirm old writer revocation and execution stop: {error}"
+                );
+                if let Err(error) = self.store.fail_context_reset(reset_id, reason) {
+                    tracing::error!(%error, "cannot block Context reset after unconfirmed shutdown");
+                }
+            }
+        } else {
+            let _ = self
+                .store
+                .mark_turn_terminal(active.claim.turn_id.clone(), outcome.lifecycle().into());
+        }
+        if matches!(
+            outcome,
+            crate::agent_session::TurnOutcome::Failed | crate::agent_session::TurnOutcome::Unknown
+        ) {
+            self.publish_turn_error(
+                &active.claim,
+                outcome.lifecycle(),
+                error.as_deref().unwrap_or("provider did not supply a terminal reason"),
+            );
+        }
+        if let Err(stop_error) = closed {
+            self.publish_turn_error(
+                &active.claim,
+                "unknown",
+                &format!("shutdown could not confirm execution stop: {stop_error}"),
+            );
+        }
+    }
+
+    async fn fence_running(&self, running: &mut Option<RunningAgentTurn>, reason: &str) {
         if let Some(active) = running.take() {
             if let Some(reset_id) = active.reset_id {
                 let _ = self.store.mark_context_reset_turn_terminal(
@@ -118,22 +347,32 @@ impl GroupDriver<'_> {
                 let _ =
                     self.store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
             }
-            let _ = self.store.enqueue_operational_status(
-                active.claim.turn_id,
-                super::provider::operational_status_unknown_profile(&active.claim.profile_id),
-            );
-            self.sessions.remove(&active.claim.provider_session_id).await;
+            self.publish_turn_error(&active.claim, "unknown", reason);
+            if let Err(error) = self.quiesce_session(&active.claim.provider_session_id).await {
+                if let Some(run) = &self.config.finite_run {
+                    run.admission.close();
+                }
+                tracing::error!(%error, "old execution stop remains unconfirmed");
+                self.publish_turn_error(
+                    &active.claim,
+                    "unknown",
+                    &format!("{reason}; old execution stop failed: {error}"),
+                );
+            }
         }
     }
 
     #[allow(clippy::too_many_lines)]
     async fn drive(
         &self,
-        reports: &tokio::sync::mpsc::Sender<crate::health::ProviderHealthUpdate>,
+        reports: &tokio::sync::mpsc::Sender<ProviderReport>,
         shutdown: &mut watch::Receiver<bool>,
     ) {
         let store = self.store;
         let mut running: Option<RunningAgentTurn> = None;
+        // A native close may end the event stream while its independent
+        // platform fence is still being retried.
+        let mut unassignment = None;
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut recovery = tokio::time::Instant::now();
@@ -141,14 +380,17 @@ impl GroupDriver<'_> {
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown.changed() => return,
+                _ = shutdown.changed() => {
+                    self.shutdown_running(&mut running).await;
+                    return;
+                },
                 event = async {
                     if let Some(ref mut active) = running {
                         active.events.recv().await
                     } else {
                         std::future::pending().await
                     }
-                }, if running.is_some() => {
+                }, if running.is_some() && unassignment.is_none() => {
                     match event {
                         Ok(crate::agent_session::SessionEvent::TurnStarted { provider_turn_id }) => {
                             tracing::debug!(%provider_turn_id, "AgentSession turn started");
@@ -169,55 +411,85 @@ impl GroupDriver<'_> {
                                         active.claim.turn_id.clone(),
                                         lifecycle.into(),
                                     );
+                                    if let Err(error) = self.quiesce_session(&active.claim.provider_session_id).await {
+                                        if let Some(run)=&self.config.finite_run {run.admission.close();}
+                                        let reason = format!("Context reset could not confirm old writer revocation and execution stop: {error}");
+                                        if let Err(error) = store.fail_context_reset(reset_id.clone(), reason.clone()) {
+                                            tracing::error!(%error, "cannot block Context reset after unconfirmed stop");
+                                        }
+                                        self.publish_turn_error(&active.claim, "unknown", &reason);
+                                    }
                                 } else {
                                     let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), lifecycle.into());
-                                    if active.claim.trusted_mention && lifecycle != "unknown" {
-                                        let reaction = if lifecycle == "completed" { "+1" } else { "confused" };
-                                        let _ = store.enqueue_turn_reaction(active.claim.turn_id.clone(), reaction.into());
-                                    }
                                 }
-                                if lifecycle == "unknown" {
-                                    let _ = store.enqueue_operational_status(
-                                        active.claim.turn_id.clone(),
-                                        operational_status_unknown_profile(&active.claim.profile_id),
-                                    );
-                                    self.sessions.remove(&active.claim.provider_session_id).await;
+                                if matches!(lifecycle, "failed" | "unknown") {
+                                    let reason = format!("provider turn {provider_turn_id}: {}", error.as_deref().unwrap_or("provider did not supply a terminal reason"));
+                                    self.publish_turn_error(&active.claim, lifecycle, &reason);
+                                }
+                                if (lifecycle == "unknown" || active.claim.trigger_kind == "finalization")
+                                    && active.reset_id.is_none()
+                                    && let Err(stop_error) = self.quiesce_session(&active.claim.provider_session_id).await {
+                                    if let Some(run)=&self.config.finite_run {run.admission.close();}
+                                    tracing::error!(%stop_error, "old execution stop remains unconfirmed");
+                                    self.publish_turn_error(&active.claim, "unknown", &format!("{}; old execution stop failed: {stop_error}", error.as_deref().unwrap_or("provider outcome unknown")));
                                 }
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             tracing::warn!(skipped, "AgentSession event consumer lagged");
-                            self.fence_running(&mut running).await;
+                            self.fence_running(&mut running, &format!("AgentSession event consumer lagged by {skipped} lifecycle events")).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            self.fence_running(&mut running).await;
+                            self.fence_running(&mut running, "AgentSession event stream closed").await;
                         }
                     }
                 }
                 _ = tick.tick() => {
-                    if running.as_ref().is_some_and(|active| active.events.is_closed()) {
-                        self.fence_running(&mut running).await;
+                    if unassignment.is_none() && running.as_ref().is_some_and(|active| active.events.is_closed()) {
+                        self.fence_running(&mut running, "AgentSession event stream closed").await;
+                    }
+                    // A closed finite root fences new execution; shutdown owns physical cleanup.
+                    if self.config.finite_run.as_ref().is_some_and(|run|run.admission.is_closed()) {
+                        continue;
                     }
                     if running.is_none() && tokio::time::Instant::now() >= recovery {
                         // Resume only absent or failed handles; a sibling's recovery must
                         // not fence healthy turns or rebuild their sessions.
                         let readiness = self.sessions.check().await;
-                        available = readiness.is_ok();
                         let result = match readiness {
                             Ok(()) => self.resume().await,
                             Err(error) => Err(error.into()),
                         };
+                        available = result.is_ok();
                         let error = result.err().map(|error| error.to_string());
                         if let Some(error) = &error { tracing::warn!(%error, kind = self.spec.kind.as_str(), "session recovery unavailable"); }
-                        if reports.send(crate::health::ProviderHealthUpdate {
-                            group: self.spec.kind.as_str(), error,
+                        if reports.send(ProviderReport {
+                            repository: self.spec.repository.clone(),
+                            group: self.spec.kind, error,
                         }).await.is_err() { return; }
                         recovery = tokio::time::Instant::now() + Duration::from_secs(2);
                     }
                     if let Some(active) = &mut running {
+                        if unassignment.is_none() && (self.spec.kind == GroupKind::Issue || self.collaboration.is_builtin()) {
+                            let target = crate::store::UnassignmentTarget::RunningTurn(active.claim.turn_id.clone());
+                            match self.confirmed_unassignment(target).await {
+                                Ok(found) => unassignment = found,
+                                Err(error) => { tracing::warn!(%error, "cannot confirm active unassignment"); }
+                            }
+                        }
+                        if let Some(change) = unassignment.as_ref() {
+                            match self.settle_unassignment(change, Some(active)).await {
+                                Ok(()) => { running = None; unassignment = None; }
+                                Err(error) => {
+                                    tracing::warn!(%error, "cannot settle active unassignment");
+                                }
+                            }
+                            continue;
+                        }
                         self.begin_active_context_reset(active).await;
-                        if active.reset_id.is_none() {
-                            self.forward_urgent_steer(active).await;
+                        if active.reset_id.is_none()
+                            && let Some(reason) = self.forward_urgent_steer(active).await {
+                            self.fence_running(&mut running, &reason).await;
                         }
                         continue;
                     }
@@ -234,6 +506,11 @@ impl GroupDriver<'_> {
                         continue;
                     }
                     self.materialize_next_assignment().await;
+                    // Settle pre-activation Context changes before the finite assignment's first turn.
+                    if self.config.finite_run.is_some()
+                        && Box::pin(self.materialize_next_context_reset()).await {
+                        continue;
+                    }
                     running = self.start_next_agent_turn().await;
                 }
             }
@@ -248,8 +525,35 @@ pub(crate) struct RunningAgentTurn {
     pub(crate) claim: TurnClaim,
     pub(crate) provider_turn_id: String,
     pub(crate) reset_id: Option<String>,
+    pub(super) stop_terminal: Option<crate::store::ObservedTurnTerminal>,
     /// The receiver that observed this turn's `TurnStarted`, created before
     /// the send and handed off with the turn, so the drive loop consumes the
     /// terminal with no subscription-timing gap.
     pub(crate) events: tokio::sync::broadcast::Receiver<crate::agent_session::SessionEvent>,
+    /// Shared run admission is held until this actual turn reaches terminal or stop.
+    pub(crate) _admission: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl RunningAgentTurn {
+    /// Keep terminal evidence across a failed fence or database commit.
+    fn terminal_after_close(&mut self) -> Option<crate::store::ObservedTurnTerminal> {
+        loop {
+            match self.events.try_recv() {
+                Ok(crate::agent_session::SessionEvent::TurnTerminal {
+                    provider_turn_id,
+                    outcome,
+                    error,
+                }) if provider_turn_id == self.provider_turn_id => {
+                    self.stop_terminal = Some(crate::store::ObservedTurnTerminal {
+                        turn_id: self.claim.turn_id.clone(),
+                        outcome,
+                        error,
+                    });
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        self.stop_terminal.clone()
+    }
 }

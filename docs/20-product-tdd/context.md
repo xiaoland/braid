@@ -6,12 +6,19 @@ in Issue Context and PR Context, see `docs/10-prd/objects.md` and
 `docs/10-prd/workflow.md`. It does not own webhook scheduling or provider
 history.
 
+Local 后端使用同一 canonical snapshot 和渲染合同，在单个 SQLite 读取事务中
+取得正文、讨论及直接关联对象。内部身份带 `local:` 前缀，对外标为
+`Braid Issue: <space>#<number>` 或 `Braid PR: <space>#<number>`。GitHub 后端
+保留下述分页与漂移核对，Local 不伪装网络分页、远端权限或 GitHub ID。
+
 ## Materialization Transaction
 
 For one Work Item Braid reads every required GitHub connection to exhaustion,
 then checks the root object `updatedAt` and relationship version again. If the
 root or association graph changed during the read, it discards the partial
-snapshot and retries a bounded number of times. Missing permission, unsupported
+snapshot and retries a bounded number of times. Stateless first-page connection
+combination changes only the HTTP grouping: continuation cursors, full bodies,
+association expansion and before/after marker checks remain mandatory. Missing permission, unsupported
 union members, pagination failure, or repeated drift produces
 `context-unavailable`; Braid never emits a partial Context.
 
@@ -91,15 +98,36 @@ changes to them produce Event References when subscribed.
 
 ## Body Filtering
 
+内建 `object context` 使用此 projector，供 Agent 重新读取设计与讨论。
+`object show` 返回平台原始对象，供对象及操作元数据检查，不承诺移除 HTML 注释；
+该过滤不是原始对象、provider history 或任意工具读取的机密隔离边界。
+
 Braid preserves original Markdown bytes except for actual HTML comment nodes.
 The Context projector parses GitHub Flavored Markdown, obtains source ranges for
 HTML inline/block comments beginning with `<!--`, and splices those ranges from
-the original UTF-8 body. Text that resembles `<!-- -->` inside fenced or inline
+the original UTF-8 body. A block's closing line can also contain visible text;
+only its actual comment delimiters and contents are removed, preserving that
+suffix and any HTML attribute values. Text that resembles `<!-- -->` inside fenced or inline
 code remains. Malformed HTML that the parser does not recognize as a comment is
 ordinary visible text.
 
-Operational Status Comments are excluded by their persisted GitHub comment IDs.
-Agent comments remain included. No hidden marker is required.
+GitHub Operational Status Comments are excluded by their persisted comment IDs.
+Before publication, Braid declares a stable role for the Work Item, Profile,
+and assignment generation, and records the digest of each complete rendered
+body. The body carries the role identifier in an HTML comment. A complete
+canonical conversation read can bind the role to a GitHub comment when its App
+actor, Work Item, role identifier, and full body match the declaration and
+identify a single comment. Both Context and reconciliation use this binding,
+including when the first POST succeeded and its publication receipt was lost.
+The role marker carries only the identifier. Regular Agent discussion remains
+included.
+
+Upgrades preserve known historical comment IDs. For an unresolved legacy
+create, canonical observation can bind a unique same-App, same-Work Item comment
+with the recorded full body and a creation time in the recovery window. When
+multiple identities match, Braid leaves the role unbound. A previously bound
+role continues to identify the same comment after edits, minimization, or
+deletion.
 
 ## Snapshot, Revision, and Version Ordering
 
@@ -161,3 +189,12 @@ state and makes no replace/inject decisions.
 
 This keeps the Profile as plain configuration and avoids coupling the core
 runtime to provider-specific compaction or resume rules.
+
+有效 Profile 版本不仅覆盖 Profile 声明，还覆盖 adapter 合同、锁定原生安装
+manifest，以及选中技能与原生模板的内容身份。材料的路径相同不证明内容兼容。
+凭据值和派生 execution/worktree/home 路径不参与语义材料摘要；原生实际启动
+仍核对所选材料与物化身份一致。完整文件读取不放回周期 readiness 循环。
+
+旧会话版本与当前有效版本不同会明确 blocked，保持旧记录，不自动覆盖其材料
+或借用旧历史新开执行。所选材料身份还用于启动诊断，但它不是模型实际使用某项
+技能或原生角色的证明；后者需实际原生装载及执行记录。

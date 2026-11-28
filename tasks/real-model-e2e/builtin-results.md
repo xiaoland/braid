@@ -1,0 +1,55 @@
+# 内建上游真实模型执行记录
+
+2026-10-11 用户批准的真实流程已开始。原候选 binary 0.3.2/1fdef82，SHA-256见 braid-e2e/builtin/raw/startup.json；模型为官方 MiniMax-M3，凭据仅通过加载器注入，账户扣费未知。配置修正为计划的 quiet30/count8/reconcile60；Issue/PR角色指令落实不同责任。基线2d65e72仅含需求、说明占位和忽略规则，没有业务实现。
+
+原版本 Console 实际启动，Issue1正常指派 issue-minimax 后仅 materialize idle Pi session；真实人类实施请求经过quiet窗口开启turn01a129fc-ff4c-7cc1-84a2-049adc4b9ae1，原生JSONL含实际user/assistant/toolResult，最终completed。IssueAgent自主维护设计、建立空提交e2ae347并创建关联PR2。根独立证明bootstrap tree未改变。首版 provider connected 但 readyfalse：src/health.rs仅检查旧ingress local，已修为builtin；全范围rg未发现其它此生命周期检查遗漏。原始错误与首版binary保留，不将其混成无修复黄金路径。
+
+修正严格Clippy及build通过，公开stop后Console正常shutdown退出0；重启Console读取上一代state=stopped证明停止。修正版binary及SHA见raw/ready-fix-version.json；再次真实start后provider connected且readytrue。正常操作者已指派PR2给pr-minimax并提交实施评论，没有代写业务实现。模型候选尚未交付，黄金路径、矩阵与应用验收尚未完成。
+
+原始证据在 /Volumes/WorkSSD/Development/braid-e2e/builtin/raw：startup.json、initial-runtime.json、create-assign-start.json、first-human-request.json、initial-request-ledger.json、issue-agent-completion-objects.json、first-stop-request.json、first-stop-confirmed.json（请求停止后中间状态为stopping，终态由Console正常退出和下一次readyfix-restart-pr-assign.json中的stopped读回确认）、ready-fix-version.json、readyfix-restart-pr-assign.json、pr-first-human-request.json、readyfix-runtime.json；Collector数据库及原生session另保留。
+
+
+首PR真实实现已提交25f92ed815c2d268b07da2ed72b8bc567c895ddd，但自行publish失败，不能将该未发布提交当正常交付。错误为“publish requires a clean committed worktree”；实际git status porcelain为空，ignored session/store/cache存在。实际依赖libgit2 status.h 的默认flags含INCLUDE_IGNORED，而Gateway直接statuses(None)，因此根因是忽略文件被算dirty。Gateway改为显式包含untracked并递归、排除ignored，具体dirty路径进入错误。平台另一clean consumer已有显式options，不受同默认flags影响。
+
+为应用该设施修复发出公开active stop，实际获得blocked，而非正常stop：两个group均报告“session reception is unknown: provider request Pi child exit after stop timed out”。PR turn落库interrupted且grantrevoked，只证明执行和写入fence，不证明原生child退出。原Console保持blocked，不私改ledger或再次启动。原件见raw/publish-failure-active-stop.json、publish-failure-stop-observed.json、publish-failure-stop-latest.json。稳定native生命周期owner接续有界调查和具体停止证据；黄金路径及后续矩阵仍在途。
+
+
+停止缺陷根因已从真实依赖源码确认：Tokio Unix ChildStdin::poll_shutdown只返回Ready而不关闭pipeFD；Pi rpc模式依赖stdin end后dispose/exit。Braid持有writer等child退出导致双方互等30秒。稳定owner已修关闭路径take/drop真实stdin FD后wait，仍保留child wait失败合同。旧代次cached failed及blocked receipt不能重开Console清除；当前公开Start/Stop无retry/resolve能力，旧失败保留，恢复方式待根确认，未改ledger。
+
+旧cap迟到写实际验证：Harness revoke主动清空token，首次直接使用已清空token的尝试422只是格式拒绝，不算fencing通过（原错误保留raw/late-revoked-writer.json）。随后使用原授予requestId幂等读取原合法cap回执，携带当前正确对象revision提交迟到Agent comment，实际HTTP409且具体原因“writer grant is stale, revoked, or does not cover this actor/item”，cap未输出/证据脱敏。真正fencing证据raw/late-revoked-writer-valid-cap.json。平台在Harness blocked期间仍可读写请求回执，生命周期独立。
+
+
+根与advisor决定不增加凭无PID解锁blocked的入口。依已批准设施修复后重跑计划，准备全新builtin-attempt2：独立Git对象库从原初始6425f01 clone，新的需求文档基线d9ba1e5，无旧25f92ed对象/业务答案；新source/platform/Harness/Console/providerhome与ports19318/19282/19281均在独立WorkSSD空间。修复binarySHA2376520c0dc3eda2680c71f64e7b705fced2eda515bc3feb3227053cf44c4bd5，configcheck通过。旧attempt1 retained blocked，未启动attempt2直到有界原工具/所有权核对完成。首次in-place安装后Mac拒执行(exit137)的原始工具输出保留；改WorkSSD临时新inode原子rename后同binary实际configcheck退出0，后续安装使用此方式。
+
+
+Attempt2 使用完全独立source、platform、Harness及Console空间，文档基线fb1449e不含旧业务实现。IssueAgent真实空提交ae8c303后创建PR2，正常指派PR Agent后真实实现并自行publish 1af8086，strict Clippy/build及实际模型publish证明ignored clean修复已消费。根独立初始CLI验收通过原需求，补充发现损坏结构[]触发AttributeError；正常人类反馈加关联Issue设计变更后模型实际提交并publish d639ff30，根10次CLI核对通过重复标题唯一ID、list --all状态、归档、持久化和损坏结构友好错误。
+
+Pending普通讨论经过真实stop/restart，仅组合成一个event_count2的新turn，先前turn未重复执行。公开stop终态stopped且平台仍在线；Collector真实native process wait记录2624/2625分别PR PID97663、Issue PID92107，graceful_eof exited、ExitStatus0/code0，不能仅从Session span confirmed推导该事实。证据builtin-attempt2/raw/waiting-stop-child-exit-otlp.json。当前正文更新前读取PRturn为running，实际编辑后旧turn interrupted、新session接续，context reset applied；完整前后证据active-pr-body-change.json、active-pr-body-reset-observed.json。
+
+定向原生toolCall核对确认Agent实际写过系统/tmp：/tmp/issue1-design.md、/tmp/pr1-body.md、/tmp/notes-evidence/*等。29个含/tmp的实际调用原件保留system-tmp-tool-facts.json，未展开assistant/CoT，也未删除原文件。本轮Mac存储合规为failed，不用后来WorkSSD澄清抵销。已正常人类评论及PR正文明确后续所有数据、临时、材料、缓存必须WorkSSD且禁止/tmp；GitHub后续两个Profile实际原生指令也冻结同约束。
+
+Console首次Diff对象详情与稍后diff响应竞态身份原件由browser保留。平台API修复为单次读PR快照，以不可变head/base OID生成diff并同响应number/revision/headCommit/baseCommit，不在生成后重新读取标签；Console UI由独立owner消费并标明过期。strict Clippy/build已通过，尚待正常停止部署和实际读回。
+
+
+Diff身份修复实际部署SHA3dc0187b6cb9799714a076d14ad885eef1ef302c1c05d0ac41d7860b9688bdf2后，浏览器独立确认固定revision14/head d639ff30/base fb1449e及旧详情读取revision15的过期提示。系统提示重读设计改用object context，真实PRg2 toolResult92700617含可见marker与list --all、隐藏marker不存在；根独立定向确认。这只证明canonical重读，原rawshow含隐藏HTML事实不抹去。提示变化导致旧session instruction_revision不兼容并blocked，整体readytrue不是这些session可resume证明；正常同actor重新指派建立g2/g3新代次，未绕过旧兼容门控。
+
+真实activecap在内存保留后，同actor重指派再使用正确revision+旧cap提交迟到comment，实际409具体stale/revoked原因，原件sameactor-reassign-late-writer.json无token。PRg2最终retired、g3active；正常close使真实finalization turn01a12a22-9a28…completed、g3retired。首次finalizer object context因Gateway将纯读也置于grant门控后而拒绝，原件closed-finalizer-read-rejection.json。纯List/Show/Context/Diff/Receipt现位于write admission前，保留BuiltinClient持久space绑定、所有写入原身份/grant门控；严格Clippy/build通过，SHAb530f0a47ebc1e490979be8036b272d5859fd60fd32374ce50f435b2bd44762a实际部署。
+
+正常reopen后真实turn01a12a26-00dc…running时公开active stop，终态stopped/errornull；Collector真实child wait记录保留readonly-fix-active-stop-native-exits.json，未以DBinterrupted替代exit proof。根合格固定d639ff30候选通过正常operator merge采纳，main真实merge77c8f50a5323756dc85d7a8e7f2dde2d91526c6f，根独立两parent/tree读回确认。合并后immutable detail=merged事件却仍pending，Store只选择closed/reopened、prepare也仅closed，Group不能进入finalization；原件merged-pending-before-lifecycle-fix.json保留。已必要共享修复完整三边界接受merged同闭合终态，不用伪closed事件替代，strictClippy通过，最终部署/自然finalizer在途。
+
+仅本任务tool命令证明且mtime位于attempt2的22个系统临时文件已元数据/hash校验、保留WorkSSD raw/recovered-system-tmp后移走，两个目录不递归删；crossproc/notes.json经原脚本STORE_DIR/STORE确切变量证明追加回收，manifest保存。搬迁不追认本轮存储合规通过。
+
+
+完整merged修复严格Clippy/build通过，最终实际二进制SHA81f963d0d5b7b4597e3707527deb0e01c4775f99197e7be242b82e84a556ccd9。Harness投影在新merged事件将状态规范为merged；已admitted原pending merge在prepare事务依据不可变detailmerged投影同事实，保留eventID/detail/cursor，并由现有closed降级保护维持该终态。原merge只开启一次finalization，PRturn01a12a2b-aa03…真实completed后assignment/agent/currentprovider session/worktree全retired；Issue正常close的finalization01a12a2b-d62b…completed后sleeping，不混同永久退休。
+
+Merged finalizer实际调用object context成功，toolResult7dee10fa/302aa82c保留filtered投影事实，没有恢复writergrant。根请求实际closedwrite时finalizer刚已terminal，直接活跃身份CLI项目为unavailable；未伪造活跃会话。随后通过原真实授予requestId公开幂等读取原cap（不新mint，不保留/展示token），原actor与正确currentrevision提交闭合PR迟到comment，HTTP409具体stale/revoked拒绝。此前回执tuple错误/附lifecycle字段HTTP422和证据formatterKeyError均保留在merged-actual-cap-late-write-rejection.json中，不当fencing证明。
+
+Postmerged普通人类评论正常被平台接受，quiet30后PRturn总数仍9；正常stop/restart再quiet30仍9，没有重复merge finalization或PR再激活。首次操作者restart传null generation导致HTTP409（门控正确），改用实际stopped generation后正常受理，原错误保留retired-restart.json。最后publicstop终态stopped/errornull，平台Issue1closedrev9/PR2merged closedrev22及Collector11193条记录仍在线可读，raw/final-stop-platform-collector-retained.json保存。最后有模型代次01a12a2b-a7cf…Pi真实wait11001 IssuePID33110、11154 PRPID33111均graceful_eof/exited/ExitStatus0/code0；最后新代无native激活后stop正常完成。
+
+内建实际产品闭环及批准矩阵已完成；首attempt1 failed/unknown、attempt2系统盘违规failed、rawshow含隐藏HTML的范围事实均保持，不能把修复后完成称为全程无故障或存储合规通过。固定业务候选1af8086→设计/[]修复d639ff30→实际合并77c8f50a；根独立应用CLI及Git采纳身份取证另见qualification-results.md。GitHub阶段须沿用最终同版二进制并冻结两Profile明确WorkSSD实体路径约束，网络/App由其稳定owner启动。
+
+
+本轮原生SDK usage仅metadata、按responseId去重：Builtin attempt1 input56908/output21881/cacheRead1423468/total1502257，冻结价格估算RMB0.90116376；全隔离attempt2 input289415/output80919/cacheRead4711772/total5082106，估算RMB3.26643534。input2.10/output8.40/cache-read0.42 RMB/M token，账号实际扣费未知，nativecost0不当免费；分项原件分别builtin/raw/native-usage-aggregate.json和builtin-attempt2/raw/native-usage-aggregate.json。原生文件数量不替代Braid角色或完整恢复身份。
+
+
+最终原件验收后旧14318 Console正常结束exit1，保留具体原stop unconfirmed/Pi child exit timed out错误及DB blocked/unknown；服务器退出不追认旧native正常停止。18282/19282平台与14318/19318 Console均实际无监听，原件保留。退出及资源事实归github-attempt2/raw/final-console-process-exit.json。

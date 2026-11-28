@@ -41,9 +41,9 @@ pub(crate) fn enqueue_context_pressure_status(
     profile: &Profile,
     assignment_id: &str,
     rendered: &RenderedContext,
-) -> Result<()> {
+) {
     if profile.status_surfaces.is_empty() {
-        return Ok(());
+        return;
     }
     let body = match rendered.pressure {
         ContextPressure::Soft => format!(
@@ -58,8 +58,9 @@ pub(crate) fn enqueue_context_pressure_status(
              The complete Context is {} bytes; the configured hard limit is {} bytes. Braid started no provider session or turn and supplied no partial, truncated, or generated summary. Reduce the GitHub Context or raise the Profile limit, then activate a new generation.",
             profile.id, rendered.bytes, profile.github_context_hard_bytes,
         ),
-        ContextPressure::Normal => return Ok(()),
+        ContextPressure::Normal => return,
     };
-    store.enqueue_assignment_operational_status(assignment_id.into(), body)?;
-    Ok(())
+    if let Err(error) = store.enqueue_assignment_operational_status(assignment_id.into(), body) {
+        tracing::error!(%error, assignment_id, "cannot record Context pressure for publication");
+    }
 }
