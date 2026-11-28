@@ -37,8 +37,15 @@ fn provider_route_inputs_are_validated_at_cli_and_config_boundaries() {
         .output()
         .expect("run init without provider and credential kind");
     assert!(!output.status.success());
-    for required in ["--llm-provider <ID>", "--llm-credential-kind <api_key|oauth|none>"] {
-        assert!(stderr(&output).contains(required), "{required}: {}", stderr(&output));
+    let diagnostic = stderr(&output);
+    let error =
+        diagnostic.lines().take_while(|line| !line.starts_with("Usage:")).collect::<Vec<_>>();
+    for required in [
+        "--llm-provider <ID>",
+        "--llm-credential-kind <api_key|oauth|none>",
+        "--llm-base-url <URL>",
+    ] {
+        assert!(error.iter().any(|line| line.trim() == required), "{required}: {diagnostic}");
     }
 
     let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
@@ -87,22 +94,19 @@ fn provider_route_inputs_are_validated_at_cli_and_config_boundaries() {
 fn schema3_rejects_legacy_provider_surfaces() {
     let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
     let example_text = fs::read_to_string(&example).expect("read example");
-    for (name, fragment, expected) in [
-        (
-            "environment",
-            "[[llm_providers]]\n\nid = \"example-llm\"\n\napi_key_environment = \"DEEPSEEK_API_KEY\"\n\n[tools]",
-            "unknown field `api_key_environment`",
-        ),
-        (
-            "api_key_file",
-            "[[llm_providers]]\nid = \"example-llm\"\napi_key_file = \"/absolute/path/to/user/secrets/example-llm.toml\"\n\n[tools]",
-            "uses legacy api_key_file",
-        ),
+    for (field, value, expected) in [
+        ("api_key_environment", "PROVIDER_KEY", "unknown field `api_key_environment`"),
+        ("api_key_file", "/absolute/path/to/key.toml", "uses legacy api_key_file"),
     ] {
         let path = std::env::temp_dir()
-            .join(format!("braid-legacy-{name}-config-{}.toml", std::process::id()));
-        fs::write(&path, example_text.replacen("[tools]", fragment, 1))
-            .expect("write legacy config");
+            .join(format!("braid-legacy-{field}-config-{}.toml", std::process::id()));
+        let mut config: toml::Table = toml::from_str(&example_text).unwrap();
+        let provider = toml::Table::from_iter([
+            ("id".into(), "example-llm".into()),
+            (field.into(), value.into()),
+        ]);
+        config.insert("llm_providers".into(), vec![toml::Value::Table(provider)].into());
+        fs::write(&path, toml::to_string(&config).unwrap()).expect("write legacy config");
         let output = braid()
             .args(["config", "check", "--config"])
             .arg(&path)
@@ -466,9 +470,12 @@ fn provider_import_auth_converts_pi_credentials() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("has no credential for \"missing\""), "{}", stderr(&output));
 
+    fs::write(&pi_auth, r#"{"example-llm":{"type":"api_key","key":"rotated"}}"#)
+        .expect("rotate the source credential");
     let output = import("example-llm").output().expect("reject overwrite without force");
     assert!(!output.status.success());
     assert!(stderr(&output).contains("already exists"), "{}", stderr(&output));
+    assert_eq!(fs::read_to_string(&imported).unwrap(), text);
 
     #[cfg(unix)]
     {
@@ -479,6 +486,8 @@ fn provider_import_auth_converts_pi_credentials() {
             import("example-llm").arg("--force").output().expect("replace an existing credential");
         assert!(output.status.success(), "{}", stderr(&output));
         assert_eq!(fs::metadata(&imported).expect("metadata").permissions().mode() & 0o777, 0o600);
+        let rotated: toml::Value = toml::from_str(&fs::read_to_string(&imported).unwrap()).unwrap();
+        assert_eq!(rotated["provider_api_key"].as_str(), Some("rotated"));
     }
 
     // BRAID_USER_HOME is honored without an explicit --user-home flag.

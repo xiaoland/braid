@@ -1,9 +1,4 @@
-#![allow(dead_code)]
-
-#[path = "../src/worktree.rs"]
-mod worktree;
-
-use std::path::Path;
+use super::*;
 
 fn initialize(path: &Path) {
     let repository = git2::Repository::init(path).unwrap();
@@ -23,7 +18,7 @@ async fn existing_target_must_share_the_requested_source_repository() {
     initialize(&source);
     initialize(&wrong);
     let git = which::which("git").unwrap();
-    let mut request = worktree::WorktreeRequest {
+    let mut request = WorktreeRequest {
         source: &source,
         target: &wrong,
         repository: "owner/repository",
@@ -33,16 +28,32 @@ async fn existing_target_must_share_the_requested_source_repository() {
         head_ref: "main",
         local_branch: "main",
     };
-    assert!(matches!(
-        worktree::provision(&request),
-        Err(worktree::WorktreeError::TargetConflict(_))
-    ));
+    assert!(matches!(provision(&request), Err(WorktreeError::TargetConflict(_))));
 
     request.target = &target;
     request.local_branch = "agent";
-    let created = worktree::provision(&request).unwrap();
+    let created = provision(&request).unwrap();
     assert_eq!(created.path, target.canonicalize().unwrap());
-    assert_eq!(worktree::provision(&request).unwrap().path, created.path);
+    assert_eq!(provision(&request).unwrap().path, created.path);
+    std::fs::create_dir(target.join(".braid")).unwrap();
+    std::fs::write(target.join(".braid/private-note"), "private").unwrap();
+    std::fs::write(target.join("change.txt"), "public").unwrap();
+    let status = std::process::Command::new(&git)
+        .arg("-C")
+        .arg(&target)
+        .args([
+            "-c",
+            "core.excludesfile=/dev/null",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert_eq!(String::from_utf8(status.stdout).unwrap(), "?? change.txt\n");
+    request.local_branch = "different-agent";
+    assert!(matches!(provision(&request), Err(WorktreeError::TargetConflict(_))));
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -53,16 +64,15 @@ fn github_remote_identity_is_exact() {
         "ssh://git@github.com/owner/repo.git",
         "git@github.com:owner/repo.git",
     ] {
-        assert_eq!(worktree::normalized_github_repository(remote).as_deref(), Some("owner/repo"));
+        assert_eq!(normalized_github_repository(remote).as_deref(), Some("owner/repo"));
     }
     for remote in
         ["https://example.invalid/owner/repo.git", "https://github.com/owner/repo/issues/1"]
     {
-        assert_eq!(worktree::normalized_github_repository(remote), None);
+        assert_eq!(normalized_github_repository(remote), None);
     }
-    assert_ne!(
-        worktree::normalized_github_repository("https://github.com/owner/repo-backup.git")
-            .as_deref(),
-        Some("owner/repo")
+    assert_eq!(
+        normalized_github_repository("https://github.com/owner/repo-backup.git").as_deref(),
+        Some("owner/repo-backup")
     );
 }

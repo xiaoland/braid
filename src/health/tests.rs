@@ -59,7 +59,39 @@ async fn health_tracks_each_repository_and_kind_independently() {
     reports.push(("owner/one", Issue, None));
     let recovered = aggregate(&reports).await;
     assert_eq!(recovered.provider, "connected");
-    assert_eq!(recovered.last_error, None);
+}
+
+#[tokio::test]
+async fn provider_recovery_clears_its_own_diagnostic_and_preserves_another_workers_error() {
+    for other_error in [None, Some("reconciliation failed")] {
+        let health = health("builtin");
+        let (_stop, shutdown) = watch::channel(false);
+        let (availability, reports) = watch::channel(ProviderAvailability::Starting);
+        let worker = tokio::spawn(provider_health_worker(health.clone(), reports, shutdown));
+        availability.send_replace(ProviderAvailability::Unavailable {
+            since: tokio::time::Instant::now(),
+            error: "provider failed".into(),
+        });
+        // The projection must have published the failure before the recovery
+        // report: a watch receiver can legally coalesce adjacent updates.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while health.snapshot().provider != "unavailable" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("health must publish the initial provider failure");
+        assert_eq!(health.snapshot().last_error.as_deref(), Some("provider failed"));
+        if let Some(other) = other_error {
+            health.update(|snapshot| snapshot.last_error = Some(other.into()));
+        }
+        availability.send_replace(ProviderAvailability::Connected);
+        drop(availability);
+        worker.await.unwrap();
+        let recovered = health.snapshot();
+        assert!(recovered.ready);
+        assert_eq!(recovered.last_error.as_deref(), other_error);
+    }
 }
 
 #[tokio::test]

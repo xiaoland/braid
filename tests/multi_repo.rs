@@ -102,3 +102,85 @@ fn multi_repository_config_requires_repo_scoped_profiles() {
     }
     fs::remove_dir_all(&temporary).unwrap();
 }
+
+#[test]
+fn instance_selectors_route_to_the_expected_config_and_doctor_names_cross_instance_conflicts() {
+    let home = std::env::temp_dir().join(format!("braid-instances-{}", uuid::Uuid::now_v7()));
+    let mut entries = Vec::new();
+    for (key, app_id, schema) in [("first", 100, 3), ("second", 200, 2)] {
+        let directory = home.join(key);
+        fs::create_dir_all(&directory).unwrap();
+        let mut config: toml::Value =
+            toml::from_str(include_str!("../config.example.toml")).unwrap();
+        config["schema_version"] = schema.into();
+        config["instance"]["key"] = key.into();
+        config["github"]["app_id"] = app_id.into();
+        config["github"]["private_key_file"] =
+            directory.join("missing.pem").to_str().unwrap().into();
+        config["runtimes"][0]["executable"] = "/usr/bin/false".into();
+        config["tools"]["gh"] = "/usr/bin/false".into();
+        config["tools"]["wrangler"] = "/usr/bin/false".into();
+        fs::write(directory.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
+        entries.push(format!(
+            "[[instances]]\nkey='{key}'\nhome='{key}'\ngithub_app_id={app_id}\nrepository='owner/repository'\n"
+        ));
+    }
+    fs::write(
+        home.join("registry.toml"),
+        format!("schema_version=1\ndefault_instance='first'\n{}", entries.join("\n")),
+    )
+    .unwrap();
+    let second_dir = home.join("second");
+    let first_config = home.join("first/config.toml");
+    let command = || {
+        let mut command = braid();
+        command.env_clear().env("PATH", "/usr/bin:/bin").env("BRAID_USER_HOME", &home);
+        command
+    };
+    for (args, instance, override_home, expected) in [
+        (vec![], None, None, "first"),
+        (vec![], Some("second"), None, "second"),
+        (vec!["--instance", "second"], Some("first"), None, "second"),
+        (vec!["--instance", "first"], None, Some(&second_dir), "second"),
+        (
+            vec!["--config", first_config.to_str().unwrap()],
+            Some("second"),
+            Some(&second_dir),
+            "first",
+        ),
+    ] {
+        let mut command = command();
+        if let Some(value) = instance {
+            command.env("BRAID_INSTANCE", value);
+        }
+        if let Some(value) = override_home {
+            command.env("BRAID_INSTANCE_HOME", value);
+        }
+        let output = command.args(["config", "check", "--json"]).args(args).output().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(summary["instance_key"], expected);
+        assert_eq!(
+            summary["database"],
+            home.join(expected).join("state/braid.sqlite3").to_str().unwrap()
+        );
+    }
+    let output = command().args(["status", "--instance", "second", "--json"]).output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["config_schema"], 2);
+    let output = command().args(["doctor", "--json"]).output().unwrap();
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let ports = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "instance ports")
+        .unwrap();
+    assert_eq!(ports["state"], "fail");
+    let detail = ports["detail"].as_str().unwrap();
+    assert!(detail.contains("8080 on second ingress"), "{detail}");
+    assert!(detail.contains("8081 on second health"), "{detail}");
+    fs::remove_dir_all(home).unwrap();
+}

@@ -41,7 +41,7 @@ if [ "$1" = "api" ] && [ "$2" = "user" ]; then
 fi
 case "$2" in
   app-manifests/*/conversions)
-    if [ -n "$BRAID_TEST_CONVERSIONS" ]; then touch "$BRAID_TEST_CONVERSIONS"; fi
+    printf '%s\n' "$2" >> "$BRAID_TEST_CONVERSIONS"
     cat <<'JSON'
 {"id":123456,"slug":"braid-of-testuser","name":"braid-of-testuser","pem":"-----BEGIN PRIVATE KEY-----\nTEST\n-----END PRIVATE KEY-----\n","webhook_secret":"webhook","html_url":"https://github.com/apps/braid-of-testuser"}
 JSON
@@ -81,6 +81,9 @@ fn setup_command(fake_bin: &Path, home: &Path) -> Command {
     let path = format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap_or_default());
     command
         .env("PATH", path)
+        .env("TMPDIR", fake_bin)
+        .env("BRAID_TEST_BROWSER", fake_bin.join("browser-opened"))
+        .env("BRAID_TEST_CONVERSIONS", fake_bin.join("conversions"))
         .args(["setup", "testuser/repository", "--adapter", "pi", "--instance", "demo"])
         .arg("--user-home")
         .arg(home);
@@ -121,12 +124,9 @@ fn no_browser_setup_can_be_completed_from_callback_url() {
 
     let draft_path = home.join("setup-drafts/demo.toml");
     let draft = fs::read_to_string(&draft_path).expect("read setup draft");
-    assert!(draft.contains("repository = \"testuser/repository\""), "{draft}");
-    let state = draft
-        .lines()
-        .find_map(|line| line.strip_prefix("state = \"")?.strip_suffix('\"'))
-        .expect("draft state")
-        .to_owned();
+    let draft: toml::Value = toml::from_str(&draft).expect("decode saved draft");
+    assert_eq!(draft["repository"].as_str(), Some("testuser/repository"));
+    let state = draft["state"].as_str().expect("saved callback state");
 
     let wrong = setup_command(&fake_bin, &home)
         .args([
@@ -145,11 +145,12 @@ fn no_browser_setup_can_be_completed_from_callback_url() {
     assert!(!wrong.status.success());
     assert!(stderr(&wrong).contains("state does not match"), "{}", stderr(&wrong));
 
+    let conversions = fake_bin.join("conversions");
+    assert!(!conversions.exists(), "invalid state must leave the one-use code unconsumed");
     let callback = format!("http://127.0.0.1/callback?code=code123&state={state}");
     let output = setup_command(&fake_bin, &home)
         .current_dir(&fake_bin)
         .env("BRAID_TEST_AVATAR_URL", avatar_url)
-        .env("BRAID_TEST_BROWSER", temporary.join("browser-opened"))
         .args([
             "--model",
             "example-chat",
@@ -169,22 +170,26 @@ fn no_browser_setup_can_be_completed_from_callback_url() {
     assert!(!draft_path.exists());
     assert!(home.join("instances/demo/braid-of-testuser-logo.png").is_file());
     avatar_server.join().expect("avatar server");
-    assert!(!temporary.join("browser-opened").exists());
+    assert!(!fake_bin.join("browser-opened").exists());
+    assert_eq!(fs::read_to_string(conversions).unwrap(), "app-manifests/code123/conversions\n");
     assert_eq!(
         fs::read_to_string(home.join("instances/demo/secrets.toml")).expect("webhook secret"),
         "webhook_secret = \"webhook\"\n"
     );
     assert!(stdout(&output).contains("braid migrate apply --instance demo"));
 
-    let config = home.join("instances/demo/config.toml");
-    assert!(config.is_file());
     let output = braid()
-        .args(["config", "check", "--config"])
-        .arg(&config)
+        .env_remove("BRAID_CONFIG")
+        .env_remove("BRAID_INSTANCE_HOME")
+        .env("BRAID_USER_HOME", &home)
+        .args(["config", "check", "--instance", "demo", "--json"])
         .output()
-        .expect("check completed config");
-    let _ = fs::remove_dir_all(&temporary);
+        .expect("resolve the newly registered instance");
     assert!(output.status.success(), "{}", stderr(&output));
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["instance_key"], "demo");
+    assert_eq!(summary["repository"], "testuser/repository");
+    let _ = fs::remove_dir_all(&temporary);
 }
 
 #[test]

@@ -221,3 +221,6 @@ pub(crate) fn normalized_github_repository(remote: &str) -> Option<String> {
     let repository = path.strip_suffix(".git").unwrap_or(path).trim_matches('/');
     (repository.split('/').count() == 2).then(|| repository.to_ascii_lowercase())
 }
+
+#[cfg(test)]
+mod tests;
