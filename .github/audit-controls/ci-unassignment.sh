@@ -62,3 +62,28 @@ for test_case in builtin_turn_runs_without_writer_service_and_cannot_mint_after_
 done
 restore
 file=
+mutate() {
+  python3 - "$file" "$1" "$2" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1])
+old,new=sys.argv[2:]
+s=p.read_text()
+assert s.count(old)==1, (p,old,s.count(old))
+p.write_text(s.replace(old,new))
+PY
+}
+reset_case=retired_reset_history_cannot_replace_an_execution_or_block_a_finite_run
+file=src/store/mod.rs
+mutate "AND a.lifecycle!='retired' AND w.kind=?1 AND ai.profile_id=?2" 'AND w.kind=?1 AND ai.profile_id=?2'
+catch_control Cargo.toml "$reset_case" 'a retired generation cannot start replacement execution'
+restore
+file=src/store/run_progress.rs
+mutate " AND a.lifecycle!='retired'" ''
+catch_control Cargo.toml "$reset_case" 'retired reset history is no longer outstanding work'
+restore
+file=src/store/mod.rs
+mutate ' || missing_terminals > 0' ''
+catch_control Cargo.toml "$case_name" 'an unobserved turn terminal must publish the configured operational status'
+restore
+file=
