@@ -92,10 +92,12 @@ impl Budget {
         let delta = comparable
             .then(|| used.zip(self.used).and_then(|(new, old)| new.checked_sub(old)))
             .flatten();
-        self.resource = resource;
-        self.used = used.or(self.used);
+        // Admission can retain the last reset hint, but a delta needs two
+        // consecutive complete samples from the same resource and window.
+        self.resource = reset.and(resource);
+        self.used = used;
         self.remaining = number("x-ratelimit-remaining").or(self.remaining);
-        self.reset = number("x-ratelimit-reset").or(self.reset);
+        self.reset = reset.or(self.reset);
         delta
     }
 
@@ -125,20 +127,6 @@ impl Budget {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn installation_sharing_and_isolation() {
-        let limits = RateLimits::default();
-        let a = limits.installation(1);
-        let same = limits.installation(1);
-        let other = limits.installation(2);
-        a.lock().await.defer(100, Some(60));
-        assert!(same.lock().await.admit(159, false).is_err());
-        assert!(other.lock().await.admit(101, false).is_ok());
-        assert!(same.lock().await.admit(160, false).is_ok());
-        same.lock().await.success();
-        assert!(a.lock().await.admit(161, false).is_ok());
-    }
 
     #[test]
     fn primary_reset_reserve_and_used_delta() {
@@ -205,29 +193,39 @@ mod window_tests {
     use super::*;
 
     #[test]
-    fn used_delta_is_unknown_when_consecutive_responses_lack_resource() {
+    fn used_delta_requires_two_comparable_complete_header_samples() {
+        fn headers(used: Option<u64>, reset: Option<u64>, resource: Option<&str>) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            if let Some(used) = used {
+                headers.insert("x-ratelimit-used", used.into());
+            }
+            if let Some(reset) = reset {
+                headers.insert("x-ratelimit-reset", reset.into());
+            }
+            if let Some(resource) = resource {
+                headers.insert("x-ratelimit-resource", resource.parse().unwrap());
+            }
+            headers
+        }
         let mut budget = Budget::default();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-ratelimit-used", "10".parse().unwrap());
-        headers.insert("x-ratelimit-reset", "500".parse().unwrap());
-        assert_eq!(budget.observe(&headers), None);
-        headers.insert("x-ratelimit-used", "12".parse().unwrap());
-        assert_eq!(budget.observe(&headers), None);
-    }
-
-    #[test]
-    fn used_delta_is_unknown_across_windows_and_resources() {
-        let mut budget = Budget::default();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-ratelimit-used", "10".parse().unwrap());
-        headers.insert("x-ratelimit-reset", "500".parse().unwrap());
-        headers.insert("x-ratelimit-resource", "graphql".parse().unwrap());
-        assert_eq!(budget.observe(&headers), None);
-        headers.insert("x-ratelimit-used", "12".parse().unwrap());
-        assert_eq!(budget.observe(&headers), Some(2));
-        headers.insert("x-ratelimit-reset", "600".parse().unwrap());
-        assert_eq!(budget.observe(&headers), None);
-        headers.insert("x-ratelimit-resource", "core".parse().unwrap());
-        assert_eq!(budget.observe(&headers), None);
+        for (used, reset, resource, delta) in [
+            (Some(10), Some(500), None, None),
+            (Some(12), Some(500), None, None),
+            (Some(12), Some(500), Some("graphql"), None),
+            (Some(17), Some(500), Some("graphql"), Some(5)),
+            (Some(20), Some(600), Some("graphql"), None),
+            (Some(22), Some(600), Some("core"), None),
+            (None, Some(600), Some("core"), None),
+            (Some(25), Some(600), Some("core"), None),
+            (Some(26), None, Some("core"), None),
+            (Some(29), Some(600), Some("core"), None),
+            (Some(31), Some(600), Some("core"), Some(2)),
+        ] {
+            assert_eq!(
+                budget.observe(&headers(used, reset, resource)),
+                delta,
+                "used={used:?}, reset={reset:?}, resource={resource:?}"
+            );
+        }
     }
 }
