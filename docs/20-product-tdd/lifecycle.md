@@ -151,9 +151,13 @@ the exact Trusted Braid Mention comment owns a turn cycle:
 | transport/provider outcome unknown | `eyes`, `rocket` plus Operational Status Comment |
 
 Ordinary turns never receive `rocket`, `+1`, or `confused`. Braid manages only
-its own App reactions and never removes Human reactions. Reaction writes are
-desired-state outbox operations; target deletion produces a tombstone, not a
-replacement comment.
+its own App reactions. Event admission records `eyes` with the exact reaction
+target. Native start, terminal, and Context reset record their feedback with the
+corresponding turn transition. The publisher consumes those durable requests and
+owns the outbox attempts and receipts. An accepted event and a recorded turn
+transition remain available during an outbox failure. A reset retains the
+request to clear `rocket` before its remote ID is known, so a late successful
+receipt can still be removed. Target deletion produces a tombstone.
 
 ## Provider and Transport Unknown
 
@@ -164,7 +168,7 @@ replacement comment.
 成功取得 adapter 的原生停止回执后，Harness 按原会话持久保存停止事实。Context
 reset 或 reopen 可以凭原句柄取得新回执，或在冷启动后使用为旧会话保存的回执。
 进入 reset_pending 或 idle 本身不能证明停止。同一物理会话恢复前先清除旧停止
-记录。旧 grant 失效与原生停止分别尝试并确认，两项都成立才允许替代。
+记录。内建平台封禁旧执行代次与原生停止分别尝试并确认，两项都成立才允许替代。
 重放只接续 canonical Event References，旧执行已发生的外部副作用继续保留。
 
 Context reset 可以记录待物化状态，但只有旧执行停止成功才创建替代会话。Pi 锁定材料先
@@ -232,7 +236,7 @@ Responsibilities do not overlap:
 
 ## 有限 root 运行
 
-`run` 复用 built-in workers、provider、撤权与 shutdown，独立的 Harness ledger
+`run` 复用 built-in workers、provider、执行封禁与 shutdown，独立的 Harness ledger
 隔离当前 run 与常驻 serve 的旧指派。平台原子保存父子 Issue，固定 root 的 run ID、Harness client 身份和交付 ref，
 并据此扩展协调 writer 的范围；执行身份和终态仍归 Harness，平台没有第二份运行工作图。
 仅注册 run root 的关闭会立即撤销整个后代范围 grants，普通 serve 的对象关系保持原合同。
@@ -244,8 +248,10 @@ root 的职责只在 run 中显式注入。子项生命周期、候选发布、�
 仍不要求公开应答或制造新一轮循环。统一准入在认领 turn 之前取得许可，并持续持有至
 真实 terminal、reset 或停止；限制的是在途 Braid turns，不是物理会话总数。
 
-root 开放时静默不形成终态。root 关闭后不再创建新的模型轮次，运行依据对象、交付 ref、
-未决写入和合并事实决定 completed 或具体 blocked，并使用现有停止屏障确认原生收尾。
+运行准备、事件摄取和开放 root 的轮询使用平台 SQLite 范围查询，读取成员和注册身份。
+root 开放时静默不形成终态。root 关闭后关闭执行准入，再读取包含交付 ref 和合并事实的
+报告，依据对象及未决写入决定 completed 或具体 blocked。交付 Git 读取失败保留明确
+诊断。终态使用执行封禁与原生停止屏障确认收尾。
 failed、stopped、blocked 与完成分开，停止确认不完整禁止覆盖执行。输入及执行
 相关的解析配置绑定 run ID。遥测配置可为该次执行单独调整，保留原始冻结文件；
 接续不得借同一身份更换需求、创建重复 root 或隐式接管无关工作。

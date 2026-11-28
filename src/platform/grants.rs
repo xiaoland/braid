@@ -24,6 +24,8 @@ pub struct GrantRequest {
     pub pending: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authority_cursor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -48,8 +50,8 @@ pub(crate) fn current_epoch(
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     let current = connection
         .query_row(
-            "SELECT epoch, lifecycle='active' FROM platform_grants
-         WHERE client_id=?1 AND item_number=?2 AND actor=?3",
+            "SELECT epoch,active FROM effective_platform_grants
+             WHERE client_id=?1 AND item_number=?2 AND actor=?3",
             params![identity.client_id, i64::try_from(identity.item_number)?, identity.actor],
             |row| Ok((row.get::<_, i64>(0)?, row.get(1)?)),
         )
@@ -78,16 +80,8 @@ pub fn validate(
 ) -> Result<()> {
     let valid: bool = connection.query_row(
         "WITH RECURSIVE owned(number) AS (
-            SELECT i.number FROM platform_grants g JOIN local_items i ON i.number=g.item_number
-            WHERE g.grant_id=?1 AND g.epoch=?2 AND g.token_sha256=?3
-            AND NOT EXISTS (
-                WITH RECURSIVE ancestors(number) AS (
-                    SELECT i.number UNION SELECT issue_number FROM local_links WHERE pr_number=i.number
-                    UNION SELECT p.parent_number FROM local_issue_parents p JOIN ancestors a ON p.child_number=a.number
-                ) SELECT 1 FROM ancestors a JOIN run_root_policies policy ON policy.root_number=a.number
-                  JOIN local_items root ON root.number=a.number WHERE root.state!='open' OR policy.client_id!=g.client_id
-            )
-            AND g.lifecycle='active' AND g.actor=?4 AND i.desired_profile=g.actor AND i.state='open'
+            SELECT g.item_number FROM effective_platform_grants g
+            WHERE g.grant_id=?1 AND g.epoch=?2 AND g.token_sha256=?3 AND g.actor=?4 AND g.active
             UNION SELECT p.child_number FROM local_issue_parents p JOIN owned o ON p.parent_number=o.number
         ), covered(number) AS (
             SELECT number FROM owned
@@ -119,6 +113,13 @@ pub fn change(
     let mut connection = Connection::open(database)?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if !revoke {
+        let execution_id = request
+            .execution_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("writer grant requires an execution attempt"))?;
+        super::execution::require_open(&tx, &request.client_id, execution_id)?;
+    }
     let payload = serde_json::to_string(&(request, revoke))?;
     let hash = digest(&payload);
     let receipt:Option<(String,String)>=tx.query_row("SELECT payload_sha256,response_json FROM control_receipts WHERE scope='grants' AND request_id=?1",[&request.request_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
@@ -138,15 +139,13 @@ pub fn change(
             .ok_or_else(|| anyhow::anyhow!("writer grant requires a captured authority cursor"))?;
         let cursor = i64::try_from(cursor)?;
         let policy = run_policy(&tx, request.item_number)?;
-        let root = policy.as_ref().map(|policy| i64::try_from(policy.root_number)).transpose()?;
         let (last_sequence, changed): (i64, bool) = tx.query_row(
             "SELECT COALESCE((SELECT MAX(event_id) FROM local_events),0),
-             EXISTS (
-                SELECT 1 FROM local_events WHERE event_id>?2
-                 AND ((item_number=?1 AND kind IN ('assign','unassign','lifecycle'))
-                      OR (item_number=?3 AND (kind='lifecycle' OR detail='run_policy')))
-             )",
-            params![number, cursor, root],
+             MAX(a.item_cursor, COALESCE(p.root_cursor,0))>?2
+             FROM local_writer_authority a
+             LEFT JOIN local_run_writer_authority p ON p.root_number=a.root_number
+             WHERE a.number=?1",
+            params![number, cursor],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         ensure!(cursor <= last_sequence, "writer authority cursor exceeds platform history");
@@ -224,7 +223,17 @@ pub fn change(
     let state = if revoke { "revoked" } else { "active" };
     let now =
         time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
-    tx.execute("INSERT INTO platform_grants(client_id,item_number,actor,grant_id,epoch,token_sha256,lifecycle,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8) ON CONFLICT(client_id,item_number,actor) DO UPDATE SET grant_id=excluded.grant_id,epoch=excluded.epoch,token_sha256=excluded.token_sha256,lifecycle=excluded.lifecycle,updated_at=excluded.updated_at",params![request.client_id,number,request.actor,grant_id,i64::try_from(epoch)?,digest(&token),state,now])?;
+    tx.execute(
+        "INSERT INTO platform_grants(client_id,item_number,actor,grant_id,epoch,token_sha256,lifecycle,
+                                     created_at,updated_at,execution_id,authority_cursor)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,?9,?10)
+         ON CONFLICT(client_id,item_number,actor) DO UPDATE SET grant_id=excluded.grant_id,
+         epoch=excluded.epoch,token_sha256=excluded.token_sha256,lifecycle=excluded.lifecycle,
+         updated_at=excluded.updated_at,execution_id=excluded.execution_id,
+         authority_cursor=excluded.authority_cursor",
+        params![request.client_id,number,request.actor,grant_id,i64::try_from(epoch)?,digest(&token),
+                state,now,request.execution_id,request.authority_cursor.map(i64::try_from).transpose()?],
+    )?;
     let result = if revoke {
         serde_json::json!({"epoch":epoch,"lifecycle":state})
     } else {

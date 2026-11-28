@@ -1,7 +1,7 @@
 //! A bounded root-task execution mode over the existing built-in Harness.
 use crate::{
     config::Config,
-    health::HealthSnapshot,
+    health::Health,
     platform::objects::{CommandRequest, ControlReceipt, ObjectCommand},
     store::{RunCommand, StoreActor},
 };
@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result, ensure};
 use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
-use tokio::sync::{RwLock, Semaphore, watch};
+use tokio::sync::{Semaphore, watch};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RunContext {
@@ -74,11 +74,10 @@ impl RunRequest {
             self.delivery_ref.starts_with("refs/heads/") && self.delivery_ref.len() > 11,
             "deliveryRef must be an explicit refs/heads/... reference"
         );
-        let status = std::process::Command::new(&config.tools.git)
-            .args(["check-ref-format", &self.delivery_ref])
-            .status()
-            .context("validate delivery Git ref")?;
-        ensure!(status.success(), "deliveryRef is not a valid Git reference");
+        ensure!(
+            git2::Reference::is_valid_name(&self.delivery_ref),
+            "deliveryRef is not a valid Git reference"
+        );
         Ok(())
     }
 }
@@ -141,7 +140,7 @@ pub(crate) async fn run_managed(
     config: Config,
     request: RunRequest,
     stop: watch::Receiver<bool>,
-    health: Arc<RwLock<HealthSnapshot>>,
+    health: Health,
 ) -> Result<RunResult> {
     request.validate(&config)?;
     match run_inner(config.clone(), request.clone(), stop, health).await {
@@ -195,7 +194,7 @@ async fn run_inner(
     mut config: Config,
     request: RunRequest,
     stop: watch::Receiver<bool>,
-    health: Arc<RwLock<HealthSnapshot>>,
+    health: Health,
 ) -> Result<RunResult> {
     request.validate(&config)?;
     let root = directory(&config, &request.run_id)?;
@@ -323,9 +322,8 @@ async fn run_inner(
         stop_confirmed: true,
     };
     save(&store, &request, &result)?;
-    let scope: crate::platform::objects::ScopeSnapshot =
-        client.get(&format!("api/platform/scope/{root_issue}")).await?;
-    if scope.root.state != "open" {
+    let boundary = client.scope_boundary(root_issue).await?;
+    if !boundary.root_open {
         let result = RunResult {
             run_id: request.run_id.clone(),
             root_issue,
@@ -337,16 +335,20 @@ async fn run_inner(
         save(&store, &request, &result)?;
         return Ok(result);
     }
-    if scope.delivery_ref.as_deref() != Some(&request.delivery_ref)
-        || scope.run_id.as_deref() != Some(&request.run_id)
-        || scope.client_id.as_deref() != Some(&client.binding.client_id)
-    {
+    let boundary = if boundary.matches_registration(
+        root_issue,
+        &request.run_id,
+        &client.binding.client_id,
+        &request.delivery_ref,
+    ) {
+        boundary
+    } else {
         let configured: ControlReceipt = client
             .post(
                 "api/control/commands",
                 &CommandRequest {
                     request_id: format!("run-{}-boundary", request.run_id),
-                    expected_revision: Some(scope.root.revision),
+                    expected_revision: Some(boundary.root_revision),
                     command: ObjectCommand::ConfigureRunRoot {
                         number: root_issue,
                         client_id: client.binding.client_id.clone(),
@@ -364,21 +366,20 @@ async fn run_inner(
             configured.state,
             configured.error
         );
-    }
-    let scope: crate::platform::objects::ScopeSnapshot =
-        client.get(&format!("api/platform/scope/{root_issue}")).await?;
+        client.scope_boundary(root_issue).await?
+    };
     let issue_profile = config
         .profiles
         .iter()
         .find(|p| p.has_tag("issue"))
         .context("configuration lacks Issue profile")?;
-    if scope.root.desired_profile.as_deref() != Some(&issue_profile.id) {
+    if boundary.assigned_actor.as_deref() != Some(&issue_profile.id) {
         let receipt: ControlReceipt = client
             .post(
                 "api/control/commands",
                 &CommandRequest {
-                    request_id: format!("run-{}-assign-{}", request.run_id, scope.root.revision),
-                    expected_revision: Some(scope.root.revision),
+                    request_id: format!("run-{}-assign-{}", request.run_id, boundary.root_revision),
+                    expected_revision: Some(boundary.root_revision),
                     command: ObjectCommand::Assign {
                         number: root_issue,
                         actor: issue_profile.id.clone(),

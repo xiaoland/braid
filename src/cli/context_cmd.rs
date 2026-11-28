@@ -38,7 +38,7 @@ pub async fn context(command: ContextCommand) -> Result<()> {
         )
     };
     let store = helpers::store(&config)?;
-    context::reconcile_local_state(&mut canonical, &store)?;
+    context::reconcile_local_state(&mut canonical, &store, Some(&client.identity().actor_node_id))?;
     let rendered = context::render(
         &canonical,
         profile.github_context_soft_ratio,

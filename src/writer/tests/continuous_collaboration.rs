@@ -38,6 +38,7 @@ pub(crate) fn revision(delivery: &str, body: &str) -> IngressEvent {
 
 fn state(version: &str, digest: char) -> CanonicalObjectState {
     CanonicalObjectState {
+        root_fields: None,
         metadata_digest: None,
         node_id: "item".into(),
         database_id: Some("1".into()),
@@ -80,6 +81,7 @@ async fn another_context_read_cannot_acknowledge_a_revision_before_delivery() {
     assert_eq!(f.store.processed_objects("item".into()).unwrap()[0].version, old_version);
     let observation = CanonicalObservation {
         unedited_creation: false,
+        created_at: None,
         work_item_node_id: "item".into(),
         work_item_kind: "issue",
         work_item_number: 1,
@@ -96,6 +98,7 @@ async fn another_context_read_cannot_acknowledge_a_revision_before_delivery() {
         author_login: Some("human".into()),
         body: Some("Current revised contract".into()),
         visible_body: Some("Current revised contract".into()),
+        root_edits: crate::context::RootEditEvidence::default(),
         title: Some("Design".into()),
         metadata_digest: None,
     };
@@ -337,62 +340,19 @@ fn an_additive_projection_does_not_replace_the_session_publication_fence() {
     assert_eq!(source.context_revision, "context");
 }
 
-#[tokio::test]
-async fn a_published_version_is_not_an_echo_after_a_human_changes_its_content() {
-    let f = Fixture::new(true);
-    let remote = Arc::new(Mutex::new(body_edit::BodyRemote::new(false)));
-    let (github, http) = body_edit::body_server(remote.clone()).await;
-    let edit = body_edit::accept(&f, &github).await;
-    f.drain(github.clone()).await;
-    assert_eq!(f.receipt(&edit.request_id).lifecycle, "applied");
-    let snapshot = remote.lock().unwrap().snapshot.clone();
-    let mut observed = CanonicalObservation {
-        unedited_creation: false,
-        work_item_node_id: "item".into(),
-        work_item_kind: "issue",
-        work_item_number: 1,
-        work_item_state: "open".into(),
-        repository_node_id: "repo".into(),
-        repository: "owner/repository".into(),
-        object_node_id: snapshot.node_id,
-        database_id: "1".into(),
-        object_kind: "issue",
-        version: snapshot.updated_at,
-        digest: "a".repeat(64),
-        lifecycle: "active",
-        author_node_id: Some("app".into()),
-        author_login: Some("braid[bot]".into()),
-        body: snapshot.body,
-        visible_body: None,
-        title: Some(snapshot.title),
-        metadata_digest: None,
-    };
-    assert!(
-        !reconcile::observation_is_external(&f.store, &observed, "edited", "app", &f.config)
-            .unwrap()
-    );
-    let published_body = observed.body.clone();
-    observed.body =
-        Some(format!("{}\n\nHuman changed the current contract", observed.body.unwrap()));
-    // Even an equal coarse timestamp is not evidence that the new content is ours.
-    assert!(
-        reconcile::observation_is_external(&f.store, &observed, "edited", "app", &f.config)
-            .unwrap()
-    );
-    // An exact body publication does not prove unrelated metadata was ours.
-    observed.body = published_body;
-    let mut prior = state(&observed.version, 'a');
-    prior.metadata_digest = Some("c".repeat(64));
-    f.store
-        .commit_observation(ObservationCommit {
-            basis: f.store.begin_observation("item".into()).unwrap(),
-            current: vec![prior],
-            events: vec![],
-            policy: SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 },
-        })
-        .unwrap();
-    observed.metadata_digest = Some("d".repeat(64));
+async fn observe_issue(
+    f: &Fixture,
+    github: &GitHubClient,
+    change_metadata: bool,
+) -> CanonicalObservation {
     let basis = f.store.begin_observation("item".into()).unwrap();
+    let locator = "owner/repository#1".parse().unwrap();
+    let issue = crate::context::materialize_issue(github, &locator, 100).await.unwrap();
+    let context = crate::context::CanonicalContext::Issue(issue);
+    let mut observed = crate::context::canonical_observations(&context).remove(0);
+    if change_metadata {
+        observed.metadata_digest = Some("d".repeat(64));
+    }
     let scope = ReconcileScope {
         work_item_node_id: "item".into(),
         work_item_kind: "issue",
@@ -402,13 +362,147 @@ async fn a_published_version_is_not_an_echo_after_a_human_changes_its_content() 
         repository_node_id: "repo".into(),
         repository: "owner/repository".into(),
     };
-    assert_eq!(
-        reconcile::reconcile_observations(&f.store, &github, &f.config, &scope, basis, &[observed])
-            .unwrap(),
-        1
-    );
-    assert_eq!(f.db().query_row("SELECT count(*) FROM events WHERE kind='invalidate' AND origin='reconciliation' AND requires_attention=1",[],|r|r.get::<_,i64>(0)).unwrap(),1);
-    http.abort();
+    reconcile::reconcile_observations(
+        &f.store,
+        github,
+        &f.config,
+        &scope,
+        basis,
+        std::slice::from_ref(&observed),
+    )
+    .unwrap();
+    observed
+}
+
+#[tokio::test]
+async fn root_edits_use_field_provenance_when_publication_evidence_is_unavailable() {
+    const BEFORE: &str = "2026-01-01T00:00:01Z";
+    const AFTER: &str = "2026-01-01T00:00:02Z";
+    for (mode, expected) in [
+        ("app-body", "origin_echo"),
+        ("app-title-body", "origin_echo"),
+        ("unknown-editor", "invalidate"),
+        ("mixed-same-second", "invalidate"),
+        ("missing-rename", "invalidate"),
+        ("wrong-rename-preimage", "invalidate"),
+        ("metadata", "invalidate"),
+    ] {
+        let f = Fixture::new(true);
+        let mut remote = body_edit::BodyRemote::new(false);
+        remote.snapshot.updated_at = BEFORE.into();
+        let remote = Arc::new(Mutex::new(remote));
+        let (github, task) = body_edit::body_server(remote.clone()).await;
+        let previous = observe_issue(&f, &github, false).await;
+        let previous_fields =
+            f.store.processed_objects("item".into()).unwrap().remove(0).root_fields.unwrap();
+        assert_eq!(Some(previous_fields.clone()), previous.root_fields());
+        {
+            let mut state = remote.lock().unwrap();
+            state.snapshot.updated_at = AFTER.into();
+            state.snapshot.body = Some("Revised design".into());
+            let mut evidence = json!({
+                "lastEditedAt": AFTER,
+                "editor": if mode == "unknown-editor" { Value::Null } else { json!({"id":"app"}) },
+                "titleHistory": {"nodes":[]},
+            });
+            if matches!(
+                mode,
+                "app-title-body" | "mixed-same-second" | "missing-rename" | "wrong-rename-preimage"
+            ) {
+                state.snapshot.title = "Renamed design".into();
+                if mode != "missing-rename" {
+                    evidence["titleHistory"]["nodes"] = json!([{
+                        "id":"rename", "createdAt":AFTER, "currentTitle":state.snapshot.title,
+                        "previousTitle":if mode == "wrong-rename-preimage" {"Unobserved title"} else {"Canonical"},
+                        "actor":{"id":if mode == "mixed-same-second" {"human"} else {"app"}},
+                    }]);
+                }
+            }
+            state.issue_edit_evidence = evidence.as_object().unwrap().clone();
+        }
+        f.db()
+            .execute_batch(
+                "ALTER TABLE publication_versions RENAME TO unavailable_publication_versions;
+             ALTER TABLE write_intents RENAME TO unavailable_write_intents;
+             ALTER TABLE github_write_outbox RENAME TO unavailable_write_outbox;",
+            )
+            .unwrap();
+        let current = observe_issue(&f, &github, mode == "metadata").await;
+        let edited: (String, bool) = f.db().query_row(
+            "SELECT kind,requires_attention FROM events WHERE detail='edited' AND object_node_id='item'",
+            [], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).unwrap();
+        assert_eq!(edited, (expected.into(), expected == "invalidate"), "{mode}");
+        let processed = f.store.processed_objects("item".into()).unwrap().remove(0);
+        assert_eq!(processed.root_fields, current.root_fields(), "{mode}");
+        assert_ne!(previous_fields.body_digest, processed.root_fields.unwrap().body_digest);
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn exact_native_edit_evidence_proves_only_the_fields_its_sender_changed() {
+    for (mode, expected) in [
+        ("app-with-body-preimage", "origin_echo"),
+        ("app-with-unproven-title", "invalidate"),
+        ("human-against-app-editor", "invalidate"),
+    ] {
+        let f = Fixture::new(true);
+        let mut remote = body_edit::BodyRemote::new(false);
+        remote.snapshot.updated_at = "2026-01-01T00:00:01Z".into();
+        let remote = Arc::new(Mutex::new(remote));
+        let (github, task) = body_edit::body_server(remote.clone()).await;
+        let previous = observe_issue(&f, &github, false).await;
+        let previous_body = previous.body.unwrap();
+        let update_time = "2026-01-01T00:00:02Z";
+        let new_body = "Updated design";
+        let title = if mode == "app-with-unproven-title" { "Human title" } else { "Canonical" };
+        let human = mode == "human-against-app-editor";
+        {
+            let mut state = remote.lock().unwrap();
+            state.snapshot.updated_at = update_time.into();
+            state.snapshot.body = Some(new_body.into());
+            state.snapshot.title = title.into();
+            if human {
+                state.issue_edit_evidence = json!({
+                    "lastEditedAt": update_time,
+                    "editor":{"id":"app"},
+                })
+                .as_object()
+                .unwrap()
+                .clone();
+            }
+        }
+        let mut native = revision("native-edit", new_body);
+        native.object_version = Some(update_time.into());
+        native.object_digest =
+            Some(crate::store::publication_digest("item", update_time, Some(title), new_body));
+        native.actor_node_id = Some(if human { "human" } else { "app" }.into());
+        if !human {
+            native.kind = EventKind::OriginEcho;
+            native.origin = "agent";
+            native.requires_attention = false;
+        }
+        native.raw_payload = serde_json::to_vec(&json!({
+            "changes":{"body":{"from":previous_body}}
+        }))
+        .unwrap();
+        f.store
+            .ingest_event(native, SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 })
+            .unwrap();
+        observe_issue(&f, &github, false).await;
+        let kind: String = f
+            .db()
+            .query_row(
+                "SELECT e.kind FROM deliveries d JOIN events e ON e.event_id=d.effect_event_id
+             WHERE d.delivery_guid LIKE 'reconcile-%' AND d.action='edited'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, expected, "{mode}");
+        task.abort();
+    }
 }
 
 #[tokio::test]
@@ -429,6 +523,7 @@ async fn native_association_changes_are_visible_without_a_root_version_change() 
     assert_eq!(before.body, after.body);
     assert_ne!(before.metadata_digest, after.metadata_digest);
     let prior = CanonicalObjectState {
+        root_fields: before.root_fields(),
         node_id: before.object_node_id,
         database_id: Some(before.database_id),
         object_kind: "pr".into(),

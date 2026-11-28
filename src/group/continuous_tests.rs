@@ -117,15 +117,34 @@ fn revision() -> IngressEvent {
 }
 
 #[tokio::test]
-async fn idle_revision_replaces_memory_then_starts_once_without_a_second_mention() {
+async fn soft_pressure_reset_replaces_memory_and_delivers_input_with_publication_unavailable() {
     let f = Fixture::new(true);
+    let mut config = f.config.clone();
+    config
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.id == "issue-codex")
+        .unwrap()
+        .github_context_soft_ratio = 0.000_01;
     let captured = Arc::new(Captured::default());
     let (github, http) = issue_context_server("The new contract: authorized Twitter User").await;
     let collaboration = Arc::new(CollaborationBackend::GitHub(github));
-    let spec = GroupSpec::new(GroupKind::Issue, &f.config, &f.store, "owner/repository").unwrap();
+    let spec = GroupSpec::new(GroupKind::Issue, &config, &f.store, "owner/repository").unwrap();
+    f.db()
+        .execute(
+            "UPDATE agent_instances SET profile_revision=?1",
+            [i64::try_from(spec.profile_record.revision).unwrap()],
+        )
+        .unwrap();
+    f.db()
+        .execute_batch(
+            "CREATE TRIGGER outbox_offline BEFORE INSERT ON github_write_outbox
+         BEGIN SELECT RAISE(ABORT, 'unavailable publisher'); END;",
+        )
+        .unwrap();
     let driver = worker::GroupDriver {
         store: &f.store,
-        config: &f.config,
+        config: &config,
         collaboration: &collaboration,
         spec: &spec,
         sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
@@ -141,6 +160,14 @@ async fn idle_revision_replaces_memory_then_starts_once_without_a_second_mention
     f.store.ingest_event(revision(), policy).unwrap();
     assert!(driver.materialize_next_context_reset().await);
     assert!(captured.memory.lock().unwrap()[0].contains("authorized Twitter User"));
+    assert_eq!(f.store.runtime_status().unwrap().agent_groups[0].context_pressure, "soft");
+    assert_eq!(
+        f.db()
+            .query_row("SELECT count(*) FROM operational_status_facts", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
     // Resetting an idle session is not an acknowledgement of the work input.
     assert_eq!(f.store.runtime_status().unwrap().batches.len(), 1);
     assert!(driver.start_next_agent_turn().await.is_none(), "ordinary revision must keep debounce");
@@ -164,6 +191,13 @@ async fn idle_revision_replaces_memory_then_starts_once_without_a_second_mention
             .unwrap(),
         1
     );
+    let publisher =
+        f.store.acquire_runtime_lease("runtime".into(), "publisher".into(), 60).unwrap();
+    assert!(f.store.claim_github_write(publisher.clone()).is_err());
+    f.db().execute_batch("DROP TRIGGER outbox_offline").unwrap();
+    let status = f.store.claim_github_write(publisher.clone()).unwrap().unwrap();
+    assert!(status.content.contains("complete Context without truncation"));
+    f.store.release_runtime_lease(publisher).unwrap();
     http.abort();
 }
 
@@ -429,7 +463,7 @@ async fn pending_idle_reset_without_native_stop_proof_cannot_launch_replacement(
 }
 
 #[tokio::test]
-async fn stopping_native_execution_does_not_wait_for_platform_revocation() {
+async fn stopping_native_execution_does_not_wait_for_execution_fence() {
     use axum::{
         Json, Router,
         http::StatusCode,
@@ -446,16 +480,16 @@ async fn stopping_native_execution_does_not_wait_for_platform_revocation() {
     let release = Arc::new(Notify::new());
     let routes = Router::new()
         .route("/api/platform/repository", get(|| async {
-            Json(serde_json::json!({"repository":"test-space","spaceId":"space","nodeId":"local:test-space","defaultBranch":"main"}))
+            Json(serde_json::json!({"repository":"test-space","spaceId":"space","executionFences":true,"nodeId":"local:test-space","defaultBranch":"main"}))
         }))
-        .route("/api/platform/grants/revoke", post({
+        .route("/api/platform/executions/fence", post({
             let (entered, release) = (entered.clone(), release.clone());
             move || {
                 let (entered, release) = (entered.clone(), release.clone());
                 async move {
                     entered.notify_one();
                     release.notified().await;
-                    (StatusCode::SERVICE_UNAVAILABLE, "writer service offline")
+                    (StatusCode::SERVICE_UNAVAILABLE, "fence service offline")
                 }
             }
         }));
@@ -468,14 +502,32 @@ async fn stopping_native_execution_does_not_wait_for_platform_revocation() {
         repository: "test-space".into(),
         endpoint: format!("http://{address}").parse().unwrap(),
     });
+    let lease = store.acquire_runtime_lease("runtime".into(), "fixture".into(), 60).unwrap();
     let collaboration = CollaborationBackend::Builtin(
-        crate::builtin::BuiltinClient::connect(&config, store.clone()).await.unwrap(),
+        crate::builtin::BuiltinClient::connect(&config, Arc::clone(&store))
+            .await
+            .unwrap()
+            .with_runtime(lease)
+            .unwrap(),
     );
     let spec = GroupSpec::new(GroupKind::Issue, &config, &store, "test-space").unwrap();
-    rusqlite::Connection::open(config.runtime.database()).unwrap().execute(
-        "INSERT INTO builtin_writer_grants(session_id,item_number,actor,request_id,epoch,lifecycle)
-         VALUES('provider',1,?1,'old-request',0,'pending')",
+    f.db().execute_batch(
+        "INSERT INTO repositories VALUES('local:test-space','test-space',1,'now');
+         INSERT INTO work_items(node_id,repository_node_id,kind,number,state,observed_at)
+           VALUES('fixture-item','local:test-space','issue',1,'open','now');
+         INSERT INTO assignments VALUES('fixture-assignment','fixture-item',1,'active','now',NULL);"
+    ).unwrap();
+    f.db().execute(
+        "INSERT INTO agent_instances(agent_id,assignment_id,profile_id,profile_revision,role,lifecycle)
+         SELECT 'fixture-agent','fixture-assignment',profile_id,revision,'issue','idle'
+         FROM profiles WHERE profile_id=?1",
         [&spec.profile.id],
+    ).unwrap();
+    f.db().execute(
+        "INSERT INTO provider_sessions(session_id,agent_id,provider_kind,provider_session_id,
+          context_revision,instruction_revision,lifecycle,started_at,builtin_execution_id,builtin_execution_owner)
+         VALUES('fixture-session','fixture-agent','codex','provider','memory','instructions','idle','now',?1,'fixture')",
+        [uuid::Uuid::now_v7().to_string()],
     ).unwrap();
     let captured = Arc::new(Captured::default());
     let driver = worker::GroupDriver {
@@ -500,8 +552,8 @@ async fn stopping_native_execution_does_not_wait_for_platform_revocation() {
         })
     })
     .await
-    .expect("native close must finish while the revoke response is withheld");
-    assert!(stop.unwrap_err().to_string().contains("writer revocation unconfirmed"));
+    .expect("native close must finish while the fence response is withheld");
+    assert!(stop.unwrap_err().to_string().contains("execution fence unconfirmed"));
     http.abort();
 }
 
@@ -567,7 +619,12 @@ async fn builtin_turn_runs_without_writer_service_and_cannot_mint_after_reassign
         StoreActor::start(config.runtime.database().into(), config.runtime.backups().into())
             .unwrap(),
     );
-    let client = BuiltinClient::connect(&config, Arc::clone(&store)).await.unwrap();
+    let lease = store.acquire_runtime_lease("runtime".into(), "fixture".into(), 60).unwrap();
+    let client = BuiltinClient::connect(&config, Arc::clone(&store))
+        .await
+        .unwrap()
+        .with_runtime(lease)
+        .unwrap();
     let spec = GroupSpec::new(GroupKind::Issue, &config, &store, "test-space").unwrap();
     let mut platform = PlatformObjects::open(&platform.database, &platform.repository).unwrap();
     let issue =
@@ -637,7 +694,9 @@ async fn builtin_turn_runs_without_writer_service_and_cannot_mint_after_reassign
     offline.store(false, Ordering::Relaxed);
     let error = client.writer_grant(writer.clone()).await.unwrap_err();
     assert!(error.to_string().contains("writer authority changed"), "{error:#}");
-    client.revoke_session(&writer.session_id).await.unwrap();
+    offline.store(true, Ordering::Relaxed);
+    driver.require_quiesced(&writer.session_id, false).await.unwrap();
+    client.fence_all_executions().await.unwrap();
     let fenced = client.writer_grant(writer).await.unwrap_err();
     assert!(fenced.to_string().contains("no current writer authority"));
     http.abort();

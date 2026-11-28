@@ -1,6 +1,6 @@
 use super::{
     OptionalExtension, Path, PendingGitHubWrite, RuntimeLease, StoreError, configure_connection,
-    deadline_rfc3339, enqueue_rocket_removal, gh_writes, now_rfc3339, open_read_write, params,
+    deadline_rfc3339, gh_writes, now_rfc3339, open_read_write, params, reaction_feedback,
     require_current_schema, settle_operational_status, sqlite_u64,
 };
 
@@ -27,6 +27,7 @@ pub(super) fn claim_github_write(
     let transaction = connection.transaction()?;
     gh_writes::require_owner(&transaction, owner)?;
     super::operational_status::reconcile(&transaction, &now)?;
+    reaction_feedback::project(&transaction)?;
     let recovery_until = deadline_rfc3339(5)?;
     let write = transaction
         .query_row(
@@ -39,7 +40,7 @@ pub(super) fn claim_github_write(
                      AND previous.status_profile_id=current.status_profile_id
                      AND previous.status_generation=current.status_generation
                      AND previous.rowid<current.rowid AND previous.lifecycle IN ('sending','uncertain'))
-             ORDER BY created_at,intent_id LIMIT 1",
+             ORDER BY created_at,CASE operation WHEN 'reaction_delete' THEN 0 ELSE 1 END,intent_id LIMIT 1",
             [&now],
             |row| {
                 Ok(PendingGitHubWrite {
@@ -134,7 +135,27 @@ pub(super) fn finish_github_write(
     } else {
         None
     };
-    let lifecycle = if delivery_error.is_some() { "rejected" } else { lifecycle };
+    let clear_rocket_at = if operation == "reaction_add"
+        && content == "rocket"
+        && matches!(lifecycle, "applied" | "pending")
+    {
+        reaction_feedback::rocket_clear_requested_at(
+            &transaction,
+            intent_id,
+            &repository,
+            &target_kind,
+            &target_database_id,
+        )?
+    } else {
+        None
+    };
+    let lifecycle = if delivery_error.is_some() {
+        "rejected"
+    } else if clear_rocket_at.is_some() && lifecycle == "pending" {
+        "superseded"
+    } else {
+        lifecycle
+    };
     let error = delivery_error.as_deref().or(error);
     let updated = transaction.execute(
         "UPDATE github_write_outbox SET lifecycle=?2,remote_database_id=?3,last_error=?4,
@@ -145,27 +166,14 @@ pub(super) fn finish_github_write(
         return Err(StoreError::InvalidData(format!("write intent {intent_id} is not sending")));
     }
     transaction.execute("UPDATE write_intents SET lifecycle=?2,attempts=?3,remote_database_id=COALESCE(?4,remote_database_id),remote_node_id=COALESCE(?5,remote_node_id),last_error=?6,updated_at=?7 WHERE intent_id=?1", params![intent_id,lifecycle,attempts,remote_database_id,remote_node_id,error,now_rfc3339()])?;
-    if lifecycle == "applied" && operation == "reaction_add" && content == "rocket" {
-        let terminal_exists = transaction
-            .query_row(
-                "SELECT 1 FROM github_write_outbox
-                 WHERE repository=?1 AND target_kind=?2 AND target_database_id=?3
-                   AND operation='reaction_add' AND content IN ('+1','confused')
-                   AND lifecycle NOT IN ('rejected','conflict','ambiguous','superseded') LIMIT 1",
-                params![repository, target_kind, target_database_id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if terminal_exists {
-            enqueue_rocket_removal(
-                &transaction,
-                &repository,
-                &target_kind,
-                &target_database_id,
-                &now_rfc3339(),
-            )?;
-        }
+    if let Some(clear_requested_at) = clear_rocket_at.filter(|_| lifecycle == "applied") {
+        reaction_feedback::enqueue_rocket_removal(
+            &transaction,
+            &repository,
+            &target_kind,
+            &target_database_id,
+            &clear_requested_at,
+        )?;
     }
     if matches!(operation.as_str(), "comment_create" | "comment_update") {
         settle_operational_status(

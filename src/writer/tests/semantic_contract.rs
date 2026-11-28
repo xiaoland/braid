@@ -40,6 +40,7 @@ fn processed(o: &context::CanonicalObservation) -> CanonicalObjectState {
         author_node_id: o.author_node_id.clone(),
         author_login: o.author_login.clone(),
         metadata_digest: o.metadata_digest.clone(),
+        root_fields: o.root_fields(),
     }
 }
 fn observe(f: &Fixture, github: &GitHubClient, current: &CanonicalContext) -> usize {

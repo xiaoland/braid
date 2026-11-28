@@ -1,6 +1,7 @@
 //! Agent Group: logical lifecycle and materialization. Shared workers execute
 //! queue decisions through neutral session handles; adapters own physical resources.
 
+pub(crate) mod availability;
 pub(crate) mod dispatch;
 pub(crate) mod input;
 pub(crate) mod issue_agent;

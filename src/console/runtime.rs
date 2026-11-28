@@ -1,7 +1,7 @@
 //! Owns actual runtime tasks; OTLP observations never drive these transitions.
 use crate::{
     config::Config,
-    health::HealthSnapshot,
+    health::Health,
     run::{RunRequest, RunResult, RunState},
 };
 use anyhow::{Context as _, Result, bail};
@@ -17,14 +17,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::{path::PathBuf, sync::Arc};
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, watch};
 
 #[derive(Clone)]
 pub struct Manager(Arc<Inner>);
 struct Inner {
     config: Config,
     state: Mutex<Execution>,
-    health: Arc<RwLock<HealthSnapshot>>,
+    health: Health,
 }
 struct Execution {
     generation: Option<String>,
@@ -115,7 +115,7 @@ impl Manager {
         };
         let state = if unconfirmed { "blocked" } else { "stopped" };
         initial.last_error.clone_from(&error);
-        let health = Arc::new(RwLock::new(initial));
+        let health = Health::new(initial);
         Ok(Self(Arc::new(Inner {
             config,
             health,
@@ -177,18 +177,37 @@ impl Manager {
 }
 
 async fn status(State(manager): State<Manager>) -> Result<Json<Value>, ApiError> {
-    let state = manager.0.state.lock().await;
-    let health = manager.0.health.read().await.clone();
+    let (
+        generation,
+        state,
+        error,
+        provider_enabled,
+        stop_confirmed,
+        run_request,
+        run_result,
+        health,
+    ) = {
+        let execution = manager.0.state.lock().await;
+        (
+            execution.generation.clone(),
+            execution.state,
+            execution.error.clone(),
+            execution.provider_enabled,
+            execution.stop_confirmed,
+            execution.run_request.clone(),
+            execution.run_result.clone(),
+            manager.0.health.snapshot(),
+        )
+    };
     let config = &manager.0.config;
-    let run = if let Some(result) = &state.run_result {
-        Some(result.clone())
-    } else if let Some(request) = &state.run_request {
-        crate::run::run_snapshot(config, &request.run_id).map_err(internal)?
-    } else {
-        None
+    let run = match (run_result, &run_request) {
+        (None, Some(request)) => {
+            crate::run::run_snapshot(config, &request.run_id).map_err(internal)?
+        }
+        (reported, _) => reported,
     };
     Ok(Json(
-        json!({"instance":config.instance_key(),"repository":config.repositories().join(", "),"upstream":if config.is_builtin(){"builtin"}else{"github"},"generation":state.generation,"state":state.state,"error":state.error,"provider_enabled":state.provider_enabled,"health":health,"authority":"in-process runtime supervisor","mode":if state.run_request.is_some() {"run"} else {"serve"},"stop_confirmed":state.stop_confirmed,"run_request":state.run_request,"run":run,"evidence":crate::telemetry::evidence_health(),"telemetry":{"endpoint":config.telemetry.endpoint,"sample_ratio":config.telemetry.sample_ratio,"incident_mode":config.telemetry.incident_mode}}),
+        json!({"instance":config.instance_key(),"repository":config.repositories().join(", "),"upstream":if config.is_builtin(){"builtin"}else{"github"},"generation":generation,"state":state,"error":error,"provider_enabled":provider_enabled,"health":health,"authority":"in-process runtime supervisor","mode":if run_request.is_some() {"run"} else {"serve"},"stop_confirmed":stop_confirmed,"run_request":run_request,"run":run,"evidence":crate::telemetry::evidence_health(),"telemetry":{"endpoint":config.telemetry.endpoint,"sample_ratio":config.telemetry.sample_ratio,"incident_mode":config.telemetry.incident_mode}}),
     ))
 }
 
@@ -285,8 +304,7 @@ async fn command(
                 generation,
                 !command.transport_only,
                 command.run_request,
-            )
-            .await;
+            );
         }
         Operation::Stop => {
             state
@@ -338,7 +356,7 @@ fn save_outcome(
     Ok(())
 }
 
-async fn start_runtime(
+fn start_runtime(
     manager: &Manager,
     state: &mut Execution,
     generation: String,
@@ -354,12 +372,12 @@ async fn start_runtime(
     state.run_request.clone_from(&run_request);
     state.run_result = None;
     state.stop = Some(stop);
-    *manager.0.health.write().await =
-        crate::runtime::initial_health(&manager.0.config, provider_enabled);
+    let initial = crate::runtime::initial_health(&manager.0.config, provider_enabled);
+    manager.0.health.update(|current| *current = initial);
     crate::telemetry::set_runtime_generation(Some(generation.clone()));
     let task_manager = manager.clone();
     let config = manager.0.config.clone();
-    let health = Arc::clone(&manager.0.health);
+    let health = manager.0.health.clone();
     let task = tokio::spawn(async move {
         if let Some(request) = run_request {
             crate::run::run_managed(config, request, receiver, health).await.map(Some)
@@ -402,8 +420,10 @@ async fn start_runtime(
             state.stop_confirmed = false;
             state.error = Some(format!("runtime outcome persistence failed: {error:#}"));
         }
-        let mut health = task_manager.0.health.write().await;
-        health.ready = false;
-        health.last_error.clone_from(&state.error);
+        let diagnostic = state.error.clone();
+        task_manager.0.health.update(|health| {
+            health.ready = false;
+            health.last_error = diagnostic;
+        });
     }));
 }

@@ -1,6 +1,7 @@
 //! Durable desired projections, not assignment or execution recovery.
 use super::{
-    StoreError, configure_connection, now_rfc3339, open_read_write, require_current_schema,
+    StoreError, configure_connection, now_rfc3339, open_read_write, operational_roles,
+    require_current_schema,
 };
 use rusqlite::{OptionalExtension as _, params};
 use sha2::{Digest as _, Sha256};
@@ -24,24 +25,75 @@ pub(super) fn enqueue_failure(
         return Err(StoreError::InvalidData("Operational Status body is empty".into()));
     }
     let now = now_rfc3339();
-    let mut db = open_read_write(database)?;
+    let db = open_read_write(database)?;
     configure_connection(&db)?;
-    let tx = db.transaction()?;
-    let (key,repository,number)=tx.query_row("SELECT w.node_id,g.profile_id,a.generation,r.name_with_owner,w.number FROM assignments a JOIN agent_instances g ON g.assignment_id=a.assignment_id JOIN work_items w ON w.node_id=a.work_item_node_id JOIN repositories r ON r.node_id=w.repository_node_id WHERE a.assignment_id=?1",[assignment],|r|Ok((Key{node:r.get(0)?,profile:r.get(1)?,generation:r.get(2)?},r.get::<_,String>(3)?,r.get::<_,i64>(4)?)))?;
+    db.execute(
+        "INSERT INTO operational_status_facts(assignment_id,body,observed_at) VALUES(?1,?2,?3)
+         ON CONFLICT(assignment_id) DO UPDATE SET body=excluded.body,observed_at=excluded.observed_at
+         WHERE operational_status_facts.body<>excluded.body",
+        params![assignment,body,observed_at.unwrap_or(&now)],
+    )?;
+    Ok(())
+}
+
+struct Failure {
+    assignment: String,
+    key: Key,
+    repository: String,
+    number: i64,
+    body: String,
+    observed: String,
+}
+
+fn project_failures(tx: &rusqlite::Transaction<'_>, now: &str) -> Result<(), StoreError> {
+    let mut query = tx.prepare(
+        "SELECT f.assignment_id,w.node_id,g.profile_id,a.generation,r.name_with_owner,w.number,
+                f.body,f.observed_at
+         FROM operational_status_facts f JOIN assignments a ON a.assignment_id=f.assignment_id
+         JOIN agent_instances g ON g.assignment_id=a.assignment_id
+         JOIN work_items w ON w.node_id=a.work_item_node_id
+         JOIN repositories r ON r.node_id=w.repository_node_id ORDER BY f.rowid",
+    )?;
+    let failures = query
+        .query_map([], |row| {
+            Ok(Failure {
+                assignment: row.get(0)?,
+                key: Key { node: row.get(1)?, profile: row.get(2)?, generation: row.get(3)? },
+                repository: row.get(4)?,
+                number: row.get(5)?,
+                body: row.get(6)?,
+                observed: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for failure in failures {
+        project_failure(tx, &failure, now)?;
+        tx.execute(
+            "DELETE FROM operational_status_facts WHERE assignment_id=?1",
+            [&failure.assignment],
+        )?;
+    }
+    Ok(())
+}
+
+fn project_failure(
+    tx: &rusqlite::Transaction<'_>,
+    failure: &Failure,
+    now: &str,
+) -> Result<(), StoreError> {
+    let Failure { key, repository, number, body, observed, .. } = failure;
     let existing=tx.query_row("SELECT projection_kind,failure_body FROM status_comments WHERE work_item_node_id=?1 AND profile_id=?2 AND assignment_generation=?3",params![key.node,key.profile,key.generation],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?))).optional()?;
     if existing.as_ref().is_some_and(|(kind, previous)| {
         kind == "superseded" || (kind == "failure" && previous.as_deref() == Some(body))
     }) {
         return Ok(());
     }
-    let observed = observed_at.unwrap_or(&now);
     tx.execute("INSERT INTO status_comments(work_item_node_id,profile_id,assignment_generation,body_digest,lifecycle,updated_at,projection_kind,failure_body,failure_recorded_at) VALUES(?1,?2,?3,?4,'pending',?5,'failure',?6,?7) ON CONFLICT(work_item_node_id,profile_id,assignment_generation) DO UPDATE SET projection_kind='failure',failure_body=excluded.failure_body,failure_recorded_at=excluded.failure_recorded_at,successor_generation=NULL",params![key.node,key.profile,key.generation,"0".repeat(64),now,body,observed])?;
     let rendered = format!(
         "{body}\n\n---\n所属 generation：**{}**；故障确认时间：`{observed}`。此条不是其他 generation 的当前状态。",
         key.generation
     );
-    publish(&tx, &key, &repository, number, &rendered, &now)?;
-    tx.commit()?;
+    publish(tx, key, repository, *number, &rendered, now)?;
     Ok(())
 }
 
@@ -49,6 +101,7 @@ pub(super) fn enqueue_failure(
 // Only an accepted current turn or its confirmed normal terminal is evidence;
 // assignment creation, a clean worktree or a memory reset is not recovery.
 pub(super) fn reconcile(tx: &rusqlite::Transaction<'_>, now: &str) -> Result<(), StoreError> {
+    project_failures(tx, now)?;
     let mut query=tx.prepare("SELECT s.work_item_node_id,s.profile_id,s.assignment_generation,r.name_with_owner,w.number,s.failure_body,s.failure_recorded_at,a.generation,g.profile_id,p.lifecycle,t.lifecycle,CASE WHEN t.lifecycle='completed' THEN t.ended_at ELSE t.started_at END FROM status_comments s JOIN work_items w ON w.node_id=s.work_item_node_id JOIN repositories r ON r.node_id=w.repository_node_id JOIN assignments a ON a.work_item_node_id=w.node_id AND a.generation=(SELECT max(newest.generation) FROM assignments newest WHERE newest.work_item_node_id=w.node_id) JOIN agent_instances g ON g.assignment_id=a.assignment_id JOIN provider_sessions p ON p.agent_id=g.agent_id AND p.rowid=(SELECT max(latest.rowid) FROM provider_sessions latest WHERE latest.agent_id=g.agent_id) JOIN turns t ON t.session_id=p.session_id AND t.rowid=(SELECT max(last.rowid) FROM turns last WHERE last.session_id=p.session_id) WHERE a.lifecycle='active' AND g.lifecycle!='blocked' AND t.provider_turn_id IS NOT NULL AND ((p.lifecycle='idle' AND t.lifecycle='completed') OR (p.lifecycle='running' AND t.lifecycle='running')) AND (s.projection_kind='failure' OR (s.assignment_generation<a.generation AND COALESCE(s.successor_generation,s.assignment_generation)<a.generation))")?;
     let rows = query
         .query_map([], |r| {
@@ -176,6 +229,8 @@ fn publish(
     if digest == old_digest && old_intent.is_some() {
         return Ok(());
     }
+    let marked_body =
+        operational_roles::declare(tx, &key.node, &key.profile, key.generation, body)?;
     let intent = Uuid::now_v7().to_string();
     tx.execute("UPDATE github_write_outbox SET lifecycle='superseded',updated_at=?4 WHERE status_work_item_node_id=?1 AND status_profile_id=?2 AND status_generation=?3 AND lifecycle='pending'",params![key.node,key.profile,key.generation,now])?;
     let request =
@@ -184,7 +239,7 @@ fn publish(
         || ("comment_create", "issue", number.to_string()),
         |id| ("comment_update", "issue_comment", id),
     );
-    tx.execute("INSERT INTO github_write_outbox(intent_id,repository,target_kind,target_database_id,operation,content,request_digest,lifecycle,next_attempt_at,created_at,updated_at,status_work_item_node_id,status_profile_id,status_generation) VALUES(?1,?2,?3,?4,?5,?6,?7,'pending',?8,?8,?8,?9,?10,?11)",params![intent,repository,kind,target,operation,body,request,now,key.node,key.profile,key.generation])?;
+    tx.execute("INSERT INTO github_write_outbox(intent_id,repository,target_kind,target_database_id,operation,content,request_digest,lifecycle,next_attempt_at,created_at,updated_at,status_work_item_node_id,status_profile_id,status_generation) VALUES(?1,?2,?3,?4,?5,?6,?7,'pending',?8,?8,?8,?9,?10,?11)",params![intent,repository,kind,target,operation,marked_body,request,now,key.node,key.profile,key.generation])?;
     tx.execute("UPDATE status_comments SET write_intent_id=?4,body_digest=?5,lifecycle='pending',updated_at=?6 WHERE work_item_node_id=?1 AND profile_id=?2 AND assignment_generation=?3",params![key.node,key.profile,key.generation,intent,digest,now])?;
     Ok(())
 }

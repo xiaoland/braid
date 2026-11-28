@@ -1,9 +1,10 @@
 use super::{
-    MIGRATIONS, StoreActor, apply_one, batch_references_connection, configure_connection,
-    open_read_write,
+    MIGRATIONS, StoreActor, apply_one, batch_references, configure_connection, open_read_write,
 };
+use sha2::{Digest as _, Sha256};
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn schema13_unknown_turn_replays_input_without_erasing_history_or_duplicating_reactions() {
     let root = std::env::temp_dir().join(format!("braid-replay-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&root).unwrap();
@@ -34,13 +35,19 @@ fn schema13_unknown_turn_replays_input_without_erasing_history_or_duplicating_re
          VALUES('eyes','event','owner/repo','issue_comment','7','reaction_add','eyes',printf('%064d',0),'pending','now','now','now');",
     )
     .unwrap();
+    let rocket_digest =
+        hex::encode(Sha256::digest(["owner/repo", "issue_comment", "7", "rocket"].join("\0")));
+    db.execute(
+        "INSERT INTO github_write_outbox(intent_id,repository,target_kind,target_database_id,operation,content,request_digest,lifecycle,next_attempt_at,created_at,updated_at)
+         VALUES('rocket','owner/repo','issue_comment','7','reaction_add','rocket',?1,'pending','now','now','now')",
+        [rocket_digest],
+    ).unwrap();
     drop(db);
     let store = StoreActor::start(database.clone(), root.join("backups")).unwrap();
     let migration = store.apply().unwrap();
     assert_eq!(migration.applied, (14..=crate::store::DATABASE_SCHEMA_VERSION).collect::<Vec<_>>());
     assert!(migration.backup.unwrap().is_file());
 
-    store.enqueue_turn_reaction("turn".into(), "rocket".into()).unwrap();
     store.mark_turn_terminal("turn".into(), "unknown".into()).unwrap();
     let status = store.runtime_status().unwrap();
     assert_eq!(status.batches.len(), 1);
@@ -49,8 +56,8 @@ fn schema13_unknown_turn_replays_input_without_erasing_history_or_duplicating_re
     let db = open_read_write(&database).unwrap();
     assert!(db.query_row("SELECT execution_stopped_at IS NULL FROM provider_sessions WHERE provider_session_id='old-physical'", [], |row| row.get::<_, bool>(0)).unwrap());
     let expected = (vec!["Review the revised design".into()], true);
-    assert_eq!(batch_references_connection(&db, "original").unwrap(), expected);
-    assert_eq!(batch_references_connection(&db, &replay_batch).unwrap(), expected);
+    assert_eq!(batch_references(&db, "original").unwrap(), expected);
+    assert_eq!(batch_references(&db, &replay_batch).unwrap(), expected);
     assert!(
         store
             .claim_runnable_turn("issue".into(), "profile".into(), vec!["old-physical".into()])
@@ -76,9 +83,10 @@ fn schema13_unknown_turn_replays_input_without_erasing_history_or_duplicating_re
         .unwrap();
     assert_eq!((replay.references, replay.trusted_mention), expected);
     store.mark_turn_started(replay.turn_id.clone(), "replacement-turn".into()).unwrap();
-    store.enqueue_turn_reaction(replay.turn_id.clone(), "rocket".into()).unwrap();
-    store.mark_turn_terminal(replay.turn_id.clone(), "completed".into()).unwrap();
-    store.enqueue_turn_reaction(replay.turn_id, "+1".into()).unwrap();
+    store.mark_turn_terminal(replay.turn_id, "completed".into()).unwrap();
+    let owner = store.acquire_runtime_lease("runtime".into(), "publisher".into(), 60).unwrap();
+    assert!(store.claim_github_write(owner.clone()).unwrap().is_some());
+    store.release_runtime_lease(owner).unwrap();
     for content in ["eyes", "rocket", "+1"] {
         assert_eq!(
             db.query_row(
@@ -90,7 +98,7 @@ fn schema13_unknown_turn_replays_input_without_erasing_history_or_duplicating_re
             1
         );
     }
-    assert_eq!(batch_references_connection(&db, "original").unwrap(), expected);
+    assert_eq!(batch_references(&db, "original").unwrap(), expected);
     assert_eq!(
         db.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).unwrap(),
         "ok"

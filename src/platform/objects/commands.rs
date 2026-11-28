@@ -136,6 +136,10 @@ impl ObjectCommand {
     fn has_external_effect(&self) -> bool {
         matches!(self, Self::Merge { .. } | Self::Publish { .. } | Self::ConfigureRunRoot { .. })
     }
+
+    pub(crate) fn requires_git(&self) -> bool {
+        matches!(self, Self::Merge { .. } | Self::Publish { .. } | Self::CreatePr { .. })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,7 +200,7 @@ impl PlatformObjects {
         policy: &ControlPolicy,
     ) -> Result<ControlReceipt, CommandFailure> {
         ensure_request_id(&request.request_id)?;
-        self.bind_source(&policy.source)?;
+        self.verify_source_binding(&policy.source)?;
         let payload = serde_json::to_string(request).map_err(CommandFailure::rejected)?;
         let digest = hex::encode(Sha256::digest(payload.as_bytes()));
         self.connection.execute_batch("BEGIN IMMEDIATE").map_err(CommandFailure::rejected)?;
@@ -420,7 +424,7 @@ impl PlatformObjects {
     ) -> Result<ControlReceipt, CommandFailure> {
         self.revision_guard = request.command.target().zip(request.expected_revision);
         let result = match &request.command {
-            ObjectCommand::ConfigureRunRoot { number, delivery_ref, run_id, client_id } => self.configure_run_root(*number, delivery_ref, run_id, client_id, &request.actor, &policy.source).map(|()| serde_json::json!({"root":number,"deliveryRef":delivery_ref,"runId":run_id,"clientId":client_id})),
+            ObjectCommand::ConfigureRunRoot { number, delivery_ref, run_id, client_id } => self.configure_run_root(*number, delivery_ref, run_id, client_id, &request.actor).map(|()| serde_json::json!({"root":number,"deliveryRef":delivery_ref,"runId":run_id,"clientId":client_id})),
             ObjectCommand::Merge { number } => self
                 .merge(*number, &policy.source, &request.actor)
                 .and_then(|r| serde_json::to_value(r).map_err(Into::into)),
@@ -491,7 +495,9 @@ impl PlatformObjects {
 
     pub fn control_item(&self, number: u64) -> Result<Value> {
         let transaction = self.connection.unchecked_transaction()?;
-        let item = serde_json::json!({"item":self.item(number)?,"comments":self.comments(number)?,"merge":self.merge_status(number)?,"parent":self.parent(number)?,"subIssues":self.children(number)?});
+        let item = self.item(number)?;
+        let merge = if item.kind == "pr" { self.merge_status(number)? } else { None };
+        let item = serde_json::json!({"item":item,"comments":self.comments(number)?,"merge":merge,"parent":self.parent(number)?,"subIssues":self.children(number)?});
         transaction.commit()?;
         Ok(item)
     }

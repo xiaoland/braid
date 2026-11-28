@@ -196,6 +196,9 @@ fn console_controls_keep_working_when_the_observation_database_cannot_open() {
     fs::create_dir(&root.0).unwrap();
     let (platform, harness) = configure(&root.0);
     let original_config = fs::read(&harness).unwrap();
+    let settings: toml::Value = toml::from_str(&fs::read_to_string(&harness).unwrap()).unwrap();
+    let _unavailable_health =
+        TcpListener::bind(settings["server"]["health"].as_str().unwrap()).unwrap();
     let alias = root.0.join("aliased.sqlite3");
     symlink(root.0.join("harness/state/braid.sqlite3"), &alias).unwrap();
     let rejected = serve(&platform, &harness, &alias).output().unwrap();
@@ -281,10 +284,10 @@ fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
     let (platform, harness) = configure(&root.0);
     let settings: toml::Value = toml::from_str(&fs::read_to_string(&platform).unwrap()).unwrap();
     let endpoint = format!("http://{}", settings["listen"].as_str().unwrap());
-    let _platform = Console(
+    let active_platform = Console(
         braid()
             .args(["platform", "serve", "--config"])
-            .arg(platform)
+            .arg(&platform)
             .stdout(Stdio::null())
             .spawn()
             .unwrap(),
@@ -326,7 +329,8 @@ fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
 
     let database = rusqlite::Connection::open(root.0.join("harness/state/braid.sqlite3")).unwrap();
     database.execute_batch(
-        "INSERT INTO repositories VALUES('local:demo','demo',1,'now');
+        "INSERT INTO owner_leases VALUES('runtime',1,'fixture','9999-12-31T00:00:00Z');
+         INSERT INTO repositories VALUES('local:demo','demo',1,'now');
          INSERT INTO work_items(node_id,repository_node_id,kind,number,state,context_revision,observed_at)
            VALUES('item','local:demo','issue',1,'open','revision','now');
          INSERT INTO profiles VALUES('issue-codex',1,printf('%064d',0),'pi','[]');
@@ -341,11 +345,21 @@ fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
          VALUES('tree','agent',?1,'local:demo','active','now')",
         [root.0.join("source").to_str().unwrap()],
     ).unwrap();
+    let execution_id = uuid::Uuid::now_v7().to_string();
     database.execute(
-        "INSERT INTO turns(turn_id,session_id,context_revision,trigger_kind,lifecycle,builtin_writer_cursor)
-         VALUES('turn','session','revision','wake_batch','running',?1)",
-        [cursor()],
+        "UPDATE provider_sessions SET builtin_execution_id=?1, builtin_execution_owner='fixture'
+         WHERE session_id='session'",
+        [&execution_id],
     ).unwrap();
+    let authority_cursor = cursor();
+    database
+        .execute(
+            "INSERT INTO turns(turn_id,session_id,context_revision,trigger_kind,lifecycle,
+          builtin_writer_cursor,builtin_execution_id)
+         VALUES('turn','session','revision','wake_batch','running',?1,?2)",
+            rusqlite::params![authority_cursor, execution_id],
+        )
+        .unwrap();
 
     let client_id: String =
         database.query_row("SELECT client_id FROM builtin_upstream", [], |r| r.get(0)).unwrap();
@@ -366,36 +380,99 @@ fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
     }));
     assert_eq!(epoch()["active"], true);
 
-    object_command("reassign", json!({"type":"assign", "actor":"issue-codex", "number":1}));
-    let revoked = epoch();
-    assert_eq!(revoked["active"], false);
-    let old = base()
-        .env("BRAID_AGENT", "1")
-        .args(["comment", "1", "--body", "Stale turn"])
-        .output()
-        .unwrap();
-    assert!(!old.status.success());
-    assert!(String::from_utf8_lossy(&old.stderr).contains("writer authority changed"));
+    let fence = |id: &str| {
+        client
+            .post(format!("{endpoint}/api/platform/executions/fence"))
+            .json(&json!({"executionId":id,"clientId":client_id}))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<Value>()
+            .unwrap()
+    };
+    let (request_id, grant_id, granted_epoch, token): (String, String, i64, String) = database
+        .query_row(
+            "SELECT request_id,grant_id,epoch,token FROM builtin_writer_grants WHERE session_id='native'",
+            [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).unwrap();
+    assert_eq!(fence(&execution_id), fence(&execution_id));
+    assert_eq!(epoch(), json!({"active":false,"epoch":granted_epoch}));
 
-    // The already-revoked row holds the exact epoch of a different pending
-    // mint. Revocation must advance it before that request arrives.
-    let mint = json!({"requestId":"delayed-mint", "clientId":client_id, "actor":"issue-codex",
-        "itemNumber":1, "expectedEpoch":revoked["epoch"], "authorityCursor":cursor()});
-    let stopped: Value = client
-        .post(format!("{endpoint}/api/platform/grants/revoke"))
-        .json(&json!({"requestId":"stop-before-mint", "clientId":client_id, "actor":"issue-codex",
-            "itemNumber":1, "expectedEpoch":revoked["epoch"], "pending":true}))
+    // Fence after mint: old receipts and a valid old token cannot reopen execution.
+    let prior_mint = json!({"requestId":request_id,"clientId":client_id,"actor":"issue-codex",
+        "itemNumber":1,"expectedEpoch":granted_epoch-1,"authorityCursor":authority_cursor,
+        "executionId":execution_id});
+    let replay =
+        client.post(format!("{endpoint}/api/platform/grants")).json(&prior_mint).send().unwrap();
+    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    let revision = get(&client, &endpoint, "/api/control/items/1")["item"]["revision"].clone();
+    let old_write = client
+        .post(format!("{endpoint}/api/control/commands"))
+        .json(&json!({"requestId":"old-write","actor":"issue-codex","expectedRevision":revision,
+          "writer":{"grantId":grant_id,"epoch":granted_epoch,"token":token},
+          "command":{"type":"comment","number":1,"body":"Fenced turn"}}))
         .send()
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
         .unwrap();
-    assert!(stopped["epoch"].as_u64().unwrap() > revoked["epoch"].as_u64().unwrap());
+    assert_eq!(old_write.status(), StatusCode::CONFLICT);
+
+    // Fence before mint: no corresponding publication row needs to exist.
+    let late_execution = uuid::Uuid::now_v7().to_string();
+    assert_eq!(fence(&late_execution)["executionId"], late_execution);
+    let mint = json!({"requestId":"delayed-mint","clientId":client_id,"actor":"issue-codex",
+        "itemNumber":1,"expectedEpoch":granted_epoch,"authorityCursor":cursor(),
+        "executionId":late_execution});
     let late = client.post(format!("{endpoint}/api/platform/grants")).json(&mint).send().unwrap();
     assert_eq!(late.status(), StatusCode::CONFLICT);
-    assert_eq!(epoch()["active"], false);
+    assert_eq!(epoch(), json!({"active":false,"epoch":granted_epoch}));
 
+    let mint_open_execution = |request_id: &str, expected_epoch: i64, run_id: Option<&str>| {
+        let response: Value = client
+            .post(format!("{endpoint}/api/platform/grants"))
+            .json(&json!({
+                "requestId":request_id, "clientId":client_id, "actor":"issue-codex",
+                "itemNumber":1, "expectedEpoch":expected_epoch, "authorityCursor":cursor(),
+                "executionId":uuid::Uuid::now_v7().to_string(), "runId":run_id
+            }))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(response["lifecycle"], "active", "{response}");
+        let epoch = response["epoch"].as_i64().unwrap();
+        (epoch, json!({"grantId":response["grantId"],"epoch":epoch,"token":response["token"]}))
+    };
+    let stale_write = |request_id: &str, writer: &Value| {
+        let revision = get(&client, &endpoint, "/api/control/items/1")["item"]["revision"].clone();
+        let response = client
+            .post(format!("{endpoint}/api/control/commands"))
+            .json(&json!({"requestId":request_id,"actor":"issue-codex","expectedRevision":revision,
+                "writer":writer,"command":{"type":"comment","number":1,"body":"stale write"}}))
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    };
+    let platform_database = rusqlite::Connection::open(
+        platform.parent().unwrap().join(settings["database"].as_str().unwrap()),
+    )
+    .unwrap();
+    let disable_grant_updates = || {
+        platform_database
+            .execute_batch(
+                "CREATE TRIGGER publication_offline BEFORE UPDATE ON platform_grants
+             BEGIN SELECT RAISE(ABORT, 'grant update unavailable'); END;",
+            )
+            .unwrap();
+    };
+    let (before_assignment, old_authority) =
+        mint_open_execution("before-reassignment", granted_epoch, None);
+    disable_grant_updates();
+    object_command("reassign", json!({"type":"assign","number":1,"actor":"issue-codex"}));
+    assert_eq!(epoch(), json!({"active":false,"epoch":before_assignment}));
+    stale_write("stale-after-reassignment", &old_authority);
     object_command(
         "configure-root",
         json!({"type":"configureRunRoot", "number":1,
@@ -409,4 +486,43 @@ fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
     owner.query_pairs_mut().append_pair("executionRunId", "test-run");
     let response = client.get(owner).send().unwrap();
     assert!(response.status().is_success(), "{}", response.text().unwrap());
+    platform_database.execute_batch("DROP TRIGGER publication_offline").unwrap();
+    let (scoped_epoch, scoped_authority) =
+        mint_open_execution("before-scope-close", before_assignment, Some("test-run"));
+    disable_grant_updates();
+    object_command("close-root", json!({"type":"close","number":1}));
+    object_command("reopen-root", json!({"type":"reopen","number":1}));
+    assert_eq!(epoch(), json!({"active":false,"epoch":scoped_epoch}));
+    stale_write("stale-after-scope-reopen", &scoped_authority);
+
+    // The bound configuration remains the same after loss of the Git checkout.
+    let source = root.0.join("source");
+    fs::rename(source.join(".git"), source.join(".git.offline")).unwrap();
+    drop(active_platform);
+    let _reopened_platform = Console(
+        braid()
+            .args(["platform", "serve", "--config"])
+            .arg(&platform)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for("Platform reopening with Git offline", || {
+        client
+            .get(format!("{endpoint}/api/platform/repository"))
+            .send()
+            .ok()
+            .filter(|response| response.status().is_success())
+    });
+
+    object_command(
+        "git-offline-comment",
+        json!({"type":"comment","number":1,"body":"Git-independent"}),
+    );
+    assert!(get(&client, &endpoint, "/api/platform/events")["lastSequence"].is_number());
+    assert_eq!(get(&client, &endpoint, "/api/platform/scope/1/boundary")["rootOpen"], true);
+    assert_eq!(
+        client.get(format!("{endpoint}/api/platform/scope/1")).send().unwrap().status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
 }

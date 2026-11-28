@@ -3,6 +3,8 @@ use super::*;
 #[allow(clippy::struct_excessive_bools)]
 pub(super) struct BodyRemote {
     pub(super) snapshot: crate::github::BodySnapshot,
+    pub(super) issue_comments: Vec<Value>,
+    pub(super) issue_edit_evidence: serde_json::Map<String, Value>,
     writes: usize,
     pub(super) associated: bool,
     associated_999: bool,
@@ -17,6 +19,8 @@ impl BodyRemote {
     pub(super) fn new(pr: bool) -> Self {
         Self {
             snapshot: serde_json::from_value(json!({"id":1,"node_id":"item","number":1,"title":"Canonical","body":"Closes #7\n\nImplementation request: https://github.com/owner/repository/issues/comments/7","state":"open","updated_at":"version-1","pull_request":if pr {Some(json!({"url":"pr"}))} else {None}})).unwrap(),
+            issue_comments: Vec::new(),
+            issue_edit_evidence: serde_json::Map::new(),
             writes: 0, pr_closed: false, associated: true, associated_999: false,
             issue_999: serde_json::from_value(json!({"id":999,"node_id":"issue-999","number":999,"title":"Controlled Issue","body":"Original design","state":"open","updated_at":"version-1"})).unwrap(), writes_999: 0, limited: false, mutation_limited: false, lose_response: false,
         }
@@ -60,6 +64,9 @@ fn combined_first_pages(
     for field in fields {
         object.insert((*field).into(), empty.clone());
     }
+    if root == "issue" {
+        object.get_mut("comments").unwrap()["nodes"] = json!(state.issue_comments);
+    }
     if request["variables"]["projects"].as_bool() == Some(true) {
         object.insert("project_items".into(), empty);
     }
@@ -78,6 +85,7 @@ pub(super) async fn body_server(
     let issue_read = remote.clone();
     let issue_patch = remote.clone();
     let pr_read = remote.clone();
+    let comment_post = remote.clone();
     let router = Router::new()
         .route("/repos/owner/repository/issues/1", get(move || { let remote = read.clone(); async move {
             use axum::response::IntoResponse as _;
@@ -95,6 +103,18 @@ pub(super) async fn body_server(
             if remote.lose_response { return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({"message":"lost acknowledgement"}))).into_response(); }
             Json(&remote.snapshot).into_response()
         }}))
+        .route("/repos/owner/repository/issues/1/comments", post(move |Json(request): Json<Value>| {
+            let remote = comment_post.clone();
+            async move {
+                let now = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap();
+                let mut remote = remote.lock().unwrap();
+                remote.issue_comments.push(json!({
+                    "id":"status", "fullDatabaseId":"99", "author":{"id":"app", "login":"braid[bot]"},
+                    "createdAt":now, "updatedAt":now, "isMinimized":false, "body":request["body"],
+                }));
+                Json(json!({"id":99, "node_id":"status"}))
+            }
+        }))
         .route("/repos/owner/repository/issues/999", get(move || { let remote=issue_read.clone(); async move {
             let mut item=serde_json::to_value(&remote.lock().unwrap().issue_999).unwrap();
             item["number"]=json!(999);
@@ -127,12 +147,13 @@ pub(super) async fn body_server(
                 return Ok(Json(json!({"data":{"repository":{root:connection}}})));
             }
             if query.contains("fullDatabaseId") {
-                let core=if query.contains("pullRequest(number:") {
+                let mut core=if query.contains("pullRequest(number:") {
                     json!({"id":"pr","fullDatabaseId":"9","number":9,"title":"Existing PR","body":"Closes #1","state":if state.pr_closed {"CLOSED"} else {"OPEN"},"isDraft":false,"merged":false,"updatedAt":"pr-v1","baseRefName":"main","headRefName":"work","headRepository":repository})
                 } else {
                     json!({"id":"item","fullDatabaseId":"1","number":1,"title":state.snapshot.title,"body":state.snapshot.body,"state":state.snapshot.state.to_uppercase(),"updatedAt":state.snapshot.updated_at})
                 };
                 let root=if query.contains("pullRequest(number:") {"pullRequest"} else {"issue"};
+                if root == "issue" { core.as_object_mut().unwrap().extend(state.issue_edit_evidence.clone()); }
                 return Ok(Json(json!({"data":{"repository":{"id":"repo","nameWithOwner":"owner/repository",root:core}}})));
             }
             if state.associated {nodes.push(json!({"number":1,"repository":{"nameWithOwner":"owner/repository"}}));}

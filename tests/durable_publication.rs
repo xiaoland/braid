@@ -67,14 +67,33 @@ fn sqlite_i64_to_u64(value: i64, _: &str) -> rusqlite::Result<u64> {
     Ok(u64::try_from(value).unwrap())
 }
 // Operational-status/reaction projections are outside this deep-module harness.
-fn enqueue_rocket_removal(
-    _: &Connection,
-    _: &str,
-    _: &str,
-    _: &str,
-    _: &str,
-) -> Result<(), StoreError> {
-    Ok(())
+mod reaction_feedback {
+    use super::StoreError;
+    use rusqlite::Transaction;
+
+    pub(super) fn project(_: &Transaction<'_>) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    pub(super) fn rocket_clear_requested_at(
+        _: &Transaction<'_>,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(None)
+    }
+
+    pub(super) fn enqueue_rocket_removal(
+        _: &Transaction<'_>,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 fn settle_operational_status(
     _: &Connection,
@@ -93,20 +112,40 @@ struct SchedulerPolicy {
     quiet_seconds: u64,
     event_threshold: u32,
 }
-fn schedule_event(
-    _: &rusqlite::Transaction<'_>,
-    _: &str,
-    _: &str,
-    _: SchedulerPolicy,
-    _: bool,
-    _: &str,
-) -> Result<(String, String), StoreError> {
-    unreachable!("handoff is tested through the production StoreActor")
+mod handoff_inputs {
+    use super::{SchedulerPolicy, StoreError};
+
+    pub(super) struct NewHandoffInput<'a> {
+        pub(super) source_repository: &'a str,
+        pub(super) source_number: i64,
+        pub(super) target_work_item: &'a str,
+        pub(super) target_assignment: &'a str,
+        pub(super) target_generation: i64,
+    }
+
+    pub(super) fn accept(
+        _: &rusqlite::Transaction<'_>,
+        _: NewHandoffInput<'_>,
+        _: SchedulerPolicy,
+    ) -> Result<String, StoreError> {
+        unreachable!("handoff is tested through the production StoreActor")
+    }
 }
 #[path = "../src/store/gh_writes.rs"]
 mod gh_writes;
 #[path = "../src/store/handoff.rs"]
 mod handoff;
+mod operational_roles {
+    pub(super) fn declare(
+        _: &rusqlite::Transaction<'_>,
+        _: &str,
+        _: &str,
+        _: i64,
+        body: &str,
+    ) -> Result<String, super::StoreError> {
+        Ok(body.to_owned())
+    }
+}
 #[path = "../src/store/operational_status.rs"]
 mod operational_status;
 #[path = "../src/store/publication_source.rs"]
@@ -137,6 +176,9 @@ impl Database {
                 .execute_batch(include_str!(
                     "../migrations/0013_operational_status_convergence.sql"
                 ))
+                .unwrap();
+            connection
+                .execute_batch(include_str!("../migrations/0022_operational_status_facts.sql"))
                 .unwrap();
         }
         Self(path)
@@ -239,6 +281,9 @@ fn legacy_cli_pending_uncertain_sending_all_get_one_execution_obligation() {
         .unwrap();
     db.connect()
         .execute_batch(include_str!("../migrations/0013_operational_status_convergence.sql"))
+        .unwrap();
+    db.connect()
+        .execute_batch(include_str!("../migrations/0022_operational_status_facts.sql"))
         .unwrap();
     let owner = db.owner();
     for _ in 0..3 {

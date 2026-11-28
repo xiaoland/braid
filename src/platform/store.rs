@@ -2,10 +2,12 @@ use super::config::PlatformConfig;
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, params};
 use std::path::Path;
-const MIGRATIONS: [(u32, &str, &str); 3] = [
+const MIGRATIONS: [(u32, &str, &str); 5] = [
     (1, "initial", include_str!("schema.sql")),
     (2, "schema_checksums", include_str!("migrations/0002_schema_checksums.sql")),
     (3, "issue_tree", include_str!("migrations/0003_issue_tree.sql")),
+    (4, "execution_fences", include_str!("migrations/0004_execution_fences.sql")),
+    (5, "writer_authority", include_str!("migrations/0005_writer_authority.sql")),
 ];
 fn checksum(sql: &str) -> String {
     use sha2::Digest as _;
@@ -35,7 +37,8 @@ fn upgrade_schema(connection: &Connection) -> Result<()> {
         connection.query_row("SELECT MAX(version) FROM platform_schema_migrations", [], |row| {
             row.get(0)
         })?;
-    ensure!((1..=3).contains(&version), "unsupported platform database schema {version}");
+    let current = MIGRATIONS.last().expect("platform migrations").0;
+    ensure!((1..=current).contains(&version), "unsupported platform database schema {version}");
     if version == 1 {
         connection.execute_batch(MIGRATIONS[1].2)?;
         let now = time::OffsetDateTime::now_utc()
@@ -43,9 +46,13 @@ fn upgrade_schema(connection: &Connection) -> Result<()> {
         connection.execute("UPDATE platform_schema_migrations SET name=?1,checksum=?2,applied_at=?3 WHERE version=1",params![MIGRATIONS[0].1,checksum(MIGRATIONS[0].2),now])?;
         connection.execute("INSERT INTO platform_schema_migrations(version,name,checksum,applied_at) VALUES(2,?1,?2,?3)",params![MIGRATIONS[1].1,checksum(MIGRATIONS[1].2),now])?;
     }
-    if version < 3 {
-        connection.execute_batch(MIGRATIONS[2].2)?;
-        connection.execute("INSERT INTO platform_schema_migrations(version,name,checksum,applied_at) VALUES(3,?1,?2,datetime('now'))",params![MIGRATIONS[2].1,checksum(MIGRATIONS[2].2)])?;
+    for &(next, name, sql) in MIGRATIONS.iter().filter(|migration| migration.0 > version.max(2)) {
+        connection.execute_batch(sql)?;
+        connection.execute(
+            "INSERT INTO platform_schema_migrations(version,name,checksum,applied_at)
+             VALUES(?1,?2,?3,datetime('now'))",
+            params![next, name, checksum(sql)],
+        )?;
     }
     verify_schema(connection)
 }
@@ -67,7 +74,18 @@ pub fn initialize(config: &PlatformConfig) -> Result<()> {
     } else {
         None
     };
-    if old_version.is_some_and(|version| version < 3) {
+    let has_binding = has_ledger
+        && connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_space WHERE singleton=1)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+    if !has_binding {
+        config.validate_git_source()?;
+    }
+    if old_version
+        .is_some_and(|version| version < MIGRATIONS.last().expect("platform migrations").0)
+    {
         connection.backup(
             rusqlite::MAIN_DB,
             config.backups.join(format!(

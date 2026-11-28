@@ -11,7 +11,7 @@ use crate::{
     github::{GitHubClient, GitHubError, RepositoryName, WorkItemLocator},
     store::{
         AssociatedWorkItem, AssociationSet, CanonicalComment, CanonicalCommentSet, DeletedComment,
-        StoreActor, StoreError,
+        OperationalCommentCandidate, StoreActor, StoreError,
     },
 };
 
@@ -108,8 +108,45 @@ pub struct CommentSnapshot {
     pub deleted: bool,
 }
 
+/// Edit attribution returned with the same canonical title and body.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RootEditEvidence {
+    pub(crate) last_edited_at: Option<String>,
+    pub(crate) editor: Option<EditActor>,
+    pub(crate) title_history: Option<TitleHistory>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct EditActor {
+    pub(crate) id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct TitleHistory {
+    pub(crate) nodes: Vec<Option<TitleRename>>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TitleRename {
+    pub(crate) id: String,
+    pub(crate) actor: Option<EditActor>,
+    pub(crate) created_at: String,
+    pub(crate) previous_title: String,
+    pub(crate) current_title: String,
+}
+
+impl RootEditEvidence {
+    pub(crate) fn latest_title_rename(&self) -> Option<&TitleRename> {
+        self.title_history.as_ref()?.nodes.last()?.as_ref()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssueSnapshot {
+    #[serde(skip)]
+    pub(crate) root_edits: RootEditEvidence,
     pub node_id: String,
     pub database_id: String,
     pub repository_node_id: String,
@@ -164,6 +201,8 @@ pub struct ReviewThreadSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequestSnapshot {
+    #[serde(skip)]
+    pub(crate) root_edits: RootEditEvidence,
     pub node_id: String,
     pub database_id: String,
     pub repository_node_id: String,
@@ -216,6 +255,7 @@ pub struct RenderedContext {
 pub struct CanonicalObservation {
     /// Original authorship is usable only when the API proves no subsequent edit.
     pub unedited_creation: bool,
+    pub created_at: Option<String>,
     pub work_item_node_id: String,
     pub work_item_kind: &'static str,
     pub work_item_number: u64,
@@ -232,12 +272,24 @@ pub struct CanonicalObservation {
     pub author_login: Option<String>,
     pub body: Option<String>,
     pub visible_body: Option<String>,
-    /// Exact body/title content used to correlate a known publication version.
+    /// Exact title content returned by the source.
     pub title: Option<String>,
     pub metadata_digest: Option<String>,
+    pub(crate) root_edits: RootEditEvidence,
 }
 
 impl CanonicalObservation {
+    pub(crate) fn root_fields(&self) -> Option<crate::store::ObservedRootFields> {
+        if !matches!(self.object_kind, "issue" | "pr") {
+            return None;
+        }
+        Some(crate::store::ObservedRootFields {
+            title_digest: root_field_digest(self.title.as_deref()?),
+            body_digest: root_field_digest(self.body.as_deref()?),
+            title_event_id: self.root_edits.latest_title_rename().map(|rename| rename.id.clone()),
+        })
+    }
+
     /// Versioned wire evidence is distinct from visible semantic equality.
     pub(crate) fn version_digest(&self) -> String {
         if matches!(self.object_kind, "issue" | "pr") {
@@ -338,16 +390,24 @@ pub fn render_complete(
 pub fn reconcile_local_state(
     context: &mut CanonicalContext,
     store: &StoreActor,
+    github_app_actor_node_id: Option<&str>,
 ) -> Result<(), ContextError> {
     match context {
-        CanonicalContext::Issue(issue) => reconcile_issue_comments(issue, store),
+        CanonicalContext::Issue(issue) => {
+            reconcile_issue_comments(issue, store, github_app_actor_node_id)
+        }
         CanonicalContext::PullRequest(pull_request) => {
             let work_item_digest = pull_request_root_digest(pull_request);
             let work_item_state = pull_request_work_item_state(pull_request);
             for issue in &mut pull_request.associated_issues {
-                reconcile_issue_comments(issue, store)?;
+                reconcile_issue_comments(issue, store, github_app_actor_node_id)?;
             }
-            let excluded = store.operational_status_comment_ids(pull_request.node_id.clone())?;
+            let excluded = discussion_roles(
+                store,
+                &pull_request.node_id,
+                &pull_request.conversation,
+                github_app_actor_node_id,
+            )?;
             let mut tombstones = store.reconcile_comments(comment_set(
                 &pull_request.repository_node_id,
                 &pull_request.repository,
@@ -489,6 +549,7 @@ pub fn canonical_observations(context: &CanonicalContext) -> Vec<CanonicalObserv
 fn issue_observation(issue: &IssueSnapshot) -> CanonicalObservation {
     CanonicalObservation {
         unedited_creation: false,
+        created_at: None,
         work_item_node_id: issue.node_id.clone(),
         work_item_kind: "issue",
         work_item_number: issue.number,
@@ -506,6 +567,7 @@ fn issue_observation(issue: &IssueSnapshot) -> CanonicalObservation {
         body: Some(issue.body.clone()),
         visible_body: Some(filter_html_comments(&issue.body)),
         title: Some(issue.title.clone()),
+        root_edits: issue.root_edits.clone(),
         metadata_digest: Some(issue_metadata_digest(issue)),
     }
 }
@@ -513,6 +575,7 @@ fn issue_observation(issue: &IssueSnapshot) -> CanonicalObservation {
 fn pull_request_observation(pull_request: &PullRequestSnapshot) -> CanonicalObservation {
     CanonicalObservation {
         unedited_creation: false,
+        created_at: None,
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
@@ -530,6 +593,7 @@ fn pull_request_observation(pull_request: &PullRequestSnapshot) -> CanonicalObse
         body: Some(pull_request.body.clone()),
         visible_body: Some(filter_html_comments(&pull_request.body)),
         title: Some(pull_request.title.clone()),
+        root_edits: pull_request.root_edits.clone(),
         metadata_digest: Some(pull_request_metadata_digest(pull_request)),
     }
 }
@@ -548,6 +612,7 @@ fn review_observation(
     };
     CanonicalObservation {
         unedited_creation: false,
+        created_at: None,
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
@@ -565,6 +630,7 @@ fn review_observation(
         body: Some(review.body.clone()),
         visible_body: Some(filter_html_comments(&review.body)),
         title: None,
+        root_edits: RootEditEvidence::default(),
         metadata_digest: Some(review_semantic_digest(review, true)),
     }
 }
@@ -585,6 +651,7 @@ fn review_thread_observation(
     );
     CanonicalObservation {
         unedited_creation: false,
+        created_at: None,
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
@@ -602,6 +669,7 @@ fn review_thread_observation(
         body: None,
         visible_body: None,
         title: None,
+        root_edits: RootEditEvidence::default(),
         metadata_digest: Some(thread_semantic_digest(thread, true)),
     }
 }
@@ -614,6 +682,7 @@ fn observation(
     let (version, digest, lifecycle) = comment_identity(comment);
     CanonicalObservation {
         unedited_creation: unedited_comment(comment),
+        created_at: Some(comment.created_at.clone()),
         work_item_node_id: issue.node_id.clone(),
         work_item_kind: "issue",
         work_item_number: issue.number,
@@ -631,6 +700,7 @@ fn observation(
         body: comment.body.clone(),
         visible_body: comment.body.as_deref().map(filter_html_comments),
         title: None,
+        root_edits: RootEditEvidence::default(),
         metadata_digest: Some(comment_semantic_digest(comment, true)),
     }
 }
@@ -643,6 +713,7 @@ fn pr_observation(
     let (version, digest, lifecycle) = comment_identity(comment);
     CanonicalObservation {
         unedited_creation: unedited_comment(comment),
+        created_at: Some(comment.created_at.clone()),
         work_item_node_id: pull_request.node_id.clone(),
         work_item_kind: "pr",
         work_item_number: pull_request.number,
@@ -660,6 +731,7 @@ fn pr_observation(
         body: comment.body.clone(),
         visible_body: comment.body.as_deref().map(filter_html_comments),
         title: None,
+        root_edits: RootEditEvidence::default(),
         metadata_digest: Some(comment_semantic_digest(comment, true)),
     }
 }
@@ -735,9 +807,11 @@ fn unedited_comment(comment: &CommentSnapshot) -> bool {
 fn reconcile_issue_comments(
     issue: &mut IssueSnapshot,
     store: &StoreActor,
+    github_app_actor_node_id: Option<&str>,
 ) -> Result<(), ContextError> {
     let work_item_digest = issue_root_digest(issue);
-    let excluded = store.operational_status_comment_ids(issue.node_id.clone())?;
+    let excluded =
+        discussion_roles(store, &issue.node_id, &issue.comments, github_app_actor_node_id)?;
     let mut tombstones = store.reconcile_comments(comment_set(
         &issue.repository_node_id,
         &issue.repository,
@@ -773,6 +847,29 @@ fn reconcile_issue_comments(
             .collect(),
     })?;
     Ok(())
+}
+
+fn discussion_roles(
+    store: &StoreActor,
+    work_item_node_id: &str,
+    comments: &[CommentSnapshot],
+    github_app_actor_node_id: Option<&str>,
+) -> Result<BTreeSet<String>, StoreError> {
+    let Some(trusted_app) = github_app_actor_node_id else { return Ok(BTreeSet::new()) };
+    let candidates = comments
+        .iter()
+        .filter(|comment| !comment.deleted)
+        .filter_map(|comment| {
+            OperationalCommentCandidate::from_discussion(
+                trusted_app,
+                comment.author.as_ref().map(|actor| actor.node_id.as_str()),
+                &comment.node_id,
+                comment.body.as_deref(),
+                &comment.created_at,
+            )
+        })
+        .collect();
+    store.reconcile_operational_comment_roles(work_item_node_id.into(), candidates)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -819,6 +916,10 @@ fn comment_set(
             })
             .collect(),
     }
+}
+
+pub(crate) fn root_field_digest(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
 }
 
 fn root_projection_digest(node_id: &str, projection: &str) -> String {
@@ -1314,6 +1415,8 @@ struct IssueTypeRaw {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct IssueCoreRaw {
+    #[serde(flatten)]
+    root_edits: RootEditEvidence,
     id: String,
     #[serde(rename = "fullDatabaseId")]
     full_database_id: String,
@@ -1334,6 +1437,8 @@ struct IssueCoreRaw {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct PullRequestCoreRaw {
+    #[serde(flatten)]
+    root_edits: RootEditEvidence,
     id: String,
     #[serde(rename = "fullDatabaseId")]
     full_database_id: String,
@@ -1492,6 +1597,14 @@ query IssueCore($owner:String!,$name:String!,$number:Int!){
     id nameWithOwner
     issue(number:$number){
       id fullDatabaseId number title body state stateReason updatedAt
+      lastEditedAt
+      editor{... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}}
+      titleHistory:timelineItems(last:2,itemTypes:[RENAMED_TITLE_EVENT]){
+        nodes{... on RenamedTitleEvent{
+          id createdAt previousTitle currentTitle
+          actor{... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}}
+        }}
+      }
       author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}}
       issueType{name}
       milestone{title}
@@ -1507,6 +1620,14 @@ query PrCore($owner:String!,$name:String!,$number:Int!){
     id nameWithOwner
     pullRequest(number:$number){
       id fullDatabaseId number title body state isDraft merged updatedAt
+      lastEditedAt
+      editor{... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}}
+      titleHistory:timelineItems(last:2,itemTypes:[RENAMED_TITLE_EVENT]){
+        nodes{... on RenamedTitleEvent{
+          id createdAt previousTitle currentTitle
+          actor{... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}}
+        }}
+      }
       author{login ... on Bot{id} ... on EnterpriseUserAccount{id} ... on Mannequin{id} ... on Organization{id} ... on User{id}}
       baseRefName headRefName headRepository{id nameWithOwner}
       milestone{title}
@@ -2425,6 +2546,7 @@ async fn read_issue_snapshot(
     });
 
     Ok(IssueSnapshot {
+        root_edits: core.root_edits,
         node_id: core.id,
         database_id: core.full_database_id,
         repository_node_id: marker.repository.id,
@@ -2638,6 +2760,7 @@ async fn read_pr_snapshot(
     });
 
     Ok(PullRequestSnapshot {
+        root_edits: core.root_edits,
         node_id: core.id,
         database_id: core.full_database_id,
         repository_node_id: marker.repository.id,

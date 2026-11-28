@@ -4,6 +4,7 @@ pub(super) mod scope;
 pub use commands::{
     CandidateLocation, CommandFailure, CommandRequest, ControlPolicy, ControlReceipt, ObjectCommand,
 };
+pub(crate) use scope::ScopeBoundary;
 pub use scope::ScopeSnapshot;
 use std::{path::Path, time::Duration};
 
@@ -133,9 +134,7 @@ impl PlatformObjects {
         Ok(Self { connection, repository: repository.into(), writer: None, revision_guard: None })
     }
 
-    pub fn verify_source(&self, source: &Path) -> Result<()> {
-        let source = source.canonicalize()?;
-        git2::Repository::open(&source)?;
+    pub(super) fn verify_source_binding(&self, source: &Path) -> Result<()> {
         let bound: Option<String> = self.connection.query_row(
             "SELECT source FROM local_space WHERE singleton=1",
             [],
@@ -145,6 +144,13 @@ impl PlatformObjects {
             bound.as_deref() == source.to_str(),
             "Git source does not match this local collaboration space"
         );
+        Ok(())
+    }
+
+    pub fn verify_source(&self, source: &Path) -> Result<()> {
+        let source = source.canonicalize()?;
+        self.verify_source_binding(&source)?;
+        git2::Repository::open(source)?;
         Ok(())
     }
 
@@ -204,25 +210,27 @@ impl PlatformObjects {
     ) -> Result<Item> {
         nonempty(head, "head")?;
         nonempty(base, "base")?;
+        self.verify_source(git_dir)?;
         let git = git2::Repository::open(git_dir)
             .with_context(|| format!("open Git repository {}", git_dir.display()))?;
-        let head_commit = git.revparse_single(head)?.peel_to_commit()?.id().to_string();
         let base_branch = full_branch(base)?;
-        let base_commit = git.refname_to_id(&base_branch)?.to_string();
-        git.find_commit(git2::Oid::from_str(&base_commit)?)?;
-        ensure!(head_commit != base_commit, "PR head and base resolve to the same commit");
         if let Some(number) = issue {
             if let Some(policy) = self.run_policy(number)? {
                 ensure!(
                     base_branch == policy.delivery_ref,
                     "run PR base must equal its registered deliveryRef"
                 );
+                self.initialize_delivery_ref(&git, &base_branch)?;
             }
             ensure!(
                 self.item(number)?.kind == "issue",
                 "associated object #{number} is not an Issue"
             );
         }
+        let head_commit = git.revparse_single(head)?.peel_to_commit()?.id().to_string();
+        let base_commit = git.refname_to_id(&base_branch)?.to_string();
+        git.find_commit(git2::Oid::from_str(&base_commit)?)?;
+        ensure!(head_commit != base_commit, "PR head and base resolve to the same commit");
         let item = self.create(
             title,
             body,
@@ -406,7 +414,6 @@ impl PlatformObjects {
             params![assigned_actor, sql_id(number)?],
         )?;
         bump(&tx, number)?;
-        revoke_item_grants(&tx, number)?;
         if old.desired_profile.is_some() {
             emit(&tx, number, "unassign", Some("unassigned"), author, None, self.writer.as_ref())?;
         }
@@ -420,10 +427,6 @@ impl PlatformObjects {
     pub fn set_state(&mut self, number: u64, open: bool, author: &str) -> Result<Item> {
         let old = self.item(number)?;
         nonempty(author, "author")?;
-        if open && old.kind == "pr" {
-            let merged:bool=self.connection.query_row("SELECT EXISTS(SELECT 1 FROM local_merges WHERE pr_number=?1 AND lifecycle='applied')",[sql_id(number)?],|r|r.get(0))?;
-            ensure!(!merged, "merged PR cannot be reopened; create a new PR candidate");
-        }
         let state = if open { "open" } else { "closed" };
         if old.state == state {
             return Ok(old);
@@ -431,15 +434,17 @@ impl PlatformObjects {
         let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
         validate_revision(&tx, &self.repository, self.revision_guard)?;
+        if open && old.kind == "pr" {
+            ensure!(
+                !was_merged(&tx, number)?,
+                "merged PR cannot be reopened; create a new PR candidate"
+            );
+        }
         tx.execute(
             "UPDATE local_items SET state=?1 WHERE number=?2",
             params![state, sql_id(number)?],
         )?;
         bump(&tx, number)?;
-        revoke_item_grants(&tx, number)?;
-        if !open {
-            tx.execute("WITH RECURSIVE descendants(number) AS (SELECT root_number FROM run_root_policies WHERE root_number=?2 UNION SELECT p.child_number FROM local_issue_parents p JOIN descendants d ON p.parent_number=d.number), covered(number) AS (SELECT number FROM descendants UNION SELECT l.pr_number FROM local_links l JOIN descendants d ON l.issue_number=d.number) UPDATE platform_grants SET epoch=epoch+1,lifecycle='revoked',updated_at=?1 WHERE item_number IN (SELECT number FROM covered) AND lifecycle='active'",params![now(),sql_id(number)?])?;
-        }
         emit(
             &tx,
             number,
@@ -503,6 +508,7 @@ impl PlatformObjects {
     fn build_issue_snapshot(&self, item: Item) -> Result<IssueSnapshot> {
         let associated_prs = self.linked(item.number, false)?.into_iter().map(reference).collect();
         Ok(IssueSnapshot {
+            root_edits: crate::context::RootEditEvidence::default(),
             node_id: item_node(&self.repository, item.number),
             database_id: item.number.to_string(),
             repository_node_id: repository_node(&self.repository),
@@ -589,6 +595,7 @@ impl PlatformObjects {
             .map(|i| self.build_issue_snapshot(i))
             .collect::<Result<Vec<_>>>()?;
         Ok(CanonicalContext::PullRequest(PullRequestSnapshot {
+            root_edits: crate::context::RootEditEvidence::default(),
             node_id: item_node(&self.repository, number),
             database_id: number.to_string(),
             repository_node_id: repository_node(&self.repository),
@@ -598,7 +605,7 @@ impl PlatformObjects {
             body: item.body,
             state: item.state,
             draft: false,
-            merged: self.connection.query_row("SELECT EXISTS(SELECT 1 FROM local_merges WHERE pr_number=?1 AND lifecycle='applied')",[sql_id(number)?],|r|r.get(0))?,
+            merged: was_merged(&self.connection, number)?,
             updated_at: item.updated_at,
             author: Some(actor(&item.author)),
             base_ref: item.base_ref.context("PR lacks base")?,
@@ -829,7 +836,12 @@ impl PlatformObjects {
             }
             if state == "prepared" && git.refname_to_id(&base_ref)? == git2::Oid::from_str(commit)?
             {
-                self.finish_merge(number, commit, author)?;
+                pin_commit(&self.connection, &git, number, "merges", commit)?;
+                let tx = write_transaction(&mut self.connection)?;
+                validate_writer(&tx, self.writer.as_ref())?;
+                validate_revision(&tx, &self.repository, self.revision_guard)?;
+                settle_merge(&tx, number, commit, author, self.writer.as_ref())?;
+                tx.commit()?;
                 return Ok(MergeResult {
                     number,
                     merge_commit: commit.clone(),
@@ -858,8 +870,14 @@ impl PlatformObjects {
         } else {
             self.prepare_merge(&git, &item, expected_base, expected_head)?
         };
-        self.adopt_merge_ref(&git, &item, &base_ref, merge_commit, expected_base, expected_head)?;
-        self.finish_merge(number, &merge_commit.to_string(), author)?;
+        self.adopt_merge_ref(
+            &git,
+            &item,
+            &base_ref,
+            merge_commit,
+            (expected_base, expected_head),
+            author,
+        )?;
         Ok(MergeResult {
             number,
             merge_commit: merge_commit.to_string(),
@@ -874,10 +892,13 @@ impl PlatformObjects {
         item: &Item,
         base_ref: &str,
         merge_commit: git2::Oid,
-        expected_base: git2::Oid,
-        expected_head: git2::Oid,
+        expected: (git2::Oid, git2::Oid),
+        author: &str,
     ) -> Result<()> {
         let number = item.number;
+        let (expected_base, expected_head) = expected;
+        let commit = merge_commit.to_string();
+        pin_commit(&self.connection, git, number, "merges", &commit)?;
         // The durable intent precedes Git CAS; restart recognizes only its exact commit.
         let updated = {
             let tx = write_transaction(&mut self.connection)?;
@@ -902,6 +923,9 @@ impl PlatformObjects {
                 )
                 .map(|_| ())
             };
+            if result.is_ok() {
+                settle_merge(&tx, number, &commit, author, self.writer.as_ref())?;
+            }
             tx.commit()?;
             result
         };
@@ -910,7 +934,7 @@ impl PlatformObjects {
                 number,
                 &expected_base.to_string(),
                 &expected_head.to_string(),
-                Some(&merge_commit.to_string()),
+                Some(&commit),
                 "failed",
                 Some(&error.to_string()),
             )?;
@@ -1002,28 +1026,6 @@ impl PlatformObjects {
         Ok(())
     }
 
-    fn finish_merge(&mut self, number: u64, commit: &str, author: &str) -> Result<()> {
-        let tx = write_transaction(&mut self.connection)?;
-        validate_writer(&tx, self.writer.as_ref())?;
-        validate_revision(&tx, &self.repository, self.revision_guard)?;
-        let source: String =
-            tx.query_row("SELECT source FROM local_space WHERE singleton=1", [], |row| row.get(0))?;
-        pin_commit(&tx, &git2::Repository::open(source)?, number, "merges", commit)?;
-        let applied=tx.execute("UPDATE local_merges SET lifecycle='applied',error=NULL,updated_at=?1 WHERE pr_number=?2 AND merge_commit=?3 AND lifecycle='prepared'",params![now(),sql_id(number)?,commit])?;
-        if applied == 0 {
-            let complete:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM local_merges WHERE pr_number=?1 AND merge_commit=?2 AND lifecycle='applied')",params![sql_id(number)?,commit],|r|r.get(0))?;
-            ensure!(complete, "prepared merge intent no longer matches this commit");
-            tx.commit()?;
-            return Ok(());
-        }
-        tx.execute("UPDATE local_items SET state='closed' WHERE number=?1", [sql_id(number)?])?;
-        bump(&tx, number)?;
-        revoke_item_grants(&tx, number)?;
-        emit(&tx, number, "lifecycle", Some("merged"), author, None, self.writer.as_ref())?;
-        tx.commit()?;
-        Ok(())
-    }
-
     pub fn apply_outbox(
         &mut self,
         intent: &super::writes::WriteRequest,
@@ -1103,6 +1105,42 @@ impl PlatformObjects {
         tx.commit()?;
         Ok(result)
     }
+}
+
+fn settle_merge(
+    tx: &Connection,
+    number: u64,
+    commit: &str,
+    author: &str,
+    writer: Option<&Writer>,
+) -> Result<()> {
+    let applied = tx.execute(
+        "UPDATE local_merges SET lifecycle='applied',error=NULL,updated_at=?1
+         WHERE pr_number=?2 AND merge_commit=?3 AND lifecycle='prepared'",
+        params![now(), sql_id(number)?, commit],
+    )?;
+    if applied == 0 {
+        let complete: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_merges
+             WHERE pr_number=?1 AND merge_commit=?2 AND lifecycle='applied')",
+            params![sql_id(number)?, commit],
+            |row| row.get(0),
+        )?;
+        ensure!(complete, "prepared merge intent no longer matches this commit");
+        return Ok(());
+    }
+    tx.execute("UPDATE local_items SET state='closed' WHERE number=?1", [sql_id(number)?])?;
+    bump(tx, number)?;
+    emit(tx, number, "lifecycle", Some("merged"), author, None, writer)
+}
+
+fn was_merged(connection: &Connection, number: u64) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_events WHERE item_number=?1
+         AND kind='lifecycle' AND detail='merged')",
+        [sql_id(number)?],
+        |row| row.get(0),
+    )?)
 }
 
 fn full_branch(value: &str) -> Result<String> {
@@ -1255,7 +1293,7 @@ impl PlatformObjects {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         Ok(
-            serde_json::json!({"repository":self.repository,"nodeId":repository_node(&self.repository),"spaceId":space,"source":source,"defaultBranch":branch}),
+            serde_json::json!({"repository":self.repository,"nodeId":repository_node(&self.repository),"spaceId":space,"executionFences":true,"source":source,"defaultBranch":branch}),
         )
     }
     pub fn event_page(&self, after: u64, limit: u32) -> Result<serde_json::Value> {
@@ -1273,11 +1311,6 @@ impl PlatformObjects {
         tx.commit()?;
         Ok(serde_json::json!({"events":events,"nextAfter":next,"lastSequence":last}))
     }
-}
-
-fn revoke_item_grants(connection: &Connection, number: u64) -> Result<()> {
-    connection.execute("UPDATE platform_grants SET epoch=epoch+1,lifecycle='revoked',updated_at=?1 WHERE item_number=?2 AND lifecycle='active'",params![now(),sql_id(number)?])?;
-    Ok(())
 }
 
 /// Retention refs never move. A rolled-back publication may leave a harmless retained commit,
@@ -1319,10 +1352,11 @@ impl PlatformObjects {
     pub fn pin_existing_candidates(&self, source: &Path) -> Result<()> {
         self.verify_source(source)?;
         let git = git2::Repository::open(source)?;
+        let mut candidates = std::collections::BTreeSet::new();
         for item in self.list()? {
-            if let (Some(head), Some(base)) = (&item.head_commit, &item.base_commit) {
-                pin_commit(&self.connection, &git, item.number, "heads", head)?;
-                pin_commit(&self.connection, &git, item.number, "bases", base)?;
+            if let (Some(head), Some(base)) = (item.head_commit, item.base_commit) {
+                candidates.insert((item.number, "heads", head));
+                candidates.insert((item.number, "bases", base));
             }
         }
         let mut statement = self.connection.prepare(
@@ -1332,14 +1366,14 @@ impl PlatformObjects {
             .query_map([], |row| Ok((row_id(row, 0)?, row.get::<_, String>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (number, commit) in merges {
-            pin_commit(&self.connection, &git, number, "merges", &commit)?;
+            candidates.insert((number, "merges", commit));
         }
         // Earlier CLI publications survive as events; HTTP preparations survive in applied receipts.
         // Preserve those candidates too when later publications replaced the current head.
         let mut events=self.connection.prepare("SELECT item_number,body FROM local_events WHERE detail='head_published' AND body IS NOT NULL")?;
         for event in events.query_map([], |row| Ok((row_id(row, 0)?, row.get::<_, String>(1)?)))? {
             let (number, commit) = event?;
-            pin_commit(&self.connection, &git, number, "heads", &commit)?;
+            candidates.insert((number, "heads", commit));
         }
         let mut receipts=self.connection.prepare("SELECT response_json FROM control_receipts WHERE scope='objects' AND state='applied' AND response_json IS NOT NULL")?;
         for response in receipts.query_map([], |row| row.get::<_, String>(0))? {
@@ -1350,10 +1384,13 @@ impl PlatformObjects {
                     [("head_commit", "heads"), ("base_commit", "bases"), ("merge_commit", "merges")]
                 {
                     if let Some(commit) = result[field].as_str() {
-                        pin_commit(&self.connection, &git, number, role, commit)?;
+                        candidates.insert((number, role, commit.to_owned()));
                     }
                 }
             }
+        }
+        for (number, role, commit) in candidates {
+            pin_commit(&self.connection, &git, number, role, &commit)?;
         }
         Ok(())
     }

@@ -7,7 +7,7 @@ use crate::{
     github::WorkItemLocator,
     store::{
         StoreActor, TurnClaim,
-        handoff::{RetiredInput, RetirementReason},
+        handoff_inputs::{self, RetiredInput, RetirementReason},
     },
 };
 use anyhow::{Result, bail};
@@ -57,24 +57,13 @@ pub(crate) async fn append_current_context(
     claim: &TurnClaim,
     reference: &mut String,
 ) -> Result<RefreshDisposition> {
-    let sources = if crate::store::handoff::batch_needs_refresh(database, &claim.batch_id)? {
-        crate::store::handoff::batch_sources(database, &claim.batch_id)?
-    } else {
-        Vec::new()
-    };
+    let handoffs = handoff_inputs::for_turn(database, claim)?;
+    if !handoffs.retired.is_empty() {
+        return Ok(RefreshDisposition::Retire(handoffs.retired));
+    }
+    let sources = handoffs.sources;
     if !sources.is_empty() && claim.work_item_kind != "pr" {
         bail!("handoff input is not bound to a PR");
-    }
-    let obsolete = sources
-        .iter()
-        .filter(|source| !source.current_generation)
-        .map(|source| RetiredInput {
-            event_id: source.event_id.clone(),
-            reason: RetirementReason::TargetGenerationChanged,
-        })
-        .collect::<Vec<_>>();
-    if !obsolete.is_empty() {
-        return Ok(RefreshDisposition::Retire(obsolete));
     }
     let mut canonical = current_turn_context(collaboration, claim).await?;
     let retired = if let CanonicalContext::PullRequest(pr) = &canonical {
@@ -121,7 +110,11 @@ pub(crate) async fn append_current_context(
             bail!("Work Item no longer grants execution responsibility to this Profile");
         }
     }
-    context::reconcile_local_state(&mut canonical, store)?;
+    context::reconcile_local_state(
+        &mut canonical,
+        store,
+        collaboration.github_app_actor_node_id(),
+    )?;
     let rendered = context::render_complete(
         &canonical,
         profile.github_context_soft_ratio,

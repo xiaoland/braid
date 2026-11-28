@@ -38,7 +38,7 @@ pub(crate) async fn prepare_pr_context(
     let locator = WorkItemLocator { repository, number: candidate.number };
     let mut canonical =
         CanonicalContext::PullRequest(github.materialize_pull_request(&locator).await?);
-    context::reconcile_local_state(&mut canonical, store)?;
+    context::reconcile_local_state(&mut canonical, store, github.github_app_actor_node_id())?;
     let rendered = context::render_complete(
         &canonical,
         profile.github_context_soft_ratio,
@@ -365,7 +365,7 @@ impl GroupDriver<'_> {
                 profile,
                 &materialization.assignment_id,
                 &prepared.rendered,
-            )?;
+            );
             return Ok(());
         }
         let effective_profile = match provision_pr_agent_worktree(
@@ -414,7 +414,7 @@ impl GroupDriver<'_> {
                         profile,
                         &materialization.assignment_id,
                         &prepared.rendered,
-                    )?;
+                    );
                 }
                 tracing::info!(
                     pr = candidate.number,

@@ -357,7 +357,7 @@ impl GroupDriver<'_> {
             store.ignore_assignment_event(candidate.event_id)?;
             return Ok(());
         }
-        context::reconcile_local_state(&mut canonical, store)?;
+        context::reconcile_local_state(&mut canonical, store, github.github_app_actor_node_id())?;
         let rendered = context::render_complete(
             &canonical,
             profile.github_context_soft_ratio,
@@ -388,7 +388,7 @@ impl GroupDriver<'_> {
                 profile,
                 &materialization.assignment_id,
                 &rendered,
-            )?;
+            );
             return Ok(());
         }
         if !profile.workspace().is_dir() {
@@ -460,7 +460,7 @@ impl GroupDriver<'_> {
                         profile,
                         &materialization.assignment_id,
                         &rendered,
-                    )?;
+                    );
                 }
                 tracing::info!(
                     issue = candidate.number,

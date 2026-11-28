@@ -435,6 +435,7 @@ mod continuous_collaboration;
 mod handoff;
 mod implementation_recovery;
 mod observation_recovery;
+mod reaction_feedback;
 mod semantic_contract;
 mod status_convergence;
 

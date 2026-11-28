@@ -412,8 +412,22 @@ Schema 15 单独保存 adapter 已确认的原生停止依据，覆盖重启后�
 
 Schema 16 在轮次认领时保存内建事件 cursor，记下已发起的 writer grant 申请和
 正在确认的撤权。升级时一并更换内建 Platform 与 Harness 二进制。新平台的 grant
-签发要求 Harness 提供认领时的 cursor。历史轮次保留空 cursor，历史 grant 继续
-通过启动撤权流程收口。
+签发要求 Harness 提供认领时的 cursor。历史轮次保留空 cursor。
+
+Harness schema 17 与 Platform schema 4 引入执行代次。先停止旧 Harness，再升级
+Platform 以禁用缺少执行代次的旧 grant 并保留原始回执，随后升级 Harness。升级只
+改变平台授予的写入资格。历史会话仍按原有原生停止证据判定。新 Harness 可继续
+接纳事件，平台支持执行封禁并确认既有代次后才启动 Provider。
+
+Schema 18 将已知 GitHub Operational Status 评论 ID 迁入 Context 的角色账本，
+保留可独立核对的旧待确认请求及多候选歧义。Schema 19 将已接纳 PR 交接的来源、
+目标代次和下一轮约束迁入输入账本。旧交接证据缺损时，在发送 Provider 前单独
+退休相应输入。Schema 20 保留旧 eyes 的精确 GitHub 目标。新的反馈由输入和轮次
+账本持有，发布器领取后才投影到 outbox。迁移保留旧发布尝试与回执。
+Schema 21 在首次完整对账时建立标题和正文各自的基线。缺少可证实作者的历史
+变更按外部变化处理。
+Schema 22 在输入和执行账本持久记录待公开的 Operational Status，发布器恢复后
+继续投影，保留原有评论身份和历史回执。
 
 ## Health and Status
 
@@ -478,10 +492,12 @@ Harness 配置 schema 3 选择 `[github]` 或 `[builtin]`。原 GitHub schema 2 
 数据库迁移至 schema 6，平台此后使用自己的 schema，不读取执行表。迁移及
 启动命令见[内建平台指南](../user-manual/local.md)。
 
-平台当前 schema 3 持有自己的嵌入迁移名称与 SHA-256 校验。旧平台 schema 1
-在启动时先备份再向前升级，保留空间身份、对象和回执；不通过重建空库升级。
+平台当前 schema 5 持有自己的嵌入迁移名称与 SHA-256 校验。已有平台在启动时
+先备份再向前升级，保留空间身份、对象和回执。
 未知版本或迁移校验不一致明确拒绝。历史候选与合并提交保留平台专属 Git 引用，
-避免工作分支移动或清理后丢失已接受的提交。
+避免工作分支移动或清理后丢失已接受的提交。已注册平台在 Git 工作区离线时仍可
+提供数据库对象、事件和范围查询。创建候选、Git diff、合并和判定最终交付时会
+重新检查相应 Git 数据。首次注册仍验证绑定工作区和默认分支。
 
 两个上游经过同一 Harness 运行入口、lease、调度和 Group/provider 停止合同。
 内建 adapter 使用 HTTP 平台接口，事件 cursor 和 grant 能力保留在 Harness
@@ -490,7 +506,9 @@ ledger；平台不为每个消费者修改事件。`--transport-only` 接入对�
 
 Agent 子进程取得 `BRAID_CONFIG` 与 `BRAID_AGENT`，对象 gateway 通过专属 cwd、
 当前 assignment/session/turn 按需使用或申请有效 grant。普通 prompt 发送无需
-等待签发。平台提交事务核验授权版本。撤销失败传播并阻断执行替换。同
+等待签发。平台签发和提交事务核验执行代次及当前指派和范围的权威事件版本。
+同名重新指派、范围登记、关闭和重开都使旧 grant 失效。
+平台封禁或原生停止无法确认时阻断执行替换。同
 账户进程不是安全沙箱的隔离对手。平台对象、provider history 与 Git 资料保留
 各自身份和数据库，停止 Harness 不删除平台。
 

@@ -7,7 +7,7 @@ use std::{
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use tokio::{
-    sync::{RwLock, watch},
+    sync::watch,
     time::{Duration, MissedTickBehavior},
 };
 
@@ -17,10 +17,11 @@ use crate::{
     config::Config,
     context::{self, CanonicalContext, CanonicalObservation},
     github::{GitHubClient, RepositoryName, WorkItemLocator},
-    health::HealthSnapshot,
+    health::Health,
     store::{
-        CanonicalObjectState, EventKind, IngressEvent, ReactionTarget, RuntimeLease,
-        SchedulerPolicy, StoreActor, TrackedWorkItem,
+        CanonicalObjectState, EventKind, IngressEvent, NativeVersionEvidence,
+        OperationalCommentCandidate, ReactionTarget, RuntimeLease, SchedulerPolicy, StoreActor,
+        TrackedWorkItem, VersionOrigin,
     },
     webhook,
 };
@@ -67,7 +68,7 @@ pub(crate) async fn reconciliation_worker(
     store: Arc<StoreActor>,
     github: Arc<HashMap<String, Arc<GitHubClient>>>,
     config: Config,
-    health: Arc<RwLock<HealthSnapshot>>,
+    health: Health,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut tick =
@@ -79,8 +80,7 @@ pub(crate) async fn reconciliation_worker(
             _ = tick.tick() => {
                 match Box::pin(reconcile_once(&store, &github, &config)).await {
                     Ok(Some(changes)) => {
-                        let mut current = health.write().await;
-                        current.reconciliation = "current";
+                        health.update(|current| current.reconciliation = "current");
                         if changes > 0 {
                             tracing::info!(changes, "canonical GitHub reconciliation observed changes");
                         }
@@ -89,12 +89,16 @@ pub(crate) async fn reconciliation_worker(
                     // state. Keep a previous failure visible until a traversal succeeds.
                     Ok(None) => {}
                     Err(error) => {
-                        let mut current = health.write().await;
-                        if current.reconciliation != "degraded/delayed" {
+                        let diagnostic = error.to_string();
+                        let became_degraded = health.update(|current| {
+                            let became_degraded = current.reconciliation != "degraded/delayed";
+                            current.reconciliation = "degraded/delayed";
+                            current.last_error = Some(diagnostic);
+                            became_degraded
+                        });
+                        if became_degraded {
                             tracing::warn!(%error, "canonical GitHub reconciliation degraded/delayed");
                         }
-                        current.reconciliation = "degraded/delayed";
-                        current.last_error = Some(error.to_string());
                     }
                 }
             }
@@ -203,7 +207,7 @@ async fn reconcile_work_item(
     };
     let observations = context::canonical_observations(&canonical);
     changes += reconcile_observations(store, github, config, &scope, basis, &observations)?;
-    context::reconcile_local_state(&mut canonical, store)?;
+    context::reconcile_local_state(&mut canonical, store, Some(&github.identity().actor_node_id))?;
     let profile = if work_item.kind == "pr" {
         config.pr_profile_for_repository(&work_item.repository)?
     } else {
@@ -233,7 +237,26 @@ pub(crate) fn reconcile_observations(
         .cloned()
         .map(|object| (object.node_id.clone(), object))
         .collect::<BTreeMap<_, _>>();
-    let operational = store.operational_status_comment_ids(scope.work_item_node_id.clone())?;
+    let trusted_app = github.identity().actor_node_id.as_str();
+    let operational = store.reconcile_operational_comment_roles(
+        scope.work_item_node_id.clone(),
+        current
+            .iter()
+            .filter(|observation| {
+                observation.work_item_node_id == scope.work_item_node_id
+                    && matches!(observation.object_kind, "issue_comment" | "pr_comment")
+            })
+            .filter_map(|observation| {
+                OperationalCommentCandidate::from_discussion(
+                    trusted_app,
+                    observation.author_node_id.as_deref(),
+                    &observation.object_node_id,
+                    observation.body.as_deref(),
+                    observation.created_at.as_deref()?,
+                )
+            })
+            .collect(),
+    )?;
     let current_map = current
         .iter()
         .map(|observation| (observation.object_node_id.as_str(), observation))
@@ -246,6 +269,7 @@ pub(crate) fn reconcile_observations(
     let mut processed = current
         .iter()
         .map(|observation| CanonicalObjectState {
+            root_fields: observation.root_fields(),
             node_id: observation.object_node_id.clone(),
             database_id: Some(observation.database_id.clone()),
             object_kind: observation.object_kind.into(),
@@ -327,6 +351,7 @@ pub(crate) fn reconcile_observations(
         let external = metadata_changed
             || observation_is_external(
                 store,
+                previous,
                 observation,
                 action,
                 github.identity().actor_node_id.as_str(),
@@ -373,6 +398,7 @@ pub(crate) fn reconcile_observations(
         }
         let observation = CanonicalObservation {
             unedited_creation: false,
+            created_at: None,
             work_item_node_id: scope.work_item_node_id.clone(),
             work_item_kind: scope.work_item_kind,
             work_item_number: scope.work_item_number,
@@ -397,6 +423,7 @@ pub(crate) fn reconcile_observations(
             visible_body: None,
             title: None,
             metadata_digest: None,
+            root_edits: context::RootEditEvidence::default(),
         };
         let mut deleted = previous.clone();
         deleted.version.clone_from(&observation.version);
@@ -425,34 +452,149 @@ pub(crate) fn reconcile_observations(
         .map_err(Into::into)
 }
 
-pub(crate) fn observation_is_external(
+fn observation_is_external(
     store: &StoreActor,
+    previous: Option<&CanonicalObjectState>,
     observation: &CanonicalObservation,
-    action: &str,
+    action: &'static str,
     app_actor_node_id: &str,
     config: &Config,
 ) -> Result<bool> {
-    let fingerprint = observation.version_digest();
-    if matches!(action, "created" | "submitted" | "edited")
-        && store.is_agent_version(
+    let native = if matches!(action, "created" | "submitted" | "edited") {
+        store.native_version_evidence(
             observation.object_node_id.clone(),
             observation.version.clone(),
-            fingerprint,
+            observation.version_digest(),
+            action,
         )?
-    {
-        return Ok(false);
-    }
-    // The creator is evidence for creation only, never for a later Human edit.
-    if !current_actor_known(observation, action) {
+    } else {
+        NativeVersionEvidence::unknown()
+    };
+    if native.origin == VersionOrigin::External {
         return Ok(true);
     }
-    let profile_origin = observation.author_node_id.as_deref().is_some_and(|author_node_id| {
-        config
-            .profiles
-            .iter()
-            .any(|profile| profile.github_actor_node_id.as_deref() == Some(author_node_id))
+    let actor_origin = |id: Option<&str>| actor_origin(id, app_actor_node_id, config);
+    if matches!(observation.object_kind, "issue" | "pr") && action == "edited" {
+        return Ok(
+            root_edit_origin(previous, observation, &native, actor_origin) != VersionOrigin::Agent
+        );
+    }
+    let canonical = if current_actor_known(observation, action) {
+        actor_origin(observation.author_node_id.as_deref())
+    } else {
+        VersionOrigin::Unknown
+    };
+    Ok(match canonical {
+        VersionOrigin::External => true,
+        VersionOrigin::Agent => false,
+        VersionOrigin::Unknown => native.origin != VersionOrigin::Agent,
+    })
+}
+
+fn actor_origin(id: Option<&str>, app: &str, config: &Config) -> VersionOrigin {
+    let Some(id) = id.filter(|id| !id.is_empty()) else { return VersionOrigin::Unknown };
+    if id == app
+        || config.profiles.iter().any(|profile| profile.github_actor_node_id.as_deref() == Some(id))
+    {
+        VersionOrigin::Agent
+    } else {
+        VersionOrigin::External
+    }
+}
+
+fn root_edit_origin(
+    previous: Option<&CanonicalObjectState>,
+    observation: &CanonicalObservation,
+    native: &NativeVersionEvidence,
+    actor_origin: impl Fn(Option<&str>) -> VersionOrigin,
+) -> VersionOrigin {
+    let Some((previous, old)) = previous.and_then(|p| p.root_fields.as_ref().map(|old| (p, old)))
+    else {
+        return VersionOrigin::Unknown;
+    };
+    let Some(current) = observation.root_fields() else { return VersionOrigin::Unknown };
+    let evidence = &observation.root_edits;
+    let fresh =
+        |edited_at: &str| is_new_root_edit(edited_at, &previous.version, &observation.version);
+    let body = (old.body_digest != current.body_digest).then(|| {
+        let canonical = if evidence.last_edited_at.as_deref().is_some_and(fresh) {
+            actor_origin(evidence.editor.as_ref().and_then(|actor| actor.id.as_deref()))
+        } else {
+            VersionOrigin::Unknown
+        };
+        use_native_field(canonical, native.prior_body.as_deref(), &old.body_digest)
     });
-    Ok(observation.author_node_id.as_deref() != Some(app_actor_node_id) && !profile_origin)
+    let title = (old.title_digest != current.title_digest).then(|| {
+        let canonical = title_edit_origin(previous, old, observation, actor_origin, fresh);
+        use_native_field(canonical, native.prior_title.as_deref(), &old.title_digest)
+    });
+    let mut changed = [body, title].into_iter().flatten().peekable();
+    if changed.clone().any(|origin| origin == VersionOrigin::External) {
+        VersionOrigin::External
+    } else if changed.peek().is_some() && changed.all(|origin| origin == VersionOrigin::Agent) {
+        VersionOrigin::Agent
+    } else {
+        VersionOrigin::Unknown
+    }
+}
+
+fn use_native_field(
+    canonical: VersionOrigin,
+    preimage: Option<&str>,
+    prior_digest: &str,
+) -> VersionOrigin {
+    if canonical == VersionOrigin::Unknown
+        && preimage.is_some_and(|preimage| context::root_field_digest(preimage) == prior_digest)
+    {
+        VersionOrigin::Agent
+    } else {
+        canonical
+    }
+}
+
+fn title_edit_origin(
+    previous: &CanonicalObjectState,
+    old: &crate::store::ObservedRootFields,
+    observation: &CanonicalObservation,
+    actor_origin: impl Fn(Option<&str>) -> VersionOrigin,
+    fresh: impl Fn(&str) -> bool,
+) -> VersionOrigin {
+    let evidence = &observation.root_edits;
+    let Some(rename) = evidence.latest_title_rename().filter(|rename| {
+        !rename.id.is_empty()
+            && old.title_event_id.as_deref() != Some(rename.id.as_str())
+            && observation.title.as_deref() == Some(rename.current_title.as_str())
+            && fresh(&rename.created_at)
+    }) else {
+        return VersionOrigin::Unknown;
+    };
+    let origin = actor_origin(rename.actor.as_ref().and_then(|actor| actor.id.as_deref()));
+    if origin == VersionOrigin::Agent
+        && (context::root_field_digest(&rename.previous_title) != old.title_digest
+            || evidence.title_history.as_ref().is_some_and(|history| {
+                history.nodes.iter().rev().nth(1).is_some_and(|prior_rename| {
+                    prior_rename.as_ref().is_none_or(|prior_rename| {
+                        old.title_event_id.as_deref() != Some(prior_rename.id.as_str())
+                            && edit_time(&prior_rename.created_at)
+                                .zip(edit_time(&previous.version))
+                                .is_none_or(|(rename, previous)| rename >= previous)
+                    })
+                })
+            }))
+    {
+        return VersionOrigin::Unknown;
+    }
+    origin
+}
+
+fn edit_time(value: &str) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+}
+
+fn is_new_root_edit(edited_at: &str, previous: &str, current: &str) -> bool {
+    edit_time(edited_at).zip(edit_time(previous)).zip(edit_time(current)).is_some_and(
+        |((edited_at, previous), current)| previous < edited_at && edited_at <= current,
+    )
 }
 
 fn current_actor_known(observation: &CanonicalObservation, action: &str) -> bool {

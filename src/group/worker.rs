@@ -7,7 +7,7 @@ use tokio::{
     time::{Duration, MissedTickBehavior},
 };
 
-use super::{SessionManager, provider::materialized_profile};
+use super::{SessionManager, availability::ProviderReport, provider::materialized_profile};
 use crate::{
     agent_session::{SessionError, SessionFactory},
     collaboration::CollaborationBackend,
@@ -16,7 +16,7 @@ use crate::{
     store::{ProfileRecord, StoreActor, TurnClaim},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum GroupKind {
     Issue,
     Pr,
@@ -91,7 +91,7 @@ pub(crate) async fn agent_group_worker(
     config: Config,
     spec: GroupSpec,
     factory: Arc<dyn SessionFactory>,
-    reports: tokio::sync::mpsc::Sender<crate::health::ProviderHealthUpdate>,
+    reports: tokio::sync::mpsc::Sender<ProviderReport>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     agent_group_worker_backend(
@@ -112,7 +112,7 @@ pub(crate) async fn agent_group_worker_backend(
     config: Config,
     spec: GroupSpec,
     factory: Arc<dyn SessionFactory>,
-    reports: tokio::sync::mpsc::Sender<crate::health::ProviderHealthUpdate>,
+    reports: tokio::sync::mpsc::Sender<ProviderReport>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let driver = GroupDriver {
@@ -140,20 +140,20 @@ impl GroupDriver<'_> {
         Ok(stopped)
     }
 
-    /// Closing a native process and revoking its platform capability each
+    /// Closing a native process and fencing its execution authority each
     /// have their own evidence. Both operations must be attempted even if
     /// one authority is unavailable.
     pub(super) async fn quiesce_session(&self, id: &str) -> Result<bool, SessionError> {
-        let (stop, revoke) =
-            tokio::join!(self.stop_execution(id), self.collaboration.revoke_session(id),);
-        match (stop, revoke) {
+        let (stop, fence) =
+            tokio::join!(self.stop_execution(id), self.collaboration.fence_session(id),);
+        match (stop, fence) {
             (Ok(stopped), Ok(())) => Ok(stopped),
             (Err(error), Ok(())) => Err(error),
             (Ok(_), Err(error)) => Err(SessionError::Failed(format!(
-                "writer revocation unconfirmed for {id}: {error:#}"
+                "execution fence unconfirmed for {id}: {error:#}"
             ))),
-            (Err(stop), Err(revoke)) => Err(SessionError::Failed(format!(
-                "{stop}; writer revocation unconfirmed for {id}: {revoke:#}"
+            (Err(stop), Err(fence)) => Err(SessionError::Failed(format!(
+                "{stop}; execution fence unconfirmed for {id}: {fence:#}"
             ))),
         }
     }
@@ -246,16 +246,6 @@ impl GroupDriver<'_> {
             let _ = self
                 .store
                 .mark_turn_terminal(active.claim.turn_id.clone(), outcome.lifecycle().into());
-            if active.claim.trusted_mention && outcome != crate::agent_session::TurnOutcome::Unknown
-            {
-                let reaction = if outcome == crate::agent_session::TurnOutcome::Completed {
-                    "+1"
-                } else {
-                    "confused"
-                };
-                let _ =
-                    self.store.enqueue_turn_reaction(active.claim.turn_id.clone(), reaction.into());
-            }
         }
         if matches!(
             outcome,
@@ -306,7 +296,7 @@ impl GroupDriver<'_> {
     #[allow(clippy::too_many_lines)]
     async fn drive(
         &self,
-        reports: &tokio::sync::mpsc::Sender<crate::health::ProviderHealthUpdate>,
+        reports: &tokio::sync::mpsc::Sender<ProviderReport>,
         shutdown: &mut watch::Receiver<bool>,
     ) {
         let store = self.store;
@@ -359,10 +349,6 @@ impl GroupDriver<'_> {
                                     }
                                 } else {
                                     let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), lifecycle.into());
-                                    if active.claim.trusted_mention && lifecycle != "unknown" {
-                                        let reaction = if lifecycle == "completed" { "+1" } else { "confused" };
-                                        let _ = store.enqueue_turn_reaction(active.claim.turn_id.clone(), reaction.into());
-                                    }
                                 }
                                 if matches!(lifecycle, "failed" | "unknown") {
                                     let reason = format!("provider turn {provider_turn_id}: {}", error.as_deref().unwrap_or("provider did not supply a terminal reason"));
@@ -405,9 +391,9 @@ impl GroupDriver<'_> {
                         available = result.is_ok();
                         let error = result.err().map(|error| error.to_string());
                         if let Some(error) = &error { tracing::warn!(%error, kind = self.spec.kind.as_str(), "session recovery unavailable"); }
-                        if reports.send(crate::health::ProviderHealthUpdate {
+                        if reports.send(ProviderReport {
                             repository: self.spec.repository.clone(),
-                            group: self.spec.kind.as_str(), error,
+                            group: self.spec.kind, error,
                         }).await.is_err() { return; }
                         recovery = tokio::time::Instant::now() + Duration::from_secs(2);
                     }

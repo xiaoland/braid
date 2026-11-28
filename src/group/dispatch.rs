@@ -224,7 +224,11 @@ impl GroupDriver<'_> {
                     effective_profile,
                 )
             };
-            context::reconcile_local_state(&mut canonical, store)?;
+            context::reconcile_local_state(
+                &mut canonical,
+                store,
+                github.github_app_actor_node_id(),
+            )?;
             let rendered = context::render_complete(
                 &canonical,
                 profile.github_context_soft_ratio,
@@ -238,7 +242,7 @@ impl GroupDriver<'_> {
                     profile,
                     &materialization.assignment_id,
                     &rendered,
-                )?;
+                );
                 return Err(ContextError::TooLarge {
                     bytes: rendered.bytes,
                     hard_bytes: profile.github_context_hard_bytes,
@@ -279,7 +283,7 @@ impl GroupDriver<'_> {
                         profile,
                         &materialization.assignment_id,
                         &rendered,
-                    )?;
+                    );
                 }
                 tracing::info!(
                     work_item_kind = candidate.work_item_kind,
@@ -391,7 +395,7 @@ impl GroupDriver<'_> {
         } else {
             bail!("unsupported Context reset Work Item kind {}", reset.work_item_kind);
         };
-        context::reconcile_local_state(&mut canonical, store)?;
+        context::reconcile_local_state(&mut canonical, store, github.github_app_actor_node_id())?;
         let rendered = context::render_complete(
             &canonical,
             profile.github_context_soft_ratio,
@@ -400,7 +404,7 @@ impl GroupDriver<'_> {
         context::record_context_revision(&canonical, &rendered, store)?;
         record_context_pressure(store, &reset.assignment_id, &rendered, None)?;
         if rendered.pressure == ContextPressure::Hard {
-            enqueue_context_pressure_status(store, profile, &reset.assignment_id, &rendered)?;
+            enqueue_context_pressure_status(store, profile, &reset.assignment_id, &rendered);
             return Err(ContextError::TooLarge {
                 bytes: rendered.bytes,
                 hard_bytes: profile.github_context_hard_bytes,
@@ -449,7 +453,7 @@ impl GroupDriver<'_> {
             braid.context.reset.id = %reset.reset_id, braid.context.revision = %rendered.revision,
             braid.assignment.id = %reset.assignment_id, "context reset completed");
         if rendered.pressure == ContextPressure::Soft {
-            enqueue_context_pressure_status(store, profile, &reset.assignment_id, &rendered)?;
+            enqueue_context_pressure_status(store, profile, &reset.assignment_id, &rendered);
         }
         tracing::info!(
             reset = %reset.reset_id,
@@ -475,11 +479,14 @@ impl GroupDriver<'_> {
             return None;
         };
         match session
-            .steer_user_msg(render_event_references(self.config, &steer), &active.provider_turn_id)
+            .steer_user_msg(
+                render_event_references(self.config, &steer.turn),
+                &active.provider_turn_id,
+            )
             .await
         {
             Ok(SendResult::Acknowledged) => {
-                if let Err(error) = self.store.consume_steer_batch(steer.batch_id) {
+                if let Err(error) = self.store.consume_steer_batch(&steer) {
                     // The input was sent: a ledger failure cannot make it safe to resend.
                     return Some(format!("accepted steer could not be recorded: {error}"));
                 }
@@ -488,22 +495,22 @@ impl GroupDriver<'_> {
             Ok(SendResult::Deferred) => None,
             Ok(SendResult::Started) => Some("steer unexpectedly started a new turn".into()),
             Err(error @ crate::agent_session::SessionError::Failed(_)) => {
-                if let Err(ledger_error) = self.store.consume_steer_batch(steer.batch_id.clone()) {
+                if let Err(ledger_error) = self.store.consume_steer_batch(&steer) {
                     return Some(format!(
                         "rejected steer could not be recorded: {ledger_error}; {error}"
                     ));
                 }
                 self.publish_turn_error(
-                    &steer,
+                    &steer.turn,
                     "input_failed",
-                    &format!("steer batch {} rejected: {error}", steer.batch_id),
+                    &format!("steer batch {} rejected: {error}", steer.turn.batch_id),
                 );
                 None
             }
             Err(error) => {
                 // Keep this input pending while the caller fences the uncertain turn.
                 // A confirmed stop and replacement will coalesce it with the replay.
-                Some(format!("steer batch {} reception is unknown: {error}", steer.batch_id))
+                Some(format!("steer batch {} reception is unknown: {error}", steer.turn.batch_id))
             }
         }
     }
@@ -568,6 +575,11 @@ impl GroupDriver<'_> {
             let _ = store.defer_turn_claim(claim.turn_id.clone());
             return None;
         };
+        if let Err(error) = self.collaboration.bind_execution(&claim.turn_id) {
+            tracing::warn!(%error, turn = %claim.turn_id, "cannot bind turn to native execution");
+            let _ = store.defer_turn_claim_with_reason(claim.turn_id, Some(error.to_string()));
+            return None;
+        }
         // Subscribe before sending so the `TurnStarted` event — the single
         // authority for provider turn identity — cannot be missed.
         let mut events = session.events();
@@ -606,18 +618,10 @@ impl GroupDriver<'_> {
                         );
                     }
                 }
-                if claim.trusted_mention && lifecycle == "failed" {
-                    let _ = store.enqueue_turn_reaction(claim.turn_id, "confused".into());
-                }
                 tracing::error!(%error, "cannot send user message through AgentSession");
                 return None;
             }
         };
-        if claim.trusted_mention
-            && let Err(error) = store.enqueue_turn_reaction(claim.turn_id.clone(), "rocket".into())
-        {
-            tracing::error!(%error, "cannot enqueue trusted-mention start reaction");
-        }
         Some(RunningAgentTurn {
             claim,
             provider_turn_id,
