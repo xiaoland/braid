@@ -111,36 +111,12 @@ pub async fn from_executable(adapter_type: &str, executable: &Path) -> Result<Ru
     .await
 }
 
-/// Build a `RuntimeEntry` from a manual HTTP API URL. No local verification is
-/// performed; the adapter is expected to answer at the URL.
-pub fn from_api_url(adapter_type: &str, api_url: String) -> Result<RuntimeEntry> {
-    if adapter_type != "deepseek-harness" {
-        bail!("--runtime-api-url is only supported for deepseek-harness in this release");
-    }
-    Ok(RuntimeEntry {
-        adapter_type: adapter_type.to_owned(),
-        version: "manual".to_owned(),
-        executable: PathBuf::from("n/a"),
-        api_url: Some(api_url),
-        home: None,
-        stable_schema_sha256: None,
-        experimental_schema_sha256: None,
-    })
-}
-
 pub fn install_hint(adapter_type: &str) -> String {
     match adapter_type {
-        "pi" => "Install the Pi CLI:\n\
-            pnpm add -g @anthropic-ai/pi-cli   # preferred\n\
-            # or: npm install -g @anthropic-ai/pi-cli\n\
-            # Then re-run `braid setup`."
-            .to_owned(),
-        "codex" => "Install the Codex CLI:\n\
-            npm install -g codex-cli\n\
-            # Then re-run `braid setup`."
-            .to_owned(),
-        "deepseek-harness" => {
-            "Start the DeepSeek harness HTTP runtime and pass --runtime-api-url.".to_owned()
+        "pi" => "Install the Pi CLI from https://pi.dev/ and re-run `braid setup`.".to_owned(),
+        "codex" => {
+            "Install the Codex CLI from https://github.com/openai/codex and re-run `braid setup`."
+                .to_owned()
         }
         other => format!("No install instructions for adapter_type {other:?}"),
     }

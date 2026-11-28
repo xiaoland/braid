@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   rust:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.93.0 --profile minimal --component clippy,rustfmt --target aarch64-apple-darwin

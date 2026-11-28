@@ -134,9 +134,9 @@ pub struct RuntimeEntry {
     pub adapter_type: String,
     /// Contract version checked at setup and serve time.
     pub version: String,
-    /// Adapter-defined connectivity. Examples: local executable path, HTTP
-    /// runtime API URL, runtime home directory.
+    /// Local adapter executable.
     pub executable: PathBuf,
+    /// Optional runtime API URL in the configuration format.
     #[serde(default)]
     pub api_url: Option<String>,
     #[serde(default)]
@@ -418,7 +418,6 @@ impl Config {
         Ok(config)
     }
 
-    #[allow(dead_code)]
     pub fn instance_key(&self) -> &str {
         &self.instance.key
     }

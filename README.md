@@ -74,6 +74,7 @@ braid setup owner/repository --provider pi --model deepseek-chat --api-key-envir
 Follow the printed GitHub App installation link, then check the instance and start the local runtime:
 
 ```sh
+braid migrate apply --instance owner
 braid doctor --instance owner
 braid serve --instance owner --tunnel
 ```
@@ -106,5 +107,8 @@ A repository maintainer can activate Braid by posting a visible, trusted `@braid
 | [Deployment & observability](docs/40-deployment/README.md) | Configuration, migrations, diagnostics, and operations. |
 | [Real end-to-end acceptance](docs/10-prd/acceptance.md) | How the complete GitHub-to-agent workflow is verified. |
 
-For source development, Braid is a single Rust package that produces a portable `braid` executable. Build with `cargo build --locked`; the repository's product and technical contracts live in [`docs/`](docs/10-prd/README.md). See the [MIT license](LICENSE).
+For source development, run `cargo build --locked` from the checkout and invoke
+`target/debug/braid` to exercise that build. For the documentation map and
+repository workflow, see the [documentation index](docs/index.md) and
+[`AGENTS.md`](AGENTS.md). See the [MIT license](LICENSE).
 

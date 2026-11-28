@@ -5,13 +5,9 @@ local Coding Agent. GitHub holds the current collaboration state; provider
 sessions are replaceable execution contexts built from that state.
 
 The project vocabulary is owned by [`glossary.md`](glossary.md).
-This document owns product purpose, promises, workflows, and exclusions. The
-cross-unit realization is owned by [`../20-product-tdd/`](../20-product-tdd/),
-and only the real campaign in [`acceptance.md`](acceptance.md) accepts them.
-
 This directory owns product purpose, promises, workflows, and exclusions.
 The cross-unit realization is owned by [`../20-product-tdd/`](../20-product-tdd/),
-and only the real campaign in [`acceptance.md`](acceptance.md) accepts them.
+and [`acceptance.md`](acceptance.md) defines the product acceptance campaign.
 
 - [`glossary.md`](glossary.md) — project vocabulary.
 - [`purpose.md`](purpose.md) — why Braid exists and the pressure it relieves.
