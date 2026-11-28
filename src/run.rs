@@ -177,6 +177,18 @@ pub(crate) async fn run_managed(
     }
 }
 
+fn check_frozen_recipe(path: &std::path::Path, requested: &str) -> Result<()> {
+    let mut recorded: toml::Table = std::fs::read_to_string(path)?.parse()?;
+    let mut requested: toml::Table = requested.parse()?;
+    // Observation can be changed during incident recovery without changing this run.
+    recorded.remove("telemetry");
+    requested.remove("telemetry");
+    if recorded != requested {
+        return Err(ConfigurationChanged.into());
+    }
+    Ok(())
+}
+
 // Keep preparation, frozen identity and execution handoff in lifecycle order.
 #[allow(clippy::too_many_lines)]
 async fn run_inner(
@@ -193,11 +205,9 @@ async fn run_inner(
     config.runtime.backups = Some(root.join("backups"));
     config.runtime.worktrees = Some(root.join("worktrees"));
     config.loaded_from = root.join("config.toml");
-    let frozen = toml::to_string_pretty(&config)?.into_bytes();
+    let frozen = toml::to_string_pretty(&config)?;
     if config.loaded_from.exists() {
-        if std::fs::read(&config.loaded_from)? != frozen {
-            return Err(ConfigurationChanged.into());
-        }
+        check_frozen_recipe(&config.loaded_from, &frozen)?;
     } else {
         use std::io::Write as _;
         let temporary = root.join(format!("config-{}.toml.pending", uuid::Uuid::now_v7()));
@@ -209,7 +219,7 @@ async fn run_inner(
             options.mode(0o600);
         }
         let mut file = options.open(&temporary)?;
-        file.write_all(&frozen)?;
+        file.write_all(frozen.as_bytes())?;
         file.sync_all()?;
         let published = std::fs::hard_link(&temporary, &config.loaded_from);
         std::fs::remove_file(&temporary)?;
@@ -217,9 +227,7 @@ async fn run_inner(
             if error.kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(error.into());
             }
-            if std::fs::read(&config.loaded_from)? != frozen {
-                return Err(ConfigurationChanged.into());
-            }
+            check_frozen_recipe(&config.loaded_from, &frozen)?;
         }
     }
     let store = Arc::new(StoreActor::start(
@@ -414,4 +422,26 @@ async fn run_inner(
     }
     save(&store, &request, &result)?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observability_changes_do_not_change_the_frozen_run_recipe() {
+        let fixture = crate::writer::tests::Fixture::new(false);
+        let mut config = fixture.config.clone();
+        let frozen = config.runtime.database().with_extension("frozen.toml");
+        let original = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&frozen, &original).unwrap();
+        config.telemetry.incident_mode = !config.telemetry.incident_mode;
+        config.telemetry.sample_ratio = 1.0;
+        check_frozen_recipe(&frozen, &toml::to_string_pretty(&config).unwrap()).unwrap();
+        assert_eq!(std::fs::read_to_string(&frozen).unwrap(), original);
+        config.profiles[0].model = Some("different-model".into());
+        let error =
+            check_frozen_recipe(&frozen, &toml::to_string_pretty(&config).unwrap()).unwrap_err();
+        assert!(error.is::<ConfigurationChanged>());
+    }
 }

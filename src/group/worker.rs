@@ -1,5 +1,5 @@
 #![allow(clippy::large_futures)]
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use tokio::{
@@ -9,7 +9,7 @@ use tokio::{
 
 use super::{SessionManager, provider::materialized_profile};
 use crate::{
-    agent_session::SessionFactory,
+    agent_session::{SessionError, SessionFactory},
     collaboration::CollaborationBackend,
     config::{Config, Profile},
     github::GitHubClient,
@@ -120,17 +120,72 @@ pub(crate) async fn agent_group_worker_backend(
         collaboration: &collaboration,
         config: &config,
         spec: &spec,
-        sessions: SessionManager::new(factory, Arc::clone(&collaboration)),
+        sessions: SessionManager::new(factory),
     };
     driver.drive(&reports, &mut shutdown).await;
     driver
-        .sessions
-        .retain(&std::collections::HashSet::new())
+        .retain_sessions(&HashSet::new())
         .await
-        .context("shutdown did not confirm all executions stopped")
+        .context("shutdown did not confirm all sessions quiesced")
 }
 
 impl GroupDriver<'_> {
+    async fn stop_execution(&self, id: &str) -> Result<bool, SessionError> {
+        let stopped = self.sessions.stop(id).await?;
+        if stopped {
+            self.store.set_provider_stop(id.into(), true).map_err(|error| {
+                SessionError::Failed(format!("cannot record native stop: {error}"))
+            })?;
+        }
+        Ok(stopped)
+    }
+
+    /// Closing a native process and revoking its platform capability each
+    /// have their own evidence. Both operations must be attempted even if
+    /// one authority is unavailable.
+    pub(super) async fn quiesce_session(&self, id: &str) -> Result<bool, SessionError> {
+        let (stop, revoke) =
+            tokio::join!(self.stop_execution(id), self.collaboration.revoke_session(id),);
+        match (stop, revoke) {
+            (Ok(stopped), Ok(())) => Ok(stopped),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(SessionError::Failed(format!(
+                "writer revocation unconfirmed for {id}: {error:#}"
+            ))),
+            (Err(stop), Err(revoke)) => Err(SessionError::Failed(format!(
+                "{stop}; writer revocation unconfirmed for {id}: {revoke:#}"
+            ))),
+        }
+    }
+
+    pub(super) async fn require_quiesced(
+        &self,
+        id: &str,
+        recorded_stop: bool,
+    ) -> Result<(), SessionError> {
+        if self.quiesce_session(id).await? || recorded_stop {
+            Ok(())
+        } else {
+            Err(SessionError::Failed(
+                "old execution has no stop evidence after restart; replacement is blocked".into(),
+            ))
+        }
+    }
+
+    pub(super) async fn retain_sessions(
+        &self,
+        retained: &HashSet<String>,
+    ) -> Result<(), SessionError> {
+        let mut failure = None;
+        for id in self.sessions.obsolete(retained).await {
+            if let Err(error) = self.quiesce_session(&id).await {
+                tracing::error!(%error, provider_session = %id, "session quiescence unconfirmed");
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     pub(super) fn publish_turn_error(&self, claim: &TurnClaim, lifecycle: &str, reason: &str) {
         if let Err(error) = self.store.record_turn_error(claim.turn_id.clone(), reason.to_owned()) {
             tracing::error!(%error, turn = %claim.turn_id, "cannot retain complete turn error");
@@ -156,7 +211,7 @@ impl GroupDriver<'_> {
         let Some(mut active) = running.take() else {
             return;
         };
-        let closed = self.sessions.remove(&active.claim.provider_session_id).await;
+        let closed = self.quiesce_session(&active.claim.provider_session_id).await;
         let mut terminal = None;
         while let Ok(event) = active.events.try_recv() {
             if let crate::agent_session::SessionEvent::TurnTerminal {
@@ -234,7 +289,7 @@ impl GroupDriver<'_> {
                     self.store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
             }
             self.publish_turn_error(&active.claim, "unknown", reason);
-            if let Err(error) = self.sessions.remove(&active.claim.provider_session_id).await {
+            if let Err(error) = self.quiesce_session(&active.claim.provider_session_id).await {
                 if let Some(run) = &self.config.finite_run {
                     run.admission.close();
                 }
@@ -294,7 +349,7 @@ impl GroupDriver<'_> {
                                         active.claim.turn_id.clone(),
                                         lifecycle.into(),
                                     );
-                                    if let Err(error) = self.sessions.remove(&active.claim.provider_session_id).await {
+                                    if let Err(error) = self.quiesce_session(&active.claim.provider_session_id).await {
                                         if let Some(run)=&self.config.finite_run {run.admission.close();}
                                         let reason = format!("Context reset could not confirm old writer revocation and execution stop: {error}");
                                         if let Err(error) = store.fail_context_reset(reset_id.clone(), reason.clone()) {
@@ -313,9 +368,9 @@ impl GroupDriver<'_> {
                                     let reason = format!("provider turn {provider_turn_id}: {}", error.as_deref().unwrap_or("provider did not supply a terminal reason"));
                                     self.publish_turn_error(&active.claim, lifecycle, &reason);
                                 }
-                                if lifecycle == "unknown"
+                                if (lifecycle == "unknown" || active.claim.trigger_kind == "finalization")
                                     && active.reset_id.is_none()
-                                    && let Err(stop_error) = self.sessions.remove(&active.claim.provider_session_id).await {
+                                    && let Err(stop_error) = self.quiesce_session(&active.claim.provider_session_id).await {
                                     if let Some(run)=&self.config.finite_run {run.admission.close();}
                                     tracing::error!(%stop_error, "old execution stop remains unconfirmed");
                                     self.publish_turn_error(&active.claim, "unknown", &format!("{}; old execution stop failed: {stop_error}", error.as_deref().unwrap_or("provider outcome unknown")));

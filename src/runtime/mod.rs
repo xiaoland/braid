@@ -36,7 +36,6 @@ use crate::producer::{
     IngressState, lease_worker, mention_worker, reconciliation_worker, webhook_handler,
 };
 use crate::queue::queue_worker;
-use crate::tunnel::start_verified_quick_tunnel;
 
 struct RuntimeLeaseGuard {
     store: Arc<StoreActor>,
@@ -127,7 +126,12 @@ async fn serve_github_managed(
     if *external_stop.borrow() {
         return Ok(());
     }
-    *health.write().await = initial_health(&config, provider_enabled);
+    let mut starting = initial_health(&config, provider_enabled);
+    if quick_tunnel {
+        starting.tunnel = "verifying";
+        starting.webhook_sync = "pending";
+    }
+    *health.write().await = starting;
     let store = Arc::new(StoreActor::start(
         config.runtime.database().to_path_buf(),
         config.runtime.backups().to_path_buf(),
@@ -254,7 +258,7 @@ async fn serve_github_managed(
 
     // Startup can fail after workers have resumed persisted executions. Route
     // those failures through the same bounded shutdown as a running service.
-    let startup: Result<()> = async {
+    let startup: Result<()> = (|| {
         if provider_enabled {
             let factories = crate::provider::session_factories(&config)?;
             let mut spec_scopes = Vec::new();
@@ -297,63 +301,28 @@ async fn serve_github_managed(
             drop(reports);
         }
 
-        let local_url = format!("http://{}", config.server.ingress);
+        Ok(())
+    })();
+
+    let mut tunnel = JoinSet::new();
+    let mut failures = Vec::new();
+    if let Err(error) = startup {
+        failures.push(format!("runtime startup failed: {error:#}"));
+    } else {
         if quick_tunnel {
-            {
-                let mut current = health.write().await;
-                current.tunnel = "verifying";
-                current.webhook_sync = "pending";
-            }
-            let (started, public_webhook) = start_verified_quick_tunnel(
-                &config,
-                &local_url,
-                &state.webhook_secret,
-                config.repository(),
-                &github.identity().repository_node_id,
-            )
-            .await?;
-            let prior = github.app_webhook_config().await?;
-            github
-                .update_app_webhook(
-                    &public_webhook,
-                    Some(
-                        std::str::from_utf8(&state.webhook_secret)
-                            .context("webhook secret is UTF-8")?,
-                    ),
-                )
-                .await?;
-            let confirmed = github.app_webhook_config().await?;
-            if confirmed.url != public_webhook {
-                bail!("App webhook URL did not converge to the verified Tunnel");
-            }
-            {
-                let mut current = health.write().await;
-                current.tunnel = "connected";
-                current.webhook_sync = "confirmed";
-                current.tunnel_verified_at = Some(time::OffsetDateTime::now_utc().to_string());
-                current.webhook_url = Some(public_webhook);
-            }
-            workers.spawn(crate::tunnel::supervise(
+            tunnel.spawn(crate::tunnel::supervise(
                 config.clone(),
-                github.clone(),
-                state.webhook_secret.clone(),
-                health.clone(),
-                started,
-                prior,
-                shutdown_receiver.clone(),
+                github,
+                Arc::clone(&state.webhook_secret),
+                Arc::clone(&health),
+                shutdown_receiver,
             ));
         }
-        Ok(())
-    }
-    .await;
-
-    let mut runtime_failure =
-        startup.err().map(|error| format!("runtime startup failed: {error:#}"));
-    if runtime_failure.is_none() {
         health.write().await.ready = true;
-        tracing::info!(repositories = %config.github_repositories().join(", "), "Braid transport runtime is ready");
-        tokio::select! {
-                _ = external_stop.changed() => {}
+        tracing::info!(repositories = %config.github_repositories().join(", "), "Braid transport runtime started");
+        loop {
+            tokio::select! {
+                _ = external_stop.changed() => break,
                 worker = workers.join_next() => {
                     let message = match worker {
                         Some(Ok(Ok(()))) => "a supervised runtime worker stopped unexpectedly".to_owned(),
@@ -366,45 +335,63 @@ async fn serve_github_managed(
                         current.ready = false;
                         current.last_error = Some(message.clone());
                     }
-                    runtime_failure = Some(message);
+                    failures.push(message);
+                    break;
                 }
+                result = tunnel.join_next(), if !tunnel.is_empty() => {
+                    let reason = match result {
+                        Some(Ok(Err(error))) => format!("Quick Tunnel supervisor failed: {error:#}"),
+                        Some(Err(error)) => format!("Quick Tunnel supervisor failed: {error}"),
+                        _ => "Quick Tunnel supervisor stopped unexpectedly".into(),
+                    };
+                    tracing::error!(%reason, "Quick Tunnel can no longer confirm its stop");
+                    let mut current = health.write().await;
+                    current.tunnel = "stop_unconfirmed";
+                    current.webhook_sync = "blocked";
+                    current.tunnel_error = Some(reason.clone());
+                    failures.push(reason);
+                }
+            }
         }
     }
 
     health.write().await.ready = false;
     let _ = shutdown_sender.send(true);
-    let workers_stopped =
-        tokio::time::timeout(Duration::from_secs(15), async {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let (workers_stopped, tunnel_stopped) = tokio::join!(
+        tokio::time::timeout_at(deadline, async {
             while let Some(worker) = workers.join_next().await {
                 match worker {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        let reason = format!("runtime worker did not confirm shutdown: {error:#}");
-                        runtime_failure =
-                            Some(runtime_failure.take().map_or(reason.clone(), |previous| {
-                                format!("{previous}\n{reason}")
-                            }));
+                        failures
+                            .push(format!("runtime worker did not confirm shutdown: {error:#}"));
                     }
                     Err(error) => {
-                        let reason = format!("runtime worker did not stop cleanly: {error}");
-                        runtime_failure =
-                            Some(runtime_failure.take().map_or(reason.clone(), |previous| {
-                                format!("{previous}\n{reason}")
-                            }));
+                        failures.push(format!("runtime worker did not stop cleanly: {error}"));
                     }
                 }
             }
-        })
-        .await
-        .is_ok();
-    if !workers_stopped {
+        }),
+        tokio::time::timeout_at(deadline, tunnel.join_next()),
+    );
+    match tunnel_stopped {
+        Ok(Some(Ok(Err(error)))) => failures.push(format!("{error:#}")),
+        Ok(Some(Err(error))) => {
+            failures.push(format!("Quick Tunnel did not stop cleanly: {error}"));
+        }
+        Ok(_) => {}
+        Err(_) => {
+            failures
+                .push("Quick Tunnel exceeded its shutdown deadline; stop is unconfirmed".into());
+            tunnel.abort_all();
+            while tunnel.join_next().await.is_some() {}
+        }
+    }
+    if workers_stopped.is_err() {
         let reason =
             "runtime workers exceeded the shutdown deadline; execution stop is unconfirmed";
-        runtime_failure = Some(
-            runtime_failure
-                .take()
-                .map_or(reason.to_owned(), |previous| format!("{previous}\n{reason}")),
-        );
+        failures.push(reason.into());
         tracing::error!("{reason}");
         workers.abort_all();
         while workers.join_next().await.is_some() {}
@@ -422,8 +409,8 @@ async fn serve_github_managed(
     let _ = tokio::time::timeout(Duration::from_secs(5), ingress).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), health_server).await;
     drop(store);
-    if let Some(error) = runtime_failure {
-        bail!(error);
+    if !failures.is_empty() {
+        bail!(failures.join("\n"));
     }
     Ok(())
 }

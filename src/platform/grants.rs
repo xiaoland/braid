@@ -22,6 +22,40 @@ pub struct GrantRequest {
     #[serde(default, skip_serializing_if = "is_false")]
     pub pending: bool,
 }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct GrantIdentity {
+    pub client_id: String,
+    pub item_number: u64,
+    pub actor: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct GrantEpoch {
+    pub epoch: u64,
+    pub active: bool,
+}
+
+pub(crate) fn current_epoch(
+    database: &std::path::Path,
+    identity: &GrantIdentity,
+) -> Result<Option<GrantEpoch>> {
+    let connection =
+        Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    let current = connection
+        .query_row(
+            "SELECT epoch, lifecycle='active' FROM platform_grants
+         WHERE client_id=?1 AND item_number=?2 AND actor=?3",
+            params![identity.client_id, i64::try_from(identity.item_number)?, identity.actor],
+            |row| Ok((row.get::<_, i64>(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    current
+        .map(|(epoch, active)| Ok(GrantEpoch { epoch: u64::try_from(epoch)?, active }))
+        .transpose()
+}
+
 // Serde's skip_serializing_if callback requires a borrowed field.
 #[allow(clippy::trivially_copy_pass_by_ref)]
 pub(crate) fn is_false(value: &bool) -> bool {
@@ -100,20 +134,18 @@ pub fn change(
             || (state == "open" && assigned.as_ref().is_some_and(|actor| actor == &request.actor)),
         "writer grant requires an open object assigned to its actor"
     );
-    if let Some(policy) = run_policy(&tx, request.item_number)? {
+    if !revoke && let Some(policy) = run_policy(&tx, request.item_number)? {
         ensure!(
             policy.client_id == request.client_id
                 && request.run_id.as_deref() == Some(policy.run_id.as_str()),
             "writer identity does not own this registered run scope"
         );
-        if !revoke {
-            let open: bool = tx.query_row(
-                "SELECT state='open' FROM local_items WHERE number=?1",
-                [i64::try_from(policy.root_number)?],
-                |r| r.get(0),
-            )?;
-            ensure!(open, "run root is closed; its writer scope is revoked");
-        }
+        let open: bool = tx.query_row(
+            "SELECT state='open' FROM local_items WHERE number=?1",
+            [i64::try_from(policy.root_number)?],
+            |r| r.get(0),
+        )?;
+        ensure!(open, "run root is closed; its writer scope is revoked");
     }
     let current: Option<i64> = tx
         .query_row(
@@ -141,6 +173,7 @@ pub fn change(
             .ok_or_else(|| anyhow::anyhow!("grant epoch exhausted"))?;
         match current_epoch {
             None => minted_epoch,
+            Some(actual) if actual == request.expected_epoch => minted_epoch,
             Some(actual) if actual == minted_epoch => {
                 actual.checked_add(1).ok_or_else(|| anyhow::anyhow!("grant epoch exhausted"))?
             }

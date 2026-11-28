@@ -2,6 +2,7 @@
 use crate::{
     config::Config,
     context::CanonicalContext,
+    platform::grants::GrantEpoch,
     store::{
         BuiltinBinding, BuiltinCommand, BuiltinGrant, BuiltinReply, EventKind, IngressEvent,
         PendingGitHubWrite, StoreActor,
@@ -134,7 +135,6 @@ pub(crate) struct PlatformItem {
     pub kind: String,
     pub revision: u64,
     pub head_commit: Option<String>,
-    pub desired_profile: Option<String>,
 }
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -260,11 +260,42 @@ impl BuiltinClient {
         item_number: u64,
         actor: &str,
     ) -> Result<()> {
-        let item = self.item(item_number).await?;
-        ensure!(
-            item.desired_profile.as_deref() == Some(actor),
-            "platform assignment no longer belongs to actor {actor}"
-        );
+        // The platform fences assignment changes in its object transaction.
+        // Reconcile an existing capability here, independently of event intake.
+        let existing = self.store.builtin(BuiltinCommand::Grant(session_id.into()))?;
+        if let BuiltinReply::Grant(Some(grant)) = existing
+            && grant.lifecycle != "revoked"
+        {
+            ensure!(
+                grant.item_number == item_number && grant.actor == actor,
+                "writer capability belongs to a different responsibility"
+            );
+            let mut url = self.endpoint.join("api/platform/grants")?;
+            url.query_pairs_mut()
+                .append_pair("clientId", &self.binding.client_id)
+                .append_pair("itemNumber", &item_number.to_string())
+                .append_pair("actor", actor);
+            let remote: Option<GrantEpoch> = decode(self.http.get(url).send().await?).await?;
+            match remote {
+                Some(epoch) if !epoch.active && epoch.epoch > grant.epoch => {
+                    self.store.builtin(BuiltinCommand::Revoke {
+                        session_id: session_id.into(),
+                        epoch: epoch.epoch,
+                    })?;
+                }
+                Some(epoch)
+                    if grant.lifecycle == "active"
+                        && epoch.active
+                        && epoch.epoch == grant.epoch =>
+                {
+                    return Ok(());
+                }
+                _ if grant.lifecycle == "pending" => return self.activate(&grant).await,
+                _ => {
+                    anyhow::bail!("platform writer epoch does not match this session's capability")
+                }
+            }
+        }
         let BuiltinReply::Grant(Some(grant)) = self.store.builtin(BuiltinCommand::Prepare {
             session_id: session_id.into(),
             item_number,
@@ -273,9 +304,6 @@ impl BuiltinClient {
         else {
             anyhow::bail!("grant intent was not persisted")
         };
-        if grant.lifecycle == "active" {
-            return Ok(());
-        }
         self.activate(&grant).await
     }
     async fn activate(&self, grant: &BuiltinGrant) -> Result<()> {
@@ -322,23 +350,6 @@ impl BuiltinClient {
             session_id: session_id.into(),
             epoch: revoked.epoch,
         })?;
-        Ok(())
-    }
-    pub(crate) async fn reconcile_fence(&self, event: &IngressEvent) -> Result<()> {
-        if !matches!(event.kind, EventKind::Assign | EventKind::Unassign | EventKind::Lifecycle) {
-            return Ok(());
-        }
-        let Some(number) = event.work_item_number else {
-            return Ok(());
-        };
-        let BuiltinReply::Grants(grants) = self.store.builtin(BuiltinCommand::Grants)? else {
-            unreachable!()
-        };
-        for grant in grants {
-            if grant.item_number == number {
-                self.revoke_session(&grant.session_id).await?;
-            }
-        }
         Ok(())
     }
     pub(crate) async fn revoke_all(&self) -> Result<()> {

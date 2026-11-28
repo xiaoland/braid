@@ -151,7 +151,10 @@ mod tests {
         drop(db);
         let store = StoreActor::start(database.clone(), root.join("backups")).unwrap();
         let result = store.apply().unwrap();
-        assert_eq!(result.applied, vec![12, 13, 14]);
+        assert_eq!(
+            result.applied,
+            (12..=crate::store::DATABASE_SCHEMA_VERSION).collect::<Vec<_>>()
+        );
         assert!(result.backup.is_some());
         let db = open_read_write(&database).unwrap();
         for (id, expected) in

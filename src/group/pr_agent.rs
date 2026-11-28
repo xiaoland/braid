@@ -130,13 +130,13 @@ impl GroupDriver<'_> {
         let candidates = store.provider_resume_candidates(profile.id.clone(), "pr".into())?;
         let retained =
             candidates.iter().map(|candidate| candidate.provider_session_id.clone()).collect();
-        sessions.retain(&retained).await?;
+        self.retain_sessions(&retained).await?;
         let mut unavailable = None;
         for candidate in candidates {
             if sessions.is_live(&candidate.provider_session_id).await {
                 continue;
             }
-            if let Err(error) = sessions.remove(&candidate.provider_session_id).await {
+            if let Err(error) = self.quiesce_session(&candidate.provider_session_id).await {
                 store.block_provider_session(
                     candidate.provider_session_id.clone(),
                     error.to_string(),
@@ -185,22 +185,24 @@ impl GroupDriver<'_> {
                 enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
                 continue;
             };
-            if candidate.has_started_turn
-                && profile.adapter_type == "pi"
-                && !std::path::Path::new(&candidate.provider_session_id).is_file()
-            {
-                let reason = "Pi native history is missing after a previously started execution; refusing an empty resume";
+            if candidate.session_lifecycle == "unknown" {
+                if candidate.execution_stopped
+                    || sessions.confirmed_stopped(&candidate.provider_session_id).await
+                {
+                    // The existing reset owns replacement; never resume the uncertain old history.
+                    continue;
+                }
+                let reason = "previous execution outcome is unknown; automatic resume cannot prove it stopped";
                 store
                     .block_provider_session(candidate.provider_session_id.clone(), reason.into())?;
                 enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
                 continue;
             }
-            if candidate.session_lifecycle == "unknown" {
-                if sessions.confirmed_stopped(&candidate.provider_session_id).await {
-                    // The existing reset owns replacement; never resume the uncertain old history.
-                    continue;
-                }
-                let reason = "previous execution outcome is unknown; automatic resume cannot prove it stopped";
+            if candidate.has_started_turn
+                && profile.adapter_type == "pi"
+                && !std::path::Path::new(&candidate.provider_session_id).is_file()
+            {
+                let reason = "Pi native history is missing after a previously started execution; refusing an empty resume";
                 store
                     .block_provider_session(candidate.provider_session_id.clone(), reason.into())?;
                 enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
@@ -249,6 +251,7 @@ impl GroupDriver<'_> {
             ) {
                 tracing::warn!(%error, braid.provider_session.id = %candidate.provider_session_id, "restored session observation identity registration failed");
             }
+            store.set_provider_stop(candidate.provider_session_id.clone(), false)?;
             match sessions
                 .resume(
                     candidate.provider_session_id.clone(),
@@ -312,14 +315,14 @@ impl GroupDriver<'_> {
             self.store.provider_resume_candidates(self.spec.profile.id.clone(), "pr".into())?
         {
             if active.number == candidate.number {
-                self.sessions.remove(&active.provider_session_id).await?;
+                self.quiesce_session(&active.provider_session_id).await?;
             }
         }
         let outcome = self.store.retire_unassigned_work_item(candidate.event_id, 0)?;
         if outcome.settled
             && let Some(session) = outcome.fenced_provider_session
         {
-            self.sessions.remove(&session).await?;
+            self.quiesce_session(&session).await?;
         }
         Ok(())
     }

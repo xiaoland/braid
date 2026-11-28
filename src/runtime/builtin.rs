@@ -124,10 +124,12 @@ async fn managed(
     let _lease_guard = LeaseGuard { store: Arc::clone(&store), lease: Arc::clone(&lease) };
     store.recover_writes()?;
     let client = BuiltinClient::connect(&config, Arc::clone(&store)).await?;
-    client
-        .revoke_all()
-        .await
-        .context("cannot revoke old built-in writer grants before execution")?;
+    if provider_enabled {
+        client
+            .revoke_all()
+            .await
+            .context("cannot revoke old built-in writer grants before execution")?;
+    }
     let backend = Arc::new(CollaborationBackend::Builtin(Arc::clone(&client)));
     let mut provider_groups = Vec::new();
     if provider_enabled {
@@ -152,11 +154,18 @@ async fn managed(
         Arc::clone(&lease),
         receiver.clone(),
     )));
+    let write_owner = lease.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    workers.spawn(write_worker(
+        write_owner,
+        Arc::clone(&store),
+        Arc::clone(&client),
+        receiver.clone(),
+    ));
     workers.spawn(object_worker(
-        lease.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
         Arc::clone(&store),
         Arc::clone(&client),
         config.clone(),
+        Arc::clone(&health),
         receiver.clone(),
     ));
     if provider_enabled {
@@ -243,7 +252,7 @@ async fn managed(
                 break;
             }
             let owner = lease.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-            if let Err(error) = advance_objects(&owner, &store, &client, &config).await {
+            if let Err(error) = apply_next_write(&owner, &store, &client).await {
                 if let Some(result) = &mut outcome {
                     result.state = crate::run::RunState::Blocked;
                     result.reason = Some(format!("shutdown outbox failed: {error:#}"));
@@ -314,10 +323,10 @@ async fn managed(
 }
 
 async fn object_worker(
-    owner: crate::store::RuntimeLease,
     store: Arc<StoreActor>,
     client: Arc<BuiltinClient>,
     config: Config,
+    health: Arc<RwLock<HealthSnapshot>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -326,7 +335,18 @@ async fn object_worker(
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),
             _ = tick.tick() => {
-                advance_objects(&owner, &store, &client, &config).await.context("cannot advance built-in collaboration")?;
+                match advance_objects(&store, &client, &config).await {
+                    Ok(()) => health.write().await.reconciliation = "builtin",
+                    Err(error) if error.is::<reqwest::Error>()
+                        || error.downcast_ref::<crate::builtin::PlatformHttpError>()
+                            .is_some_and(|http| http.status.is_server_error()) =>
+                    {
+                        tracing::warn!(%error, "built-in event feed unavailable; keeping its durable cursor");
+                        health.write().await.reconciliation = "builtin-degraded";
+                        tick.reset_after(Duration::from_secs(2));
+                    }
+                    Err(error) => return Err(error.context("cannot advance built-in collaboration")),
+                }
             }
         }
     }
@@ -343,7 +363,6 @@ fn client_cursor(store: &StoreActor) -> Result<u64> {
 
 #[allow(clippy::too_many_lines)]
 async fn advance_objects(
-    owner: &crate::store::RuntimeLease,
     store: &StoreActor,
     client: &BuiltinClient,
     config: &Config,
@@ -400,10 +419,6 @@ async fn advance_objects(
             cursor = pending.sequence;
             continue;
         }
-        client
-            .reconcile_fence(&event)
-            .await
-            .context("cannot reconcile upstream writer revocation")?;
         let delivery_guid = event.delivery_guid.clone();
         let number = event.work_item_number;
         let item_kind = event.work_item_kind;
@@ -448,6 +463,32 @@ async fn advance_objects(
         feed.next_after == cursor,
         "platform nextAfter does not match delivered event sequence"
     );
+    Ok(())
+}
+
+async fn write_worker(
+    owner: RuntimeLease,
+    store: Arc<StoreActor>,
+    client: Arc<BuiltinClient>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return Ok(()),
+            _ = tick.tick() => {
+                apply_next_write(&owner, &store, &client).await.context("cannot settle built-in outbox")?;
+            }
+        }
+    }
+}
+
+async fn apply_next_write(
+    owner: &RuntimeLease,
+    store: &StoreActor,
+    client: &BuiltinClient,
+) -> Result<()> {
     if let Some(write) = store.claim_github_write(owner.clone())? {
         match client.apply_write(&write).await {
             Ok((database_id, node_id)) => {
@@ -633,5 +674,74 @@ async fn finite_outcome(
         result.state = crate::run::RunState::Completed;
         result.delivery_commit = Some(commit);
         return Ok(result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, routing::get};
+
+    #[tokio::test]
+    async fn lifecycle_event_advances_without_the_grant_or_outbox_endpoint() {
+        let fixture = crate::writer::tests::Fixture::new(false);
+        let store = Arc::new(
+            StoreActor::start(
+                fixture.config.runtime.database().into(),
+                fixture.config.runtime.backups().into(),
+            )
+            .unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/api/platform/repository",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "repository": "test-space", "spaceId": "space",
+                        "nodeId": "local:test-space", "defaultBranch": "main"
+                    }))
+                }),
+            )
+            .route(
+                "/api/platform/events",
+                get(|| async {
+                    Json(serde_json::json!({"events": [{
+                    "sequence": 1, "event": {
+                        "delivery_guid": "local:1", "event_name": "local",
+                        "repository": "test-space", "repository_node_id": "local:test-space",
+                        "work_item_node_id": "local:test-space:issue:1", "work_item_kind": "issue",
+                        "work_item_number": 1, "work_item_state": "closed",
+                        "kind": "lifecycle", "detail": "closed",
+                        "cross_surface_invalidation": false, "origin": "human",
+                        "reference": "Issue closed", "mention_candidate": false,
+                        "known": true, "raw_payload": []
+                    }
+                }], "nextAfter": 1, "lastSequence": 1}))
+                }),
+            );
+        let http = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = fixture.config.clone();
+        config.github = None;
+        config.builtin = Some(crate::config::BuiltinConfig {
+            repository: "test-space".into(),
+            endpoint: format!("http://{address}").parse().unwrap(),
+        });
+        let client = BuiltinClient::connect(&config, store.clone()).await.unwrap();
+        store
+            .builtin(crate::store::BuiltinCommand::Prepare {
+                session_id: "previous-execution".into(),
+                item_number: 1,
+                actor: "design".into(),
+            })
+            .unwrap();
+
+        advance_objects(&store, &client, &config).await.unwrap();
+        assert_eq!(client_cursor(&store).unwrap(), 1);
+        let events =
+            store.work_item_lifecycle_candidates("test-space".into(), "issue".into(), 1).unwrap();
+        assert_eq!(events[0].action, "closed");
+        http.abort();
     }
 }

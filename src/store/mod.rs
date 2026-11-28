@@ -47,7 +47,7 @@ use gh_writes::{
     prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 14;
+pub const DATABASE_SCHEMA_VERSION: u32 = 15;
 
 const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
 const EVENT_KINDS_SQL: &str = include_str!("../../migrations/0002_event_kinds.sql");
@@ -113,6 +113,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 14,
         name: "replay_batch_membership",
         sql: include_str!("../../migrations/0014_replay_batch_membership.sql"),
+    },
+    Migration {
+        version: 15,
+        name: "provider_stop_evidence",
+        sql: include_str!("../../migrations/0015_provider_stop_evidence.sql"),
     },
 ];
 
@@ -457,6 +462,13 @@ pub struct AgentMaterialization {
     pub profile_revision: u64,
     pub worktree_path: Option<PathBuf>,
     pub worktree_head_ref: Option<String>,
+    pub(crate) previous_execution: Option<PreviousExecution>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreviousExecution {
+    pub(crate) provider_session_id: String,
+    pub(crate) stopped: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -476,8 +488,7 @@ pub struct TurnClaim {
 #[derive(Debug, Clone)]
 pub struct ContextResetClaim {
     pub old_provider_session_id: String,
-    pub old_session_lifecycle: String,
-    pub active_turn_lifecycle: Option<String>,
+    pub old_execution_stopped: bool,
     pub reset_id: String,
     pub assignment_id: String,
     pub repository: String,
@@ -534,6 +545,7 @@ pub struct ProviderResumeCandidate {
     pub active_turn_lifecycle: Option<String>,
     pub worktree_path: Option<PathBuf>,
     pub worktree_head_ref: Option<String>,
+    pub(crate) execution_stopped: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1044,6 +1056,18 @@ impl StoreActor {
         let (reply, receiver) = mpsc::channel();
         self.sender
             .send(Command::RecordProviderResume(provider_session_id, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub(crate) fn set_provider_stop(
+        &self,
+        provider_session_id: String,
+        stopped: bool,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::SetProviderStop(provider_session_id, stopped, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1566,6 +1590,7 @@ enum Command {
         Sender<Result<Vec<ProviderResumeCandidate>, StoreError>>,
     ),
     RecordProviderResume(String, Sender<Result<(), StoreError>>),
+    SetProviderStop(String, bool, Sender<Result<(), StoreError>>),
     BlockProviderSession(String, String, Sender<Result<(), StoreError>>),
     AssignmentCandidates(
         String,
@@ -1845,6 +1870,9 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             }
             Command::RecordProviderResume(provider_session_id, reply) => {
                 let _ = reply.send(record_provider_resume(database, &provider_session_id));
+            }
+            Command::SetProviderStop(provider_session_id, stopped, reply) => {
+                let _ = reply.send(set_provider_stop(database, &provider_session_id, stopped));
             }
             Command::BlockProviderSession(provider_session_id, error, reply) => {
                 let _ = reply.send(block_provider_session(database, &provider_session_id, &error));
@@ -3419,7 +3447,8 @@ fn provider_resume_candidates(
         "SELECT a.assignment_id,ps.provider_session_id,r.name_with_owner,w.number,
                 ai.profile_id,ai.profile_revision,ps.instruction_revision,ps.lifecycle,
                 t.turn_id,t.lifecycle,wt.path,wt.head_ref,w.kind,
-                EXISTS(SELECT 1 FROM turns st WHERE st.session_id=ps.session_id AND st.provider_turn_id IS NOT NULL)
+                EXISTS(SELECT 1 FROM turns st WHERE st.session_id=ps.session_id AND st.provider_turn_id IS NOT NULL),
+                ps.execution_stopped_at IS NOT NULL
          FROM assignments a
          JOIN work_items w ON w.node_id=a.work_item_node_id AND w.kind=?2
          JOIN repositories r ON r.node_id=w.repository_node_id
@@ -3448,6 +3477,7 @@ fn provider_resume_candidates(
             worktree_head_ref: row.get(11)?,
             work_item_kind: row.get(12)?,
             has_started_turn: row.get(13)?,
+            execution_stopped: row.get(14)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
@@ -3470,6 +3500,21 @@ fn record_provider_resume(database: &Path, provider_session_id: &str) -> Result<
             "provider session {provider_session_id} is not resumable"
         )))
     }
+}
+
+fn set_provider_stop(
+    database: &Path,
+    provider_session_id: &str,
+    stopped: bool,
+) -> Result<(), StoreError> {
+    require_current_schema(database)?;
+    let connection = open_read_write(database)?;
+    configure_connection(&connection)?;
+    connection.execute(
+        "UPDATE provider_sessions SET execution_stopped_at=?2 WHERE provider_session_id=?1",
+        params![provider_session_id, stopped.then(now_rfc3339)],
+    )?;
+    Ok(())
 }
 
 fn block_provider_session(
@@ -3851,11 +3896,12 @@ fn begin_work_item_reactivation(
     let selected = transaction
         .query_row(
             "SELECT a.assignment_id,ai.agent_id,a.generation,ai.profile_id,ai.profile_revision,
-                    wt.path,wt.head_ref
+                    wt.path,wt.head_ref,ps.provider_session_id,ps.execution_stopped_at IS NOT NULL
              FROM assignments a
              JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
              LEFT JOIN worktrees wt ON wt.agent_id=ai.agent_id
                AND wt.lifecycle IN ('active','sleeping')
+             LEFT JOIN provider_sessions ps ON ps.rowid=(SELECT max(s.rowid) FROM provider_sessions s WHERE s.agent_id=ai.agent_id)
              WHERE a.work_item_node_id=?1 AND a.lifecycle='sleeping' AND ai.lifecycle='sleeping'
              ORDER BY a.generation DESC LIMIT 1",
             [&work_item_node_id],
@@ -3872,6 +3918,9 @@ fn begin_work_item_reactivation(
                     )?,
                     worktree_path: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
                     worktree_head_ref: row.get(6)?,
+                    previous_execution: row.get::<_, Option<String>>(7)?.map(|provider_session_id| {
+                        row.get(8).map(|stopped| PreviousExecution { provider_session_id, stopped })
+                    }).transpose()?,
                 })
             },
         )
@@ -4171,6 +4220,7 @@ fn begin_agent_assignment(
         profile_revision: profile.revision,
         worktree_path: None,
         worktree_head_ref: None,
+        previous_execution: None,
     };
     transaction.execute(
         "INSERT INTO assignments(
@@ -4717,7 +4767,7 @@ fn load_context_reset_claim(
     let mut claim = connection.query_row(
         "SELECT cr.reset_id,a.assignment_id,r.name_with_owner,w.kind,w.number,ai.profile_id,
                 cr.active_turn_id,t.provider_turn_id,cr.continuation,
-                wt.path,wt.head_ref,ps.provider_session_id,ps.lifecycle,t.lifecycle,ai.profile_revision
+                wt.path,wt.head_ref,ps.provider_session_id,ps.execution_stopped_at IS NOT NULL,ai.profile_revision
          FROM context_resets cr
          JOIN provider_sessions ps ON ps.session_id=cr.old_session_id
          JOIN agent_instances ai ON ai.agent_id=cr.agent_id
@@ -4731,15 +4781,14 @@ fn load_context_reset_claim(
         |row| {
             Ok(ContextResetClaim {
                 old_provider_session_id: row.get(11)?,
-                old_session_lifecycle: row.get(12)?,
-                active_turn_lifecycle: row.get(13)?,
+                old_execution_stopped: row.get(12)?,
                 reset_id: row.get(0)?,
                 assignment_id: row.get(1)?,
                 repository: row.get(2)?,
                 work_item_kind: row.get(3)?,
                 number: sqlite_i64_to_u64(row.get(4)?, "context reset Work Item number")?,
                 profile_id: row.get(5)?,
-                profile_revision: sqlite_i64_to_u64(row.get(14)?, "Context reset Profile revision")?,
+                profile_revision: sqlite_i64_to_u64(row.get(13)?, "Context reset Profile revision")?,
                 active_turn_id: row.get(6)?,
                 provider_turn_id: row.get(7)?,
                 references: Vec::new(),

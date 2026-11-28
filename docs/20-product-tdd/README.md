@@ -77,12 +77,15 @@ Harness 的 `collaboration` adapter 从所选上游取得当前对象与默认�
 Context、queue、provider 和停止证明共用。内建 adapter 使用 HTTP 平台接口，
 在自己的 ledger 保存平台身份、事件 cursor 和 delivery 去重。平台对象变化
 与稳定事件原子提交，事件不因某一消费者读过而消失；Harness 成功 ingest 后才
-推进自己的 cursor，状态 outbox 通过幂等接口写回平台。
+推进自己的 cursor。平台在提交指派、关闭或合并时同时撤销相关 grant。Harness
+按已接收事件推进 cursor，发布重试和撤权回执不参与入账。状态 outbox 独立领取
+并通过幂等接口写回平台。
 
 平台 actor 与 Harness Profile 分别拥有含义。Harness gateway 核验当前工作区及
 执行身份，使用平台 writer grant。平台提交事务检查 grant epoch、对象 revision
-和 request ID；执行替换先撤销旧 grant，撤销确认后才能完成 fencing。平台
-保存授权版本，不保存原生会话状态；撤销前已经提交的命令仍属于合法历史。
+和 request ID。替代执行准入同时要求旧 grant 已失效和原生执行已停止。两个
+责任方分别确认，原生停止不等待平台撤权。平台保存授权版本；撤销前已提交的
+命令仍属于合法历史。
 
 PR 交接固定 commit OID。Harness 验证工作树责任，平台只在绑定 Git 对象库中
 验证提交并保留可达引用。首版要求两者能访问同一 Git 对象库，不提供远程
@@ -307,7 +310,8 @@ are outside it and converge only when GitHub reports them.
 
 Console 的 OTLP Collector 保存原始传输批次与完整解码记录，使用独立数据库，
 不能写回对象或执行权威。资源身份、runtime generation、session、turn 与原生
-协议身份显式关联；采样和未关联记录是证据缺口，不是空闲状态。Web 查询分页
+协议身份显式关联；采样和未关联记录可能留下证据缺口。观测库启动失败时，Collector 和证据读取
+返回不可用，权威控制和平台 API 仍可启动。Web 查询分页
 读取该读模型，当前对象来自协作平台 API，执行状态来自 Harness ledger 与 runtime manager。
 
 平台通过有类型的应用命令修改对象。命令 request ID、内容摘要、预期 revision

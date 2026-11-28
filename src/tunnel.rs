@@ -21,13 +21,13 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
-    github::{AppWebhookConfig, GitHubClient, RepositoryName},
+    github::{GitHubClient, RepositoryName},
 };
 
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Error)]
-pub enum TunnelError {
+enum TunnelError {
     #[error("cannot start Wrangler Quick Tunnel: {0}")]
     Start(std::io::Error),
     #[error(
@@ -38,17 +38,24 @@ pub enum TunnelError {
     Stop(std::io::Error),
 }
 
-pub struct QuickTunnel {
+struct QuickTunnel {
     child: Child,
     drains: Vec<JoinHandle<()>>,
-    pub url: String,
+    url: String,
     failure: watch::Receiver<Option<&'static str>>,
     #[cfg(unix)]
     group: process_group::OwnedGroup,
 }
 
 impl QuickTunnel {
-    pub async fn start(wrangler: &Path, local_url: &str) -> Result<Self, TunnelError> {
+    async fn start(
+        wrangler: &Path,
+        local_url: &str,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<Option<Self>, TunnelError> {
+        if *shutdown.borrow() {
+            return Ok(None);
+        }
         let mut command = Command::new(wrangler);
         command
             .args(["tunnel", "quick-start", local_url, "--log-level", "info"])
@@ -78,7 +85,7 @@ impl QuickTunnel {
         let stderr = running.child.stderr.take().expect("piped stderr");
         running.drains =
             vec![drain(stdout, sender.clone(), failure.clone()), drain(stderr, sender, failure)];
-        let url = timeout(Duration::from_secs(45), async {
+        let registration = async {
             let mut public_url = None;
             let mut registered = false;
             loop {
@@ -103,27 +110,36 @@ impl QuickTunnel {
                     }
                 }
             }
-        })
-        .await
-        .ok()
-        .flatten();
+        };
+        let url = tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                running.stop().await?;
+                return Ok(None);
+            }
+            result = timeout(Duration::from_secs(45), registration) => result.ok().flatten(),
+        };
         let Some(url) = url else {
             running.stop().await?;
             return Err(TunnelError::MissingUrl);
         };
         running.url = url;
-        Ok(running)
+        Ok(Some(running))
     }
 
-    pub(crate) fn failure(&self) -> Option<&'static str> {
+    fn failure(&self) -> Option<&'static str> {
         *self.failure.borrow()
     }
 
-    pub fn has_exited(&mut self) -> Result<bool, TunnelError> {
+    fn has_exited(&mut self) -> Result<bool, TunnelError> {
         self.child.try_wait().map(|status| status.is_some()).map_err(TunnelError::Stop)
     }
 
-    pub async fn stop(mut self) -> Result<(), TunnelError> {
+    fn webhook_url(&self) -> String {
+        format!("{}/webhook", self.url)
+    }
+
+    async fn stop(mut self) -> Result<(), TunnelError> {
         #[cfg(unix)]
         self.group.close(&mut self.child).await.map_err(TunnelError::Stop)?;
         #[cfg(not(unix))]
@@ -238,48 +254,41 @@ async fn signed_public_probe_once(
     Ok(())
 }
 
-pub async fn start_verified_quick_tunnel(
+async fn start_verified_quick_tunnel(
     config: &Config,
-    local_url: &str,
     secret: &[u8],
-    repository: &str,
     repository_node_id: &str,
-) -> Result<(QuickTunnel, String)> {
-    let mut last_error = None;
-    for attempt in 1..=5 {
-        let started = match QuickTunnel::start(&config.tools.wrangler, local_url).await {
-            Ok(started) => started,
-            Err(error @ TunnelError::Stop(_)) => return Err(error.into()),
-            Err(error) => {
-                let message = error.to_string();
-                tracing::warn!(attempt, error = %message, "cannot start Quick Tunnel candidate");
-                last_error = Some(message);
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<Option<QuickTunnel>> {
+    let local = format!("http://{}", config.server.ingress);
+    let Some(started) = QuickTunnel::start(&config.tools.wrangler, &local, shutdown).await? else {
+        return Ok(None);
+    };
+    let verification = async {
         // The banner appears before Cloudflare publishes the fresh hostname;
         // probing immediately primes negative DNS caches (system and
         // upstream) that outlive the probe loop. Give the record time to
         // exist before the first lookup.
         tokio::time::sleep(Duration::from_secs(20)).await;
-        let public_webhook = format!("{}/webhook", started.url);
-        match signed_public_probe(&public_webhook, secret, repository, repository_node_id).await {
-            Ok(()) => return Ok((started, public_webhook)),
-            Err(error) => {
-                let message = error.to_string();
-                tracing::warn!(attempt, url = %public_webhook, error = %message, "discarding an unreachable Quick Tunnel");
-                last_error = Some(message);
-                // Do not create another candidate after an unconfirmed stop.
-                started.stop().await?;
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
+        signed_public_probe(&started.webhook_url(), secret, config.repository(), repository_node_id)
+            .await
+    };
+    let result = tokio::select! {
+        biased;
+        _ = shutdown.changed() => None,
+        result = verification => Some(result),
+    };
+    match result {
+        Some(Ok(())) => Ok(Some(started)),
+        Some(Err(error)) => {
+            started.stop().await?;
+            Err(error)
+        }
+        None => {
+            started.stop().await?;
+            Ok(None)
         }
     }
-    bail!(
-        "no verified Quick Tunnel became reachable after 5 candidates: {}",
-        last_error.as_deref().unwrap_or("no public probe result")
-    )
 }
 
 pub async fn probe_public_webhook(config: &Config, url: &str) -> Result<()> {
@@ -305,17 +314,4 @@ pub async fn probe_public_webhook(config: &Config, url: &str) -> Result<()> {
         &github.identity().repository_node_id,
     )
     .await
-}
-
-pub(crate) async fn restore_webhook(github: &GitHubClient, prior: &AppWebhookConfig) -> Result<()> {
-    // Shutdown must stay bounded: on an unavailable network this request would
-    // otherwise hang until the OS TCP timeout and stall service stop.
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        github.update_app_webhook(&prior.url, None),
-    )
-    .await
-    .context("restoring the prior App webhook timed out")?
-    .context("cannot restore the prior App webhook")?;
-    Ok(())
 }

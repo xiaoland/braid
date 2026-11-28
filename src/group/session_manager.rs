@@ -1,6 +1,5 @@
 use crate::{
     agent_session::{AgentSession, CreatedSession, SessionError, SessionFactory},
-    collaboration::CollaborationBackend,
     config::Profile,
 };
 use std::{
@@ -13,22 +12,13 @@ use tokio::sync::Mutex;
 /// resource ownership and sharing stay in the injected adapter factory.
 pub(super) struct SessionManager {
     factory: Arc<dyn SessionFactory>,
-    collaboration: Arc<CollaborationBackend>,
     sessions: Mutex<HashMap<String, Arc<dyn AgentSession>>>,
     stopped: Mutex<HashSet<String>>,
 }
 
 impl SessionManager {
-    pub(super) fn new(
-        factory: Arc<dyn SessionFactory>,
-        collaboration: Arc<CollaborationBackend>,
-    ) -> Self {
-        Self {
-            factory,
-            collaboration,
-            sessions: Mutex::new(HashMap::new()),
-            stopped: Mutex::new(HashSet::new()),
-        }
+    pub(super) fn new(factory: Arc<dyn SessionFactory>) -> Self {
+        Self { factory, sessions: Mutex::new(HashMap::new()), stopped: Mutex::new(HashSet::new()) }
     }
 
     pub(super) async fn check(&self) -> Result<(), SessionError> {
@@ -75,13 +65,12 @@ impl SessionManager {
         if self.is_live(&id).await {
             return Ok(());
         }
-        self.remove(&id).await?;
         let created = self.factory.resume(&id, profile, instructions).await?;
         if created.id != id {
             let unexpected = created.id;
             self.sessions.lock().await.insert(unexpected.clone(), created.session);
-            let reason = match self.remove(&unexpected).await {
-                Ok(()) => "resume changed the durable session identity".into(),
+            let reason = match self.stop(&unexpected).await {
+                Ok(_) => "resume changed the durable session identity".into(),
                 Err(error) => format!(
                     "resume changed the durable session identity; unexpected session stop failed: {error}"
                 ),
@@ -93,36 +82,23 @@ impl SessionManager {
         Ok(())
     }
 
-    pub(super) async fn remove(&self, id: &str) -> Result<(), SessionError> {
-        // Revocation fences platform writes even when the native stop remains uncertain.
-        self.collaboration.revoke_session(id).await.map_err(|error| {
-            SessionError::Failed(format!(
-                "cannot revoke writer grant for provider session {id}: {error:#}"
-            ))
-        })?;
+    /// Returns evidence from this process, including confirmed closes retried
+    /// after another prerequisite failed. An absent handle alone proves nothing.
+    pub(super) async fn stop(&self, id: &str) -> Result<bool, SessionError> {
         if let Some(session) = self.get(id).await {
             // Keep the handle until its adapter proves the old execution stopped.
             session.close().await?;
             self.sessions.lock().await.remove(id);
             self.stopped.lock().await.insert(id.to_owned());
         }
-        Ok(())
+        Ok(self.confirmed_stopped(id).await)
     }
 
     pub(super) async fn confirmed_stopped(&self, id: &str) -> bool {
         self.stopped.lock().await.contains(id)
     }
 
-    pub(super) async fn retain(&self, ids: &HashSet<String>) -> Result<(), SessionError> {
-        let obsolete: Vec<_> =
-            self.sessions.lock().await.keys().filter(|id| !ids.contains(*id)).cloned().collect();
-        let mut failure = None;
-        for id in obsolete {
-            if let Err(error) = self.remove(&id).await {
-                tracing::error!(%error, provider_session = %id, "execution stop remains unconfirmed");
-                failure.get_or_insert(error);
-            }
-        }
-        failure.map_or(Ok(()), Err)
+    pub(super) async fn obsolete(&self, retained: &HashSet<String>) -> Vec<String> {
+        self.sessions.lock().await.keys().filter(|id| !retained.contains(*id)).cloned().collect()
     }
 }

@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::{
     Json, Router,
@@ -17,11 +17,19 @@ use super::{
 };
 
 #[derive(Clone)]
-pub struct ApiState {
-    pub storage: Arc<Mutex<Storage>>,
+struct ApiState(Arc<anyhow::Result<Mutex<Storage>>>);
+
+impl ApiState {
+    fn storage(&self) -> Result<&Mutex<Storage>, ApiError> {
+        self.0.as_ref().as_ref().map_err(unavailable)
+    }
+
+    fn lock_storage(&self) -> Result<MutexGuard<'_, Storage>, ApiError> {
+        self.storage()?.lock().map_err(internal)
+    }
 }
 
-pub fn routes(state: ApiState) -> Router {
+pub(super) fn routes(storage: anyhow::Result<Storage>) -> Router {
     Router::new()
         .route("/v1/traces", post(traces).fallback(otlp_method_not_allowed))
         .route("/v1/logs", post(logs).fallback(otlp_method_not_allowed))
@@ -32,7 +40,7 @@ pub fn routes(state: ApiState) -> Router {
         .route("/api/batches/{id}", get(batch))
         .route("/api/receive-errors", get(receive_errors))
         .route("/api/receive-errors/{id}", get(rejected_body))
-        .with_state(state)
+        .with_state(ApiState(Arc::new(storage.map(Mutex::new))))
 }
 
 #[derive(prost::Message)]
@@ -79,6 +87,12 @@ impl IntoResponse for ApiError {
 fn internal(error: impl std::fmt::Display) -> ApiError {
     ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
+fn unavailable(error: impl std::fmt::Display) -> ApiError {
+    ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("Console observation database unavailable: {error:#}"),
+    )
+}
 
 async fn traces(
     State(state): State<ApiState>,
@@ -108,42 +122,29 @@ async fn ingest(
     body: Result<Bytes, BytesRejection>,
     signal: &'static str,
 ) -> Result<Response, ApiError> {
-    let body = match body {
-        Ok(body) => body,
-        Err(rejection) => {
-            let status = rejection.status();
-            let reason = format!(
-                "{}; request body was not captured because extraction failed",
-                rejection.body_text()
-            );
-            let mut error = ApiError(status, reason);
-            let persisted = tokio::task::spawn_blocking({
-                let state = state.clone();
-                let reason = error.1.clone();
-                move || {
-                    state
-                        .storage
-                        .lock()
-                        .map_err(internal)?
-                        .reject(signal, status.as_u16(), &reason, &[])
-                        .map_err(internal)
-                }
-            })
-            .await
-            .map_err(internal)?;
-            if let Err(persist) = persisted {
-                error.1 = format!("{}; receive-error persistence failed: {}", error.1, persist.1);
-            }
-            return Err(error);
-        }
-    };
     tokio::task::spawn_blocking(move || {
-        let validated = validate(&headers, &body, signal);
-        let mut storage = state.storage.lock().map_err(internal)?;
+        let storage = state.storage()?;
+        let (body, validated) = match body {
+            Ok(body) => {
+                let validated = validate(&headers, &body, signal);
+                (body, validated)
+            }
+            Err(rejection) => (
+                Bytes::new(),
+                Err(ApiError(
+                    rejection.status(),
+                    format!(
+                        "{}; request body was not captured because extraction failed",
+                        rejection.body_text()
+                    ),
+                )),
+            ),
+        };
+        let mut storage = storage.lock().map_err(internal)?;
         let outcome = match validated {
-            Ok((encoding, records)) => storage
-                .ingest(signal, &encoding, &body, records)
-                .map_err(|error| ApiError(StatusCode::SERVICE_UNAVAILABLE, format!("{error:#}"))),
+            Ok((encoding, records)) => {
+                storage.ingest(signal, &encoding, &body, records).map_err(unavailable)
+            }
             Err(error) => Err(error),
         };
         if let Err(mut error) = outcome {
@@ -201,7 +202,7 @@ async fn receive_errors(
     Query(filter): Query<Filter>,
 ) -> Result<Json<Value>, ApiError> {
     tokio::task::spawn_blocking(move || {
-        state.storage.lock().map_err(internal)?.receive_errors(&filter).map(Json).map_err(internal)
+        state.lock_storage()?.receive_errors(&filter).map(Json).map_err(unavailable)
     })
     .await
     .map_err(internal)?
@@ -211,7 +212,7 @@ async fn rejected_body(
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
     let body = tokio::task::spawn_blocking(move || {
-        state.storage.lock().map_err(internal)?.rejected_body(id).map_err(internal)
+        state.lock_storage()?.rejected_body(id).map_err(unavailable)
     })
     .await
     .map_err(internal)??;
@@ -231,7 +232,7 @@ async fn rejected_body(
 
 async fn resources(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
     tokio::task::spawn_blocking(move || {
-        state.storage.lock().map_err(internal)?.resources().map(Json).map_err(internal)
+        state.lock_storage()?.resources().map(Json).map_err(unavailable)
     })
     .await
     .map_err(internal)?
@@ -251,17 +252,16 @@ async fn records(
         return Err(ApiError(StatusCode::BAD_REQUEST, "after must be nonnegative".into()));
     }
     tokio::task::spawn_blocking(move || {
-        state.storage.lock().map_err(internal)?.records(&filter).map(Json).map_err(internal)
+        state.lock_storage()?.records(&filter).map(Json).map_err(unavailable)
     })
     .await
     .map_err(internal)?
 }
 async fn batch(State(state): State<ApiState>, Path(id): Path<i64>) -> Result<Response, ApiError> {
-    let found = tokio::task::spawn_blocking(move || {
-        state.storage.lock().map_err(internal)?.batch(id).map_err(internal)
-    })
-    .await
-    .map_err(internal)??;
+    let found =
+        tokio::task::spawn_blocking(move || state.lock_storage()?.batch(id).map_err(unavailable))
+            .await
+            .map_err(internal)??;
     let Some((encoding, body)) = found else {
         return Err(ApiError(StatusCode::NOT_FOUND, format!("OTLP batch {id} not found")));
     };

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context as _, Result};
 use axum::{
     Json, Router,
-    extract::{Path, State, rejection::JsonRejection},
+    extract::{Path, Query, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -43,7 +43,7 @@ pub fn router(config: &PlatformConfig) -> Result<Router> {
         .route("/api/platform/scope/{number}", get(scope))
         .route("/api/platform/events", get(events))
         .route("/api/platform/writes", post(writes))
-        .route("/api/platform/grants", post(grant))
+        .route("/api/platform/grants", get(grant_epoch).post(grant))
         .route("/api/platform/grants/revoke", post(revoke))
         .route("/api/control/items/{number}", get(item))
         .route("/api/control/items/{number}/diff", get(diff))
@@ -203,6 +203,17 @@ async fn writes(
     .map(Json)
     .map_err(HttpError::internal)
 }
+async fn grant_epoch(
+    State(state): State<Arc<ControlState>>,
+    Query(identity): Query<super::grants::GrantIdentity>,
+) -> Result<Json<Option<super::grants::GrantEpoch>>, HttpError> {
+    tokio::task::spawn_blocking(move || super::grants::current_epoch(&state.database, &identity))
+        .await
+        .map_err(HttpError::internal)?
+        .map(Json)
+        .map_err(HttpError::internal)
+}
+
 async fn grant(
     State(state): State<Arc<ControlState>>,
     Json(request): Json<super::grants::GrantRequest>,

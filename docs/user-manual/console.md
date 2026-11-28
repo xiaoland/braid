@@ -28,6 +28,9 @@ endpoint，不改磁盘配置。停止 runtime 后页面、Collector 和对象�
 停服期间平台继续接受对象操作，稳定事件等待 Harness 从自己的 cursor 接续。
 平台服务是否可用、Harness 是否执行与最后观测时间分别展示；启动平台不启动 Agent。
 
+观测数据库打开失败时，平台和 Harness 控制仍可使用。OTLP 和证据读取返回
+503，概览显示采集错误。修复存储后重启 Console 以恢复采集。
+
 ## 阅读证据与当前状态
 
 概览将 Collector 收到的数据、新鲜度和 runtime 权威状态分别展示。trace 时间轴

@@ -37,7 +37,7 @@ fn schema13_unknown_turn_replays_input_without_erasing_history_or_duplicating_re
     drop(db);
     let store = StoreActor::start(database.clone(), root.join("backups")).unwrap();
     let migration = store.apply().unwrap();
-    assert_eq!(migration.applied, vec![14]);
+    assert_eq!(migration.applied, (14..=crate::store::DATABASE_SCHEMA_VERSION).collect::<Vec<_>>());
     assert!(migration.backup.unwrap().is_file());
 
     store.enqueue_turn_reaction("turn".into(), "rocket".into()).unwrap();
@@ -47,6 +47,7 @@ fn schema13_unknown_turn_replays_input_without_erasing_history_or_duplicating_re
     assert_eq!(status.batches[0].event_count, 1);
     let replay_batch = status.batches[0].batch_id.clone();
     let db = open_read_write(&database).unwrap();
+    assert!(db.query_row("SELECT execution_stopped_at IS NULL FROM provider_sessions WHERE provider_session_id='old-physical'", [], |row| row.get::<_, bool>(0)).unwrap());
     let expected = (vec!["Review the revised design".into()], true);
     assert_eq!(batch_references_connection(&db, "original").unwrap(), expected);
     assert_eq!(batch_references_connection(&db, &replay_batch).unwrap(), expected);

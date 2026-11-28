@@ -24,9 +24,11 @@ Braid performs these steps automatically:
    `https://<random>.trycloudflare.com`.
 4. Appends `/webhook` to form the public webhook endpoint.
 5. Sends a signed `ping` probe to that endpoint to confirm GitHub can reach it.
-6. Once reachable, updates the GitHub App's webhook URL to the public endpoint.
-7. Runs the runtime normally.
-8. On clean shutdown, restores the GitHub App's previous webhook URL.
+6. Once reachable, updates the GitHub App's webhook URL to the public endpoint
+   and confirms it by reading the App configuration.
+7. Local runtime and reconciliation can operate while the public endpoint recovers.
+8. On clean shutdown, attempts to restore the previous webhook URL if the App
+   still points to this supervisor's published endpoint.
 
 ## No Cloudflare account required
 
@@ -57,7 +59,7 @@ maps instance keys to their home directories, so `--instance` (or
 
 ## Troubleshooting
 
-- If the tunnel does not converge within 45 seconds, Braid retries up to 3
-  tunnel candidates and then fails with `QuickTunnel` error details in the logs.
+- If a tunnel candidate fails, Braid reports degraded public connectivity and
+  retries with backoff. Inspect the tunnel error in health or the supervisor logs.
 - `braid tunnel probe --instance <KEY> --url <public-url>` can verify a
   specific URL manually, but normal `serve --tunnel` does this automatically.

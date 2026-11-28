@@ -330,8 +330,10 @@ the next compatible resume; Braid neither starts a parallel turn nor calls it a
 success or failure.
 
 Quick Tunnel URLs are temporary. A dedicated supervisor owns the child, public
-verification and App URL synchronization independently of Agent execution. Child
-exit or an explicit `Tunnel not found` marks connectivity unavailable and starts
+verification and App URL synchronization independently of Agent execution.
+The first public registration also runs under this supervisor. A failed candidate
+leaves connectivity degraded while local ingress and reconciliation continue.
+Child exit or an explicit `Tunnel not found` marks connectivity unavailable and starts
 bounded, backed-off candidate rebuilding without restarting `serve` or its Agent
 sessions. Every 60 seconds it verifies a signed public request receives ingress
 202 and that the App still names that URL. A failed check reports degraded
@@ -402,7 +404,11 @@ Schema 13 只修复 Operational Status 的公开投影。已有 generation 的�
 Schema 14 将事件与批次的唯一关系限定在单个批次内。结果 unknown 的轮次重放时，
 新批次可保留原 Event References 与 trusted mention 身份，旧轮次的输入历史不变。
 迁移不把 unknown 当作已停止；替代执行仍须经过旧执行停止与 Context replacement
-屏障。升级前停止服务并备份；旧 binary 不能打开 schema 14 账本。
+屏障。
+
+Schema 15 单独保存 adapter 已确认的原生停止依据，覆盖重启后的 Context 替换
+和重开。迁移为旧会话保留空的停止记录，避免从旧生命周期推断执行已停。升级
+前停止服务并备份；旧 binary 不能打开 schema 15 账本。
 
 ## Health and Status
 

@@ -10,7 +10,7 @@ braid run --config /absolute/path/to/harness/config.toml --run-id feature-a \
   --delivery-ref refs/heads/run/feature-a --max-concurrency 2
 ```
 
-现有 root 必须是没有父 Issue 的顶层任务；已作为其它任务子项的 Issue 不能直接注册为 run root。已有 root 则把 `--description-file` 换成 `--root-issue 42`，二者不可同时提供。description 创建的 root 通过固定请求 ID 去重；`run-id` 绑定输入、交付 ref、并发和已解析配置。同一个 ID 接续不能换需求或配方。完成后再次调用只回读既有完成结果，不重新生成。未确认旧执行停止时禁止替代启动。
+现有 root 必须是没有父 Issue 的顶层任务；已作为其它任务子项的 Issue 不能直接注册为 run root。已有 root 则把 `--description-file` 换成 `--root-issue 42`，二者不可同时提供。description 创建的 root 通过固定请求 ID 去重；`run-id` 绑定输入、交付 ref、并发和执行相关的解析配置。同一个 ID 接续可以调整遥测采样或输出端点，仍使用原需求和执行配方。完成后再次调用只回读既有完成结果，不重新生成。未确认旧执行停止时禁止替代启动。
 
 每次 run 有独立 Harness ledger、工作树和冻结配置，存于原 `runtime.root/runs/<run-id>/`。平台仍保存唯一的 Issue/PR 工作图；run 不接管 `serve` 的旧指派和无关对象。description 或现有 root、子项和关联 PR 通过公开平台 API 读取和修改，不直接操作平台数据库。配置和原生历史仍包含实例允许保存的材料，应按该实例的授权范围保留。
 

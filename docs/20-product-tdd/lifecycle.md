@@ -161,9 +161,11 @@ replacement comment.
 记为 Unknown 并发布 Operational Status。账本 fence 不能阻止旧执行通过 Git、GitHub
 或 shell 继续产生副作用；替代执行启动前必须取得 adapter 的停止成功结果。停止失败
 或无法确认时保留旧句柄和现场，将工作项阻断并公开原因，不重发结果未知的原生 RPC。
-同一进程内已取得停止成功回执时，现有 Context reset 可以重建当前依据并重新调度
-canonical Event References；这不保证旧执行的 GitHub、Git 或 shell 副作用只发生一次。
-冷启动缺少原句柄时，遗留 starting、running 或 Unknown 也不能自动恢复。
+成功取得 adapter 的原生停止回执后，Harness 按原会话持久保存停止事实。Context
+reset 或 reopen 可以凭原句柄取得新回执，或在冷启动后使用为旧会话保存的回执。
+进入 reset_pending 或 idle 本身不能证明停止。同一物理会话恢复前先清除旧停止
+记录。旧 grant 失效与原生停止分别尝试并确认，两项都成立才允许替代。
+重放只接续 canonical Event References，旧执行已发生的外部副作用继续保留。
 
 Context reset 可以记录待物化状态，但只有旧执行停止成功才创建替代会话。Pi 锁定材料先
 收口 owned 执行，再释放 stdin 管道句柄以发送 EOF，等待父进程退出并核对离线后代清理
@@ -244,5 +246,6 @@ root 的职责只在 run 中显式注入。子项生命周期、候选发布、�
 
 root 开放时静默不形成终态。root 关闭后不再创建新的模型轮次，运行依据对象、交付 ref、
 未决写入和合并事实决定 completed 或具体 blocked，并使用现有停止屏障确认原生收尾。
-failed、stopped、blocked 与完成分开，停止确认不完整禁止覆盖执行。输入及解析配置
-绑定 run ID；接续不得借同一身份更换需求、创建重复 root 或隐式接管无关工作。
+failed、stopped、blocked 与完成分开，停止确认不完整禁止覆盖执行。输入及执行
+相关的解析配置绑定 run ID。遥测配置可为该次执行单独调整，保留原始冻结文件；
+接续不得借同一身份更换需求、创建重复 root 或隐式接管无关工作。

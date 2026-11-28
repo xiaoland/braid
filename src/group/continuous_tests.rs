@@ -5,7 +5,7 @@ use crate::{
     },
     collaboration::CollaborationBackend,
     config::Profile,
-    store::{EventKind, IngressEvent, SchedulerPolicy},
+    store::{EventKind, IngressEvent, SchedulerPolicy, StoreActor},
     writer::tests::{Fixture, issue_context_server},
 };
 use std::sync::{Arc, Mutex};
@@ -16,6 +16,7 @@ struct Captured {
     memory: Mutex<Vec<String>>,
     inputs: Mutex<Vec<String>>,
     steer_error: Mutex<Option<SessionError>>,
+    closed: tokio::sync::Notify,
 }
 struct Factory(Arc<Captured>);
 struct Session {
@@ -33,9 +34,9 @@ impl SessionFactory for Factory {
         _instructions: String,
         context: String,
     ) -> Result<CreatedSession, SessionError> {
-        self.0.memory.lock().unwrap().push(context);
+        self.0.memory.lock().unwrap().push(context.clone());
         Ok(CreatedSession {
-            id: "fresh-provider".into(),
+            id: if context == "old memory" { "provider" } else { "fresh-provider" }.into(),
             session: Arc::new(Session {
                 captured: self.0.clone(),
                 events: broadcast::channel(8).0,
@@ -60,6 +61,7 @@ impl AgentSession for Session {
         false
     }
     async fn close(&self) -> Result<(), SessionError> {
+        self.captured.closed.notify_one();
         Ok(())
     }
     async fn send_user_msg(&self, msg: String, steering: bool) -> Result<SendResult, SessionError> {
@@ -126,8 +128,14 @@ async fn idle_revision_replaces_memory_then_starts_once_without_a_second_mention
         config: &f.config,
         collaboration: &collaboration,
         spec: &spec,
-        sessions: SessionManager::new(Arc::new(Factory(captured.clone())), collaboration.clone()),
+        sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
     };
+    driver
+        .sessions
+        .start(spec.profile.clone(), "old instructions".into(), "old memory".into())
+        .await
+        .unwrap();
+    captured.memory.lock().unwrap().clear();
     let policy = SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 };
     f.store.ingest_event(revision(), policy).unwrap();
     f.store.ingest_event(revision(), policy).unwrap();
@@ -170,7 +178,7 @@ async fn unavailable_complete_input_stays_pending_with_a_visible_reason() {
         issue_context_server("A complete contract that exceeds the test budget").await;
     let collaboration = Arc::new(CollaborationBackend::GitHub(github));
     let spec = GroupSpec::new(GroupKind::Issue, &config, &f.store, "owner/repository").unwrap();
-    let sessions = SessionManager::new(Arc::new(Factory(captured.clone())), collaboration.clone());
+    let sessions = SessionManager::new(Arc::new(Factory(captured.clone())));
     sessions
         .start(spec.profile.clone(), "instructions".into(), "existing memory".into())
         .await
@@ -226,7 +234,7 @@ async fn reopened_generation_cannot_silently_adopt_changed_profile_materials() {
         config: &config,
         collaboration: &collaboration,
         spec: &spec,
-        sessions: SessionManager::new(Arc::new(Factory(captured.clone())), collaboration.clone()),
+        sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
     };
     let candidate = f
         .store
@@ -248,7 +256,8 @@ async fn pending_reset_cannot_silently_adopt_changed_profile_materials() {
     f.store
         .ingest_event(revision(), SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 })
         .unwrap();
-    // The reset was persisted under the old Profile before the service restarted.
+    // Native stop and the pending reset survived the restart under the old Profile.
+    f.store.set_provider_stop("provider".into(), true).unwrap();
     f.store.begin_context_reset(None, "issue".into(), "issue-codex".into()).unwrap().unwrap();
     let mut config = f.config.clone();
     config.profiles.iter_mut().find(|p| p.id == "issue-codex").unwrap().model =
@@ -262,7 +271,7 @@ async fn pending_reset_cannot_silently_adopt_changed_profile_materials() {
         config: &config,
         collaboration: &collaboration,
         spec: &spec,
-        sessions: SessionManager::new(Arc::new(Factory(captured.clone())), collaboration.clone()),
+        sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
     };
     assert!(driver.materialize_next_context_reset().await);
     assert!(captured.memory.lock().unwrap().is_empty(), "must not create a physical session");
@@ -310,7 +319,7 @@ async fn unknown_replay_cannot_replace_a_session_without_confirmed_stop() {
         config: &f.config,
         collaboration: &collaboration,
         spec: &spec,
-        sessions: SessionManager::new(Arc::new(Factory(captured.clone())), collaboration.clone()),
+        sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
     };
     assert!(driver.materialize_next_context_reset().await);
     assert!(captured.memory.lock().unwrap().is_empty());
@@ -345,8 +354,7 @@ async fn rejected_steer_stops_retrying_while_unknown_steer_retains_its_input() {
         let collaboration = Arc::new(CollaborationBackend::GitHub(github));
         let spec =
             GroupSpec::new(GroupKind::Issue, &f.config, &f.store, "owner/repository").unwrap();
-        let sessions =
-            SessionManager::new(Arc::new(Factory(captured.clone())), collaboration.clone());
+        let sessions = SessionManager::new(Arc::new(Factory(captured.clone())));
         sessions.start(spec.profile.clone(), "instructions".into(), "memory".into()).await.unwrap();
         f.db()
             .execute("UPDATE provider_sessions SET provider_session_id='fresh-provider'", [])
@@ -390,4 +398,111 @@ async fn rejected_steer_stops_retrying_while_unknown_steer_retains_its_input() {
         }
         http.abort();
     }
+}
+
+#[tokio::test]
+async fn pending_idle_reset_without_native_stop_proof_cannot_launch_replacement() {
+    let f = Fixture::new(true);
+    f.store
+        .ingest_event(revision(), SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 })
+        .unwrap();
+    f.store.begin_context_reset(None, "issue".into(), "issue-codex".into()).unwrap().unwrap();
+
+    let captured = Arc::new(Captured::default());
+    let (github, http) = issue_context_server("Current context").await;
+    let collaboration = CollaborationBackend::GitHub(github);
+    let spec = GroupSpec::new(GroupKind::Issue, &f.config, &f.store, "owner/repository").unwrap();
+    let driver = worker::GroupDriver {
+        store: &f.store,
+        config: &f.config,
+        collaboration: &collaboration,
+        spec: &spec,
+        sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
+    };
+    assert!(driver.materialize_next_context_reset().await);
+    let status = f.store.runtime_status().unwrap();
+    assert_eq!(status.context_resets[0].lifecycle, "blocked");
+    assert!(status.agent_groups[0].context_error.as_deref().unwrap().contains("no stop evidence"));
+    assert_eq!(status.batches.len(), 1);
+    assert!(captured.memory.lock().unwrap().is_empty());
+    http.abort();
+}
+
+#[tokio::test]
+async fn stopping_native_execution_does_not_wait_for_platform_revocation() {
+    use axum::{
+        Json, Router,
+        http::StatusCode,
+        routing::{get, post},
+    };
+    use tokio::sync::Notify;
+
+    let f = Fixture::new(false);
+    let store = Arc::new(
+        StoreActor::start(f.config.runtime.database().into(), f.config.runtime.backups().into())
+            .unwrap(),
+    );
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let routes = Router::new()
+        .route("/api/platform/repository", get(|| async {
+            Json(serde_json::json!({"repository":"test-space","spaceId":"space","nodeId":"local:test-space","defaultBranch":"main"}))
+        }))
+        .route("/api/platform/grants/revoke", post({
+            let (entered, release) = (entered.clone(), release.clone());
+            move || {
+                let (entered, release) = (entered.clone(), release.clone());
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    (StatusCode::SERVICE_UNAVAILABLE, "writer service offline")
+                }
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let http = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+    let mut config = f.config.clone();
+    config.github = None;
+    config.builtin = Some(crate::config::BuiltinConfig {
+        repository: "test-space".into(),
+        endpoint: format!("http://{address}").parse().unwrap(),
+    });
+    let collaboration = CollaborationBackend::Builtin(
+        crate::builtin::BuiltinClient::connect(&config, store.clone()).await.unwrap(),
+    );
+    let spec = GroupSpec::new(GroupKind::Issue, &config, &store, "test-space").unwrap();
+    store
+        .builtin(crate::store::BuiltinCommand::Prepare {
+            session_id: "provider".into(),
+            item_number: 1,
+            actor: spec.profile.id.clone(),
+        })
+        .unwrap();
+    let captured = Arc::new(Captured::default());
+    let driver = worker::GroupDriver {
+        store: &store,
+        config: &config,
+        collaboration: &collaboration,
+        spec: &spec,
+        sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
+    };
+    driver
+        .sessions
+        .start(spec.profile.clone(), "instructions".into(), "old memory".into())
+        .await
+        .unwrap();
+
+    let (stop, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(driver.quiesce_session("provider"), async {
+            entered.notified().await;
+            captured.closed.notified().await;
+            assert!(driver.sessions.confirmed_stopped("provider").await);
+            release.notify_one();
+        })
+    })
+    .await
+    .expect("native close must finish while the revoke response is withheld");
+    assert!(stop.unwrap_err().to_string().contains("writer revocation unconfirmed"));
+    http.abort();
 }

@@ -75,13 +75,13 @@ impl GroupDriver<'_> {
         let candidates = store.provider_resume_candidates(profile.id.clone(), "issue".into())?;
         let retained =
             candidates.iter().map(|candidate| candidate.provider_session_id.clone()).collect();
-        sessions.retain(&retained).await?;
+        self.retain_sessions(&retained).await?;
         let mut unavailable = None;
         for candidate in candidates {
             if sessions.is_live(&candidate.provider_session_id).await {
                 continue;
             }
-            if let Err(error) = sessions.remove(&candidate.provider_session_id).await {
+            if let Err(error) = self.quiesce_session(&candidate.provider_session_id).await {
                 store.block_provider_session(
                     candidate.provider_session_id.clone(),
                     error.to_string(),
@@ -90,22 +90,24 @@ impl GroupDriver<'_> {
                 tracing::error!(%error, provider_session = %candidate.provider_session_id, "old execution could not be stopped");
                 continue;
             }
-            if candidate.has_started_turn
-                && profile.adapter_type == "pi"
-                && !std::path::Path::new(&candidate.provider_session_id).is_file()
-            {
-                let reason = "Pi native history is missing after a previously started execution; refusing an empty resume";
+            if candidate.session_lifecycle == "unknown" {
+                if candidate.execution_stopped
+                    || sessions.confirmed_stopped(&candidate.provider_session_id).await
+                {
+                    // The existing reset owns replacement; never resume the uncertain old history.
+                    continue;
+                }
+                let reason = "previous execution outcome is unknown; automatic resume cannot prove it stopped";
                 store
                     .block_provider_session(candidate.provider_session_id.clone(), reason.into())?;
                 enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
                 continue;
             }
-            if candidate.session_lifecycle == "unknown" {
-                if sessions.confirmed_stopped(&candidate.provider_session_id).await {
-                    // The existing reset owns replacement; never resume the uncertain old history.
-                    continue;
-                }
-                let reason = "previous execution outcome is unknown; automatic resume cannot prove it stopped";
+            if candidate.has_started_turn
+                && profile.adapter_type == "pi"
+                && !std::path::Path::new(&candidate.provider_session_id).is_file()
+            {
+                let reason = "Pi native history is missing after a previously started execution; refusing an empty resume";
                 store
                     .block_provider_session(candidate.provider_session_id.clone(), reason.into())?;
                 enqueue_provider_blocked_status(store, profile, &candidate.assignment_id)?;
@@ -185,6 +187,7 @@ impl GroupDriver<'_> {
             }
             let mut effective_profile = profile.clone();
             effective_profile.workspace = Some(worktree_path);
+            store.set_provider_stop(candidate.provider_session_id.clone(), false)?;
             match sessions
                 .resume(
                     candidate.provider_session_id.clone(),
@@ -285,7 +288,7 @@ impl GroupDriver<'_> {
                 store.provider_resume_candidates(self.spec.profile.id.clone(), "issue".into())?
             {
                 if active.number == candidate.number {
-                    sessions.remove(&active.provider_session_id).await?;
+                    self.quiesce_session(&active.provider_session_id).await?;
                 }
             }
         }

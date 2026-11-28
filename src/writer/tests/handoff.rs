@@ -84,7 +84,7 @@ async fn handoff_rejects_local_authority_and_generation_changes() {
         "UPDATE assignments SET lifecycle='blocked' WHERE assignment_id='pr-assignment'",
         "UPDATE assignments SET lifecycle='finalizing' WHERE assignment_id='pr-assignment'",
         "DELETE FROM provider_sessions WHERE session_id='pr-session'",
-        "INSERT INTO provider_sessions SELECT 'latest-pr-session',agent_id,provider_kind,'latest-pr-provider',context_revision,instruction_revision,'blocked',started_at,resume_count,last_resumed_at,last_resume_error FROM provider_sessions WHERE session_id='pr-session'",
+        "INSERT INTO provider_sessions SELECT 'latest-pr-session',agent_id,provider_kind,'latest-pr-provider',context_revision,instruction_revision,'blocked',started_at,resume_count,last_resumed_at,last_resume_error,NULL FROM provider_sessions WHERE session_id='pr-session'",
         "UPDATE work_items SET state='closed' WHERE node_id='pr'",
         "UPDATE work_items SET state='merged' WHERE node_id='pr'",
         "UPDATE work_items SET state='closed' WHERE node_id='item'",

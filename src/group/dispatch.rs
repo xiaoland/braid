@@ -135,6 +135,9 @@ impl GroupDriver<'_> {
             bail!(message);
         }
         let result = Box::pin(async {
+            if let Some(previous) = &materialization.previous_execution {
+                self.require_quiesced(&previous.provider_session_id, previous.stopped).await?;
+            }
             let repository = if github.is_builtin() {
                 RepositoryName::local(&candidate.repository)
             } else {
@@ -325,22 +328,9 @@ impl GroupDriver<'_> {
             }
         };
         let Some(reset) = reset else { return false };
-        let uncertain =
-            matches!(reset.old_session_lifecycle.as_str(), "unknown" | "blocked" | "running")
-                || reset
-                    .active_turn_lifecycle
-                    .as_deref()
-                    .is_some_and(|state| matches!(state, "starting" | "running" | "unknown"));
-        let stop = if uncertain
-            && self.sessions.get(&reset.old_provider_session_id).await.is_none()
-            && !self.sessions.confirmed_stopped(&reset.old_provider_session_id).await
-        {
-            Err(crate::agent_session::SessionError::Failed(
-                "old execution has no stop evidence after restart; replacement is blocked".into(),
-            ))
-        } else {
-            self.sessions.remove(&reset.old_provider_session_id).await
-        };
+        let stop = self
+            .require_quiesced(&reset.old_provider_session_id, reset.old_execution_stopped)
+            .await;
         if let Err(error) = stop {
             let reason = error.to_string();
             let _ = store.fail_context_reset(reset.reset_id.clone(), reason.clone());
@@ -580,33 +570,28 @@ impl GroupDriver<'_> {
         };
         let finalizing_builtin =
             self.collaboration.is_builtin() && claim.trigger_kind == "finalization";
-        // Closed work items still run native cleanup, without platform write authority.
-        let grant_admission = if finalizing_builtin {
-            self.collaboration.revoke_session(&claim.provider_session_id).await
-        } else {
-            self.collaboration
+        // The platform atomically revoked its grants when it closed the item.
+        // A finalization turn can run native cleanup without obtaining a new grant.
+        if !finalizing_builtin
+            && let Err(error) = self
+                .collaboration
                 .ensure_grant(&claim.provider_session_id, claim.number, &profile.id)
                 .await
-        };
-        if let Err(error) = grant_admission {
-            let reason = format!(
-                "{} failed for provider session {}: {error:#}",
-                if finalizing_builtin {
-                    "finalization writer revocation"
-                } else {
-                    "writer grant admission"
-                },
-                claim.provider_session_id,
-            );
-            if let Err(error) = store.mark_turn_terminal(claim.turn_id.clone(), "failed".into()) {
-                tracing::error!(%error, turn = %claim.turn_id, "cannot record writer grant admission failure");
+        {
+            // No provider call occurred. Keep the input obligation and expose the
+            // admission failure without inventing a failed Agent turn.
+            let reason = format!("writer grant admission failed: {error:#}");
+            tracing::warn!(%reason, turn = %claim.turn_id, "input remains queued");
+            if let Err(error) =
+                store.defer_turn_claim_with_reason(claim.turn_id.clone(), Some(reason.clone()))
+            {
+                tracing::error!(%error, turn = %claim.turn_id, "cannot restore unsent turn claim");
             }
-            self.publish_turn_error(&claim, "failed", &reason);
             crate::telemetry::lifecycle_event(
                 &claim.provider_session_id,
                 None,
                 "prompt",
-                "failed",
+                "deferred",
                 Some(&reason),
             );
             return None;
@@ -640,7 +625,8 @@ impl GroupDriver<'_> {
                 let _ = store.mark_turn_terminal(claim.turn_id.clone(), lifecycle.clone());
                 self.publish_turn_error(&claim, &lifecycle, &error.to_string());
                 if lifecycle == "unknown" {
-                    if let Err(stop_error) = sessions.remove(&claim.provider_session_id).await {
+                    if let Err(stop_error) = self.quiesce_session(&claim.provider_session_id).await
+                    {
                         self.publish_turn_error(
                             &claim,
                             "unknown",
@@ -669,18 +655,11 @@ impl GroupDriver<'_> {
         })
     }
 
-    /// Fence the active turn with a DB reset claim, then best-effort interrupt it.
-    ///
-    /// The fence attributes lifecycle events; stopping the old execution is
-    /// a separate prerequisite for replacement: the turn's terminal is attributed
-    /// to the reset (no success/failure) and `materialize_context_reset` starts a
-    /// fresh session with the rebuilt context. The interrupt is the documented
-    /// latency/resource optimization on top of the fence — the turn stops now
-    /// instead of running stale work to its natural terminal; if it fails, the
-    /// fence alone still guarantees correctness.
+    /// Record the logical fence before attempting either independent stop. The
+    /// active receiver still owns the provider terminal, even when close finishes
+    /// before the writer authority responds.
     pub(super) async fn begin_active_context_reset(&self, active: &mut RunningAgentTurn) {
         let store = self.store;
-        let sessions = &self.sessions;
         if active.reset_id.is_some() {
             return;
         }
@@ -709,32 +688,15 @@ impl GroupDriver<'_> {
             braid.turn.id = %active.claim.turn_id, provider.turn.id = %active.provider_turn_id,
             braid.context.reset.id = %reset.reset_id, braid.assignment.id = %reset.assignment_id,
             "context reset began");
-        if let Err(error) =
-            self.collaboration.revoke_session(&active.claim.provider_session_id).await
-        {
-            let reason = format!(
-                "Context reset {} could not confirm old writer grant revocation: {error:#}",
-                reset.reset_id
-            );
+        if let Err(error) = self.quiesce_session(&active.claim.provider_session_id).await {
+            let reason =
+                format!("Context reset {} could not confirm quiescence: {error}", reset.reset_id);
             if let Err(error) =
                 store.record_turn_error(active.claim.turn_id.clone(), reason.clone())
             {
-                tracing::error!(%error, "cannot retain writer grant revocation failure");
+                tracing::error!(%error, "cannot retain context reset stop failure");
             }
-            tracing::error!(%reason, reset = %reset.reset_id, "old writer grant remains unconfirmed; replacement requires confirmed revocation");
-        }
-        match sessions.get(&active.claim.provider_session_id).await {
-            Some(session) => {
-                if let Err(error) = session.interrupt().await {
-                    tracing::warn!(%error, reset = %reset.reset_id, "active Context reset interrupt failed; fence still applies");
-                }
-            }
-            None => {
-                tracing::warn!(
-                    provider_session = %active.claim.provider_session_id,
-                    "no AgentSession for active reset interrupt"
-                );
-            }
+            tracing::error!(%reason, reset = %reset.reset_id, "replacement still requires quiescence");
         }
     }
 }
