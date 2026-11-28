@@ -949,7 +949,15 @@ async fn builtin_running_unassignment(
         assert!(body.contains(outcome.lifecycle()));
         assert!(body.contains(reason));
     }
-    assert_eq!(turn_state(), (outcome.lifecycle().to_owned(), reason));
+    let (lifecycle, error) = turn_state();
+    assert_eq!(lifecycle, outcome.lifecycle());
+    if outcome == crate::agent_session::TurnOutcome::Unknown {
+        // The worker may already have recorded a steer rejection on this turn.
+        // Retirement must append its own terminal reason to any earlier diagnosis.
+        assert_eq!(error.as_deref().and_then(|body| body.lines().last()), reason.as_deref());
+    } else {
+        assert_eq!(error, reason);
+    }
     assert_eq!(*captured.close_attempts.lock().unwrap(), ["fresh-provider"]);
     assert_eq!(captured.memory.lock().unwrap().len(), 2);
     if !restart {
