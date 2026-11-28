@@ -330,6 +330,7 @@ fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
         )
         .unwrap();
 
+    checked(base().env("BRAID_AGENT", "1").args(["show", "1"]));
     let client_id: String =
         database.query_row("SELECT client_id FROM builtin_upstream", [], |r| r.get(0)).unwrap();
     let epoch = || {
@@ -340,7 +341,6 @@ fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
             .append_pair("actor", "issue-codex");
         client.get(url).send().unwrap().error_for_status().unwrap().json::<Value>().unwrap()
     };
-    checked(base().env("BRAID_AGENT", "1").args(["show", "1"]));
     assert!(epoch().is_null());
     object_command("unrelated", json!({"type":"comment", "number":1,"body":"Human update"}));
     checked(base().env("BRAID_AGENT", "1").args(["comment", "1", "--body", "Agent update"]));
