@@ -82,6 +82,75 @@ async fn failed_registration_also_closes_the_owned_process_tree() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn closing_reaps_an_exited_wrapper_but_waits_for_remaining_group_members() {
+    use nix::{
+        errno::Errno,
+        sys::signal::{Signal, kill, killpg},
+        unistd::Pid,
+    };
+
+    // Both children belong to this test. Keeping the second one unreaped makes
+    // the otherwise transient zombie-only group deterministic, without mocks.
+    let mut wrapper = Command::new("/usr/bin/tail")
+        .args(["-f", "/dev/null"])
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut group = process_group::OwnedGroup::new(&wrapper);
+    let wrapper_pid = wrapper.id().unwrap();
+    let group_id = Pid::from_raw(i32::try_from(wrapper_pid).unwrap());
+    let mut member = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .process_group(group_id.as_raw())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let member_pid = member.id().unwrap();
+    wait_for_process_state(member_pid, "Z").await;
+    kill(group_id, Signal::SIGTERM).unwrap();
+    wait_for_process_state(wrapper_pid, "Z").await;
+
+    let close = group.close(&mut wrapper);
+    tokio::pin!(close);
+    tokio::select! {
+        biased;
+        result = &mut close => panic!("cleanup completed with an unreaped member: {result:?}"),
+        () = wait_for_process_state(wrapper_pid, "") => {}
+    }
+    // Reaping the wrapper alone is insufficient. The other real member still
+    // owns the group until its parent (this test) consumes its exit status.
+    assert_ne!(killpg(group_id, None), Err(Errno::ESRCH));
+    assert!(member.wait().await.unwrap().success());
+    tokio::time::timeout(Duration::from_secs(2), &mut close).await.unwrap().unwrap();
+    assert_eq!(killpg(group_id, None), Err(Errno::ESRCH));
+}
+
+#[cfg(unix)]
+async fn wait_for_process_state(pid: u32, expected: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let output = Command::new("/bin/ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()
+                .await
+                .unwrap();
+            let state = String::from_utf8(output.stdout).unwrap();
+            let state = state.trim();
+            if (expected.is_empty() && state.is_empty())
+                || (!expected.is_empty() && state.starts_with(expected))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn signed_probe_requires_ingress_acceptance_not_an_arbitrary_http_success() {
     use std::sync::{
