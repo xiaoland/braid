@@ -76,16 +76,19 @@ transcript authority. A full Context is rebuilt from the selected upstream befor
 Harness 的 `collaboration` adapter 从所选上游取得当前对象与默认分支，Group、
 Context、queue、provider 和停止证明共用。内建 adapter 使用 HTTP 平台接口，
 在自己的 ledger 保存平台身份、事件 cursor 和 delivery 去重。平台对象变化
-与稳定事件原子提交，事件不因某一消费者读过而消失；Harness 成功 ingest 后才
-推进自己的 cursor。平台在提交指派、关闭或合并时同时撤销相关 grant。Harness
-按已接收事件推进 cursor，发布重试和撤权回执不参与入账。状态 outbox 独立领取
-并通过幂等接口写回平台。
+与稳定事件原子提交，事件不因某一消费者读过而消失。Harness 在同一事务接纳
+事件并推进自己的 cursor。平台在提交指派、关闭或合并时同时撤销相关 grant。
+发布重试和撤权回执不参与入账。状态 outbox 独立领取并通过幂等接口写回平台。
 
-平台 actor 与 Harness Profile 分别拥有含义。Harness gateway 核验当前工作区及
-执行身份，使用平台 writer grant。平台提交事务检查 grant epoch、对象 revision
-和 request ID。替代执行准入同时要求旧 grant 已失效和原生执行已停止。两个
-责任方分别确认，原生停止不等待平台撤权。平台保存授权版本；撤销前已提交的
-命令仍属于合法历史。
+平台 actor 与 Harness Profile 分别拥有含义。内建轮次认领时保存已接纳事件位置，
+发送原生 prompt 时通过只读 Context 核验当前指派和 run 范围，无需请求 writer grant。
+Agent 首次写入时，Harness gateway
+使用当前工作区和精确 session/turn 身份，按认领时的事件位置申请 grant。平台签发
+事务核验期间是否发生指派或生命周期变化，以及适用的 run root 权限变化。平台提交
+事务检查 grant epoch、对象 revision 和 request ID。停止流程原子关闭旧轮次的授权
+申请入口，并对已发起的申请取得撤权证明。替代执行同时要求旧 grant 已失效和原生
+执行已停止。两个责任方分别确认，原生停止不等待平台撤权。撤销前已提交的命令仍
+属于合法历史。
 
 PR 交接固定 commit OID。Harness 验证工作树责任，平台只在绑定 Git 对象库中
 验证提交并保留可达引用。首版要求两者能访问同一 Git 对象库，不提供远程

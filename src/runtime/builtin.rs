@@ -424,7 +424,8 @@ async fn advance_objects(
         let item_kind = event.work_item_kind;
         let queue_kind = event.kind.as_str();
         let generation = crate::telemetry::evidence_health().runtime_generation;
-        let ingest = store.ingest_event(event, policy_from_config(config));
+        let ingest =
+            store.ingest_builtin_event(event, policy_from_config(config), pending.sequence);
         tracing::info!(
             name="braid.local.event_ingest",
             braid.runtime.generation=generation.as_deref().unwrap_or(""),
@@ -442,8 +443,7 @@ async fn advance_objects(
             braid.event.error=ingest.as_ref().err().map(ToString::to_string).as_deref().unwrap_or(""),
             "built-in upstream event ingested"
         );
-        ingest?;
-        let ack = store.builtin(crate::store::BuiltinCommand::Advance(pending.sequence));
+        // Event, queued input and cursor are committed together.
         tracing::info!(
             name="braid.builtin.cursor_advance",
             braid.runtime.generation=generation.as_deref().unwrap_or(""),
@@ -452,11 +452,11 @@ async fn advance_objects(
             braid.work_item.number=number,
             braid.work_item.kind=item_kind.unwrap_or(""),
             braid.queue.kind=queue_kind,
-            braid.event.cursor_saved=ack.is_ok(),
-            braid.event.error=ack.as_ref().err().map(|error|format!("{error:#}")).as_deref().unwrap_or(""),
-            "Harness upstream cursor advanced"
+            braid.event.cursor_saved=ingest.is_ok(),
+            braid.event.error=ingest.as_ref().err().map(|error|format!("{error:#}")).as_deref().unwrap_or(""),
+            "Harness upstream cursor advanced with event intake"
         );
-        ack?;
+        ingest?;
         cursor = pending.sequence;
     }
     anyhow::ensure!(
@@ -729,13 +729,11 @@ mod tests {
             endpoint: format!("http://{address}").parse().unwrap(),
         });
         let client = BuiltinClient::connect(&config, store.clone()).await.unwrap();
-        store
-            .builtin(crate::store::BuiltinCommand::Prepare {
-                session_id: "previous-execution".into(),
-                item_number: 1,
-                actor: "design".into(),
-            })
-            .unwrap();
+        rusqlite::Connection::open(config.runtime.database()).unwrap().execute(
+            "INSERT INTO builtin_writer_grants(session_id,item_number,actor,request_id,epoch,lifecycle)
+             VALUES('previous-execution',1,?1,'old-request',0,'pending')",
+            ["design"],
+        ).unwrap();
 
         advance_objects(&store, &client, &config).await.unwrap();
         assert_eq!(client_cursor(&store).unwrap(), 1);

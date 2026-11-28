@@ -272,3 +272,141 @@ fn console_controls_keep_working_when_the_observation_database_cannot_open() {
     let result = wait_for("graceful Console exit", || console.0.try_wait().unwrap());
     assert!(result.success(), "{}", fs::read_to_string(stderr).unwrap());
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
+    let root = Scratch(std::env::temp_dir().join(format!("braid-writer-{}", uuid::Uuid::now_v7())));
+    fs::create_dir(&root.0).unwrap();
+    let (platform, harness) = configure(&root.0);
+    let settings: toml::Value = toml::from_str(&fs::read_to_string(&platform).unwrap()).unwrap();
+    let endpoint = format!("http://{}", settings["listen"].as_str().unwrap());
+    let _platform = Console(
+        braid()
+            .args(["platform", "serve", "--config"])
+            .arg(platform)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let client = Client::builder().no_proxy().timeout(Duration::from_secs(3)).build().unwrap();
+    wait_for("Platform listener", || {
+        client
+            .get(format!("{endpoint}/api/platform/repository"))
+            .send()
+            .ok()
+            .filter(|response| response.status().is_success())
+    });
+    let object_command = |request_id: &str, command: Value| {
+        let revision = command.get("number").map(|number| {
+            get(&client, &endpoint, &format!("/api/control/items/{number}"))["item"]["revision"]
+                .clone()
+        });
+        let receipt: Value = client
+            .post(format!("{endpoint}/api/control/commands"))
+            .json(&json!({"requestId":request_id, "command":command, "expectedRevision":revision}))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(receipt["state"], "applied", "{receipt}");
+    };
+    object_command("create", json!({"type":"createIssue", "title":"Writer", "body":""}));
+    object_command("assign", json!({"type":"assign", "actor":"issue-codex", "number":1}));
+    let cursor =
+        || get(&client, &endpoint, "/api/platform/events")["lastSequence"].as_i64().unwrap();
+    let base = || {
+        let mut command = braid();
+        command.args(["object", "--config"]).arg(&harness).current_dir(root.0.join("source"));
+        command
+    };
+    checked(base().env_remove("BRAID_AGENT").args(["show", "1"]));
+
+    let database = rusqlite::Connection::open(root.0.join("harness/state/braid.sqlite3")).unwrap();
+    database.execute_batch(
+        "INSERT INTO repositories VALUES('local:demo','demo',1,'now');
+         INSERT INTO work_items(node_id,repository_node_id,kind,number,state,context_revision,observed_at)
+           VALUES('item','local:demo','issue',1,'open','revision','now');
+         INSERT INTO profiles VALUES('issue-codex',1,printf('%064d',0),'pi','[]');
+         INSERT INTO assignments VALUES('assignment','item',1,'active','now',NULL);
+         INSERT INTO agent_instances(agent_id,assignment_id,profile_id,profile_revision,role,lifecycle)
+           VALUES('agent','assignment','issue-codex',1,'issue','idle');
+         INSERT INTO provider_sessions(session_id,agent_id,provider_kind,provider_session_id,context_revision,instruction_revision,lifecycle,started_at)
+           VALUES('session','agent','pi','native','revision','1','running','now');",
+    ).unwrap();
+    database.execute(
+        "INSERT INTO worktrees(worktree_id,agent_id,path,repository_node_id,lifecycle,observed_at)
+         VALUES('tree','agent',?1,'local:demo','active','now')",
+        [root.0.join("source").to_str().unwrap()],
+    ).unwrap();
+    database.execute(
+        "INSERT INTO turns(turn_id,session_id,context_revision,trigger_kind,lifecycle,builtin_writer_cursor)
+         VALUES('turn','session','revision','wake_batch','running',?1)",
+        [cursor()],
+    ).unwrap();
+
+    let client_id: String =
+        database.query_row("SELECT client_id FROM builtin_upstream", [], |r| r.get(0)).unwrap();
+    let epoch = || {
+        let mut url = reqwest::Url::parse(&format!("{endpoint}/api/platform/grants")).unwrap();
+        url.query_pairs_mut()
+            .append_pair("clientId", &client_id)
+            .append_pair("itemNumber", "1")
+            .append_pair("actor", "issue-codex");
+        client.get(url).send().unwrap().error_for_status().unwrap().json::<Value>().unwrap()
+    };
+    assert!(epoch().is_null());
+    object_command("unrelated", json!({"type":"comment", "number":1,"body":"Human update"}));
+    checked(base().env("BRAID_AGENT", "1").args(["comment", "1", "--body", "Agent update"]));
+    let context = get(&client, &endpoint, "/api/platform/context/1");
+    assert!(context["comments"].as_array().unwrap().iter().any(|comment| {
+        comment["body"] == "Agent update" && comment["author"]["login"] == "issue-codex"
+    }));
+    assert_eq!(epoch()["active"], true);
+
+    object_command("reassign", json!({"type":"assign", "actor":"issue-codex", "number":1}));
+    let revoked = epoch();
+    assert_eq!(revoked["active"], false);
+    let old = base()
+        .env("BRAID_AGENT", "1")
+        .args(["comment", "1", "--body", "Stale turn"])
+        .output()
+        .unwrap();
+    assert!(!old.status.success());
+    assert!(String::from_utf8_lossy(&old.stderr).contains("writer authority changed"));
+
+    // The already-revoked row holds the exact epoch of a different pending
+    // mint. Revocation must advance it before that request arrives.
+    let mint = json!({"requestId":"delayed-mint", "clientId":client_id, "actor":"issue-codex",
+        "itemNumber":1, "expectedEpoch":revoked["epoch"], "authorityCursor":cursor()});
+    let stopped: Value = client
+        .post(format!("{endpoint}/api/platform/grants/revoke"))
+        .json(&json!({"requestId":"stop-before-mint", "clientId":client_id, "actor":"issue-codex",
+            "itemNumber":1, "expectedEpoch":revoked["epoch"], "pending":true}))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert!(stopped["epoch"].as_u64().unwrap() > revoked["epoch"].as_u64().unwrap());
+    let late = client.post(format!("{endpoint}/api/platform/grants")).json(&mint).send().unwrap();
+    assert_eq!(late.status(), StatusCode::CONFLICT);
+    assert_eq!(epoch()["active"], false);
+
+    object_command(
+        "configure-root",
+        json!({"type":"configureRunRoot", "number":1,
+        "deliveryRef":"refs/heads/braid/test", "runId":"test-run", "clientId":client_id}),
+    );
+    let context_url = format!("{endpoint}/api/platform/context/1");
+    assert!(client.get(&context_url).send().unwrap().status().is_success());
+    let mut owner = reqwest::Url::parse(&context_url).unwrap();
+    owner.query_pairs_mut().append_pair("executionClientId", &client_id);
+    assert!(!client.get(owner.clone()).send().unwrap().status().is_success());
+    owner.query_pairs_mut().append_pair("executionRunId", "test-run");
+    let response = client.get(owner).send().unwrap();
+    assert!(response.status().is_success(), "{}", response.text().unwrap());
+}

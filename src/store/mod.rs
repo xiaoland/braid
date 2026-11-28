@@ -36,7 +36,7 @@ pub(crate) mod handoff;
 mod write_execution;
 use write_execution::{claim_github_write, finish_github_write, recover_writes};
 pub mod publication_source;
-pub use builtin::{BuiltinBinding, BuiltinCommand, BuiltinGrant, BuiltinReply};
+pub use builtin::{BuiltinBinding, BuiltinCommand, BuiltinGrant, BuiltinReply, BuiltinWriterTurn};
 
 pub use gh_writes::{
     GhWriteReceipt, ImplementationProgress, ImplementationRequestReceipt, NewGhWriteIntent,
@@ -47,7 +47,7 @@ use gh_writes::{
     prepare_implementation_request, record_implementation_progress,
 };
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 15;
+pub const DATABASE_SCHEMA_VERSION: u32 = 16;
 
 const INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
 const EVENT_KINDS_SQL: &str = include_str!("../../migrations/0002_event_kinds.sql");
@@ -118,6 +118,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 15,
         name: "provider_stop_evidence",
         sql: include_str!("../../migrations/0015_provider_stop_evidence.sql"),
+    },
+    Migration {
+        version: 16,
+        name: "builtin_writer_admission",
+        sql: include_str!("../../migrations/0016_builtin_writer_admission.sql"),
     },
 ];
 
@@ -723,9 +728,27 @@ impl StoreActor {
         event: IngressEvent,
         policy: SchedulerPolicy,
     ) -> Result<IngestResult, StoreError> {
+        self.ingest(event, policy, None)
+    }
+
+    pub(crate) fn ingest_builtin_event(
+        &self,
+        event: IngressEvent,
+        policy: SchedulerPolicy,
+        sequence: u64,
+    ) -> Result<IngestResult, StoreError> {
+        self.ingest(event, policy, Some(sequence))
+    }
+
+    fn ingest(
+        &self,
+        event: IngressEvent,
+        policy: SchedulerPolicy,
+        builtin_cursor: Option<u64>,
+    ) -> Result<IngestResult, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::IngestEvent(Box::new(event), policy, reply))
+            .send(Command::IngestEvent(Box::new(event), policy, builtin_cursor, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1531,7 +1554,12 @@ enum Command {
     SetContextRevision(String, String, Sender<Result<(), StoreError>>),
     OperationalStatusCommentIds(String, Sender<Result<BTreeSet<String>, StoreError>>),
     ReconcileAssociations(AssociationSet, Sender<Result<(), StoreError>>),
-    IngestEvent(Box<IngressEvent>, SchedulerPolicy, Sender<Result<IngestResult, StoreError>>),
+    IngestEvent(
+        Box<IngressEvent>,
+        SchedulerPolicy,
+        Option<u64>,
+        Sender<Result<IngestResult, StoreError>>,
+    ),
     MentionCandidates(String, usize, Sender<Result<Vec<MentionCandidate>, StoreError>>),
     ResolveMention(String, bool, SchedulerPolicy, Sender<Result<(), StoreError>>),
     AdvanceScheduler(Sender<Result<u64, StoreError>>),
@@ -1730,8 +1758,8 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::ReconcileAssociations(update, reply) => {
                 let _ = reply.send(reconcile_associations(database, &update));
             }
-            Command::IngestEvent(event, policy, reply) => {
-                let _ = reply.send(ingest_event(database, &event, policy));
+            Command::IngestEvent(event, policy, builtin_cursor, reply) => {
+                let _ = reply.send(ingest_event(database, &event, policy, builtin_cursor));
             }
             Command::MentionCandidates(repository, limit, reply) => {
                 let _ = reply.send(mention_candidates(database, &repository, limit));
@@ -2488,6 +2516,7 @@ fn ingest_event(
     database: &Path,
     event: &IngressEvent,
     policy: SchedulerPolicy,
+    builtin_cursor: Option<u64>,
 ) -> Result<IngestResult, StoreError> {
     require_current_schema(database)?;
     let mut connection = open_read_write(database)?;
@@ -2499,6 +2528,9 @@ fn ingest_event(
         ));
     }
     let result = ingest_event_on(&transaction, event, policy, Admission::Event)?;
+    if let Some(cursor) = builtin_cursor {
+        builtin::advance_cursor(&transaction, cursor)?;
+    }
     transaction.commit()?;
     Ok(result)
 }
@@ -5025,6 +5057,7 @@ fn remove_turn_rocket(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn claim_runnable_turn(
     database: &Path,
     work_item_kind: &str,
@@ -5108,9 +5141,16 @@ fn claim_runnable_turn(
     )?;
     transaction.execute(
         "INSERT INTO turns(
-           turn_id,session_id,context_revision,trigger_kind,lifecycle,batch_id
-         ) VALUES (?1,?2,?3,?4,'starting',?5)",
-        params![turn_id, session_id, context_revision, trigger_kind, batch_id,],
+           turn_id,session_id,context_revision,trigger_kind,lifecycle,batch_id,builtin_writer_cursor
+         ) VALUES (?1,?2,?3,?4,'starting',?5,?6)",
+        params![
+            turn_id,
+            session_id,
+            context_revision,
+            trigger_kind,
+            batch_id,
+            builtin::cursor_at_turn_claim(&transaction, &batch_id, trigger_kind)?
+        ],
     )?;
     transaction.commit()?;
     Ok(Some(TurnClaim {

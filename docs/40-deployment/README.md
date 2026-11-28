@@ -410,6 +410,11 @@ Schema 15 单独保存 adapter 已确认的原生停止依据，覆盖重启后�
 和重开。迁移为旧会话保留空的停止记录，避免从旧生命周期推断执行已停。升级
 前停止服务并备份；旧 binary 不能打开 schema 15 账本。
 
+Schema 16 在轮次认领时保存内建事件 cursor，记下已发起的 writer grant 申请和
+正在确认的撤权。升级时一并更换内建 Platform 与 Harness 二进制。新平台的 grant
+签发要求 Harness 提供认领时的 cursor。历史轮次保留空 cursor，历史 grant 继续
+通过启动撤权流程收口。
+
 ## Health and Status
 
 Loopback `/healthz` and `braid status` expose bounded, non-semantic state:
@@ -484,8 +489,8 @@ ledger；平台不为每个消费者修改事件。`--transport-only` 接入对�
 不启动原生模型会话。GitHub 专属命令在内建上游明确拒绝。
 
 Agent 子进程取得 `BRAID_CONFIG` 与 `BRAID_AGENT`，对象 gateway 通过专属 cwd、
-当前 assignment/session/turn 选择有效 grant；平台提交事务核验授权版本。撤销
-失败传播并阻断执行替换，不把一次 gateway 读取当作提交时仍有效的证明。同
+当前 assignment/session/turn 按需使用或申请有效 grant。普通 prompt 发送无需
+等待签发。平台提交事务核验授权版本。撤销失败传播并阻断执行替换。同
 账户进程不是安全沙箱的隔离对手。平台对象、provider history 与 Git 资料保留
 各自身份和数据库，停止 Harness 不删除平台。
 

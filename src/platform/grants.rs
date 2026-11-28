@@ -1,3 +1,4 @@
+use super::objects::scope::run_policy;
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,8 @@ pub struct GrantRequest {
     pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority_cursor: Option<u64>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -129,23 +132,43 @@ pub fn change(
         [number],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    ensure!(
-        revoke
-            || (state == "open" && assigned.as_ref().is_some_and(|actor| actor == &request.actor)),
-        "writer grant requires an open object assigned to its actor"
-    );
-    if !revoke && let Some(policy) = run_policy(&tx, request.item_number)? {
-        ensure!(
-            policy.client_id == request.client_id
-                && request.run_id.as_deref() == Some(policy.run_id.as_str()),
-            "writer identity does not own this registered run scope"
-        );
-        let open: bool = tx.query_row(
-            "SELECT state='open' FROM local_items WHERE number=?1",
-            [i64::try_from(policy.root_number)?],
-            |r| r.get(0),
+    if !revoke {
+        let cursor = request
+            .authority_cursor
+            .ok_or_else(|| anyhow::anyhow!("writer grant requires a captured authority cursor"))?;
+        let cursor = i64::try_from(cursor)?;
+        let policy = run_policy(&tx, request.item_number)?;
+        let root = policy.as_ref().map(|policy| i64::try_from(policy.root_number)).transpose()?;
+        let (last_sequence, changed): (i64, bool) = tx.query_row(
+            "SELECT COALESCE((SELECT MAX(event_id) FROM local_events),0),
+             EXISTS (
+                SELECT 1 FROM local_events WHERE event_id>?2
+                 AND ((item_number=?1 AND kind IN ('assign','unassign','lifecycle'))
+                      OR (item_number=?3 AND (kind='lifecycle' OR detail='run_policy')))
+             )",
+            params![number, cursor, root],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        ensure!(open, "run root is closed; its writer scope is revoked");
+        ensure!(cursor <= last_sequence, "writer authority cursor exceeds platform history");
+        if changed {
+            // Freeze a definitive denial, so the Harness can discard this
+            // mint intent without racing a delayed retry of the same request.
+            let result = serde_json::json!({"lifecycle":"denied","reason":"writer authority changed after the Agent turn was admitted"});
+            tx.execute(
+                "INSERT INTO control_receipts(scope,request_id,payload_sha256,request_json,state,response_json,created_at,updated_at)
+                 VALUES('grants',?1,?2,?3,'rejected',?4,datetime('now'),datetime('now'))",
+                params![request.request_id,hash,payload,result.to_string()],
+            )?;
+            tx.commit()?;
+            return Ok(result);
+        }
+        ensure!(
+            state == "open" && assigned.as_ref().is_some_and(|actor| actor == &request.actor),
+            "writer grant requires an open object assigned to its actor"
+        );
+        if let Some(policy) = &policy {
+            policy.require_open_owner(&tx, &request.client_id, request.run_id.as_deref())?;
+        }
     }
     let current: Option<i64> = tx
         .query_row(
@@ -154,8 +177,10 @@ pub fn change(
             |r| r.get(0),
         )
         .optional()?;
+    // At the exact pending intent epoch, a delayed mint can still land.
+    // A revocation must move past that epoch even if the old row is already revoked.
     let already_revoked = if revoke {
-        tx.query_row("SELECT lifecycle='revoked' AND (epoch>?4 OR (?5 AND epoch=?4)) FROM platform_grants WHERE client_id=?1 AND item_number=?2 AND actor=?3",params![request.client_id,number,request.actor,i64::try_from(request.expected_epoch)?,request.pending],|r|r.get::<_,bool>(0)).optional()?.unwrap_or(false)
+        tx.query_row("SELECT lifecycle='revoked' AND epoch>?4 FROM platform_grants WHERE client_id=?1 AND item_number=?2 AND actor=?3",params![request.client_id,number,request.actor,i64::try_from(request.expected_epoch)?],|r|r.get::<_,bool>(0)).optional()?.unwrap_or(false)
     } else {
         false
     };
@@ -208,23 +233,4 @@ pub fn change(
     tx.execute("INSERT INTO control_receipts(scope,request_id,payload_sha256,request_json,state,response_json,created_at,updated_at) VALUES('grants',?1,?2,?3,'applied',?4,?5,?5)",params![request.request_id,hash,payload,result.to_string(),now])?;
     tx.commit()?;
     Ok(result)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RunPolicy {
-    pub root_number: u64,
-    pub delivery_ref: String,
-    pub run_id: String,
-    pub client_id: String,
-}
-pub(crate) fn run_policy(connection: &Connection, number: u64) -> Result<Option<RunPolicy>> {
-    let policy: Option<(i64, String, String, String)> = connection.query_row(
-        "WITH RECURSIVE ancestors(number) AS (SELECT ?1 UNION SELECT issue_number FROM local_links WHERE pr_number=?1 UNION SELECT p.parent_number FROM local_issue_parents p JOIN ancestors a ON p.child_number=a.number) SELECT policy.root_number,policy.delivery_ref,policy.run_id,policy.client_id FROM ancestors a JOIN run_root_policies policy ON policy.root_number=a.number",
-        [i64::try_from(number)?], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
-    ).optional()?;
-    policy
-        .map(|(root, delivery_ref, run_id, client_id)| {
-            Ok(RunPolicy { root_number: u64::try_from(root)?, delivery_ref, run_id, client_id })
-        })
-        .transpose()
 }

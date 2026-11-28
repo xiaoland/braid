@@ -166,11 +166,28 @@ async fn items(State(state): State<Arc<ControlState>>) -> Result<Json<Value>, Ht
 async fn repository(State(state): State<Arc<ControlState>>) -> Result<Json<Value>, HttpError> {
     run_read(state, PlatformObjects::repository_info).await.map(Json)
 }
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextQuery {
+    execution_client_id: Option<String>,
+    execution_run_id: Option<String>,
+}
+
 async fn context(
     State(state): State<Arc<ControlState>>,
     Path(number): Path<u64>,
+    Query(query): Query<ContextQuery>,
 ) -> Result<Json<Value>, HttpError> {
-    run_read(state, move |o| Ok(serde_json::to_value(o.context(number)?)?)).await.map(Json)
+    run_read(state, move |objects| {
+        let context = if let Some(client_id) = query.execution_client_id {
+            objects.execution_context(number, &client_id, query.execution_run_id.as_deref())?
+        } else {
+            objects.context(number)?
+        };
+        Ok(serde_json::to_value(context)?)
+    })
+    .await
+    .map(Json)
 }
 #[derive(serde::Deserialize)]
 struct EventQuery {

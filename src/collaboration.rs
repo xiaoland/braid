@@ -60,17 +60,6 @@ impl CollaborationBackend {
             Self::Builtin(client) => client.candidate(number).await,
         }
     }
-    pub(crate) async fn ensure_grant(
-        &self,
-        session_id: &str,
-        number: u64,
-        actor: &str,
-    ) -> Result<()> {
-        match self {
-            Self::GitHub(_) => Ok(()),
-            Self::Builtin(client) => client.ensure_grant(session_id, number, actor).await,
-        }
-    }
     pub(crate) async fn revoke_session(&self, session_id: &str) -> Result<()> {
         match self {
             Self::GitHub(_) => Ok(()),

@@ -1,6 +1,6 @@
 //! Braid-owned collaboration objects and their atomic event outbox.
 mod commands;
-mod scope;
+pub(super) mod scope;
 pub use commands::{
     CandidateLocation, CommandFailure, CommandRequest, ControlPolicy, ControlReceipt, ObjectCommand,
 };
@@ -554,6 +554,21 @@ impl PlatformObjects {
                 deleted: false,
             })
             .collect())
+    }
+
+    pub(crate) fn execution_context(
+        &self,
+        number: u64,
+        client_id: &str,
+        run_id: Option<&str>,
+    ) -> Result<CanonicalContext> {
+        let tx = self.connection.unchecked_transaction()?;
+        if let Some(policy) = scope::run_policy(&tx, number)? {
+            policy.require_open_owner(&tx, client_id, run_id)?;
+        }
+        let context = self.context_inner(number)?;
+        tx.commit()?;
+        Ok(context)
     }
 
     pub fn context(&self, number: u64) -> Result<CanonicalContext> {

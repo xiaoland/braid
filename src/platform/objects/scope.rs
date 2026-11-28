@@ -1,7 +1,7 @@
 //! A root's authoritative collaboration scope; execution remains Harness-owned.
 use super::{CommandRequest, Item, ObjectCommand, PlatformObjects, row_id, sql_id};
 use anyhow::{Result, ensure};
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,11 +150,8 @@ impl PlatformObjects {
 }
 
 impl PlatformObjects {
-    pub(super) fn run_policy(
-        &self,
-        number: u64,
-    ) -> Result<Option<super::super::grants::RunPolicy>> {
-        super::super::grants::run_policy(&self.connection, number)
+    pub(super) fn run_policy(&self, number: u64) -> Result<Option<RunPolicy>> {
+        run_policy(&self.connection, number)
     }
     fn delivery_commit(&self, delivery_ref: &str) -> Result<Option<String>> {
         let source: String = self.connection.query_row(
@@ -190,7 +187,7 @@ impl PlatformObjects {
             |r| r.get(0),
         )?;
         ensure!(!has_parent, "run root cannot be a child Issue");
-        if let Some(existing) = super::super::grants::run_policy(&tx, number)? {
+        if let Some(existing) = run_policy(&tx, number)? {
             ensure!(
                 existing.root_number == number
                     && existing.delivery_ref == delivery_ref
@@ -250,4 +247,44 @@ impl PlatformObjects {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunPolicy {
+    pub root_number: u64,
+    pub delivery_ref: String,
+    pub run_id: String,
+    pub client_id: String,
+}
+impl RunPolicy {
+    pub(crate) fn require_open_owner(
+        &self,
+        connection: &Connection,
+        client_id: &str,
+        run_id: Option<&str>,
+    ) -> Result<()> {
+        ensure!(
+            self.client_id == client_id && run_id == Some(self.run_id.as_str()),
+            "execution identity does not own this registered run scope"
+        );
+        let open: bool = connection.query_row(
+            "SELECT state='open' FROM local_items WHERE number=?1",
+            [i64::try_from(self.root_number)?],
+            |row| row.get(0),
+        )?;
+        ensure!(open, "run root is closed; its execution scope is no longer open");
+        Ok(())
+    }
+}
+
+pub(crate) fn run_policy(connection: &Connection, number: u64) -> Result<Option<RunPolicy>> {
+    let policy: Option<(i64, String, String, String)> = connection.query_row(
+        "WITH RECURSIVE ancestors(number) AS (SELECT ?1 UNION SELECT issue_number FROM local_links WHERE pr_number=?1 UNION SELECT p.parent_number FROM local_issue_parents p JOIN ancestors a ON p.child_number=a.number) SELECT policy.root_number,policy.delivery_ref,policy.run_id,policy.client_id FROM ancestors a JOIN run_root_policies policy ON policy.root_number=a.number",
+        [i64::try_from(number)?], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+    ).optional()?;
+    policy
+        .map(|(root, delivery_ref, run_id, client_id)| {
+            Ok(RunPolicy { root_number: u64::try_from(root)?, delivery_ref, run_id, client_id })
+        })
+        .transpose()
 }

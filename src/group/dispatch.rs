@@ -568,34 +568,6 @@ impl GroupDriver<'_> {
             let _ = store.defer_turn_claim(claim.turn_id.clone());
             return None;
         };
-        let finalizing_builtin =
-            self.collaboration.is_builtin() && claim.trigger_kind == "finalization";
-        // The platform atomically revoked its grants when it closed the item.
-        // A finalization turn can run native cleanup without obtaining a new grant.
-        if !finalizing_builtin
-            && let Err(error) = self
-                .collaboration
-                .ensure_grant(&claim.provider_session_id, claim.number, &profile.id)
-                .await
-        {
-            // No provider call occurred. Keep the input obligation and expose the
-            // admission failure without inventing a failed Agent turn.
-            let reason = format!("writer grant admission failed: {error:#}");
-            tracing::warn!(%reason, turn = %claim.turn_id, "input remains queued");
-            if let Err(error) =
-                store.defer_turn_claim_with_reason(claim.turn_id.clone(), Some(reason.clone()))
-            {
-                tracing::error!(%error, turn = %claim.turn_id, "cannot restore unsent turn claim");
-            }
-            crate::telemetry::lifecycle_event(
-                &claim.provider_session_id,
-                None,
-                "prompt",
-                "deferred",
-                Some(&reason),
-            );
-            return None;
-        }
         // Subscribe before sending so the `TurnStarted` event — the single
         // authority for provider turn identity — cannot be missed.
         let mut events = session.events();

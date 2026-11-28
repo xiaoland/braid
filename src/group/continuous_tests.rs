@@ -472,13 +472,11 @@ async fn stopping_native_execution_does_not_wait_for_platform_revocation() {
         crate::builtin::BuiltinClient::connect(&config, store.clone()).await.unwrap(),
     );
     let spec = GroupSpec::new(GroupKind::Issue, &config, &store, "test-space").unwrap();
-    store
-        .builtin(crate::store::BuiltinCommand::Prepare {
-            session_id: "provider".into(),
-            item_number: 1,
-            actor: spec.profile.id.clone(),
-        })
-        .unwrap();
+    rusqlite::Connection::open(config.runtime.database()).unwrap().execute(
+        "INSERT INTO builtin_writer_grants(session_id,item_number,actor,request_id,epoch,lifecycle)
+         VALUES('provider',1,?1,'old-request',0,'pending')",
+        [&spec.profile.id],
+    ).unwrap();
     let captured = Arc::new(Captured::default());
     let driver = worker::GroupDriver {
         store: &store,
@@ -504,5 +502,143 @@ async fn stopping_native_execution_does_not_wait_for_platform_revocation() {
     .await
     .expect("native close must finish while the revoke response is withheld");
     assert!(stop.unwrap_err().to_string().contains("writer revocation unconfirmed"));
+    http.abort();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn builtin_turn_runs_without_writer_service_and_cannot_mint_after_reassignment() {
+    use crate::{
+        builtin::BuiltinClient,
+        platform::{PlatformConfig, objects::PlatformObjects},
+        store::BuiltinWriterTurn,
+    };
+    use axum::http::StatusCode;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let f = Fixture::new(false);
+    let root = f.config.runtime.database().parent().unwrap();
+    let source = root.join("source");
+    let git = git2::Repository::init_opts(
+        &source,
+        git2::RepositoryInitOptions::new().initial_head("main"),
+    )
+    .unwrap();
+    let signature = git2::Signature::now("Braid Test", "test@example.invalid").unwrap();
+    let tree = git.find_tree(git.treebuilder(None).unwrap().write().unwrap()).unwrap();
+    git.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[]).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let platform = PlatformConfig {
+        schema_version: 1,
+        repository: "test-space".into(),
+        source: source.canonicalize().unwrap(),
+        default_branch: "main".into(),
+        database: root.join("platform.sqlite3"),
+        backups: root.join("platform-backups"),
+        listen: address.to_string(),
+    };
+    let offline = Arc::new(AtomicBool::new(true));
+    let routes = crate::platform::router(&platform).unwrap().layer(axum::middleware::from_fn({
+        let offline = Arc::clone(&offline);
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let offline = Arc::clone(&offline);
+            async move {
+                use axum::response::IntoResponse as _;
+                if request.uri().path().starts_with("/api/platform/grants")
+                    && offline.load(Ordering::Relaxed)
+                {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                next.run(request).await
+            }
+        }
+    }));
+    let http = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+
+    let mut config = f.config.clone();
+    config.github = None;
+    config.builtin = Some(crate::config::BuiltinConfig {
+        repository: platform.repository.clone(),
+        endpoint: format!("http://{address}").parse().unwrap(),
+    });
+    let store = Arc::new(
+        StoreActor::start(config.runtime.database().into(), config.runtime.backups().into())
+            .unwrap(),
+    );
+    let client = BuiltinClient::connect(&config, Arc::clone(&store)).await.unwrap();
+    let spec = GroupSpec::new(GroupKind::Issue, &config, &store, "test-space").unwrap();
+    let mut platform = PlatformObjects::open(&platform.database, &platform.repository).unwrap();
+    let issue =
+        platform.create_child_issue("Writer independence", "Read first", "human", None).unwrap();
+    platform.assign(issue.number, Some(&spec.profile.id), "human").unwrap();
+    let policy = SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 };
+    let mut cursor = 0;
+    for pending in platform.events(cursor, 100).unwrap() {
+        store.ingest_builtin_event(pending.event, policy, pending.event_id).unwrap();
+        cursor = pending.event_id;
+    }
+    let assignment =
+        store.assignment_candidates("test-space".into(), "issue".into(), 1).unwrap().pop().unwrap();
+    let materialization = store
+        .begin_agent_assignment(
+            assignment.event_id,
+            spec.profile_record.clone(),
+            Some("old memory".into()),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+    store
+        .complete_agent_assignment(
+            materialization,
+            "provider".into(),
+            "old memory".into(),
+            "instructions".into(),
+        )
+        .unwrap();
+    platform.reply(issue.number, "Run this turn", "human", None).unwrap();
+    for pending in platform.events(cursor, 100).unwrap() {
+        store.ingest_builtin_event(pending.event, policy, pending.event_id).unwrap();
+    }
+    store.advance_scheduler().unwrap();
+
+    let captured = Arc::new(Captured::default());
+    let collaboration = CollaborationBackend::Builtin(Arc::clone(&client));
+    let driver = worker::GroupDriver {
+        store: &store,
+        config: &config,
+        collaboration: &collaboration,
+        spec: &spec,
+        sessions: SessionManager::new(Arc::new(Factory(Arc::clone(&captured)))),
+    };
+    driver
+        .sessions
+        .start(spec.profile.clone(), "instructions".into(), "old memory".into())
+        .await
+        .unwrap();
+    let running = driver.start_next_agent_turn().await.unwrap_or_else(|| {
+        panic!("writer service must not gate a turn: {:?}", store.runtime_status().unwrap().batches)
+    });
+    assert_eq!(captured.inputs.lock().unwrap().len(), 1);
+    let writer = BuiltinWriterTurn {
+        session_id: running.claim.provider_session_id,
+        turn_id: running.claim.turn_id,
+        item_number: issue.number,
+        actor: spec.profile.id.clone(),
+    };
+    let offline_error = client.writer_grant(writer.clone()).await.unwrap_err();
+    assert!(offline_error.to_string().contains("503"));
+
+    // The old turn never minted a grant. Name equality must not revive it
+    // after an unassign/reassign and before those events reach the Harness.
+    platform.assign(issue.number, Some(&spec.profile.id), "human").unwrap();
+    offline.store(false, Ordering::Relaxed);
+    let error = client.writer_grant(writer.clone()).await.unwrap_err();
+    assert!(error.to_string().contains("writer authority changed"), "{error:#}");
+    client.revoke_session(&writer.session_id).await.unwrap();
+    let fenced = client.writer_grant(writer).await.unwrap_err();
+    assert!(fenced.to_string().contains("no current writer authority"));
     http.abort();
 }

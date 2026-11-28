@@ -4,7 +4,7 @@ use crate::{
     context,
     platform::grants::WriterGrant,
     platform::objects::{CandidateLocation, CommandRequest, ControlReceipt, ObjectCommand},
-    store::{BuiltinCommand, BuiltinReply, StoreActor},
+    store::{BuiltinWriterTurn, StoreActor},
 };
 use anyhow::{Context as _, Result, ensure};
 use clap::{Args, Subcommand};
@@ -123,7 +123,7 @@ pub async fn run_options(
         config.runtime.database().to_path_buf(),
         config.runtime.backups().to_path_buf(),
     )?);
-    let client = BuiltinClient::connect(config, Arc::clone(&store)).await?;
+    let client = BuiltinClient::connect(config, store).await?;
     if let LocalCommand::Receipt(target) = &command {
         let mut url = config
             .builtin
@@ -171,21 +171,9 @@ pub async fn run_options(
     } else {
         None
     };
-    let actor = writer.as_ref().map_or("human", |writer| writer.actor.as_str()).to_owned();
+    let actor = writer.as_ref().map_or("human", |writer| writer.turn.actor.as_str()).to_owned();
     let capability = if let Some(writer) = &writer {
-        let BuiltinReply::Grant(Some(grant)) =
-            store.builtin(BuiltinCommand::Grant(writer.session_id.clone()))?
-        else {
-            anyhow::bail!(
-                "Agent has no active platform writer capability; refusing operator fallback"
-            )
-        };
-        ensure!(
-            grant.lifecycle == "active"
-                && grant.actor == writer.actor
-                && grant.item_number == writer.number,
-            "Agent writer capability does not match current assignment"
-        );
+        let grant = client.writer_grant(writer.turn.clone()).await?;
         Some(WriterGrant {
             grant_id: grant.grant_id.context("writer grant has no identity")?,
             epoch: grant.epoch,
@@ -288,9 +276,7 @@ pub async fn run_options(
 }
 
 struct AgentWriter {
-    session_id: String,
-    actor: String,
-    number: u64,
+    turn: BuiltinWriterTurn,
     worktree: PathBuf,
 }
 fn active_writer(database: &Path, cwd: &Path) -> Result<AgentWriter> {
@@ -299,7 +285,7 @@ fn active_writer(database: &Path, cwd: &Path) -> Result<AgentWriter> {
         database,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
-    let mut query=connection.prepare("SELECT s.provider_session_id,g.profile_id,i.number,w.path FROM provider_sessions s JOIN turns t ON t.session_id=s.session_id JOIN agent_instances g ON g.agent_id=s.agent_id JOIN assignments a ON a.assignment_id=g.assignment_id JOIN work_items i ON i.node_id=a.work_item_node_id JOIN worktrees w ON w.agent_id=g.agent_id WHERE s.lifecycle='running' AND t.lifecycle IN ('starting','running') AND a.lifecycle IN ('active','finalizing') AND g.lifecycle IN ('idle','finalizing') AND w.lifecycle='active'")?;
+    let mut query=connection.prepare("SELECT s.provider_session_id,g.profile_id,i.number,w.path,t.turn_id FROM provider_sessions s JOIN turns t ON t.session_id=s.session_id JOIN agent_instances g ON g.agent_id=s.agent_id JOIN assignments a ON a.assignment_id=g.assignment_id JOIN work_items i ON i.node_id=a.work_item_node_id JOIN worktrees w ON w.agent_id=g.agent_id WHERE s.lifecycle='running' AND t.lifecycle IN ('starting','running') AND a.lifecycle IN ('active','finalizing') AND g.lifecycle IN ('idle','finalizing') AND w.lifecycle='active'")?;
     let rows = query
         .query_map([], |row| {
             Ok((
@@ -307,17 +293,21 @@ fn active_writer(database: &Path, cwd: &Path) -> Result<AgentWriter> {
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut matches = Vec::new();
-    for (session_id, actor, number, path) in rows {
+    for (session_id, actor, number, path, turn_id) in rows {
         let worktree = PathBuf::from(path).canonicalize()?;
         if cwd.starts_with(&worktree) {
             matches.push(AgentWriter {
-                session_id,
-                actor,
-                number: u64::try_from(number)?,
+                turn: BuiltinWriterTurn {
+                    session_id,
+                    turn_id,
+                    actor,
+                    item_number: u64::try_from(number)?,
+                },
                 worktree,
             });
         }
