@@ -113,3 +113,18 @@ fn comment_edits_compare_visible_suffix_instead_of_discarding_the_html_block_lin
         assert_eq!(admitted.requires_attention, expected == EventKind::Invalidate);
     }
 }
+
+#[test]
+fn human_edit_of_a_braid_authored_body_is_not_an_echo_or_an_urgent_mention() {
+    let mut revision = payload();
+    revision.as_object_mut().unwrap().remove("comment");
+    revision["action"] = json!("edited");
+    revision["changes"] = json!({"body":{"from":"old requirements"}});
+    revision["issue"]["body"] =
+        json!("> **Braid Agent · Braid**\n> Issue Agent\n\nRevised requirements");
+    let event = parse(&revision, "issues");
+    assert_eq!(event.kind, EventKind::Invalidate);
+    assert!(event.requires_attention);
+    assert!(!event.mention_candidate);
+    assert_eq!(event.origin, "external");
+}

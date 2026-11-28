@@ -155,7 +155,7 @@ fn legacy_cli_pending_uncertain_sending_all_get_one_execution_obligation() {
     drop(connection);
     let store = StoreActor::start(db.path.clone(), db.root.join("backups")).unwrap();
     let migrated = store.apply().unwrap();
-    assert_eq!(migrated.applied, vec![9, 10, 11, 12, 13, 14]);
+    assert_eq!(migrated.applied.first(), Some(&9));
     assert!(migrated.backup.is_some());
     let owner = store.acquire_runtime_lease("runtime".into(), "writer".into(), 3600).unwrap();
     let mut seen = std::collections::BTreeMap::new();

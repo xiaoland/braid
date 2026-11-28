@@ -172,6 +172,7 @@ async fn ambiguous_create_blocks_only_that_comments_successor_after_restart() {
     }
     f.store.release_runtime_lease(owner).unwrap();
     replacement(&f, "completed");
+    let f = f.reopen();
     f.store.recover_writes().unwrap();
     f.drain(github.clone()).await;
     assert_eq!(

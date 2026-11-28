@@ -171,27 +171,7 @@ pub(super) async fn body_server(
         .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
         .build()
         .unwrap();
-    let (template, other) = server(Arc::new(Mutex::new(Remote::default())), true).await;
-    other.abort();
-    let config = crate::config::GitHubConfig {
-        app_id: 1,
-        private_key_file: PathBuf::new(),
-        projects_v2_enabled: false,
-        repository: "owner/repository".into(),
-        additional_repositories: Vec::new(),
-        handle: "braid".into(),
-        api_version: "2022-11-28".into(),
-        webhook_secret_environment: None,
-        webhook_secret_file: None,
-    };
-    (
-        Arc::new(GitHubClient::publication_test_client(
-            client,
-            template.identity().clone(),
-            config,
-        )),
-        task,
-    )
+    (Arc::new(publication_client(client, true)), task)
 }
 pub(super) fn pr_source(fixture: &Fixture, own_pr: bool) {
     fixture.db().execute("UPDATE agent_instances SET role='pr_implementation_agent'", []).unwrap();
@@ -262,9 +242,14 @@ async fn pr_source_corrects_direct_issue_with_pr_attribution_not_profile_target_
 #[tokio::test]
 async fn changed_association_closed_target_old_context_generation_session_and_human_edits_never_mutate()
  {
-    for fence in
-        ["unrelated", "closed", "context", "generation", "session", "human", "profile", "turn"]
-    {
+    for (fence, state, reason) in [
+        ("unrelated", "rejected", "target is not a permitted directly associated work item"),
+        ("closed", "conflict", "canonical title/body changed since snapshot"),
+        ("context", "rejected", "publication source was invalidated or superseded"),
+        ("generation", "rejected", "publication source was invalidated or superseded"),
+        ("session", "rejected", "publication source was invalidated or superseded"),
+        ("human", "conflict", "canonical title/body changed since snapshot"),
+    ] {
         let fixture = Fixture::new(true);
         pr_source(&fixture, false);
         let remote = Arc::new(Mutex::new(BodyRemote::new(false)));
@@ -286,34 +271,12 @@ async fn changed_association_closed_target_old_context_generation_session_and_hu
                 fixture.db().execute("INSERT INTO provider_sessions(session_id,agent_id,provider_kind,provider_session_id,context_revision,instruction_revision,lifecycle,started_at) VALUES ('new','agent','codex','new','context','instructions','idle','now')",[]).unwrap();
             }
             "human" => remote.lock().unwrap().snapshot.body = Some("Human new design".into()),
-            "profile" => {
-                assert!(
-                    resolve_source(&fixture.config, Some("pr-codex"), &fixture.invocation())
-                        .unwrap_err()
-                        .to_string()
-                        .contains("publication Profile does not match source assignment")
-                );
-            }
-            "turn" => assert!(
-                resolve_source(&fixture.config, None, &Invocation::Agent("not-current".into()))
-                    .unwrap_err()
-                    .to_string()
-                    .contains("publication turn does not match current runtime worktree")
-            ),
             _ => unreachable!(),
-        }
-        if matches!(fence, "profile" | "turn") {
-            task.abort();
-            continue;
         }
         fixture.drain(github).await;
         let result = fixture.receipt(&receipt.request_id);
-        assert_eq!(
-            result.lifecycle,
-            if matches!(fence, "human" | "closed") { "conflict" } else { "rejected" },
-            "{fence}: {:?}",
-            result.last_error
-        );
+        assert_eq!(result.lifecycle, state, "{fence}: {:?}", result.last_error);
+        assert!(result.last_error.as_deref().unwrap().contains(reason), "{fence}: {result:?}");
         assert_eq!(remote.lock().unwrap().writes, 0, "{fence}");
         task.abort();
     }
@@ -340,6 +303,7 @@ async fn preflight_and_mutation_limits_remain_durable_then_converge_after_restar
             state.limited = false;
             state.mutation_limited = false;
         }
+        let fixture = fixture.reopen();
         let (github, task) = body_server(remote.clone()).await;
         fixture.due();
         fixture.drain(github).await;
@@ -378,6 +342,21 @@ async fn own_issue_body_edit_and_input_boundaries_use_the_same_acceptance_path()
         )
         .unwrap_err();
         assert!(error.to_string().contains(expected), "wrong failure: {error}");
+    }
+    for (profile, invocation, expected) in [
+        (
+            Some("pr-codex"),
+            fixture.invocation(),
+            "publication Profile does not match source assignment",
+        ),
+        (
+            None,
+            Invocation::Agent("not-current".into()),
+            "publication turn does not match current runtime worktree",
+        ),
+    ] {
+        let error = resolve_source(&fixture.config, profile, &invocation).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
     }
     assert!(
         resolve_source(&fixture.config, None, &Invocation::Operator)

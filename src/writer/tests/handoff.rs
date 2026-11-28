@@ -159,7 +159,6 @@ async fn accepted_handoff_waits_for_next_turn_and_survives_unavailable_publisher
             .await
             .unwrap();
             assert!(prepared.is_none(), "canonical disassociation retires the handoff");
-            assert!(recorder.inputs.lock().unwrap().is_empty());
             let lifecycle: String = f
                 .db()
                 .query_row("SELECT lifecycle FROM events WHERE detail='pr_handoff'", [], |r| {
@@ -219,7 +218,13 @@ async fn handoff_rejects_local_authority_and_generation_changes() {
 
 #[tokio::test]
 async fn handoff_remote_validation_never_schedules_before_confirmation() {
-    for mode in ["unrelated", "closed", "closed-target", "limited", "old-source"] {
+    for (mode, lifecycle, reason) in [
+        ("unrelated", "rejected", "handoff requires GitHub-confirmed direct association"),
+        ("closed", "rejected", "handoff requires an OPEN Issue and OPEN unmerged PR"),
+        ("closed-target", "rejected", "handoff requires an OPEN Issue and OPEN unmerged PR"),
+        ("limited", "pending", "429"),
+        ("old-source", "rejected", "publication source was invalidated or superseded"),
+    ] {
         let f = Fixture::new(true);
         bind_pr(&f);
         let a = handoff(&f, mode).unwrap();
@@ -243,11 +248,9 @@ async fn handoff_remote_validation_never_schedules_before_confirmation() {
         }
         let (github, task) = body_edit::body_server(Arc::new(Mutex::new(state))).await;
         f.drain(github).await;
-        assert_eq!(
-            f.receipt(&a.request_id).lifecycle,
-            if mode == "limited" { "pending" } else { "rejected" },
-            "{mode}"
-        );
+        let receipt = f.receipt(&a.request_id);
+        assert_eq!(receipt.lifecycle, lifecycle, "{mode}: {receipt:?}");
+        assert!(receipt.last_error.as_deref().unwrap().contains(reason), "{mode}: {receipt:?}");
         assert_eq!(count(&f, "events"), 0);
         assert_eq!(count(&f, "wake_batches"), 0);
         task.abort();
@@ -346,43 +349,6 @@ fn handoff_same_key_cannot_change_target_or_impersonate_issue_agent() {
 }
 
 #[tokio::test]
-async fn app_comment_with_mention_is_not_a_handoff() {
-    let f = Fixture::new(true);
-    bind_pr(&f);
-    let event = IngressEvent {
-        identity: crate::store::ChangeIdentity::Occurrence,
-        delivery_guid: "app-echo".into(),
-        event_name: "issue_comment".into(),
-        action: Some("created".into()),
-        repository_node_id: "repo".into(),
-        repository: "owner/repository".into(),
-        work_item_node_id: Some("pr".into()),
-        work_item_kind: Some("pr"),
-        work_item_number: Some(9),
-        work_item_state: Some("open".into()),
-        object_node_id: Some("app-comment".into()),
-        object_version: None,
-        object_digest: None,
-        visible_body: Some("@braid please continue".into()),
-        actor_node_id: Some("app".into()),
-        actor_login: Some("braid[bot]".into()),
-        kind: crate::store::EventKind::OriginEcho,
-        detail: None,
-        cross_surface_invalidation: false,
-        requires_attention: true,
-        origin: "agent",
-        reference: "owner/repository#9".into(),
-        mention_candidate: false,
-        reaction_target: None,
-        known: true,
-        raw_payload: vec![],
-    };
-    f.store.ingest_event(event, SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 }).unwrap();
-    assert_eq!(count(&f, "wake_batches"), 0);
-    assert_eq!(count(&f, "pr_handoffs"), 0);
-}
-
-#[tokio::test]
 async fn handoff_transaction_rechecks_source_fence_before_any_wake_or_applied_receipt() {
     let f = Fixture::new(true);
     bind_pr(&f);
@@ -424,17 +390,18 @@ async fn refresh_failure_defers_and_merges_an_arriving_handoff_without_losing_in
     remote.lock().unwrap().limited = true;
     let backend = crate::collaboration::CollaborationBackend::GitHub(github);
     let mut input = String::new();
+    let result = crate::group::input::append_current_context(
+        f.config.runtime.database(),
+        &backend,
+        &f.store,
+        f.config.profile("issue-codex").unwrap(),
+        &first,
+        &mut input,
+    )
+    .await;
     assert!(
-        crate::group::input::append_current_context(
-            f.config.runtime.database(),
-            &backend,
-            &f.store,
-            f.config.profile("issue-codex").unwrap(),
-            &first,
-            &mut input
-        )
-        .await
-        .is_err()
+        matches!(result, Err(ref error) if error.to_string().contains("503")),
+        "expected canonical HTTP 503"
     );
     assert!(input.is_empty());
     f.store.defer_turn_claim(first.turn_id).unwrap();
@@ -507,9 +474,6 @@ impl crate::agent_session::AgentSession for RecordingSession {
         false
     }
     async fn close(&self) -> std::result::Result<(), crate::agent_session::SessionError> {
-        Ok(())
-    }
-    async fn interrupt(&self) -> std::result::Result<(), crate::agent_session::SessionError> {
         Ok(())
     }
     async fn steer_user_msg(

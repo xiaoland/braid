@@ -1,6 +1,6 @@
 use super::{
     MIGRATIONS, OperationalCommentCandidate, StoreActor, apply_one, configure_connection,
-    open_read_write, operational_status,
+    open_read_write,
 };
 use rusqlite::params;
 
@@ -192,26 +192,4 @@ fn role_migration_preserves_legacy_evidence_and_requires_a_unique_identity() {
     drop(db);
     drop(store);
     std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn status_convergence_confirmation_compares_instants_not_timestamp_strings() {
-    assert!(
-        operational_status::confirmation_after(
-            "2000-01-01T00:00:00.1Z",
-            Some("2000-01-01T00:00:00Z")
-        )
-        .unwrap()
-    );
-    assert!(
-        !operational_status::confirmation_after(
-            "2000-01-01T01:00:00+01:00",
-            Some("2000-01-01T00:00:00Z")
-        )
-        .unwrap()
-    );
-    assert!(!operational_status::confirmation_after("2000-01-01T00:00:00Z", None).unwrap());
-    assert!(
-        operational_status::confirmation_after("not-a-time", Some("2000-01-01T00:00:00Z")).is_err()
-    );
 }

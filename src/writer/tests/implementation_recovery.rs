@@ -95,7 +95,7 @@ fn ensure_rejects_invalid_ref_components_before_accepting_an_obligation() {
 }
 
 #[test]
-fn temporary_ledger_contention_preserves_the_publication_obligation() {
+fn ledger_errors_distinguish_retryable_contention_and_actor_loss_from_invalid_writes() {
     use crate::store::StoreError;
     for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
         let error = StoreError::Sqlite(rusqlite::Error::SqliteFailure(
@@ -187,9 +187,17 @@ async fn a_followup_comment_reuses_the_original_managed_implementation_identity(
 
 #[tokio::test]
 async fn recovery_revalidates_the_current_open_source_target_and_association() {
-    for authority in
-        [Authority::SourceClosed, Authority::TargetClosed, Authority::AssociationRemoved]
-    {
+    for (authority, reason) in [
+        (
+            Authority::SourceClosed,
+            "implementation source Issue is no longer the same open work item",
+        ),
+        (Authority::TargetClosed, "implementation request PR is no longer open"),
+        (
+            Authority::AssociationRemoved,
+            "managed implementation is no longer directly associated with its source Issue",
+        ),
+    ] {
         let f = Fixture::new(true);
         let receipt = request(&f, 7);
         let remote = Arc::new(Mutex::new(Remote::default()));
@@ -198,7 +206,7 @@ async fn recovery_revalidates_the_current_open_source_target_and_association() {
         legacy_gap(&f, &receipt);
         remote.lock().unwrap().authority = authority;
         f.drain(github).await;
-        assert_eq!(f.receipt(&receipt.request_id).lifecycle, "rejected");
+        assert_rejected(&f.receipt(&receipt.request_id), reason);
         assert_eq!(activations(&f), 0);
         assert_eq!(remote.lock().unwrap().writes, 0);
         http.abort();
@@ -217,13 +225,16 @@ async fn recovery_cannot_replace_a_blocked_generation_or_adopt_another_issue() {
         if blocked {
             f.db().execute("INSERT INTO assignments(assignment_id,work_item_node_id,generation,lifecycle,assigned_at) VALUES('withdrawn','pr',1,'blocked','now')",[]).unwrap();
             f.drain(github).await;
-            assert_eq!(f.receipt(&original.request_id).lifecycle, "rejected");
+            assert_rejected(&f.receipt(&original.request_id), "existing PR assignment is blocked");
         } else {
             f.db().execute("UPDATE github_write_outbox SET next_attempt_at='2099-01-01T00:00:00Z' WHERE intent_id=?1",[&original.intent_id]).unwrap();
             remote.lock().unwrap().authority = Authority::OtherIssue;
             let foreign = request(&f, 8);
             f.drain(github).await;
-            assert_eq!(f.receipt(&foreign.request_id).lifecycle, "rejected");
+            assert_rejected(
+                &f.receipt(&foreign.request_id),
+                "initial PR ensure must originate from its own Issue source",
+            );
         }
         assert_eq!(activations(&f), 0);
         assert_eq!(remote.lock().unwrap().writes, 0);
@@ -239,8 +250,16 @@ async fn an_unpublished_request_still_requires_its_original_source_authority() {
     let remote = Arc::new(Mutex::new(Remote { create_pr: true, ..Remote::default() }));
     let (github, http) = server(remote.clone(), true).await;
     f.drain(github).await;
-    assert_eq!(f.receipt(&receipt.request_id).lifecycle, "rejected");
+    assert_rejected(
+        &f.receipt(&receipt.request_id),
+        "publication source was invalidated or superseded",
+    );
     assert_eq!(remote.lock().unwrap().writes, 0);
     assert_eq!(activations(&f), 0);
     http.abort();
+}
+
+fn assert_rejected(receipt: &GhWriteReceipt, reason: &str) {
+    assert_eq!(receipt.lifecycle, "rejected", "{receipt:?}");
+    assert!(receipt.last_error.as_deref().unwrap().contains(reason), "{receipt:?}");
 }

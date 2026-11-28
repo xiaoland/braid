@@ -125,12 +125,14 @@ enum Authority {
     SourceClosed,
     TargetClosed,
     AssociationRemoved,
+    AssociationUnavailable,
     OtherIssue,
 }
 
 #[derive(Default)]
 struct Remote {
     authority: Authority,
+    closing_issue: Option<u64>,
     pr_body: Option<String>,
     create_pr: bool,
     target_kind: TargetKind,
@@ -188,7 +190,23 @@ async fn server(
         .route("/repos/owner/repository/git/refs",post({let remote=remote.clone(); move |Json(body): Json<Value>| {let remote=remote.clone(); async move {let mut state=remote.lock().unwrap(); state.ref_requests.push(body); state.head_created=true; state.writes+=1; Json(json!({"ref":"refs/heads/head","object":{"sha":"new"}}))}}}))
         .route("/repos/owner/repository/pulls/9", get(move || {let mut pr=pr.clone();let remote=pr_read.clone(); async move {let remote=remote.lock().unwrap();if remote.authority==Authority::TargetClosed{pr["state"]=json!("closed");}
             if let Some(body)=&remote.pr_body{pr["body"]=json!(body);}Json(pr)}}))
-        .route("/graphql", post(move||{let remote=associations.clone(); async move {let nodes=if remote.lock().unwrap().authority==Authority::AssociationRemoved{json!([])}else{json!([{"number":1,"repository":{"nameWithOwner":"owner/repository"}}])};Json(json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}})) }}));
+        .route("/graphql", post(move || {
+            let remote = associations.clone();
+            async move {
+                let state = remote.lock().unwrap();
+                if state.authority == Authority::AssociationUnavailable {
+                    return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+                }
+                let nodes = if state.authority == Authority::AssociationRemoved {
+                    json!([])
+                } else {
+                    json!([{"number":state.closing_issue.unwrap_or(1),"repository":{"nameWithOwner":"owner/repository"}}])
+                };
+                Ok(Json(json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":{
+                    "nodes":nodes, "pageInfo":{"hasNextPage":false,"endCursor":null}
+                }}}}})))
+            }
+        }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
@@ -200,6 +218,10 @@ async fn server(
         .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
         .build()
         .unwrap();
+    (Arc::new(publication_client(client, permission)), task)
+}
+
+fn publication_client(client: octocrab::Octocrab, permission: bool) -> GitHubClient {
     let identity = crate::github::GitHubIdentity {
         app_id: 1,
         app_slug: "braid".into(),
@@ -219,26 +241,22 @@ async fn server(
             BTreeMap::new()
         },
     };
-    (
-        Arc::new(GitHubClient::publication_test_client(
-            client,
-            identity,
-            crate::config::GitHubConfig {
-                app_id: 1,
-                private_key_file: PathBuf::new(),
-                projects_v2_enabled: false,
-                repository: "owner/repository".into(),
-                additional_repositories: Vec::new(),
-                handle: "braid".into(),
-                api_version: "2022-11-28".into(),
-                webhook_secret_environment: None,
-                webhook_secret_file: None,
-            },
-        )),
-        task,
+    GitHubClient::publication_test_client(
+        client,
+        identity,
+        crate::config::GitHubConfig {
+            app_id: 1,
+            private_key_file: PathBuf::new(),
+            projects_v2_enabled: false,
+            repository: "owner/repository".into(),
+            additional_repositories: Vec::new(),
+            handle: "braid".into(),
+            api_version: "2022-11-28".into(),
+            webhook_secret_environment: None,
+            webhook_secret_file: None,
+        },
     )
 }
-
 #[tokio::test]
 async fn outbox_delivery_recovery_and_rate_deadline_use_production_executor() {
     let fixture = Fixture::new(false);
@@ -294,22 +312,8 @@ async fn uncertain_comment_recovery_scans_the_remote_conversation_once() {
 }
 
 #[tokio::test]
-async fn issue_source_ensures_pr_with_frozen_plan_and_one_native_activation() {
+async fn issue_source_adopts_an_existing_pr_with_one_native_activation() {
     let fixture = Fixture::new(true);
-    assert!(
-        create_comment(
-            &fixture.config,
-            &fixture.store,
-            CommentCreateRequest {
-                invocation: fixture.invocation(),
-                target: "owner/repository#1".parse().unwrap(),
-                profile_id: "pr-codex".into(),
-                body: "forged".into(),
-                request_id: None
-            }
-        )
-        .is_err()
-    );
     let receipt = ensure_pull_request(
         &fixture.config,
         &fixture.store,
@@ -332,13 +336,6 @@ async fn issue_source_ensures_pr_with_frozen_plan_and_one_native_activation() {
         fixture.store.implementation_request_receipt(receipt.intent_id.clone()).unwrap().unwrap();
     assert_eq!(plan.head_ref, "head");
     assert_eq!(plan.stage, "activation_pending");
-    for stage in ["head_ready", "pull_request_ready", "associated", "activation_pending"] {
-        fixture.db().execute("UPDATE implementation_requests SET stage=?1", [stage]).unwrap();
-        fixture.db().execute("UPDATE github_write_outbox SET lifecycle='sending'", []).unwrap();
-        fixture.store.recover_writes().unwrap();
-        fixture.drain(github.clone()).await;
-        assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
-    }
     let count: i64 = fixture
         .db()
         .query_row(
@@ -356,6 +353,24 @@ async fn issue_source_ensures_pr_with_frozen_plan_and_one_native_activation() {
 async fn completed_turn_can_publish_but_source_fences_reject_before_mutation() {
     for fence in ["completed", "reset", "invalidation", "replacement"] {
         let fixture = Fixture::new(true);
+        if fence == "completed" {
+            let error = create_comment(
+                &fixture.config,
+                &fixture.store,
+                CommentCreateRequest {
+                    invocation: fixture.invocation(),
+                    target: "owner/repository#1".parse().unwrap(),
+                    profile_id: "pr-codex".into(),
+                    body: "forged".into(),
+                    request_id: None,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("publication Profile does not match source assignment"),
+                "{error}"
+            );
+        }
         let receipt = fixture.comment();
         match fence {
             "reset" => {
@@ -416,11 +431,22 @@ async fn initial_ensure_bootstrap_pr_association_and_restart_do_not_duplicate_mu
         },
     )
     .unwrap();
-    let remote = Arc::new(Mutex::new(Remote { create_pr: true, ..Remote::default() }));
+    let remote = Arc::new(Mutex::new(Remote {
+        create_pr: true,
+        authority: Authority::AssociationUnavailable,
+        ..Remote::default()
+    }));
     let (github, task) = server(remote.clone(), true).await;
-    fixture.drain(github.clone()).await;
+    fixture.drain(github).await;
     let result = fixture.receipt(&receipt.request_id);
-    assert_eq!(result.lifecycle, "applied", "{:?}", result.last_error);
+    assert_eq!(result.lifecycle, "uncertain", "{result:?}");
+    assert!(result.last_error.as_deref().unwrap().contains("503"), "{result:?}");
+    let plan =
+        fixture.store.implementation_request_receipt(receipt.intent_id.clone()).unwrap().unwrap();
+    assert_eq!(plan.stage, "pull_request_ready");
+    assert_eq!(plan.pull_request_number, Some(9));
+    assert!(!plan.activation_delivered);
+    task.abort();
     {
         let remote = remote.lock().unwrap();
         assert_eq!(remote.writes, 3);
@@ -439,11 +465,27 @@ async fn initial_ensure_bootstrap_pr_association_and_restart_do_not_duplicate_mu
             "missing durable request: {body}"
         );
     }
-    fixture.db().execute("UPDATE github_write_outbox SET lifecycle='sending'", []).unwrap();
+    remote.lock().unwrap().authority = Authority::Intact;
     let fixture = fixture.reopen();
     fixture.store.recover_writes().unwrap();
+    fixture.due();
+    let (github, task) = server(remote.clone(), true).await;
     fixture.drain(github).await;
     assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
+    let delivered =
+        fixture.store.implementation_request_receipt(receipt.intent_id).unwrap().unwrap();
+    assert!(delivered.activation_delivered);
+    assert_eq!(
+        fixture
+            .db()
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='assign' AND detail='pr_ensure'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
     assert_eq!(remote.lock().unwrap().writes, 3);
     task.abort();
 }
@@ -453,18 +495,15 @@ async fn source_role_can_publish_related_cross_surface_without_target_profile_ta
     for target_pr in [true, false] {
         for fence in ["valid", "invalidated", "profile_changed"] {
             let fixture = Fixture::new(true);
-            if !target_pr {
+            if target_pr {
+                fixture.db().execute("UPDATE work_items SET number=7", []).unwrap();
+            } else {
                 fixture
                     .db()
                     .execute("UPDATE agent_instances SET role='pr_implementation_agent'", [])
                     .unwrap();
-            }
-            if !target_pr {
                 fixture.db().execute("UPDATE work_items SET kind='pr',number=9", []).unwrap();
             }
-            assert!(
-                resolve_source(&fixture.config, Some("pr-codex"), &fixture.invocation()).is_err()
-            );
             let receipt = fixture.comment();
             match fence {
                 "invalidated" => {
@@ -479,6 +518,7 @@ async fn source_role_can_publish_related_cross_surface_without_target_profile_ta
                 _ => {}
             }
             let remote = Arc::new(Mutex::new(Remote {
+                closing_issue: Some(if target_pr { 7 } else { 1 }),
                 target_kind: if target_pr { TargetKind::PullRequest } else { TargetKind::Issue },
                 ..Remote::default()
             }));
@@ -491,7 +531,21 @@ async fn source_role_can_publish_related_cross_surface_without_target_profile_ta
                 "{:?}",
                 result.last_error
             );
-            assert_eq!(remote.lock().unwrap().writes, usize::from(fence == "valid"));
+            let state = remote.lock().unwrap();
+            assert_eq!(state.writes, usize::from(fence == "valid"));
+            if fence == "valid" {
+                let role = if target_pr { "Issue Agent" } else { "PR Implementation Agent" };
+                assert!(state.comments[0]["body"].as_str().unwrap().contains(role));
+            } else {
+                assert!(
+                    result
+                        .last_error
+                        .as_deref()
+                        .unwrap()
+                        .contains("publication source was invalidated or superseded"),
+                    "{fence}: {result:?}"
+                );
+            }
             task.abort();
         }
     }

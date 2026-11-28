@@ -166,3 +166,38 @@ async fn signed_same_number_repositories_keep_distinct_events_and_deduplicate_af
         ])
     );
 }
+
+#[tokio::test]
+async fn signed_app_comment_mention_does_not_schedule_a_handoff_or_wake() {
+    const BODY: &str = r#"{"action":"created","repository":{"node_id":"R1","full_name":"owner/repository"},"sender":{"login":"braid[bot]","node_id":"APP"},"issue":{"node_id":"I1","number":1,"state":"open","pull_request":{}},"comment":{"id":7,"node_id":"C1","body":"@braid continue this handoff","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#;
+    let db = Database::new();
+    let state = db.state(&["owner/repository"]);
+    db.connect()
+        .execute_batch(
+            "INSERT INTO repositories VALUES ('R1','owner/repository',1,'now');
+         INSERT INTO work_items(node_id,repository_node_id,kind,number,state,observed_at)
+             VALUES ('I1','R1','pr',1,'open','now');
+         INSERT INTO assignments VALUES ('current','I1',1,'active','now',NULL);",
+        )
+        .unwrap();
+    let (status, receipt) = deliver(
+        &state,
+        BODY,
+        Some("sha256=cc52441234b35bf3359ce89a5d58821e6d65ab784f8e87d7880fe4478da628f3"),
+        "app-echo",
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{receipt}");
+    let id: Value = serde_json::from_str(&receipt).unwrap();
+    let kind: String = db
+        .connect()
+        .query_row(
+            "SELECT kind FROM events WHERE event_id=?1",
+            [id["event_id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind, "origin_echo");
+    assert_eq!(db.count("wake_batches"), 0);
+    assert_eq!(db.count("pr_handoffs"), 0);
+}

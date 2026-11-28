@@ -186,10 +186,7 @@ fn block_unidentified_creates(tx: &rusqlite::Transaction<'_>, now: &str) -> Resu
     Ok(())
 }
 
-pub(super) fn confirmation_after(
-    confirmed: &str,
-    failure: Option<&str>,
-) -> Result<bool, StoreError> {
+fn confirmation_after(confirmed: &str, failure: Option<&str>) -> Result<bool, StoreError> {
     let Some(failure) = failure else { return Ok(false) };
     let parse = |value: &str| {
         time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).map_err(
@@ -256,4 +253,22 @@ pub(super) fn settle(
     // lifecycle of a newer desired publication. Keep both facts atomically.
     tx.execute("UPDATE status_comments SET remote_comment_node_id=COALESCE(?3,remote_comment_node_id),remote_comment_database_id=COALESCE(?4,remote_comment_database_id),lifecycle=CASE WHEN write_intent_id=?1 THEN ?2 ELSE lifecycle END,updated_at=CASE WHEN write_intent_id=?1 THEN ?5 ELSE updated_at END WHERE EXISTS(SELECT 1 FROM github_write_outbox o WHERE o.intent_id=?1 AND o.status_work_item_node_id=status_comments.work_item_node_id AND o.status_profile_id=status_comments.profile_id AND o.status_generation=status_comments.assignment_generation)",params![intent,lifecycle,remote_node,remote_id,now])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_convergence_confirmation_compares_instants_not_timestamp_strings() {
+        assert!(
+            confirmation_after("2000-01-01T00:00:00.1Z", Some("2000-01-01T00:00:00Z")).unwrap()
+        );
+        assert!(
+            !confirmation_after("2000-01-01T01:00:00+01:00", Some("2000-01-01T00:00:00Z")).unwrap()
+        );
+        assert!(!confirmation_after("2000-01-01T00:00:00Z", None).unwrap());
+        assert!(matches!(confirmation_after("not-a-time", Some("2000-01-01T00:00:00Z")),
+            Err(StoreError::InvalidData(reason)) if reason.contains("invalid operational status confirmation timestamp")));
+    }
 }

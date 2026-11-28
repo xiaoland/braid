@@ -21,8 +21,8 @@ fn core(pr: bool, version: usize) -> Value {
     }
     value
 }
-fn comment() -> Value {
-    json!({"id":"C1","fullDatabaseId":"2","author":null,"body":"Complete comment body","createdAt":"2026-01-01","updatedAt":"2026-01-01","lastEditedAt":null,"isMinimized":false,"minimizedReason":null,"isPinned":false})
+fn comment(id: &str, body: &str) -> Value {
+    json!({"id":id,"fullDatabaseId":if id == "C1" {"2"} else {"3"},"author":null,"body":body,"createdAt":"2026-01-01","updatedAt":"2026-01-01","lastEditedAt":null,"isMinimized":false,"minimizedReason":null,"isPinned":false})
 }
 #[allow(clippy::too_many_lines)]
 async fn server(
@@ -70,8 +70,12 @@ async fn server(
                         ]
                     } {
                         object[field] = page(
-                            if field == "comments" && !multi {
-                                json!([comment()])
+                            if field == "comments" {
+                                let mut nodes = vec![comment("C1", "First comment")];
+                                if !multi {
+                                    nodes.push(comment("C2", "Complete comment body"));
+                                }
+                                json!(nodes)
                             } else {
                                 json!([])
                             },
@@ -80,7 +84,9 @@ async fn server(
                     }
                 } else if !op.ends_with("Core") {
                     object["items"] = page(
-                        if op.ends_with("Comments") { json!([comment()]) } else { json!([]) },
+                        if matches!(op, "IssueComments" | "PrComments") && request["variables"]["cursor"] == "next" {
+                            json!([comment("C2", "Complete comment body")])
+                        } else { json!([]) },
                         false,
                     );
                 }
@@ -103,7 +109,7 @@ async fn server(
                 let mut repository = json!({"id":"R1","nameWithOwner":"owner/repo"});
                 repository[if pr { "pullRequest" } else { "issue" }] = object;
                 let mut result = json!({"data":{"repository":repository,"rateLimit":{"cost":1}}});
-                if op == "ReviewThreadComments" { result["data"]=json!({"node":{"items":page(json!([comment()]),false)},"rateLimit":{"cost":1}}); }
+                if op == "ReviewThreadComments" { result["data"]=json!({"node":{"items":page(json!([comment("C1","Review thread discussion")]),false)},"rateLimit":{"cost":1}}); }
                 if fault == Some("partial") && op.ends_with("FirstPages") {
                     result["errors"] = json!([{"message":"incomplete"}]);
                 }
@@ -168,9 +174,11 @@ async fn single_page_bill_and_multipage_output_equivalence() {
         for snapshot in [&single, &multi] {
             let comments =
                 snapshot[if pr { "conversation" } else { "comments" }].as_array().unwrap();
-            assert_eq!(comments.len(), 1);
+            assert_eq!(comments.len(), 2);
             assert_eq!(comments[0]["node_id"], "C1");
-            assert_eq!(comments[0]["body"], "Complete comment body");
+            assert_eq!(comments[0]["body"], "First comment");
+            assert_eq!(comments[1]["node_id"], "C2");
+            assert_eq!(comments[1]["body"], "Complete comment body");
         }
         assert_eq!(single, multi);
         assert_eq!(ops.lock().unwrap().len(), 6);
@@ -220,8 +228,8 @@ async fn associated_issue_and_review_thread_bodies_are_fully_materialized() {
     let (client, ops, task) = server(true, false, false, Some("rich")).await;
     let result = materialize(&client, true).await.unwrap();
     assert_eq!(result["associated_issues"][0]["body"], "Full body");
-    assert_eq!(result["associated_issues"][0]["comments"][0]["body"], "Complete comment body");
-    assert_eq!(result["review_threads"][0]["comments"][0]["body"], "Complete comment body");
+    assert_eq!(result["associated_issues"][0]["comments"][1]["body"], "Complete comment body");
+    assert_eq!(result["review_threads"][0]["comments"][0]["body"], "Review thread discussion");
     assert_eq!(ops.lock().unwrap().len(), 11);
     task.abort();
 }
