@@ -147,6 +147,18 @@ fn revision() -> IngressEvent {
     }
 }
 
+fn unassignment(delivery_guid: &str) -> IngressEvent {
+    IngressEvent {
+        delivery_guid: delivery_guid.into(),
+        identity: crate::store::ChangeIdentity::Occurrence,
+        kind: EventKind::Unassign,
+        action: Some("unassigned".into()),
+        requires_attention: false,
+        cross_surface_invalidation: false,
+        ..revision()
+    }
+}
+
 #[tokio::test]
 async fn soft_pressure_reset_replaces_memory_and_delivers_input_with_publication_unavailable() {
     let f = Fixture::new(true);
@@ -531,13 +543,7 @@ async fn retired_reset_history_cannot_replace_an_execution_or_block_a_finite_run
         let before = f.store.execution_progress().unwrap();
         assert!(before.unresolved_reset);
         assert_eq!(before.blocked_reset.as_deref(), blocked.then_some(reset.reset_id.as_str()));
-        let mut revoke = revision();
-        revoke.delivery_guid = "assignment-removed-during-reset".into();
-        revoke.identity = crate::store::ChangeIdentity::Occurrence;
-        revoke.kind = EventKind::Unassign;
-        revoke.action = Some("unassigned".into());
-        revoke.requires_attention = false;
-        revoke.cross_surface_invalidation = false;
+        let revoke = unassignment("assignment-removed-during-reset");
         let event = f.store.ingest_event(revoke, policy).unwrap().event_id.unwrap();
         driver.settle_idle_unassignment(event).await.unwrap();
         let after = f.store.runtime_status().unwrap();
@@ -1093,13 +1099,7 @@ async fn worker_stops_a_running_unassigned_issue_only_after_its_quiet_window() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }).await.expect("the provider must start a real turn before unassignment");
-    let mut unassign = revision();
-    unassign.delivery_guid = "assignment-removed".into();
-    unassign.identity = crate::store::ChangeIdentity::Occurrence;
-    unassign.kind = EventKind::Unassign;
-    unassign.action = Some("unassigned".into());
-    unassign.cross_surface_invalidation = false;
-    unassign.requires_attention = false;
+    let unassign = unassignment("assignment-removed");
     let event = store.ingest_event(unassign, policy).unwrap().event_id.unwrap();
 
     // A second provider input acknowledges a worker tick inside the window.
