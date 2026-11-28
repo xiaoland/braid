@@ -130,6 +130,13 @@ run_clean() {
 }
 
 run_clean "$braid" --version
+run_clean "$braid" setup --help | /usr/bin/grep -q -- '--runtime-executable'
+if run_clean "$braid" setup owner/repo --runtime-api-url https://example.invalid \
+    > "$temporary_root/setup-removed-argument.out" 2>&1; then
+    echo "setup accepted a removed option" >&2
+    exit 1
+fi
+/usr/bin/grep -q 'unexpected argument.*--runtime-api-url' "$temporary_root/setup-removed-argument.out"
 run_clean "$braid" config check --config "$config"
 run_clean "$braid" migrate plan --config "$config"
 run_clean "$braid" migrate apply --config "$config"
