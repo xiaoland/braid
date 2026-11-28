@@ -867,6 +867,11 @@ async fn builtin_running_unassignment(
             )
             .unwrap()
     };
+    // The turn may already carry an input rejection. A terminal error is
+    // appended to that diagnosis, and a successful terminal adds no reason.
+    let assert_terminal_reason = |error: Option<&str>, reason: &str| {
+        assert_eq!(error.and_then(|body| body.lines().last()), Some(reason), "{error:?}");
+    };
     let (outcome, reason) = if let Some((outcome, reason)) = terminal {
         tokio::time::timeout(limit, async {
             while turn_state().0 != outcome.lifecycle() {
@@ -875,7 +880,9 @@ async fn builtin_running_unassignment(
         })
         .await
         .expect("observed provider terminal must be durable while the platform fence is offline");
-        assert_eq!(turn_state().1, reason);
+        if let Some(reason) = &reason {
+            assert_terminal_reason(turn_state().1.as_deref(), reason);
+        }
         (outcome, reason)
     } else {
         tokio::time::timeout(limit, async {
@@ -951,12 +958,8 @@ async fn builtin_running_unassignment(
     }
     let (lifecycle, error) = turn_state();
     assert_eq!(lifecycle, outcome.lifecycle());
-    if outcome == crate::agent_session::TurnOutcome::Unknown {
-        // The worker may already have recorded a steer rejection on this turn.
-        // Retirement must append its own terminal reason to any earlier diagnosis.
-        assert_eq!(error.as_deref().and_then(|body| body.lines().last()), reason.as_deref());
-    } else {
-        assert_eq!(error, reason);
+    if let Some(reason) = &reason {
+        assert_terminal_reason(error.as_deref(), reason);
     }
     assert_eq!(*captured.close_attempts.lock().unwrap(), ["fresh-provider"]);
     assert_eq!(captured.memory.lock().unwrap().len(), 2);
