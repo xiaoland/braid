@@ -1,16 +1,21 @@
 use super::*;
 use serde_json::{Value, json};
 
-fn configuration(root: &Path, kind: CredentialKind, install: Option<&Path>) -> Config {
+fn configuration(
+    root: &Path,
+    kind: CredentialKind,
+    executable: Option<&Path>,
+    manifest: Option<&Path>,
+) -> Config {
     let mut config: Config = toml::from_str(include_str!("../../config.example.toml")).unwrap();
     for runtime in &mut config.runtimes {
         runtime.adapter_type = "pi".into();
         runtime.version = "1.1.0".into();
         runtime.home = None;
-        if let Some(install) = install {
-            runtime.executable = install.join("pi");
-            runtime.native_runtime = Some(install.join("runtime-manifest.json"));
+        if let Some(executable) = executable {
+            runtime.executable = executable.to_owned();
         }
+        runtime.native_runtime = manifest.map(Path::to_owned);
     }
     for profile in &mut config.profiles {
         profile.adapter_type = "pi".into();
@@ -64,7 +69,7 @@ fn snapshot_writes_native_model_fields_and_keeps_credentials_out_of_models_json(
     ] {
         let directory = root.join(name);
         fs::create_dir_all(&directory).unwrap();
-        let config = configuration(&directory, kind, None);
+        let config = configuration(&directory, kind, None, None);
         let profile = &config.profiles[0];
         let materials = collect(&config, profile).unwrap();
         let home_key = uuid::Uuid::now_v7().to_string();
@@ -103,7 +108,12 @@ async fn failed_home_binding_stops_the_installed_execution_before_returning() {
     fs::create_dir_all(&homes).unwrap();
     // A real post-launch metadata write fails after the SDK has opened its session.
     fs::write(homes.join("index"), "not a directory").unwrap();
-    let config = configuration(&root, CredentialKind::None, Some(&install));
+    let config = configuration(
+        &root,
+        CredentialKind::None,
+        Some(&install.join("pi")),
+        Some(&install.join("runtime-manifest.json")),
+    );
     let profile = config.profiles[0].clone();
     let factories = crate::provider::session_factories(&config).unwrap();
     let factory = &factories[&profile.id];
@@ -143,4 +153,34 @@ async fn failed_home_binding_stops_the_installed_execution_before_returning() {
     assert_eq!(receipt["scope"], "execution");
     assert_eq!(receipt["status"], "stopped");
     assert_eq!(receipt["coverage"], "registered-process-groups-and-inherited-execution-markers");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_rejection_retains_an_unconfirmed_physical_shutdown() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = std::env::temp_dir().join(format!("braid-pi-exit-{}", uuid::Uuid::now_v7()));
+    fs::create_dir_all(&root).unwrap();
+    let executable = root.join("pi");
+    fs::write(&executable, r#"#!/usr/bin/env python3
+import json, sys
+command = json.loads(sys.stdin.readline())
+assert command["type"] == "new_session"
+print(json.dumps({"id":command["id"], "success":False, "error":"session creation rejected"}), flush=True)
+assert not sys.stdin.read()
+sys.exit(29)
+"#).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let config = configuration(&root, CredentialKind::None, Some(&executable), None);
+    let profile = config.profiles[0].clone();
+    let factories = crate::provider::session_factories(&config).unwrap();
+    let factory = &factories[&profile.id];
+    let error = factory.start(profile, String::new(), String::new()).await.err().unwrap();
+    fs::remove_dir_all(root).unwrap();
+    assert!(
+        matches!(error, crate::agent_session::SessionError::Unknown(ref cause)
+        if cause.contains("session creation rejected")
+            && cause.contains("External Pi parent exited with exit status: 29")),
+        "{error}"
+    );
 }

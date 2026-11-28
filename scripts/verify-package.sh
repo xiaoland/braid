@@ -37,6 +37,11 @@ if [ "$version" != "braid ${2#v}" ]; then
 fi
 config="$PWD/config.example.toml"
 braid config check --config "$config"
-braid migrate apply --config "$config"
+applied=$(braid migrate apply --config "$config")
+printf '%s\n' "$applied"
+if ! printf '%s\n' "$applied" | grep -Eq '^schema: 0 -> [1-9][0-9]*$'; then
+  echo 'Clean installation must migrate a fresh database from schema 0' >&2
+  exit 1
+fi
 plan=$(braid migrate plan --config "$config")
 printf '%s\n' "$plan" | grep -Fx 'pending: none'
