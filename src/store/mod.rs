@@ -3547,6 +3547,10 @@ fn provider_resume_candidates(
          LEFT JOIN turns t ON t.session_id=ps.session_id
            AND t.lifecycle IN ('starting','running','unknown')
          WHERE a.lifecycle IN ('active','finalizing') AND ai.profile_id=?1
+           AND NOT (ps.execution_stopped_at IS NOT NULL
+             AND (w.kind='issue' OR EXISTS(SELECT 1 FROM builtin_upstream))
+             AND EXISTS(SELECT 1 FROM events e WHERE e.work_item_node_id=w.node_id
+                        AND e.kind='unassign' AND e.lifecycle='pending'))
          ORDER BY a.assigned_at,a.assignment_id,ps.started_at",
     )?;
     let rows = statement.query_map(params![profile_id, work_item_kind], |row| {

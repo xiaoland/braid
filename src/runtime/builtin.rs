@@ -798,21 +798,21 @@ mod tests {
     use super::*;
     use axum::{Json, Router, routing::get};
 
-    #[tokio::test]
-    async fn managed_ingests_while_old_execution_fence_is_unavailable() {
-        let fixture = crate::writer::tests::Fixture::new(false);
-        let store = Arc::new(
-            StoreActor::start(
-                fixture.config.runtime.database().into(),
-                fixture.config.runtime.backups().into(),
-            )
-            .unwrap(),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let resumed = Arc::new(tokio::sync::Notify::new());
-        let requested_after_close = Arc::clone(&resumed);
-        let app = Router::new()
+    fn closed_issue_with_unavailable_fence(resumed: Arc<tokio::sync::Notify>) -> Router {
+        let event = serde_json::json!({
+            "sequence": 1,
+            "event": {
+                "delivery_guid": "local:1", "event_name": "local",
+                "repository": "test-space", "repository_node_id": "local:test-space",
+                "work_item_node_id": "local:test-space:issue:1", "work_item_kind": "issue",
+                "work_item_number": 1, "work_item_state": "closed",
+                "kind": "lifecycle", "detail": "closed",
+                "cross_surface_invalidation": false, "origin": "human",
+                "reference": "Issue closed", "mention_candidate": false,
+                "known": true, "raw_payload": []
+            }
+        });
+        Router::new()
             .route(
                 "/api/platform/repository",
                 get(|| async {
@@ -825,31 +825,37 @@ mod tests {
             .route(
                 "/api/platform/events",
                 get(move |axum::extract::Query(query): axum::extract::Query<HashMap<String, u64>>| {
-                    let resumed = Arc::clone(&resumed);
-                    async move {
-                    if query["after"] == 1 {
+                    let events = if query["after"] == 1 {
                         resumed.notify_one();
-                        return Json(serde_json::json!({"events": [], "nextAfter": 1, "lastSequence": 1}));
-                    }
-                    Json(serde_json::json!({"events": [{
-                    "sequence": 1, "event": {
-                        "delivery_guid": "local:1", "event_name": "local",
-                        "repository": "test-space", "repository_node_id": "local:test-space",
-                        "work_item_node_id": "local:test-space:issue:1", "work_item_kind": "issue",
-                        "work_item_number": 1, "work_item_state": "closed",
-                        "kind": "lifecycle", "detail": "closed",
-                        "cross_surface_invalidation": false, "origin": "human",
-                        "reference": "Issue closed", "mention_candidate": false,
-                        "known": true, "raw_payload": []
-                    }
-                }], "nextAfter": 1, "lastSequence": 1}))
+                        vec![]
+                    } else {
+                        vec![event.clone()]
+                    };
+                    async move {
+                        Json(serde_json::json!({"events": events, "nextAfter": 1, "lastSequence": 1}))
                     }
                 }),
             )
             .route(
                 "/api/platform/executions/fence",
                 axum::routing::post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
-            );
+            )
+    }
+
+    #[tokio::test]
+    async fn managed_ingests_while_old_execution_fence_is_unavailable() {
+        let fixture = crate::writer::tests::Fixture::new(false);
+        let store = Arc::new(
+            StoreActor::start(
+                fixture.config.runtime.database().into(),
+                fixture.config.runtime.backups().into(),
+            )
+            .unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requested_after_close = Arc::new(tokio::sync::Notify::new());
+        let app = closed_issue_with_unavailable_fence(Arc::clone(&requested_after_close));
         let http = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let mut config = fixture.config.clone();
         config.github = None;
@@ -903,10 +909,10 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(turns, 0);
-        if halt.send(true).is_err() {
-            panic!("runtime exited before the requested stop: {:#?}", runtime.await);
-        }
-        let error = runtime.await.unwrap().unwrap_err();
+        let requested_stop = halt.send(true);
+        let result = runtime.await.unwrap();
+        assert!(requested_stop.is_ok(), "runtime exited before the requested stop: {result:#?}");
+        let error = result.unwrap_err();
         assert!(error.to_string().contains("execution fence remains unconfirmed"), "{error:#}");
         http.abort();
     }

@@ -200,7 +200,7 @@ impl GroupDriver<'_> {
     pub(super) async fn settle_unassignment(
         &self,
         change: &crate::store::Unassignment,
-        mut active: Option<&mut RunningAgentTurn>,
+        active: Option<&mut RunningAgentTurn>,
     ) -> Result<()> {
         let mut stop = Ok(());
         for (session, stopped) in &change.sessions {
@@ -208,10 +208,10 @@ impl GroupDriver<'_> {
                 stop = Err(error);
             }
         }
-        let terminal = active.as_deref_mut().and_then(RunningAgentTurn::terminal_after_close);
+        let terminal = active.and_then(RunningAgentTurn::terminal_after_close);
         if (stop.is_ok() || terminal.is_some())
             && self.store.settle_unassignment(change, terminal.clone(), stop.is_ok())?
-            && let Some(active) = active
+            && let Some((turn, session)) = &change.running_turn
         {
             use crate::agent_session::TurnOutcome;
             let (outcome, reason) = terminal.as_ref().map_or(
@@ -227,7 +227,7 @@ impl GroupDriver<'_> {
                 },
             );
             if matches!(outcome, TurnOutcome::Failed | TurnOutcome::Unknown) {
-                self.enqueue_turn_error(&active.claim, outcome.lifecycle(), reason);
+                self.enqueue_turn_error(turn, session, outcome.lifecycle(), reason);
             }
         }
         stop.map_err(Into::into)
@@ -260,24 +260,25 @@ impl GroupDriver<'_> {
         if let Err(error) = self.store.record_turn_error(claim.turn_id.clone(), reason.to_owned()) {
             tracing::error!(%error, turn = %claim.turn_id, "cannot retain complete turn error");
         }
-        self.enqueue_turn_error(claim, lifecycle, reason);
+        self.enqueue_turn_error(&claim.turn_id, &claim.provider_session_id, lifecycle, reason);
     }
 
-    fn enqueue_turn_error(&self, claim: &TurnClaim, lifecycle: &str, reason: &str) {
+    fn enqueue_turn_error(&self, turn_id: &str, session: &str, lifecycle: &str, reason: &str) {
         if self.spec.profile.status_surfaces.is_empty() {
             return;
         }
         if let Err(error) = self.store.enqueue_operational_status(
-            claim.turn_id.clone(),
+            turn_id.into(),
             super::provider::operational_status_turn_error(
                 self.config,
                 &self.spec.profile,
-                claim,
+                turn_id,
+                session,
                 lifecycle,
                 reason,
             ),
         ) {
-            tracing::error!(%error, turn = %claim.turn_id, "cannot publish turn error status");
+            tracing::error!(%error, turn = %turn_id, "cannot publish turn error status");
         }
     }
 

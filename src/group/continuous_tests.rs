@@ -15,6 +15,7 @@ use tokio::sync::broadcast;
 struct Captured {
     memory: Mutex<Vec<String>>,
     inputs: Mutex<Vec<String>>,
+    resumed: Mutex<Vec<String>>,
     steer_error: Mutex<Option<SessionError>>,
     close_error: Mutex<Option<SessionError>>,
     close_attempts: Mutex<Vec<String>>,
@@ -61,7 +62,7 @@ impl SessionFactory for Factory {
         _profile: Profile,
         _instructions: String,
     ) -> Result<CreatedSession, SessionError> {
-        assert_eq!(id, "provider", "only the existing session is restored");
+        self.0.resumed.lock().unwrap().push(id.to_owned());
         Ok(CreatedSession {
             id: id.into(),
             session: Arc::new(Session {
@@ -749,22 +750,31 @@ async fn stopping_native_execution_does_not_wait_for_execution_fence() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn builtin_turn_runs_without_writer_service_and_cannot_mint_after_reassignment() {
-    builtin_running_unassignment(crate::agent_session::TurnOutcome::Completed, None).await;
+    builtin_running_unassignment(Some((crate::agent_session::TurnOutcome::Completed, None)), false)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_preserves_a_failed_turn_during_unassignment_while_the_platform_fence_is_offline() {
     builtin_running_unassignment(
-        crate::agent_session::TurnOutcome::Failed,
-        Some("provider failed while stopping".into()),
+        Some((
+            crate::agent_session::TurnOutcome::Failed,
+            Some("provider failed while stopping".into()),
+        )),
+        true,
     )
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restarted_worker_retires_a_stopped_unassignment_without_a_provider_terminal() {
+    builtin_running_unassignment(None, true).await;
+}
+
 #[allow(clippy::too_many_lines)]
 async fn builtin_running_unassignment(
-    outcome: crate::agent_session::TurnOutcome,
-    reason: Option<String>,
+    terminal: Option<(crate::agent_session::TurnOutcome, Option<String>)>,
+    restart: bool,
 ) {
     use crate::{
         builtin::BuiltinClient,
@@ -831,21 +841,12 @@ async fn builtin_running_unassignment(
         repository: platform.repository.clone(),
         endpoint: format!("http://{address}").parse().unwrap(),
     });
-    let store = Arc::new(
-        StoreActor::start(config.runtime.database().into(), config.runtime.backups().into())
-            .unwrap(),
-    );
-    let lease = store.acquire_runtime_lease("runtime".into(), "fixture".into(), 60).unwrap();
-    let client = BuiltinClient::connect(&config, Arc::clone(&store))
-        .await
-        .unwrap()
-        .with_runtime(lease)
-        .unwrap();
-    let spec = GroupSpec::new(GroupKind::Issue, &config, &store, "test-space").unwrap();
+    let (mut store, mut client) = open_worker_runtime(&config, "fixture").await;
+    let actor = "issue-codex";
     let mut platform = PlatformObjects::open(&platform.database, &platform.repository).unwrap();
     let issue =
         platform.create_child_issue("Writer independence", "Read first", "human", None).unwrap();
-    platform.assign(issue.number, Some(&spec.profile.id), "human").unwrap();
+    platform.assign(issue.number, Some(actor), "human").unwrap();
     let policy = SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 };
     let mut cursor = 0;
     for pending in platform.events(cursor, 100).unwrap() {
@@ -855,16 +856,19 @@ async fn builtin_running_unassignment(
     let captured = Arc::new(Captured::default());
     let (shutdown, stop) = tokio::sync::watch::channel(false);
     let (reports, _receiver) = tokio::sync::mpsc::channel(8);
-    let actor = spec.profile.id.clone();
-    let worker = tokio::spawn(agent_group_worker_backend(
-        Arc::clone(&store),
-        Arc::new(CollaborationBackend::Builtin(Arc::clone(&client))),
-        config,
-        spec,
-        Arc::new(Factory(Arc::clone(&captured))),
-        reports,
-        stop,
-    ));
+    let spawn = |store: &Arc<StoreActor>, client: &Arc<BuiltinClient>| {
+        let spec = GroupSpec::new(GroupKind::Issue, &config, store, "test-space").unwrap();
+        tokio::spawn(agent_group_worker_backend(
+            Arc::clone(store),
+            Arc::new(CollaborationBackend::Builtin(Arc::clone(client))),
+            config.clone(),
+            spec,
+            Arc::new(Factory(Arc::clone(&captured))),
+            reports.clone(),
+            stop.clone(),
+        ))
+    };
+    let mut worker = spawn(&store, &client);
     let limit = std::time::Duration::from_secs(5);
     tokio::time::timeout(limit, async {
         while !store
@@ -887,15 +891,21 @@ async fn builtin_running_unassignment(
     store.advance_scheduler().unwrap();
 
     let (session_id, turn_id) = tokio::time::timeout(limit, async {
+        use rusqlite::OptionalExtension as _;
         loop {
-            if let Some(group) = store
-                .runtime_status()
-                .unwrap()
-                .agent_groups
-                .into_iter()
-                .find(|group| group.turn_lifecycle.as_deref() == Some("running"))
-            {
-                break (group.provider_session_id.unwrap(), group.active_turn_id.unwrap());
+            let running = f
+                .db()
+                .query_row(
+                    "SELECT ps.provider_session_id,t.turn_id FROM turns t
+                 JOIN provider_sessions ps ON ps.session_id=t.session_id
+                 WHERE t.lifecycle='running' AND t.provider_turn_id='after-revision'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .unwrap();
+            if let Some(running) = running {
+                break running;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -904,18 +914,18 @@ async fn builtin_running_unassignment(
     .expect("writer service must not gate a real turn");
     assert_eq!(captured.inputs.lock().unwrap().len(), 1);
     let writer =
-        BuiltinWriterTurn { session_id, turn_id, item_number: issue.number, actor: actor.clone() };
+        BuiltinWriterTurn { session_id, turn_id, item_number: issue.number, actor: actor.into() };
     let offline_error = client.writer_grant(writer.clone()).await.unwrap_err();
-    assert!(offline_error.to_string().contains("503"));
+    assert!(offline_error.to_string().contains("503"), "{offline_error:#}");
 
     // The old turn never minted a grant. Name equality must not revive it
     // after an unassign/reassign and before those events reach the Harness.
-    platform.assign(issue.number, Some(&actor), "human").unwrap();
+    platform.assign(issue.number, Some(actor), "human").unwrap();
     offline.store(false, Ordering::Relaxed);
     let error = client.writer_grant(writer.clone()).await.unwrap_err();
     assert!(error.to_string().contains("writer authority changed"), "{error:#}");
     offline.store(true, Ordering::Relaxed);
-    *captured.close_terminal.lock().unwrap() = Some((outcome, reason.clone()));
+    captured.close_terminal.lock().unwrap().clone_from(&terminal);
     fence_offline.store(true, Ordering::Relaxed);
     for pending in platform.events(cursor, 100).unwrap() {
         store.ingest_builtin_event(pending.event, policy, pending.event_id).unwrap();
@@ -931,20 +941,60 @@ async fn builtin_running_unassignment(
             )
             .unwrap()
     };
-    tokio::time::timeout(limit, async {
-        while turn_state().0 != outcome.lifecycle() {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("observed provider terminal must be durable while the platform fence is offline");
-    assert_eq!(turn_state().1, reason);
+    let (outcome, reason) = if let Some((outcome, reason)) = terminal {
+        tokio::time::timeout(limit, async {
+            while turn_state().0 != outcome.lifecycle() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("observed provider terminal must be durable while the platform fence is offline");
+        assert_eq!(turn_state().1, reason);
+        (outcome, reason)
+    } else {
+        tokio::time::timeout(limit, async {
+            while !f.db().query_row(
+                "SELECT execution_stopped_at IS NOT NULL FROM provider_sessions WHERE provider_session_id=?1",
+                [&writer.session_id], |row| row.get::<_, bool>(0),
+            ).unwrap() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }).await.expect("native stop must reach SQLite before a successful platform fence");
+        assert_eq!(turn_state().0, "running");
+        (
+            crate::agent_session::TurnOutcome::Unknown,
+            Some("unassignment did not observe the active turn terminal".to_owned()),
+        )
+    };
     assert_eq!(*captured.close_attempts.lock().unwrap(), ["fresh-provider"]);
     assert_eq!(store.runtime_status().unwrap().agent_groups[0].assignment_lifecycle, "active");
-    fence_offline.store(false, Ordering::Relaxed);
+    if restart {
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        drop(client);
+        drop(store);
+        // A dead owner no longer renews its lease. Advance just that deadline.
+        f.db().execute("UPDATE owner_leases SET expires_at='2000-01-01T00:00:00Z' WHERE owner_id='fixture'", []).unwrap();
+        (store, client) = open_worker_runtime(&config, "next-runtime").await;
+        fence_offline.store(false, Ordering::Relaxed);
+        client.fence_all_executions().await.unwrap();
+        worker = spawn(&store, &client);
+    } else {
+        fence_offline.store(false, Ordering::Relaxed);
+    }
     let groups = tokio::time::timeout(limit, async {
         loop {
             let groups = store.runtime_status().unwrap().agent_groups;
+            assert!(
+                groups
+                    .iter()
+                    .all(|g| g.assignment_generation != 1 || g.assignment_lifecycle != "blocked"),
+                "a stopped unassignment must retire instead of becoming a blocked lost turn"
+            );
+            assert!(
+                captured.resumed.lock().unwrap().is_empty(),
+                "a stopped unassignment must never resume its old native session"
+            );
             if groups.iter().any(|group| {
                 group.assignment_generation == 2 && group.assignment_lifecycle == "active"
             }) {
@@ -957,8 +1007,20 @@ async fn builtin_running_unassignment(
     .expect("retire the old generation and materialize its immutable reassignment");
     let retired = groups.iter().find(|group| group.assignment_generation == 1).unwrap();
     let current = groups.iter().find(|group| group.assignment_generation == 2).unwrap();
-    assert_eq!(retired.assignment_lifecycle, "retired");
+    assert_eq!(
+        retired.assignment_lifecycle, "retired",
+        "the stopped old generation must retire after recovery"
+    );
+    assert!(
+        captured.resumed.lock().unwrap().is_empty(),
+        "a stopped unassignment must never resume its old native session"
+    );
     assert_eq!(current.provider_session_id.as_deref(), Some("fresh-provider-2"));
+    if let Some(reason) = &reason {
+        let body: String = f.db().query_row("SELECT body FROM operational_status_facts WHERE assignment_id=(SELECT assignment_id FROM assignments WHERE generation=1)", [], |row| row.get(0)).expect("the failed or unknown old turn must have a configured Operational Status");
+        assert!(body.contains(outcome.lifecycle()));
+        assert!(body.contains(reason));
+    }
     assert_eq!(turn_state(), (outcome.lifecycle().to_owned(), reason));
     assert_eq!(*captured.close_attempts.lock().unwrap(), ["fresh-provider"]);
     assert_eq!(captured.memory.lock().unwrap().len(), 2);
@@ -968,6 +1030,23 @@ async fn builtin_running_unassignment(
     shutdown.send(true).unwrap();
     worker.await.unwrap().unwrap();
     http.abort();
+}
+
+async fn open_worker_runtime(
+    config: &crate::config::Config,
+    owner: &str,
+) -> (Arc<StoreActor>, Arc<crate::builtin::BuiltinClient>) {
+    let store = Arc::new(
+        StoreActor::start(config.runtime.database().into(), config.runtime.backups().into())
+            .unwrap(),
+    );
+    let lease = store.acquire_runtime_lease("runtime".into(), owner.into(), 60).unwrap();
+    let client = crate::builtin::BuiltinClient::connect(config, Arc::clone(&store))
+        .await
+        .unwrap()
+        .with_runtime(lease)
+        .unwrap();
+    (store, client)
 }
 
 #[tokio::test]

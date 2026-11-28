@@ -22,6 +22,7 @@ pub(crate) struct Unassignment {
     pub repository: String,
     pub number: u64,
     pub sessions: Vec<(String, bool)>,
+    pub running_turn: Option<(String, String)>,
 }
 
 /// An active worker only handles the revocation of its own work item.
@@ -77,5 +78,15 @@ pub(super) fn due(
     let sessions = statement
         .query_map([&assignment_id], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Some(Unassignment { event_id, assignment_id, repository, number, sessions }))
+    let running_turn = connection
+        .query_row(
+            "SELECT t.turn_id,ps.provider_session_id FROM turns t
+         JOIN provider_sessions ps ON ps.session_id=t.session_id
+         JOIN agent_instances ai ON ai.agent_id=ps.agent_id
+         WHERE ai.assignment_id=?1 AND t.lifecycle IN ('starting','running')",
+            [&assignment_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(Some(Unassignment { event_id, assignment_id, repository, number, sessions, running_turn }))
 }

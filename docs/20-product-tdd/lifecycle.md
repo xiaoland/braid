@@ -124,7 +124,8 @@ classified as Agent-origin.
   Group 在关闭期间继续接收原有 turn 的终态。平台撤权暂时失败时，已经收到的终态与
   错误仍须持久化。原生停止和平台撤权均已确认后，Group 才将该代记为 `retired`；
   此时仍缺 provider 终态的 turn 记为 `unknown`，并按该 Profile 的配置发布执行状态。
-  该代未完成的 Context reset 保留在历史中，不再创建会话或阻止有限 run 完成。重新指派创建新一代及新会话。
+  若原生停止已保存而撤销尚未完成，重启的 worker 沿原顺序结算撤销并确认平台 fence，
+  保留已观察的终态，不恢复旧物理会话。该代未完成的 Context reset 保留在历史中，不再创建会话或阻止有限 run 完成。重新指派创建新一代及新会话。
 - Issue/PR close or PR merge never interrupts the current turn. The lifecycle
   event grants exactly one Finalization Turn after the current terminal, or
   immediately when idle. Afterwards closed Issue and closed-unmerged PR groups
