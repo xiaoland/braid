@@ -4,6 +4,7 @@ use super::{
 use sha2::{Digest as _, Sha256};
 
 #[test]
+// Keep the old database, its restored backup and the replayed history in one journey.
 #[allow(clippy::too_many_lines)]
 fn schema13_unknown_turn_replays_input_without_erasing_history_or_duplicating_reactions() {
     let root = std::env::temp_dir().join(format!("braid-replay-{}", uuid::Uuid::now_v7()));
@@ -46,16 +47,41 @@ fn schema13_unknown_turn_replays_input_without_erasing_history_or_duplicating_re
     let store = StoreActor::start(database.clone(), root.join("backups")).unwrap();
     let migration = store.apply().unwrap();
     assert_eq!(migration.applied, (14..=crate::store::DATABASE_SCHEMA_VERSION).collect::<Vec<_>>());
-    assert!(migration.backup.unwrap().is_file());
+    // Restore into a distinct location, as a rollback does. Existence alone
+    // would accept an empty backup or one taken after migration changed history.
+    let restored = root.join("restored.sqlite3");
+    std::fs::copy(migration.backup.unwrap(), &restored).unwrap();
+    let backup = open_read_write(&restored).unwrap();
+    assert_eq!(
+        backup
+            .query_row("SELECT max(version) FROM schema_migrations", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        13
+    );
+    assert_eq!(
+        backup
+            .query_row("SELECT lifecycle FROM turns WHERE turn_id='turn'", [], |r| r
+                .get::<_, String>(0))
+            .unwrap(),
+        "running"
+    );
+    let expected = (vec!["Review the revised design".into()], true);
+    assert_eq!(batch_references(&backup, "original").unwrap(), expected);
+    assert_eq!(
+        backup.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).unwrap(),
+        "ok"
+    );
+    drop(backup);
 
     store.mark_turn_terminal("turn".into(), "unknown".into()).unwrap();
+    drop(store);
+    let store = StoreActor::start(database.clone(), root.join("backups")).unwrap();
     let status = store.runtime_status().unwrap();
     assert_eq!(status.batches.len(), 1);
     assert_eq!(status.batches[0].event_count, 1);
     let replay_batch = status.batches[0].batch_id.clone();
     let db = open_read_write(&database).unwrap();
     assert!(db.query_row("SELECT execution_stopped_at IS NULL FROM provider_sessions WHERE provider_session_id='old-physical'", [], |row| row.get::<_, bool>(0)).unwrap());
-    let expected = (vec!["Review the revised design".into()], true);
     assert_eq!(batch_references(&db, "original").unwrap(), expected);
     assert_eq!(batch_references(&db, &replay_batch).unwrap(), expected);
     assert!(
@@ -65,10 +91,23 @@ fn schema13_unknown_turn_replays_input_without_erasing_history_or_duplicating_re
             .is_none(),
         "an unknown old session cannot execute the replay"
     );
-    assert!(store.mark_turn_terminal("turn".into(), "unknown".into()).is_err());
+    assert!(matches!(
+        store.mark_turn_terminal("turn".into(), "unknown".into()),
+        Err(super::StoreError::InvalidData(reason)) if reason == "turn turn is not active"
+    ));
     assert_eq!(store.runtime_status().unwrap().batches.len(), 1);
 
-    // The Group calls completion only after its adapter has confirmed the old stop.
+    // Record the stop evidence the Group supplies before completing a reset.
+    store.set_provider_stop("old-physical".into(), true).unwrap();
+    assert!(
+        db.query_row(
+            "SELECT execution_stopped_at IS NOT NULL FROM provider_sessions
+             WHERE provider_session_id='old-physical'",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    );
     store
         .complete_context_reset(
             status.context_resets[0].reset_id.clone(),

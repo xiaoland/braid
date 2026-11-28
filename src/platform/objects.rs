@@ -749,12 +749,18 @@ fn validate_writer(tx: &Connection, writer: Option<&Writer>) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeResult {
     pub number: u64,
     pub merge_commit: String,
     pub base_ref: String,
     pub recovered: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PreparedMerge {
+    merge: MergeResult,
+    writer_item: Option<String>,
 }
 
 impl PlatformObjects {
@@ -799,7 +805,13 @@ impl PlatformObjects {
         }))
     }
 
-    pub fn merge(&mut self, number: u64, source: &Path, author: &str) -> Result<MergeResult> {
+    fn merge(
+        &mut self,
+        number: u64,
+        source: &Path,
+        author: &str,
+        request_id: &str,
+    ) -> Result<MergeResult> {
         self.bind_source(source)?;
         nonempty(author, "author")?;
         let item = self.item(number)?;
@@ -825,35 +837,27 @@ impl PlatformObjects {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if let Some((state, Some(commit))) = &receipt {
+        if let Some((state, commit)) = receipt {
             if state == "applied" {
-                return Ok(MergeResult {
+                let result = MergeResult {
                     number,
-                    merge_commit: commit.clone(),
+                    merge_commit: commit.context("applied merge lacks a commit")?,
                     base_ref,
                     recovered: true,
-                });
+                };
+                self.finish_merge(&result, author, request_id)?;
+                return Ok(result);
             }
-            if state == "prepared" && git.refname_to_id(&base_ref)? == git2::Oid::from_str(commit)?
-            {
-                pin_commit(&self.connection, &git, number, "merges", commit)?;
-                let tx = write_transaction(&mut self.connection)?;
-                validate_writer(&tx, self.writer.as_ref())?;
-                validate_revision(&tx, &self.repository, self.revision_guard)?;
-                settle_merge(&tx, number, commit, author, self.writer.as_ref())?;
-                tx.commit()?;
-                return Ok(MergeResult {
-                    number,
-                    merge_commit: commit.clone(),
-                    base_ref,
-                    recovered: true,
-                });
-            }
+            // The owner retries through recover_merge_request with its bound receipt.
+            // A new request cannot adopt or attribute the original owner's Git effect.
+            ensure!(
+                state != "prepared",
+                "another merge request already owns this prepared intent; inspect its original receipt"
+            );
+            bail!(
+                "previous merge attempt failed or conflicted; inspect its stored error and create a new PR candidate"
+            );
         }
-        ensure!(
-            receipt.as_ref().is_none_or(|(s, _)| s == "prepared"),
-            "previous merge attempt failed or conflicted; inspect its stored error and create a new PR candidate"
-        );
         ensure!(item.state == "open", "PR #{number} is closed");
         ensure!(
             git.refname_to_id(&base_ref)? == expected_base,
@@ -865,40 +869,34 @@ impl PlatformObjects {
             "head revision moved since this PR candidate was created"
         );
         reject_checked_out(&git, &base_ref)?;
-        let merge_commit = if let Some((_, Some(commit))) = receipt {
-            git2::Oid::from_str(&commit)?
-        } else {
-            self.prepare_merge(&git, &item, expected_base, expected_head)?
-        };
+        let merge_commit = self.prepare_merge(&git, &item, expected_base, expected_head)?;
+        let result = self.prepare_merge_request(&item, &base_ref, merge_commit, request_id)?;
         self.adopt_merge_ref(
             &git,
             &item,
-            &base_ref,
-            merge_commit,
+            &result,
             (expected_base, expected_head),
             author,
+            request_id,
         )?;
-        Ok(MergeResult {
-            number,
-            merge_commit: merge_commit.to_string(),
-            base_ref,
-            recovered: false,
-        })
+        Ok(result)
     }
 
     fn adopt_merge_ref(
         &mut self,
         git: &git2::Repository,
         item: &Item,
-        base_ref: &str,
-        merge_commit: git2::Oid,
+        merge: &MergeResult,
         expected: (git2::Oid, git2::Oid),
         author: &str,
+        request_id: &str,
     ) -> Result<()> {
         let number = item.number;
         let (expected_base, expected_head) = expected;
-        let commit = merge_commit.to_string();
-        pin_commit(&self.connection, git, number, "merges", &commit)?;
+        let base_ref = &merge.base_ref;
+        let commit = &merge.merge_commit;
+        let merge_commit = git2::Oid::from_str(commit)?;
+        pin_commit(&self.connection, git, number, "merges", commit)?;
         // The durable intent precedes Git CAS; restart recognizes only its exact commit.
         let updated = {
             let tx = write_transaction(&mut self.connection)?;
@@ -924,7 +922,7 @@ impl PlatformObjects {
                 .map(|_| ())
             };
             if result.is_ok() {
-                settle_merge(&tx, number, &commit, author, self.writer.as_ref())?;
+                settle_merge(&tx, merge, author, self.writer.as_ref(), request_id)?;
             }
             tx.commit()?;
             result
@@ -934,7 +932,7 @@ impl PlatformObjects {
                 number,
                 &expected_base.to_string(),
                 &expected_head.to_string(),
-                Some(&commit),
+                Some(commit),
                 "failed",
                 Some(&error.to_string()),
             )?;
@@ -988,25 +986,51 @@ impl PlatformObjects {
             &tree,
             &[&base, &head],
         )?;
-        self.record_merge(
-            item.number,
-            &expected_base.to_string(),
-            &expected_head.to_string(),
-            Some(&commit.to_string()),
-            "prepared",
-            None,
+        Ok(commit)
+    }
+
+    fn prepare_merge_request(
+        &mut self,
+        item: &Item,
+        base_ref: &str,
+        commit: git2::Oid,
+        request_id: &str,
+    ) -> Result<MergeResult> {
+        let tx = write_transaction(&mut self.connection)?;
+        validate_writer(&tx, self.writer.as_ref())?;
+        validate_revision(&tx, &self.repository, self.revision_guard)?;
+        let inserted = tx.execute(
+            "INSERT INTO local_merges(pr_number,expected_base,expected_head,merge_commit,lifecycle,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,'prepared',?5,?5) ON CONFLICT(pr_number) DO NOTHING",
+            params![sql_id(item.number)?, item.base_commit, item.head_commit, commit.to_string(), now()],
         )?;
-        let (stored_base,stored_head,stored_commit,state):(String,String,Option<String>,String)=self.connection.query_row("SELECT expected_base,expected_head,merge_commit,lifecycle FROM local_merges WHERE pr_number=?1",[sql_id(item.number)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
         ensure!(
-            stored_base == expected_base.to_string() && stored_head == expected_head.to_string(),
-            "another merge intent already owns a different candidate"
+            inserted == 1,
+            "another merge request already owns this intent; inspect its original receipt"
         );
-        ensure!(
-            matches!(state.as_str(), "prepared" | "applied"),
-            "canonical merge intent is {state}; inspect its persisted failure"
-        );
-        git2::Oid::from_str(&stored_commit.context("canonical merge intent lacks a commit")?)
-            .map_err(Into::into)
+        let result = MergeResult {
+            number: item.number,
+            merge_commit: commit.to_string(),
+            base_ref: base_ref.into(),
+            recovered: false,
+        };
+        // Bind this request to the canonical intent before Git CAS. A retry may
+        // confirm only this exact commit, without reauthorizing any Git mutation.
+        let prepared = PreparedMerge {
+            merge: result.clone(),
+            writer_item: self.writer.as_ref().map(|writer| writer.item.clone()),
+        };
+        commands::save_control_receipt(
+            &tx,
+            &ControlReceipt {
+                request_id: request_id.into(),
+                state: "prepared".into(),
+                result: Some(serde_json::to_value(prepared)?),
+                error: None,
+            },
+        )?;
+        tx.commit()?;
+        Ok(result)
     }
 
     fn record_merge(
@@ -1022,6 +1046,20 @@ impl PlatformObjects {
         validate_writer(&tx, self.writer.as_ref())?;
         validate_revision(&tx, &self.repository, self.revision_guard)?;
         tx.execute("INSERT INTO local_merges(pr_number,expected_base,expected_head,merge_commit,lifecycle,error,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7) ON CONFLICT(pr_number) DO UPDATE SET lifecycle=excluded.lifecycle,error=excluded.error,updated_at=excluded.updated_at WHERE local_merges.lifecycle='prepared'",params![sql_id(number)?,base,head,commit,state,error,now()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn finish_merge(&mut self, result: &MergeResult, author: &str, request_id: &str) -> Result<()> {
+        let number = result.number;
+        let commit = &result.merge_commit;
+        // Authorization fences the Git CAS. This transaction confirms its adopted
+        // result, even if the writer was revoked after that irreversible effect.
+        let tx = write_transaction(&mut self.connection)?;
+        let source: String =
+            tx.query_row("SELECT source FROM local_space WHERE singleton=1", [], |row| row.get(0))?;
+        pin_commit(&tx, &git2::Repository::open(source)?, number, "merges", commit)?;
+        settle_merge(&tx, result, author, self.writer.as_ref(), request_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -1109,11 +1147,13 @@ impl PlatformObjects {
 
 fn settle_merge(
     tx: &Connection,
-    number: u64,
-    commit: &str,
+    merge: &MergeResult,
     author: &str,
     writer: Option<&Writer>,
+    request_id: &str,
 ) -> Result<()> {
+    let number = merge.number;
+    let commit = &merge.merge_commit;
     let applied = tx.execute(
         "UPDATE local_merges SET lifecycle='applied',error=NULL,updated_at=?1
          WHERE pr_number=?2 AND merge_commit=?3 AND lifecycle='prepared'",
@@ -1127,11 +1167,21 @@ fn settle_merge(
             |row| row.get(0),
         )?;
         ensure!(complete, "prepared merge intent no longer matches this commit");
-        return Ok(());
+    } else {
+        tx.execute("UPDATE local_items SET state='closed' WHERE number=?1", [sql_id(number)?])?;
+        bump(tx, number)?;
+        emit(tx, number, "lifecycle", Some("merged"), author, None, writer)?;
     }
-    tx.execute("UPDATE local_items SET state='closed' WHERE number=?1", [sql_id(number)?])?;
-    bump(tx, number)?;
-    emit(tx, number, "lifecycle", Some("merged"), author, None, writer)
+    commands::save_control_receipt(
+        tx,
+        &ControlReceipt {
+            request_id: request_id.into(),
+            state: "applied".into(),
+            result: Some(serde_json::to_value(merge)?),
+            error: None,
+        },
+    )?;
+    Ok(())
 }
 
 fn was_merged(connection: &Connection, number: u64) -> Result<bool> {

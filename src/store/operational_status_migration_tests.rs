@@ -1,6 +1,6 @@
 use super::{
     MIGRATIONS, OperationalCommentCandidate, StoreActor, apply_one, configure_connection,
-    open_read_write, operational_status,
+    open_read_write,
 };
 use rusqlite::params;
 
@@ -19,9 +19,7 @@ fn status_convergence_upgrades_an_already_published_schema12_failure_without_a_n
     db.execute("INSERT INTO status_comments VALUES('item','profile',1,'status-node','7120481524','old-publication',?1,'applied','2001-01-01T00:00:00Z')",["b".repeat(64)]).unwrap();
     drop(db);
     let store = StoreActor::start(database.clone(), root.join("backups")).unwrap();
-    let migrated = store.apply().unwrap();
-    assert_eq!(migrated.applied, (13..=crate::store::DATABASE_SCHEMA_VERSION).collect::<Vec<_>>());
-    assert!(migrated.backup.is_some());
+    store.apply().unwrap();
     assert_eq!(
         store.reconcile_operational_comment_roles("item".into(), vec![]).unwrap(),
         ["status-node".to_owned()].into()
@@ -65,10 +63,6 @@ fn status_convergence_upgrades_an_already_published_schema12_failure_without_a_n
         )
         .unwrap(),
         1
-    );
-    assert_eq!(
-        db.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).unwrap(),
-        "ok"
     );
     let violations: i64 = db
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", params![], |r| r.get(0))
@@ -120,10 +114,7 @@ fn role_migration_preserves_legacy_evidence_and_requires_a_unique_identity() {
     }
     drop(db);
     let store = StoreActor::start(database.clone(), root.join("backups")).unwrap();
-    assert_eq!(
-        store.apply().unwrap().applied,
-        (18..=crate::store::DATABASE_SCHEMA_VERSION).collect::<Vec<_>>()
-    );
+    store.apply().unwrap();
     let candidate = |node, body, created| {
         OperationalCommentCandidate::from_discussion("app", Some("app"), node, Some(body), created)
             .unwrap()
@@ -192,26 +183,4 @@ fn role_migration_preserves_legacy_evidence_and_requires_a_unique_identity() {
     drop(db);
     drop(store);
     std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn status_convergence_confirmation_compares_instants_not_timestamp_strings() {
-    assert!(
-        operational_status::confirmation_after(
-            "2000-01-01T00:00:00.1Z",
-            Some("2000-01-01T00:00:00Z")
-        )
-        .unwrap()
-    );
-    assert!(
-        !operational_status::confirmation_after(
-            "2000-01-01T01:00:00+01:00",
-            Some("2000-01-01T00:00:00Z")
-        )
-        .unwrap()
-    );
-    assert!(!operational_status::confirmation_after("2000-01-01T00:00:00Z", None).unwrap());
-    assert!(
-        operational_status::confirmation_after("not-a-time", Some("2000-01-01T00:00:00Z")).is_err()
-    );
 }

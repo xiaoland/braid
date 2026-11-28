@@ -77,10 +77,7 @@ pub(crate) struct ObservationCommit {
     pub policy: SchedulerPolicy,
 }
 
-pub(super) fn load(
-    connection: &Connection,
-    work_item: &str,
-) -> Result<Vec<CanonicalObjectState>, StoreError> {
+fn load(connection: &Connection, work_item: &str) -> Result<Vec<CanonicalObjectState>, StoreError> {
     let mut statement = connection.prepare(
         "SELECT node_id,database_id,object_kind,version,digest,lifecycle,author_node_id,
                 author_login,metadata_digest,title_digest,body_digest,title_event_id

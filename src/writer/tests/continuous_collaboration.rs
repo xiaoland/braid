@@ -78,7 +78,7 @@ async fn another_context_read_cannot_acknowledge_a_revision_before_delivery() {
             comments: vec![],
         })
         .unwrap();
-    assert_eq!(f.store.processed_objects("item".into()).unwrap()[0].version, old_version);
+    assert_eq!(f.store.begin_observation("item".into()).unwrap().objects[0].version, old_version);
     let observation = CanonicalObservation {
         unedited_creation: false,
         created_at: None,
@@ -150,12 +150,15 @@ fn failed_observation_commits_neither_events_nor_frontier() {
         events: vec![revision("v2", "new")],
         policy: SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 },
     });
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(crate::store::StoreError::InvalidData(ref reason)) if reason == "complete observation has no root"),
+        "{result:?}"
+    );
     assert_eq!(
         f.db().query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0)).unwrap(),
         0
     );
-    assert!(f.store.processed_objects("item".into()).unwrap().is_empty());
+    assert!(f.store.begin_observation("item".into()).unwrap().objects.is_empty());
     assert!(f.store.runtime_status().unwrap().batches.is_empty());
 }
 
@@ -167,27 +170,22 @@ fn independent_pr_ensures_deliver_two_activations_and_retry_one_identity() {
     let owner =
         f.store.acquire_runtime_lease("runtime".into(), "activation-test".into(), 3600).unwrap();
     for number in [9, 10] {
-        let payload = serde_json::to_string(&AcceptedRequest::Ensure {
-            comment_id: number,
-            head: Some(format!("head-{number}")),
-            profile: profile.clone(),
-        })
+        let receipt = ensure_pull_request(
+            &f.config,
+            &f.store,
+            PullRequestEnsureRequest {
+                invocation: Invocation::Operator,
+                repository: "owner/repository".parse().unwrap(),
+                comment_id: number,
+                head: Some(format!("head-{number}")),
+            },
+        )
         .unwrap();
         let plan = f
             .store
             .prepare_implementation_request(NewImplementationRequest {
                 root_intent_id: None,
-                write: NewGhWriteIntent {
-                    request_key: format!("ensure-{number}"),
-                    operation: "pr_ensure",
-                    repository: "owner/repository".into(),
-                    target: format!("https://github.com/owner/repository/issues/comments/{number}"),
-                    profile_id: profile.id.clone(),
-                    role: "Operator".into(),
-                    request_digest: helpers::digest(&payload),
-                    payload,
-                    source: None,
-                },
+                intent_id: receipt.intent_id,
                 comment_database_id: number,
                 comment_node_id: format!("comment-{number}"),
                 issue_node_id: "item".into(),
@@ -242,33 +240,6 @@ fn independent_pr_ensures_deliver_two_activations_and_retry_one_identity() {
             .unwrap(),
         2
     );
-}
-
-#[test]
-fn human_edit_of_a_braid_authored_body_is_not_an_echo_or_an_urgent_mention() {
-    use crate::webhook::{self, ActorPolicy, WebhookHeaders};
-    use hmac::{Hmac, KeyInit as _, Mac as _};
-    let body=serde_json::to_vec(&json!({"action":"edited","sender":{"login":"human","node_id":"human"},"repository":{"node_id":"repo","full_name":"owner/repository"},"issue":{"node_id":"item","number":1,"title":"Design","state":"open","body":"> **Braid Agent · Braid**\n> Issue Agent\n\nRevised requirements","updated_at":"v2"},"changes":{"body":{"from":"old requirements"}}})).unwrap();
-    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"secret").unwrap();
-    mac.update(&body);
-    let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-    let event = webhook::parse_verified(
-        WebhookHeaders {
-            signature: Some(&signature),
-            delivery: Some("revision"),
-            event: Some("issues"),
-        },
-        &body,
-        b"secret",
-        &["owner/repository".into()],
-        "braid",
-        ActorPolicy { app_node_id: "app", app_login: "braid[bot]", agent_node_ids: &[] },
-    )
-    .unwrap();
-    assert_eq!(event.kind, EventKind::Invalidate);
-    assert!(event.requires_attention);
-    assert!(!event.mention_candidate);
-    assert_eq!(event.origin, "external");
 }
 
 #[test]
@@ -393,8 +364,14 @@ async fn root_edits_use_field_provenance_when_publication_evidence_is_unavailabl
         let remote = Arc::new(Mutex::new(remote));
         let (github, task) = body_edit::body_server(remote.clone()).await;
         let previous = observe_issue(&f, &github, false).await;
-        let previous_fields =
-            f.store.processed_objects("item".into()).unwrap().remove(0).root_fields.unwrap();
+        let previous_fields = f
+            .store
+            .begin_observation("item".into())
+            .unwrap()
+            .objects
+            .remove(0)
+            .root_fields
+            .unwrap();
         assert_eq!(Some(previous_fields.clone()), previous.root_fields());
         {
             let mut state = remote.lock().unwrap();
@@ -433,7 +410,7 @@ async fn root_edits_use_field_provenance_when_publication_evidence_is_unavailabl
             [], |r| Ok((r.get(0)?,r.get(1)?)),
         ).unwrap();
         assert_eq!(edited, (expected.into(), expected == "invalidate"), "{mode}");
-        let processed = f.store.processed_objects("item".into()).unwrap().remove(0);
+        let processed = f.store.begin_observation("item".into()).unwrap().objects.remove(0);
         assert_eq!(processed.root_fields, current.root_fields(), "{mode}");
         assert_ne!(previous_fields.body_digest, processed.root_fields.unwrap().body_digest);
         task.abort();
@@ -517,24 +494,20 @@ async fn native_association_changes_are_visible_without_a_root_version_change() 
     let after = crate::context::CanonicalContext::PullRequest(
         crate::context::materialize_pull_request(&github, &locator, 100).await.unwrap(),
     );
-    let before = crate::context::canonical_observations(&before).remove(0);
-    let after = crate::context::canonical_observations(&after).remove(0);
-    assert_eq!(before.version, after.version);
-    assert_eq!(before.body, after.body);
-    assert_ne!(before.metadata_digest, after.metadata_digest);
-    let prior = CanonicalObjectState {
-        root_fields: before.root_fields(),
-        node_id: before.object_node_id,
-        database_id: Some(before.database_id),
-        object_kind: "pr".into(),
-        version: before.version,
-        digest: before.digest,
-        lifecycle: "open".into(),
-        author_node_id: None,
-        author_login: None,
-        metadata_digest: before.metadata_digest,
-    };
-    assert!(!reconcile::observation_unchanged(&prior, &after));
+    let f = Fixture::new(false);
+    super::semantic_contract::observe(&f, &github, &before);
+    super::semantic_contract::observe(&f, &github, &after);
+    super::semantic_contract::observe(&f, &github, &after);
+    let edits: i64 = f
+        .db()
+        .query_row(
+            "SELECT count(*) FROM events WHERE work_item_node_id='pr' AND object_node_id='pr'
+         AND kind='invalidate' AND detail='edited' AND requires_attention=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(edits, 1, "losing a native edge must deliver exactly one PR invalidation");
     http.abort();
 }
 

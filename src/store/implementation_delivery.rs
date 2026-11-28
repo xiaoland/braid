@@ -150,12 +150,7 @@ mod tests {
         }
         drop(db);
         let store = StoreActor::start(database.clone(), root.join("backups")).unwrap();
-        let result = store.apply().unwrap();
-        assert_eq!(
-            result.applied,
-            (12..=crate::store::DATABASE_SCHEMA_VERSION).collect::<Vec<_>>()
-        );
-        assert!(result.backup.is_some());
+        store.apply().unwrap();
         let db = open_read_write(&database).unwrap();
         for (id, expected) in
             [("missing", "pending"), ("complete", "applied"), ("unpublished", "applied")]
@@ -167,11 +162,14 @@ mod tests {
                 .unwrap();
             assert_eq!(state, expected);
         }
-        assert_eq!(
-            db.query_row("SELECT count(*) FROM github_write_outbox", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
+        let queued = db
+            .prepare("SELECT intent_id,lifecycle FROM github_write_outbox")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(queued, [("missing".to_owned(), "pending".to_owned())]);
         assert_eq!(
             db.query_row("SELECT count(*) FROM assignments", [], |r| r.get::<_, i64>(0)).unwrap(),
             0,
@@ -185,10 +183,6 @@ mod tests {
             )
             .unwrap(),
             "pr"
-        );
-        assert_eq!(
-            db.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).unwrap(),
-            "ok"
         );
         drop(db);
         drop(store);

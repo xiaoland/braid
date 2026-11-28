@@ -626,6 +626,7 @@ impl GroupDriver<'_> {
             claim,
             provider_turn_id,
             reset_id: None,
+            stop_terminal: None,
             events,
             _admission: admission,
         })

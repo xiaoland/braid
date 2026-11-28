@@ -147,3 +147,4 @@ repository workflow, see the [documentation index](docs/index.md) and
 
 
 Braid 使用编译、回归测试、实际操作及获授权实验取得反馈。测试验证局部行为和故障边界；真实 GitHub、provider 和 OTel 原始证据及人工判断构成产品验收依据。
+开发验证命令、测试归属及不能由本地回归证明的范围见[验证分层](docs/10-prd/acceptance.md#开发回归与产品验收的分层)。

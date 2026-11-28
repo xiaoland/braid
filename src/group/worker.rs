@@ -172,6 +172,76 @@ impl GroupDriver<'_> {
         }
     }
 
+    pub(super) async fn confirmed_unassignment(
+        &self,
+        target: crate::store::UnassignmentTarget,
+    ) -> Result<Option<crate::store::Unassignment>> {
+        let builtin = self.collaboration.is_builtin();
+        let quiet = if builtin { 0 } else { self.config.scheduler.quiet_seconds };
+        let Some(change) = self.store.due_unassignment(target, quiet)? else { return Ok(None) };
+        if !builtin {
+            let locator = crate::github::WorkItemLocator {
+                repository: change.repository.parse()?,
+                number: change.number,
+            };
+            let issue = self.collaboration.materialize_issue(&locator).await?;
+            if issue
+                .assignees
+                .iter()
+                .any(|actor| self.collaboration.assignee_matches(actor, &self.spec.profile.id))
+            {
+                self.store.ignore_assignment_event(change.event_id)?;
+                return Ok(None);
+            }
+        }
+        Ok(Some(change))
+    }
+
+    pub(super) async fn settle_unassignment(
+        &self,
+        change: &crate::store::Unassignment,
+        active: Option<&mut RunningAgentTurn>,
+    ) -> Result<()> {
+        let mut stop = Ok(());
+        for (session, stopped) in &change.sessions {
+            if let Err(error) = self.require_quiesced(session, *stopped).await {
+                stop = Err(error);
+            }
+        }
+        let terminal = active.and_then(RunningAgentTurn::terminal_after_close);
+        if (stop.is_ok() || terminal.is_some())
+            && self.store.settle_unassignment(change, terminal.clone(), stop.is_ok())?
+            && let Some((turn, session)) = &change.running_turn
+        {
+            use crate::agent_session::TurnOutcome;
+            let (outcome, reason) = terminal.as_ref().map_or(
+                (TurnOutcome::Unknown, crate::store::MISSING_TERMINAL),
+                |terminal| {
+                    (
+                        terminal.outcome,
+                        terminal
+                            .error
+                            .as_deref()
+                            .unwrap_or("provider did not supply a terminal reason"),
+                    )
+                },
+            );
+            if matches!(outcome, TurnOutcome::Failed | TurnOutcome::Unknown) {
+                self.enqueue_turn_error(turn, session, outcome.lifecycle(), reason);
+            }
+        }
+        stop.map_err(Into::into)
+    }
+
+    pub(super) async fn settle_idle_unassignment(&self, event: String) -> Result<()> {
+        if let Some(change) =
+            self.confirmed_unassignment(crate::store::UnassignmentTarget::Event(event)).await?
+        {
+            self.settle_unassignment(&change, None).await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn retain_sessions(
         &self,
         retained: &HashSet<String>,
@@ -190,20 +260,25 @@ impl GroupDriver<'_> {
         if let Err(error) = self.store.record_turn_error(claim.turn_id.clone(), reason.to_owned()) {
             tracing::error!(%error, turn = %claim.turn_id, "cannot retain complete turn error");
         }
+        self.enqueue_turn_error(&claim.turn_id, &claim.provider_session_id, lifecycle, reason);
+    }
+
+    fn enqueue_turn_error(&self, turn_id: &str, session: &str, lifecycle: &str, reason: &str) {
         if self.spec.profile.status_surfaces.is_empty() {
             return;
         }
         if let Err(error) = self.store.enqueue_operational_status(
-            claim.turn_id.clone(),
+            turn_id.into(),
             super::provider::operational_status_turn_error(
                 self.config,
                 &self.spec.profile,
-                claim,
+                turn_id,
+                session,
                 lifecycle,
                 reason,
             ),
         ) {
-            tracing::error!(%error, turn = %claim.turn_id, "cannot publish turn error status");
+            tracing::error!(%error, turn = %turn_id, "cannot publish turn error status");
         }
     }
 
@@ -212,22 +287,16 @@ impl GroupDriver<'_> {
             return;
         };
         let closed = self.quiesce_session(&active.claim.provider_session_id).await;
-        let mut terminal = None;
-        while let Ok(event) = active.events.try_recv() {
-            if let crate::agent_session::SessionEvent::TurnTerminal {
-                provider_turn_id,
-                outcome,
-                error,
-            } = event
-                && provider_turn_id == active.provider_turn_id
-            {
-                terminal = Some((outcome, error));
-            }
-        }
-        let (outcome, error) = terminal.unwrap_or((
-            crate::agent_session::TurnOutcome::Unknown,
-            Some("shutdown did not observe the active turn terminal".into()),
-        ));
+        let terminal = active.terminal_after_close();
+        let (outcome, error) = terminal.map_or_else(
+            || {
+                (
+                    crate::agent_session::TurnOutcome::Unknown,
+                    Some("shutdown did not observe the active turn terminal".into()),
+                )
+            },
+            |terminal| (terminal.outcome, terminal.error),
+        );
         if let Some(reset_id) = active.reset_id {
             let _ = self.store.mark_context_reset_turn_terminal(
                 reset_id.clone(),
@@ -301,6 +370,9 @@ impl GroupDriver<'_> {
     ) {
         let store = self.store;
         let mut running: Option<RunningAgentTurn> = None;
+        // A native close may end the event stream while its independent
+        // platform fence is still being retried.
+        let mut unassignment = None;
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut recovery = tokio::time::Instant::now();
@@ -318,7 +390,7 @@ impl GroupDriver<'_> {
                     } else {
                         std::future::pending().await
                     }
-                }, if running.is_some() => {
+                }, if running.is_some() && unassignment.is_none() => {
                     match event {
                         Ok(crate::agent_session::SessionEvent::TurnStarted { provider_turn_id }) => {
                             tracing::debug!(%provider_turn_id, "AgentSession turn started");
@@ -373,7 +445,7 @@ impl GroupDriver<'_> {
                     }
                 }
                 _ = tick.tick() => {
-                    if running.as_ref().is_some_and(|active| active.events.is_closed()) {
+                    if unassignment.is_none() && running.as_ref().is_some_and(|active| active.events.is_closed()) {
                         self.fence_running(&mut running, "AgentSession event stream closed").await;
                     }
                     // A closed finite root fences new execution; shutdown owns physical cleanup.
@@ -398,6 +470,22 @@ impl GroupDriver<'_> {
                         recovery = tokio::time::Instant::now() + Duration::from_secs(2);
                     }
                     if let Some(active) = &mut running {
+                        if unassignment.is_none() && (self.spec.kind == GroupKind::Issue || self.collaboration.is_builtin()) {
+                            let target = crate::store::UnassignmentTarget::RunningTurn(active.claim.turn_id.clone());
+                            match self.confirmed_unassignment(target).await {
+                                Ok(found) => unassignment = found,
+                                Err(error) => { tracing::warn!(%error, "cannot confirm active unassignment"); }
+                            }
+                        }
+                        if let Some(change) = unassignment.as_ref() {
+                            match self.settle_unassignment(change, Some(active)).await {
+                                Ok(()) => { running = None; unassignment = None; }
+                                Err(error) => {
+                                    tracing::warn!(%error, "cannot settle active unassignment");
+                                }
+                            }
+                            continue;
+                        }
                         self.begin_active_context_reset(active).await;
                         if active.reset_id.is_none()
                             && let Some(reason) = self.forward_urgent_steer(active).await {
@@ -437,10 +525,35 @@ pub(crate) struct RunningAgentTurn {
     pub(crate) claim: TurnClaim,
     pub(crate) provider_turn_id: String,
     pub(crate) reset_id: Option<String>,
+    pub(super) stop_terminal: Option<crate::store::ObservedTurnTerminal>,
     /// The receiver that observed this turn's `TurnStarted`, created before
     /// the send and handed off with the turn, so the drive loop consumes the
     /// terminal with no subscription-timing gap.
     pub(crate) events: tokio::sync::broadcast::Receiver<crate::agent_session::SessionEvent>,
     /// Shared run admission is held until this actual turn reaches terminal or stop.
     pub(crate) _admission: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl RunningAgentTurn {
+    /// Keep terminal evidence across a failed fence or database commit.
+    fn terminal_after_close(&mut self) -> Option<crate::store::ObservedTurnTerminal> {
+        loop {
+            match self.events.try_recv() {
+                Ok(crate::agent_session::SessionEvent::TurnTerminal {
+                    provider_turn_id,
+                    outcome,
+                    error,
+                }) if provider_turn_id == self.provider_turn_id => {
+                    self.stop_terminal = Some(crate::store::ObservedTurnTerminal {
+                        turn_id: self.claim.turn_id.clone(),
+                        outcome,
+                        error,
+                    });
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        self.stop_terminal.clone()
+    }
 }

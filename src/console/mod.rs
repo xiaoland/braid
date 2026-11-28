@@ -4,6 +4,8 @@ mod harness;
 mod proxy;
 mod runtime;
 mod storage;
+#[cfg(test)]
+mod tests;
 
 use crate::{config::Config, store::StoreActor, telemetry::TelemetryGuard};
 use anyhow::{Context as _, Result, bail};

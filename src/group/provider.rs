@@ -45,7 +45,8 @@ fn public_error_summary(config: &Config, profile: &Profile, reason: &str) -> Str
 pub(crate) fn operational_status_turn_error(
     config: &Config,
     profile: &Profile,
-    claim: &TurnClaim,
+    turn_id: &str,
+    provider_session_id: &str,
     lifecycle: &str,
     reason: &str,
 ) -> String {
@@ -55,7 +56,7 @@ pub(crate) fn operational_status_turn_error(
          **执行状态：{lifecycle}**\n\n\
          Braid turn：`{}`\n\n原生会话：`{}`\n\n{quoted}\n\n\
          此状态描述执行结果，不代表工作项验收结论。",
-        profile.id, claim.turn_id, claim.provider_session_id,
+        profile.id, turn_id, provider_session_id,
     )
 }
 

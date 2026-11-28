@@ -798,19 +798,21 @@ mod tests {
     use super::*;
     use axum::{Json, Router, routing::get};
 
-    #[tokio::test]
-    async fn managed_ingests_while_old_execution_fence_is_unavailable() {
-        let fixture = crate::writer::tests::Fixture::new(false);
-        let store = Arc::new(
-            StoreActor::start(
-                fixture.config.runtime.database().into(),
-                fixture.config.runtime.backups().into(),
-            )
-            .unwrap(),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let app = Router::new()
+    fn closed_issue_with_unavailable_fence(resumed: Arc<tokio::sync::Notify>) -> Router {
+        let event = serde_json::json!({
+            "sequence": 1,
+            "event": {
+                "delivery_guid": "local:1", "event_name": "local",
+                "repository": "test-space", "repository_node_id": "local:test-space",
+                "work_item_node_id": "local:test-space:issue:1", "work_item_kind": "issue",
+                "work_item_number": 1, "work_item_state": "closed",
+                "kind": "lifecycle", "detail": "closed",
+                "cross_surface_invalidation": false, "origin": "human",
+                "reference": "Issue closed", "mention_candidate": false,
+                "known": true, "raw_payload": []
+            }
+        });
+        Router::new()
             .route(
                 "/api/platform/repository",
                 get(|| async {
@@ -822,25 +824,32 @@ mod tests {
             )
             .route(
                 "/api/platform/events",
-                get(|| async {
-                    Json(serde_json::json!({"events": [{
-                    "sequence": 1, "event": {
-                        "delivery_guid": "local:1", "event_name": "local",
-                        "repository": "test-space", "repository_node_id": "local:test-space",
-                        "work_item_node_id": "local:test-space:issue:1", "work_item_kind": "issue",
-                        "work_item_number": 1, "work_item_state": "closed",
-                        "kind": "lifecycle", "detail": "closed",
-                        "cross_surface_invalidation": false, "origin": "human",
-                        "reference": "Issue closed", "mention_candidate": false,
-                        "known": true, "raw_payload": []
+                get(move |axum::extract::Query(query): axum::extract::Query<HashMap<String, u64>>| {
+                    let events = if query["after"] == 1 {
+                        resumed.notify_one();
+                        vec![]
+                    } else {
+                        vec![event.clone()]
+                    };
+                    async move {
+                        Json(serde_json::json!({"events": events, "nextAfter": 1, "lastSequence": 1}))
                     }
-                }], "nextAfter": 1, "lastSequence": 1}))
                 }),
             )
             .route(
                 "/api/platform/executions/fence",
                 axum::routing::post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
-            );
+            )
+    }
+
+    #[tokio::test]
+    async fn managed_ingests_while_old_execution_fence_is_unavailable() {
+        let fixture = crate::writer::tests::Fixture::new(false);
+        let store = &fixture.store;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requested_after_close = Arc::new(tokio::sync::Notify::new());
+        let app = closed_issue_with_unavailable_fence(Arc::clone(&requested_after_close));
         let http = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let mut config = fixture.config.clone();
         config.github = None;
@@ -873,7 +882,7 @@ mod tests {
                     .last_error
                     .as_deref()
                     .is_some_and(|error| error.contains("execution fence"));
-                if watching_fence && client_cursor(&store).is_ok_and(|cursor| cursor == 1) {
+                if watching_fence && client_cursor(store).is_ok_and(|cursor| cursor == 1) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -881,18 +890,16 @@ mod tests {
         })
         .await
         .expect("feed reception must survive a failed execution restore");
+        tokio::time::timeout(Duration::from_secs(3), requested_after_close.notified())
+            .await
+            .expect("intake must keep polling from the durable cursor during fence failure");
         let events =
             store.work_item_lifecycle_candidates("test-space".into(), "issue".into(), 1).unwrap();
         assert_eq!(events[0].action, "closed");
-        let turns: u64 = fixture
-            .db()
-            .query_row("SELECT COUNT(*) FROM turns", [], |row| row.get::<_, i64>(0))
-            .unwrap()
-            .try_into()
-            .unwrap();
-        assert_eq!(turns, 0);
-        halt.send(true).unwrap();
-        let error = runtime.await.unwrap().unwrap_err();
+        let requested_stop = halt.send(true);
+        let result = runtime.await.unwrap();
+        assert!(requested_stop.is_ok(), "runtime exited before the requested stop: {result:#?}");
+        let error = result.unwrap_err();
         assert!(error.to_string().contains("execution fence remains unconfirmed"), "{error:#}");
         http.abort();
     }
@@ -904,8 +911,6 @@ mod tests {
             PlatformConfig,
             objects::{CommandRequest, ControlReceipt, ObjectCommand, PlatformObjects},
         };
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::sync::Notify;
 
         const DELIVERY_REF: &str = "refs/heads/delivery";
         let fixture = crate::writer::tests::Fixture::new(false);
@@ -931,25 +936,21 @@ mod tests {
             backups: runtime.join("platform-backups"),
             listen: address.to_string(),
         };
-        let two_open_polls = Arc::new(Notify::new());
+        let (completed_reads, mut boundary_reads) = tokio::sync::mpsc::unbounded_channel();
         let routes =
-            crate::platform::router(&declaration).unwrap().layer(axum::middleware::from_fn({
-                let two_open_polls = Arc::clone(&two_open_polls);
-                let boundary_reads = Arc::new(AtomicUsize::new(0));
+            crate::platform::router(&declaration).unwrap().layer(axum::middleware::from_fn(
                 move |request: axum::extract::Request, next: axum::middleware::Next| {
-                    let two_open_polls = Arc::clone(&two_open_polls);
-                    let boundary_reads = Arc::clone(&boundary_reads);
+                    let completed_reads = completed_reads.clone();
                     async move {
                         let boundary = request.uri().path().ends_with("/boundary");
                         let response = next.run(request).await;
-                        // Event intake reads once, followed by two finite outcome polls.
-                        if boundary && boundary_reads.fetch_add(1, Ordering::Relaxed) == 2 {
-                            two_open_polls.notify_one();
+                        if boundary && response.status().is_success() {
+                            let _ = completed_reads.send(());
                         }
                         response
                     }
-                }
-            }));
+                },
+            ));
         let http = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
 
         let mut platform =
@@ -998,7 +999,10 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.state, "applied");
         std::fs::rename(&offline_directory, &git_directory).unwrap();
-        assert!(git.find_reference(DELIVERY_REF).is_err());
+        assert_eq!(
+            git.find_reference(DELIVERY_REF).err().unwrap().code(),
+            git2::ErrorCode::NotFound
+        );
         let candidate = git
             .commit(
                 None,
@@ -1023,26 +1027,30 @@ mod tests {
         platform.link(root.number, pr.number, "human").unwrap();
         platform.publish(pr.number, &declaration.source, &candidate.to_string(), "human").unwrap();
         assert_eq!(git.refname_to_id(DELIVERY_REF).unwrap(), base);
-        let merged = platform.merge(pr.number, &declaration.source, "human").unwrap().merge_commit;
+        let receipt: ControlReceipt = client
+            .post(
+                "api/control/commands",
+                &CommandRequest {
+                    request_id: "test-run-merge".into(),
+                    expected_revision: Some(platform.item(pr.number).unwrap().revision),
+                    command: ObjectCommand::Merge { number: pr.number },
+                    actor: "human".into(),
+                    writer: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.state, "applied", "{:?}", receipt.error);
+        let merged = serde_json::from_value::<crate::platform::objects::MergeResult>(
+            receipt.result.unwrap(),
+        )
+        .unwrap()
+        .merge_commit;
         assert_eq!(git.refname_to_id(DELIVERY_REF).unwrap().to_string(), merged);
-        let db = rusqlite::Connection::open(&declaration.database).unwrap();
-        db.execute_batch("ALTER TABLE local_merges RENAME TO offline_merges").unwrap();
-        assert_eq!(client.candidate(pr.number).await.unwrap(), candidate.to_string());
-        let root_view: serde_json::Value =
-            client.get(&format!("api/control/items/{}", root.number)).await.unwrap();
-        assert_eq!(root_view["item"]["number"], root.number);
-        let context = client.context(pr.number).await.unwrap();
-        assert!(matches!(context, crate::context::CanonicalContext::PullRequest(pr) if pr.merged));
-        assert!(platform.set_state(pr.number, true, "human").is_err());
-        db.execute_batch("ALTER TABLE offline_merges RENAME TO local_merges").unwrap();
         platform.set_state(child.number, false, "human").unwrap();
         let outside = platform.create_child_issue("Outside", "Other run", "human", None).unwrap();
         platform.set_state(outside.number, false, "human").unwrap();
 
-        let healthy: crate::platform::objects::ScopeSnapshot =
-            client.get(&format!("api/platform/scope/{}", root.number)).await.unwrap();
-        assert_eq!(healthy.delivery_commit.as_deref(), Some(merged.as_str()));
-        assert_eq!(healthy.pull_requests.len(), 1);
         let blob = git.blob(b"delivery ref cannot peel to a commit").unwrap();
         let delivery_path = git.path().join(DELIVERY_REF);
         std::fs::write(&delivery_path, format!("{blob}\n")).unwrap();
@@ -1062,12 +1070,18 @@ mod tests {
         }
 
         let (_availability, provider_status) = watch::channel(ProviderAvailability::Starting);
+        // Observe this polling loop independently of any earlier object intake.
+        while boundary_reads.try_recv().is_ok() {}
         let outcome = finite_outcome(&config, &client, &store, &provider_status);
         tokio::pin!(outcome);
         tokio::time::timeout(Duration::from_secs(5), async {
             tokio::select! {
                 result = &mut outcome => panic!("open root stopped polling: {result:?}"),
-                () = two_open_polls.notified() => {},
+                () = async {
+                    for _ in 0..2 {
+                        boundary_reads.recv().await.expect("boundary observer closed");
+                    }
+                } => {},
             }
         })
         .await

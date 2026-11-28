@@ -6,6 +6,10 @@ use std::sync::{
 
 use tokio::sync::{Mutex, broadcast};
 
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;
+
 use crate::{
     agent_session::{AgentSession, SendResult, SessionError, SessionEvent, TurnOutcome},
     config::Profile,
@@ -550,20 +554,6 @@ impl AgentSession for ProviderAgentSession {
                 );
                 Err(map_provider_error(error))
             }
-        }
-    }
-
-    async fn interrupt(&self) -> Result<(), SessionError> {
-        let _command = self.commands.lock().await;
-        let (thread, turn) = {
-            let inner = self.inner.lock().await;
-            (inner.thread_id.clone(), inner.current_turn_id.clone())
-        };
-        match (thread, turn) {
-            (Some(thread), Some(turn)) => {
-                self.provider.interrupt(&thread, &turn).await.map_err(map_provider_error)
-            }
-            _ => Ok(()),
         }
     }
 }

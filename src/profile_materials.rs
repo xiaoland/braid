@@ -13,6 +13,9 @@ use crate::config::{
     Config, CredentialKind, LlmProvider, PROVIDER_API_KEY_ENVIRONMENT, Profile, ProviderCredential,
 };
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EffectiveMaterials {
     pub digest: String,

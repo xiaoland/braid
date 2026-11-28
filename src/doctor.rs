@@ -539,23 +539,13 @@ fn otlp_check(config: &Config) -> Check {
 mod tests {
     use super::{Check, CheckState, report_ready};
 
-    fn check(name: &str, state: CheckState) -> Check {
-        Check { name: name.into(), state, detail: String::new() }
-    }
-
     #[test]
-    fn unavailable_optional_otlp_does_not_block_readiness() {
-        let checks = vec![
-            check("SQLite", CheckState::Pass),
-            check("OTLP endpoint", CheckState::Unavailable),
-        ];
-        assert!(report_ready(&checks));
-    }
-
-    #[test]
-    fn other_unavailable_checks_block_readiness() {
-        let checks =
-            vec![check("SQLite", CheckState::Pass), check("GitHub App", CheckState::Unavailable)];
-        assert!(!report_ready(&checks));
+    fn unavailable_required_service_prevents_readiness() {
+        let github = Check {
+            name: "GitHub App".into(),
+            state: CheckState::Unavailable,
+            detail: "temporarily offline".into(),
+        };
+        assert!(!report_ready(&[github]));
     }
 }

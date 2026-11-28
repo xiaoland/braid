@@ -604,7 +604,7 @@ fn current_actor_known(observation: &CanonicalObservation, action: &str) -> bool
             && observation.author_node_id.is_some())
 }
 
-pub(crate) fn observation_unchanged(
+fn observation_unchanged(
     previous: &CanonicalObjectState,
     observation: &CanonicalObservation,
 ) -> bool {
@@ -621,7 +621,7 @@ pub(crate) fn observation_unchanged(
     }
 }
 
-pub(crate) fn reconciled_change(
+fn reconciled_change(
     previous: Option<&CanonicalObjectState>,
     observation: &CanonicalObservation,
 ) -> (&'static str, EventKind) {
@@ -659,7 +659,7 @@ pub(crate) fn reconciled_change(
     }
 }
 
-pub(crate) fn reconciled_event(
+fn reconciled_event(
     observation: &CanonicalObservation,
     action: &'static str,
     kind: EventKind,

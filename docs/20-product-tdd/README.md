@@ -324,8 +324,14 @@ Console 的 OTLP Collector 保存原始传输批次与完整解码记录，使�
 
 平台通过有类型的应用命令修改对象。命令 request ID、内容摘要、预期 revision
 与回执持久保存在平台库；普通对象变更与事件、回执一起提交，
-并发正文修改不会覆盖新 revision。发布和合并保留 Git/SQLite 意图边界，不能用
-外层数据库事务假装跨系统原子化。浏览器只能选择固定 source 或由 Harness 验证的候选，不能提供任意路径。
+并发正文修改不会覆盖新 revision。发布候选的对象更新、事件与成功回执也在同一
+SQLite 事务提交；Git 保留引用不代替数据库中的候选事实。合并在 Git CAS 前将
+请求 ID、精确合并 commit 与原 writer 来源绑定到持久意图；CAS 仍验证当前授权和
+revision。最终合并状态、对象关闭、撤权、事件与成功回执一起提交。相同请求的恢复
+只在当前目标引用等于绑定 commit 时确认已发生的效果，不重放 Git CAS，也不恢复
+writer 权限；原 writer 来源仅用于保持事件归属。旧无绑定回执或目标引用已经前移时
+保留未完成状态，交由操作者核实，不以 revision 推断结果归属。这一边界不提供跨
+Git/SQLite 的原子事务。浏览器只能选择固定 source 或由 Harness 验证的候选，不能提供任意路径。
 
 `console::runtime` 持有实际 runtime task、停止通道与启动 generation。Collector
 、平台和控制端点持续存活，Harness 可单独停止。GitHub 与内建上游通过统一 runtime 接口托管。请求接受不等于任务已就绪或已停止；

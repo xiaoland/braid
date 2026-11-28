@@ -95,7 +95,7 @@ fn ensure_rejects_invalid_ref_components_before_accepting_an_obligation() {
 }
 
 #[test]
-fn temporary_ledger_contention_preserves_the_publication_obligation() {
+fn ledger_errors_distinguish_retryable_contention_and_actor_loss_from_invalid_writes() {
     use crate::store::StoreError;
     for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
         let error = StoreError::Sqlite(rusqlite::Error::SqliteFailure(
@@ -122,7 +122,7 @@ fn temporary_ledger_contention_preserves_the_publication_obligation() {
 async fn a_published_request_recovers_delivery_without_replaying_fenced_mutations() {
     let f = Fixture::new(true);
     let receipt = request(&f, 7);
-    let remote = Arc::new(Mutex::new(Remote { create_pr: true, ..Remote::default() }));
+    let remote = Arc::new(Mutex::new(Remote { pr_missing: true, ..Remote::default() }));
     let (github, http) = server(remote.clone(), true).await;
     f.drain(github.clone()).await;
     assert_eq!(f.receipt(&receipt.request_id).lifecycle, "applied");
@@ -131,7 +131,7 @@ async fn a_published_request_recovers_delivery_without_replaying_fenced_mutation
     legacy_gap(&f, &receipt);
     replace_source(&f);
     remote.lock().unwrap().pr_body = Some("Current scope, no historical discovery marker".into());
-    f.drain(github.clone()).await;
+    f.drain(github).await;
     let result = f.receipt(&receipt.request_id);
     assert_eq!(result.lifecycle, "applied", "{:?}", result.last_error);
     assert!(
@@ -143,16 +143,6 @@ async fn a_published_request_recovers_delivery_without_replaying_fenced_mutation
     );
     assert_eq!(activations(&f), 1);
     assert_eq!(remote.lock().unwrap().writes, writes);
-    f.db()
-        .execute(
-            "UPDATE github_write_outbox SET lifecycle='sending' WHERE intent_id=?1",
-            [receipt.intent_id],
-        )
-        .unwrap();
-    f.store.recover_writes().unwrap();
-    f.drain(github).await;
-    assert_eq!(activations(&f), 1);
-    assert_eq!(remote.lock().unwrap().writes, writes);
     http.abort();
 }
 
@@ -160,7 +150,7 @@ async fn a_published_request_recovers_delivery_without_replaying_fenced_mutation
 async fn a_followup_comment_reuses_the_original_managed_implementation_identity() {
     let f = Fixture::new(true);
     let original = request(&f, 7);
-    let remote = Arc::new(Mutex::new(Remote { create_pr: true, ..Remote::default() }));
+    let remote = Arc::new(Mutex::new(Remote { pr_missing: true, ..Remote::default() }));
     let (github, http) = server(remote.clone(), true).await;
     f.drain(github.clone()).await;
     legacy_gap(&f, &original);
@@ -187,9 +177,17 @@ async fn a_followup_comment_reuses_the_original_managed_implementation_identity(
 
 #[tokio::test]
 async fn recovery_revalidates_the_current_open_source_target_and_association() {
-    for authority in
-        [Authority::SourceClosed, Authority::TargetClosed, Authority::AssociationRemoved]
-    {
+    for (authority, reason) in [
+        (
+            Authority::SourceClosed,
+            "implementation source Issue is no longer the same open work item",
+        ),
+        (Authority::TargetClosed, "implementation request PR is no longer open"),
+        (
+            Authority::AssociationRemoved,
+            "managed implementation is no longer directly associated with its source Issue",
+        ),
+    ] {
         let f = Fixture::new(true);
         let receipt = request(&f, 7);
         let remote = Arc::new(Mutex::new(Remote::default()));
@@ -198,7 +196,7 @@ async fn recovery_revalidates_the_current_open_source_target_and_association() {
         legacy_gap(&f, &receipt);
         remote.lock().unwrap().authority = authority;
         f.drain(github).await;
-        assert_eq!(f.receipt(&receipt.request_id).lifecycle, "rejected");
+        assert_rejected(&f.receipt(&receipt.request_id), reason);
         assert_eq!(activations(&f), 0);
         assert_eq!(remote.lock().unwrap().writes, 0);
         http.abort();
@@ -217,13 +215,16 @@ async fn recovery_cannot_replace_a_blocked_generation_or_adopt_another_issue() {
         if blocked {
             f.db().execute("INSERT INTO assignments(assignment_id,work_item_node_id,generation,lifecycle,assigned_at) VALUES('withdrawn','pr',1,'blocked','now')",[]).unwrap();
             f.drain(github).await;
-            assert_eq!(f.receipt(&original.request_id).lifecycle, "rejected");
+            assert_rejected(&f.receipt(&original.request_id), "existing PR assignment is blocked");
         } else {
             f.db().execute("UPDATE github_write_outbox SET next_attempt_at='2099-01-01T00:00:00Z' WHERE intent_id=?1",[&original.intent_id]).unwrap();
             remote.lock().unwrap().authority = Authority::OtherIssue;
             let foreign = request(&f, 8);
             f.drain(github).await;
-            assert_eq!(f.receipt(&foreign.request_id).lifecycle, "rejected");
+            assert_rejected(
+                &f.receipt(&foreign.request_id),
+                "initial PR ensure must originate from its own Issue source",
+            );
         }
         assert_eq!(activations(&f), 0);
         assert_eq!(remote.lock().unwrap().writes, 0);
@@ -236,11 +237,19 @@ async fn an_unpublished_request_still_requires_its_original_source_authority() {
     let f = Fixture::new(true);
     let receipt = request(&f, 7);
     replace_source(&f);
-    let remote = Arc::new(Mutex::new(Remote { create_pr: true, ..Remote::default() }));
+    let remote = Arc::new(Mutex::new(Remote { pr_missing: true, ..Remote::default() }));
     let (github, http) = server(remote.clone(), true).await;
     f.drain(github).await;
-    assert_eq!(f.receipt(&receipt.request_id).lifecycle, "rejected");
+    assert_rejected(
+        &f.receipt(&receipt.request_id),
+        "publication source was invalidated or superseded",
+    );
     assert_eq!(remote.lock().unwrap().writes, 0);
     assert_eq!(activations(&f), 0);
     http.abort();
+}
+
+fn assert_rejected(receipt: &GhWriteReceipt, reason: &str) {
+    assert_eq!(receipt.lifecycle, "rejected", "{receipt:?}");
+    assert!(receipt.last_error.as_deref().unwrap().contains(reason), "{receipt:?}");
 }

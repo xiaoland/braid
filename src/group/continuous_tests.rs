@@ -8,6 +8,7 @@ use crate::{
     store::{EventKind, IngressEvent, SchedulerPolicy, StoreActor},
     writer::tests::{Fixture, issue_context_server},
 };
+use rusqlite::OptionalExtension as _;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -15,11 +16,17 @@ use tokio::sync::broadcast;
 struct Captured {
     memory: Mutex<Vec<String>>,
     inputs: Mutex<Vec<String>>,
+    resumed: Mutex<Vec<String>>,
     steer_error: Mutex<Option<SessionError>>,
+    close_error: Mutex<Option<SessionError>>,
+    close_attempts: Mutex<Vec<String>>,
+    close_terminal: Mutex<Option<(crate::agent_session::TurnOutcome, Option<String>)>>,
     closed: tokio::sync::Notify,
+    steered: tokio::sync::Notify,
 }
 struct Factory(Arc<Captured>);
 struct Session {
+    id: String,
     captured: Arc<Captured>,
     events: broadcast::Sender<SessionEvent>,
 }
@@ -34,10 +41,17 @@ impl SessionFactory for Factory {
         _instructions: String,
         context: String,
     ) -> Result<CreatedSession, SessionError> {
-        self.0.memory.lock().unwrap().push(context.clone());
+        let mut memories = self.0.memory.lock().unwrap();
+        memories.push(context);
+        let id = if memories.len() == 1 {
+            "fresh-provider".to_owned()
+        } else {
+            format!("fresh-provider-{}", memories.len())
+        };
         Ok(CreatedSession {
-            id: if context == "old memory" { "provider" } else { "fresh-provider" }.into(),
+            id: id.clone(),
             session: Arc::new(Session {
+                id,
                 captured: self.0.clone(),
                 events: broadcast::channel(8).0,
             }),
@@ -45,11 +59,19 @@ impl SessionFactory for Factory {
     }
     async fn resume(
         &self,
-        _id: &str,
+        id: &str,
         _profile: Profile,
         _instructions: String,
     ) -> Result<CreatedSession, SessionError> {
-        Err(SessionError::Failed("unexpected resume".into()))
+        self.0.resumed.lock().unwrap().push(id.to_owned());
+        Ok(CreatedSession {
+            id: id.into(),
+            session: Arc::new(Session {
+                id: id.into(),
+                captured: self.0.clone(),
+                events: broadcast::channel(8).0,
+            }),
+        })
     }
 }
 #[async_trait::async_trait]
@@ -62,6 +84,17 @@ impl AgentSession for Session {
     }
     async fn close(&self) -> Result<(), SessionError> {
         self.captured.closed.notify_one();
+        self.captured.close_attempts.lock().unwrap().push(self.id.clone());
+        if let Some(error) = self.captured.close_error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        if let Some((outcome, error)) = self.captured.close_terminal.lock().unwrap().take() {
+            let _ = self.events.send(SessionEvent::TurnTerminal {
+                provider_turn_id: "after-revision".into(),
+                outcome,
+                error,
+            });
+        }
         Ok(())
     }
     async fn send_user_msg(&self, msg: String, steering: bool) -> Result<SendResult, SessionError> {
@@ -77,12 +110,10 @@ impl AgentSession for Session {
         _msg: String,
         _expected: &str,
     ) -> Result<SendResult, SessionError> {
+        self.captured.steered.notify_one();
         Err(self.captured.steer_error.lock().unwrap().clone().unwrap_or_else(|| {
             SessionError::Failed("revision must wait for the safe boundary".into())
         }))
-    }
-    async fn interrupt(&self) -> Result<(), SessionError> {
-        Ok(())
     }
 }
 fn revision() -> IngressEvent {
@@ -113,6 +144,18 @@ fn revision() -> IngressEvent {
         reaction_target: None,
         known: true,
         raw_payload: vec![],
+    }
+}
+
+fn unassignment(delivery_guid: &str) -> IngressEvent {
+    IngressEvent {
+        delivery_guid: delivery_guid.into(),
+        identity: crate::store::ChangeIdentity::Occurrence,
+        kind: EventKind::Unassign,
+        action: Some("unassigned".into()),
+        requires_attention: false,
+        cross_surface_invalidation: false,
+        ..revision()
     }
 }
 
@@ -151,15 +194,18 @@ async fn soft_pressure_reset_replaces_memory_and_delivers_input_with_publication
     };
     driver
         .sessions
-        .start(spec.profile.clone(), "old instructions".into(), "old memory".into())
+        .resume("provider".into(), spec.profile.clone(), "old instructions".into())
         .await
         .unwrap();
-    captured.memory.lock().unwrap().clear();
     let policy = SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 };
     f.store.ingest_event(revision(), policy).unwrap();
     f.store.ingest_event(revision(), policy).unwrap();
     assert!(driver.materialize_next_context_reset().await);
-    assert!(captured.memory.lock().unwrap()[0].contains("authorized Twitter User"));
+    assert!(!driver.materialize_next_context_reset().await);
+    assert_eq!(*captured.close_attempts.lock().unwrap(), ["provider"]);
+    let memory = captured.memory.lock().unwrap().clone();
+    assert_eq!(memory.len(), 1);
+    assert!(memory[0].contains("authorized Twitter User"));
     assert_eq!(f.store.runtime_status().unwrap().agent_groups[0].context_pressure, "soft");
     assert_eq!(
         f.db()
@@ -170,6 +216,7 @@ async fn soft_pressure_reset_replaces_memory_and_delivers_input_with_publication
     );
     // Resetting an idle session is not an acknowledgement of the work input.
     assert_eq!(f.store.runtime_status().unwrap().batches.len(), 1);
+    f.store.advance_scheduler().unwrap();
     assert!(driver.start_next_agent_turn().await.is_none(), "ordinary revision must keep debounce");
     f.db().execute("UPDATE wake_batches SET quiet_deadline='2000-01-01T00:00:00Z' WHERE lifecycle='pending'",[]).unwrap();
     f.store.advance_scheduler().unwrap();
@@ -179,21 +226,17 @@ async fn soft_pressure_reset_replaces_memory_and_delivers_input_with_publication
         .expect("revision starts native work without another Human comment");
     assert_eq!(active.provider_turn_id, "after-revision");
     assert_eq!(active.claim.trigger_kind, "wake_batch");
+    assert_eq!(active.claim.references, ["Human revised the Issue description"]);
     assert!(!active.claim.trusted_mention);
     assert_eq!(captured.inputs.lock().unwrap().len(), 1);
     assert!(driver.start_next_agent_turn().await.is_none());
-    assert_eq!(
-        f.db()
-            .query_row("SELECT count(*) FROM context_resets WHERE lifecycle='applied'", [], |r| r
-                .get::<_, i64>(
-                0
-            ))
-            .unwrap(),
-        1
-    );
     let publisher =
         f.store.acquire_runtime_lease("runtime".into(), "publisher".into(), 60).unwrap();
-    assert!(f.store.claim_github_write(publisher.clone()).is_err());
+    let error = f.store.claim_github_write(publisher.clone()).unwrap_err();
+    assert!(
+        matches!(error, crate::store::StoreError::Sqlite(ref sql) if sql.to_string().contains("unavailable publisher")),
+        "{error}"
+    );
     f.db().execute_batch("DROP TRIGGER outbox_offline").unwrap();
     let status = f.store.claim_github_write(publisher.clone()).unwrap().unwrap();
     assert!(status.content.contains("complete Context without truncation"));
@@ -290,8 +333,7 @@ async fn pending_reset_cannot_silently_adopt_changed_profile_materials() {
     f.store
         .ingest_event(revision(), SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 })
         .unwrap();
-    // Native stop and the pending reset survived the restart under the old Profile.
-    f.store.set_provider_stop("provider".into(), true).unwrap();
+    // The reset was persisted under the old Profile; its old handle can still stop.
     f.store.begin_context_reset(None, "issue".into(), "issue-codex".into()).unwrap().unwrap();
     let mut config = f.config.clone();
     config.profiles.iter_mut().find(|p| p.id == "issue-codex").unwrap().model =
@@ -300,12 +342,14 @@ async fn pending_reset_cannot_silently_adopt_changed_profile_materials() {
     let (github, http) = issue_context_server("Current context").await;
     let collaboration = Arc::new(CollaborationBackend::GitHub(github));
     let spec = GroupSpec::new(GroupKind::Issue, &config, &f.store, "owner/repository").unwrap();
+    let sessions = SessionManager::new(Arc::new(Factory(captured.clone())));
+    sessions.resume("provider".into(), spec.profile.clone(), "instructions".into()).await.unwrap();
     let driver = worker::GroupDriver {
         store: &f.store,
         config: &config,
         collaboration: &collaboration,
         spec: &spec,
-        sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
+        sessions,
     };
     assert!(driver.materialize_next_context_reset().await);
     assert!(captured.memory.lock().unwrap().is_empty(), "must not create a physical session");
@@ -376,6 +420,153 @@ async fn unknown_replay_cannot_replace_a_session_without_confirmed_stop() {
 }
 
 #[tokio::test]
+async fn persisted_native_stop_allows_an_idle_reset_to_finish_after_restart() {
+    let f = Fixture::new(true);
+    let captured = Arc::new(Captured::default());
+    let (github, http) = issue_context_server("Persisted revised contract").await;
+    let collaboration = CollaborationBackend::GitHub(github);
+    let spec = GroupSpec::new(GroupKind::Issue, &f.config, &f.store, "owner/repository").unwrap();
+    f.store
+        .ingest_event(revision(), SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 })
+        .unwrap();
+    let reset =
+        f.store.begin_context_reset(None, "issue".into(), "issue-codex".into()).unwrap().unwrap();
+    assert_eq!(reset.active_turn_id, None);
+    {
+        let driver = worker::GroupDriver {
+            store: &f.store,
+            config: &f.config,
+            collaboration: &collaboration,
+            spec: &spec,
+            sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
+        };
+        driver
+            .sessions
+            .resume("provider".into(), spec.profile.clone(), "instructions".into())
+            .await
+            .unwrap();
+        assert!(driver.quiesce_session("provider").await.unwrap());
+        assert_eq!(*captured.close_attempts.lock().unwrap(), ["provider"]);
+    }
+    drop(f.store);
+    let store =
+        StoreActor::start(f.config.runtime.database().into(), f.config.runtime.backups().into())
+            .unwrap();
+    let driver = worker::GroupDriver {
+        store: &store,
+        config: &f.config,
+        collaboration: &collaboration,
+        spec: &spec,
+        sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
+    };
+    assert!(driver.materialize_next_context_reset().await);
+    let status = store.runtime_status().unwrap();
+    assert_eq!(status.context_resets[0].lifecycle, "applied");
+    let memory = captured.memory.lock().unwrap().clone();
+    assert_eq!(memory.len(), 1);
+    assert!(memory[0].contains("Persisted revised contract"));
+    let running = driver.start_next_agent_turn().await.unwrap();
+    assert_eq!(running.claim.references, ["Human revised the Issue description"]);
+    assert_eq!(captured.inputs.lock().unwrap().len(), 1);
+    http.abort();
+}
+
+#[tokio::test]
+async fn retired_reset_history_cannot_replace_an_execution_or_block_a_finite_run() {
+    for blocked in [false, true] {
+        let f = Fixture::new(true);
+        let mut config = f.config.clone();
+        config.scheduler.quiet_seconds = 0;
+        let captured = Arc::new(Captured::default());
+        let (github, http) = issue_context_server("Current contract").await;
+        let collaboration = CollaborationBackend::GitHub(github);
+        let spec = GroupSpec::new(GroupKind::Issue, &config, &f.store, "owner/repository").unwrap();
+        let driver = worker::GroupDriver {
+            store: &f.store,
+            config: &config,
+            collaboration: &collaboration,
+            spec: &spec,
+            sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
+        };
+        driver
+            .sessions
+            .resume("provider".into(), spec.profile.clone(), "instructions".into())
+            .await
+            .unwrap();
+        let policy = SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 };
+        f.store.ingest_event(revision(), policy).unwrap();
+        let reset = f
+            .store
+            .begin_context_reset(None, "issue".into(), "issue-codex".into())
+            .unwrap()
+            .unwrap();
+        if blocked {
+            f.store
+                .fail_context_reset(reset.reset_id.clone(), "old context is unavailable".into())
+                .unwrap();
+        }
+        let before = f.store.execution_progress().unwrap();
+        assert!(before.unresolved_reset);
+        assert_eq!(before.blocked_reset.as_deref(), blocked.then_some(reset.reset_id.as_str()));
+        let revoke = unassignment("assignment-removed-during-reset");
+        let event = f.store.ingest_event(revoke, policy).unwrap().event_id.unwrap();
+        driver.settle_idle_unassignment(event).await.unwrap();
+        let after = f.store.runtime_status().unwrap();
+        assert_eq!(after.agent_groups[0].assignment_lifecycle, "retired");
+        assert_eq!(
+            after.context_resets[0].lifecycle,
+            if blocked { "blocked" } else { "materializing" }
+        );
+        assert!(
+            !driver.materialize_next_context_reset().await,
+            "a retired generation cannot start replacement execution"
+        );
+        assert!(captured.memory.lock().unwrap().is_empty());
+        let progress = f.store.execution_progress().unwrap();
+        assert!(progress.blocked_reset.is_none(), "a historical reset cannot block a finite run");
+        assert!(!progress.unresolved_reset, "retired reset history is no longer outstanding work");
+        http.abort();
+    }
+}
+
+#[tokio::test]
+async fn failed_idle_stop_keeps_the_handle_and_blocks_replacement() {
+    let f = Fixture::new(true);
+    let captured = Arc::new(Captured::default());
+    *captured.close_error.lock().unwrap() =
+        Some(SessionError::Unknown("owned task still alive".into()));
+    let (github, http) = issue_context_server("Current context").await;
+    let collaboration = Arc::new(CollaborationBackend::GitHub(github));
+    let spec = GroupSpec::new(GroupKind::Issue, &f.config, &f.store, "owner/repository").unwrap();
+    let sessions = SessionManager::new(Arc::new(Factory(captured.clone())));
+    sessions.resume("provider".into(), spec.profile.clone(), "instructions".into()).await.unwrap();
+    let driver = worker::GroupDriver {
+        store: &f.store,
+        config: &f.config,
+        collaboration: &collaboration,
+        spec: &spec,
+        sessions,
+    };
+    f.store
+        .ingest_event(revision(), SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 })
+        .unwrap();
+    assert!(driver.materialize_next_context_reset().await);
+    assert_eq!(*captured.close_attempts.lock().unwrap(), ["provider"]);
+    assert!(captured.memory.lock().unwrap().is_empty());
+    assert!(captured.inputs.lock().unwrap().is_empty());
+    let status = f.store.runtime_status().unwrap();
+    assert_eq!(status.context_resets[0].lifecycle, "blocked");
+    assert!(
+        status.agent_groups[0].context_error.as_deref().unwrap().contains("owned task still alive")
+    );
+    assert_eq!(status.batches.len(), 1);
+    *captured.close_error.lock().unwrap() = None;
+    assert!(driver.quiesce_session("provider").await.unwrap());
+    assert_eq!(*captured.close_attempts.lock().unwrap(), ["provider", "provider"]);
+    http.abort();
+}
+
+#[tokio::test]
 async fn rejected_steer_stops_retrying_while_unknown_steer_retains_its_input() {
     for unknown in [false, true] {
         let f = Fixture::new(true);
@@ -434,139 +625,41 @@ async fn rejected_steer_stops_retrying_while_unknown_steer_retains_its_input() {
     }
 }
 
-#[tokio::test]
-async fn pending_idle_reset_without_native_stop_proof_cannot_launch_replacement() {
-    let f = Fixture::new(true);
-    f.store
-        .ingest_event(revision(), SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 })
-        .unwrap();
-    f.store.begin_context_reset(None, "issue".into(), "issue-codex".into()).unwrap().unwrap();
-
-    let captured = Arc::new(Captured::default());
-    let (github, http) = issue_context_server("Current context").await;
-    let collaboration = CollaborationBackend::GitHub(github);
-    let spec = GroupSpec::new(GroupKind::Issue, &f.config, &f.store, "owner/repository").unwrap();
-    let driver = worker::GroupDriver {
-        store: &f.store,
-        config: &f.config,
-        collaboration: &collaboration,
-        spec: &spec,
-        sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
-    };
-    assert!(driver.materialize_next_context_reset().await);
-    let status = f.store.runtime_status().unwrap();
-    assert_eq!(status.context_resets[0].lifecycle, "blocked");
-    assert!(status.agent_groups[0].context_error.as_deref().unwrap().contains("no stop evidence"));
-    assert_eq!(status.batches.len(), 1);
-    assert!(captured.memory.lock().unwrap().is_empty());
-    http.abort();
-}
-
-#[tokio::test]
-async fn stopping_native_execution_does_not_wait_for_execution_fence() {
-    use axum::{
-        Json, Router,
-        http::StatusCode,
-        routing::{get, post},
-    };
-    use tokio::sync::Notify;
-
-    let f = Fixture::new(false);
-    let store = Arc::new(
-        StoreActor::start(f.config.runtime.database().into(), f.config.runtime.backups().into())
-            .unwrap(),
-    );
-    let entered = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let routes = Router::new()
-        .route("/api/platform/repository", get(|| async {
-            Json(serde_json::json!({"repository":"test-space","spaceId":"space","executionFences":true,"nodeId":"local:test-space","defaultBranch":"main"}))
-        }))
-        .route("/api/platform/executions/fence", post({
-            let (entered, release) = (entered.clone(), release.clone());
-            move || {
-                let (entered, release) = (entered.clone(), release.clone());
-                async move {
-                    entered.notify_one();
-                    release.notified().await;
-                    (StatusCode::SERVICE_UNAVAILABLE, "fence service offline")
-                }
-            }
-        }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let http = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
-    let mut config = f.config.clone();
-    config.github = None;
-    config.builtin = Some(crate::config::BuiltinConfig {
-        repository: "test-space".into(),
-        endpoint: format!("http://{address}").parse().unwrap(),
-    });
-    let lease = store.acquire_runtime_lease("runtime".into(), "fixture".into(), 60).unwrap();
-    let collaboration = CollaborationBackend::Builtin(
-        crate::builtin::BuiltinClient::connect(&config, Arc::clone(&store))
-            .await
-            .unwrap()
-            .with_runtime(lease)
-            .unwrap(),
-    );
-    let spec = GroupSpec::new(GroupKind::Issue, &config, &store, "test-space").unwrap();
-    f.db().execute_batch(
-        "INSERT INTO repositories VALUES('local:test-space','test-space',1,'now');
-         INSERT INTO work_items(node_id,repository_node_id,kind,number,state,observed_at)
-           VALUES('fixture-item','local:test-space','issue',1,'open','now');
-         INSERT INTO assignments VALUES('fixture-assignment','fixture-item',1,'active','now',NULL);"
-    ).unwrap();
-    f.db().execute(
-        "INSERT INTO agent_instances(agent_id,assignment_id,profile_id,profile_revision,role,lifecycle)
-         SELECT 'fixture-agent','fixture-assignment',profile_id,revision,'issue','idle'
-         FROM profiles WHERE profile_id=?1",
-        [&spec.profile.id],
-    ).unwrap();
-    f.db().execute(
-        "INSERT INTO provider_sessions(session_id,agent_id,provider_kind,provider_session_id,
-          context_revision,instruction_revision,lifecycle,started_at,builtin_execution_id,builtin_execution_owner)
-         VALUES('fixture-session','fixture-agent','codex','provider','memory','instructions','idle','now',?1,'fixture')",
-        [uuid::Uuid::now_v7().to_string()],
-    ).unwrap();
-    let captured = Arc::new(Captured::default());
-    let driver = worker::GroupDriver {
-        store: &store,
-        config: &config,
-        collaboration: &collaboration,
-        spec: &spec,
-        sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
-    };
-    driver
-        .sessions
-        .start(spec.profile.clone(), "instructions".into(), "old memory".into())
-        .await
-        .unwrap();
-
-    let (stop, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        tokio::join!(driver.quiesce_session("provider"), async {
-            entered.notified().await;
-            captured.closed.notified().await;
-            assert!(driver.sessions.confirmed_stopped("provider").await);
-            release.notify_one();
-        })
-    })
-    .await
-    .expect("native close must finish while the fence response is withheld");
-    assert!(stop.unwrap_err().to_string().contains("execution fence unconfirmed"));
-    http.abort();
-}
-
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn builtin_turn_runs_without_writer_service_and_cannot_mint_after_reassignment() {
+    builtin_running_unassignment(Some((crate::agent_session::TurnOutcome::Completed, None)), false)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_preserves_a_failed_turn_during_unassignment_while_the_platform_fence_is_offline() {
+    builtin_running_unassignment(
+        Some((
+            crate::agent_session::TurnOutcome::Failed,
+            Some("provider failed while stopping".into()),
+        )),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restarted_worker_retires_a_stopped_unassignment_without_a_provider_terminal() {
+    builtin_running_unassignment(None, true).await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn builtin_running_unassignment(
+    terminal: Option<(crate::agent_session::TurnOutcome, Option<String>)>,
+    restart: bool,
+) {
     use crate::{
         builtin::BuiltinClient,
         platform::{PlatformConfig, objects::PlatformObjects},
         store::BuiltinWriterTurn,
     };
     use axum::http::StatusCode;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let f = Fixture::new(false);
     let root = f.config.runtime.database().parent().unwrap();
@@ -591,16 +684,38 @@ async fn builtin_turn_runs_without_writer_service_and_cannot_mint_after_reassign
         backups: root.join("platform-backups"),
         listen: address.to_string(),
     };
-    let offline = Arc::new(AtomicBool::new(true));
+    let offline = Arc::new(AtomicBool::new(!restart));
+    let fence_offline = Arc::new(AtomicBool::new(false));
+    // A missing terminal is the cold-recovery case. Hold the first fence response
+    // there so only the native side can produce the observed durable stop.
+    let fence_entered = Arc::new(tokio::sync::Notify::new());
+    let fence_attempts = Arc::new(AtomicUsize::new(0));
+    let fence_response = Arc::new(tokio::sync::Semaphore::new(usize::from(terminal.is_some())));
     let routes = crate::platform::router(&platform).unwrap().layer(axum::middleware::from_fn({
         let offline = Arc::clone(&offline);
+        let fence_offline = Arc::clone(&fence_offline);
+        let fence_entered = Arc::clone(&fence_entered);
+        let fence_attempts = Arc::clone(&fence_attempts);
+        let fence_response = Arc::clone(&fence_response);
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let offline = Arc::clone(&offline);
+            let fence_offline = Arc::clone(&fence_offline);
+            let fence_entered = Arc::clone(&fence_entered);
+            let fence_attempts = Arc::clone(&fence_attempts);
+            let fence_response = Arc::clone(&fence_response);
             async move {
                 use axum::response::IntoResponse as _;
                 if request.uri().path().starts_with("/api/platform/grants")
                     && offline.load(Ordering::Relaxed)
                 {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                if request.uri().path() == "/api/platform/executions/fence"
+                    && fence_offline.load(Ordering::Relaxed)
+                {
+                    fence_attempts.fetch_add(1, Ordering::Relaxed);
+                    fence_entered.notify_one();
+                    let _permit = fence_response.acquire().await.unwrap();
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 }
                 next.run(request).await
@@ -611,93 +726,374 @@ async fn builtin_turn_runs_without_writer_service_and_cannot_mint_after_reassign
 
     let mut config = f.config.clone();
     config.github = None;
+    config.profiles.iter_mut().find(|profile| profile.id == "issue-codex").unwrap().workspace =
+        Some(source.clone());
     config.builtin = Some(crate::config::BuiltinConfig {
         repository: platform.repository.clone(),
         endpoint: format!("http://{address}").parse().unwrap(),
     });
-    let store = Arc::new(
-        StoreActor::start(config.runtime.database().into(), config.runtime.backups().into())
-            .unwrap(),
-    );
-    let lease = store.acquire_runtime_lease("runtime".into(), "fixture".into(), 60).unwrap();
-    let client = BuiltinClient::connect(&config, Arc::clone(&store))
-        .await
-        .unwrap()
-        .with_runtime(lease)
-        .unwrap();
-    let spec = GroupSpec::new(GroupKind::Issue, &config, &store, "test-space").unwrap();
-    let mut platform = PlatformObjects::open(&platform.database, &platform.repository).unwrap();
+    let (mut store, mut client) = open_worker_runtime(&config, "fixture").await;
+    let actor = "issue-codex";
+    let platform_database = platform.database.clone();
+    let mut platform = PlatformObjects::open(&platform_database, &platform.repository).unwrap();
     let issue =
         platform.create_child_issue("Writer independence", "Read first", "human", None).unwrap();
-    platform.assign(issue.number, Some(&spec.profile.id), "human").unwrap();
+    platform.assign(issue.number, Some(actor), "human").unwrap();
     let policy = SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 };
     let mut cursor = 0;
     for pending in platform.events(cursor, 100).unwrap() {
         store.ingest_builtin_event(pending.event, policy, pending.event_id).unwrap();
         cursor = pending.event_id;
     }
-    let assignment =
-        store.assignment_candidates("test-space".into(), "issue".into(), 1).unwrap().pop().unwrap();
-    let materialization = store
-        .begin_agent_assignment(
-            assignment.event_id,
-            spec.profile_record.clone(),
-            Some("old memory".into()),
-            false,
-        )
-        .unwrap()
-        .unwrap();
-    store
-        .complete_agent_assignment(
-            materialization,
-            "provider".into(),
-            "old memory".into(),
-            "instructions".into(),
-        )
-        .unwrap();
+    let captured = Arc::new(Captured::default());
+    let (shutdown, stop) = tokio::sync::watch::channel(false);
+    let (reports, _receiver) = tokio::sync::mpsc::channel(8);
+    let spawn = |store: &Arc<StoreActor>, client: &Arc<BuiltinClient>| {
+        let spec = GroupSpec::new(GroupKind::Issue, &config, store, "test-space").unwrap();
+        tokio::spawn(agent_group_worker_backend(
+            Arc::clone(store),
+            Arc::new(CollaborationBackend::Builtin(Arc::clone(client))),
+            config.clone(),
+            spec,
+            Arc::new(Factory(Arc::clone(&captured))),
+            reports.clone(),
+            stop.clone(),
+        ))
+    };
+    let mut worker = spawn(&store, &client);
+    let limit = std::time::Duration::from_secs(5);
+    tokio::time::timeout(limit, async {
+        while !store
+            .runtime_status()
+            .unwrap()
+            .agent_groups
+            .iter()
+            .any(|group| group.assignment_generation == 1 && group.assignment_lifecycle == "active")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("assignment materializes before the first user input");
     platform.reply(issue.number, "Run this turn", "human", None).unwrap();
     for pending in platform.events(cursor, 100).unwrap() {
         store.ingest_builtin_event(pending.event, policy, pending.event_id).unwrap();
+        cursor = pending.event_id;
     }
     store.advance_scheduler().unwrap();
 
-    let captured = Arc::new(Captured::default());
-    let collaboration = CollaborationBackend::Builtin(Arc::clone(&client));
-    let driver = worker::GroupDriver {
-        store: &store,
-        config: &config,
-        collaboration: &collaboration,
-        spec: &spec,
-        sessions: SessionManager::new(Arc::new(Factory(Arc::clone(&captured)))),
-    };
-    driver
-        .sessions
-        .start(spec.profile.clone(), "instructions".into(), "old memory".into())
-        .await
-        .unwrap();
-    let running = driver.start_next_agent_turn().await.unwrap_or_else(|| {
-        panic!("writer service must not gate a turn: {:?}", store.runtime_status().unwrap().batches)
-    });
+    let (session_id, turn_id) = tokio::time::timeout(limit, async {
+        loop {
+            let running = f
+                .db()
+                .query_row(
+                    "SELECT ps.provider_session_id,t.turn_id FROM turns t
+                 JOIN provider_sessions ps ON ps.session_id=t.session_id
+                 WHERE t.lifecycle='running' AND t.provider_turn_id='after-revision'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .unwrap();
+            if let Some(running) = running {
+                break running;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("writer service must not gate a real turn");
     assert_eq!(captured.inputs.lock().unwrap().len(), 1);
-    let writer = BuiltinWriterTurn {
-        session_id: running.claim.provider_session_id,
-        turn_id: running.claim.turn_id,
-        item_number: issue.number,
-        actor: spec.profile.id.clone(),
-    };
-    let offline_error = client.writer_grant(writer.clone()).await.unwrap_err();
-    assert!(offline_error.to_string().contains("503"));
+    let writer =
+        BuiltinWriterTurn { session_id, turn_id, item_number: issue.number, actor: actor.into() };
+    if !restart {
+        let error = client.writer_grant(writer.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("503"), "{error:#}");
+    }
 
     // The old turn never minted a grant. Name equality must not revive it
     // after an unassign/reassign and before those events reach the Harness.
-    platform.assign(issue.number, Some(&spec.profile.id), "human").unwrap();
-    offline.store(false, Ordering::Relaxed);
-    let error = client.writer_grant(writer.clone()).await.unwrap_err();
-    assert!(error.to_string().contains("writer authority changed"), "{error:#}");
-    offline.store(true, Ordering::Relaxed);
-    driver.require_quiesced(&writer.session_id, false).await.unwrap();
-    client.fence_all_executions().await.unwrap();
-    let fenced = client.writer_grant(writer).await.unwrap_err();
-    assert!(fenced.to_string().contains("no current writer authority"));
+    platform.assign(issue.number, Some(actor), "human").unwrap();
+    if !restart {
+        offline.store(false, Ordering::Relaxed);
+        let error = client.writer_grant(writer.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("writer authority changed"), "{error:#}");
+    }
+    captured.close_terminal.lock().unwrap().clone_from(&terminal);
+    fence_offline.store(true, Ordering::Relaxed);
+    for pending in platform.events(cursor, 100).unwrap() {
+        store.ingest_builtin_event(pending.event, policy, pending.event_id).unwrap();
+    }
+    // The adapter returned a terminal during close. The worker must retain it
+    // even across a failed independent fence, before creating another generation.
+    let turn_state = || {
+        f.db()
+            .query_row(
+                "SELECT lifecycle,error FROM turns WHERE turn_id=?1",
+                [&writer.turn_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap()
+    };
+    let native_stop_recorded = || {
+        f.db()
+            .query_row(
+                "SELECT execution_stopped_at IS NOT NULL FROM provider_sessions
+                 WHERE provider_session_id=?1",
+                [&writer.session_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    };
+    // The turn may already carry an input rejection. A terminal error is
+    // appended to that diagnosis, and a successful terminal adds no reason.
+    let assert_terminal_reason = |error: Option<&str>, reason: &str| {
+        assert_eq!(error.and_then(|body| body.lines().last()), Some(reason), "{error:?}");
+    };
+    let missing_terminal = terminal.is_none();
+    let (outcome, reason) = if let Some((outcome, reason)) = terminal {
+        tokio::time::timeout(limit, async {
+            fence_entered.notified().await;
+            while turn_state().0 != outcome.lifecycle() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("observed provider terminal must be durable while the platform fence is offline");
+        if let Some(reason) = &reason {
+            assert_terminal_reason(turn_state().1.as_deref(), reason);
+        }
+        tokio::time::timeout(limit, async {
+            while fence_attempts.load(Ordering::Relaxed) < 2 {
+                fence_entered.notified().await;
+            }
+        })
+        .await
+        .expect("an unavailable fence must be retried before replacing the old execution");
+        (outcome, reason)
+    } else {
+        tokio::time::timeout(limit, async {
+            fence_entered.notified().await;
+            while !native_stop_recorded() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("native stop must reach SQLite while the fence response is withheld");
+        assert_eq!(turn_state().0, "running");
+        (
+            crate::agent_session::TurnOutcome::Unknown,
+            Some("unassignment did not observe the active turn terminal".to_owned()),
+        )
+    };
+    assert!(native_stop_recorded(), "native stop must be durable with the fence unavailable");
+    assert_eq!(*captured.close_attempts.lock().unwrap(), ["fresh-provider"]);
+    let groups = store.runtime_status().unwrap().agent_groups;
+    assert_eq!(groups.len(), 1, "a new assignment cannot materialize before the fence");
+    assert_eq!(groups[0].assignment_generation, 1);
+    assert_eq!(groups[0].assignment_lifecycle, "active");
+    assert_eq!(
+        captured.memory.lock().unwrap().len(),
+        1,
+        "a replacement native session cannot start before the fence"
+    );
+    if missing_terminal {
+        fence_response.add_permits(1);
+    }
+    if restart {
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        drop(client);
+        drop(store);
+        // A dead owner no longer renews its lease. Advance just that deadline.
+        f.db().execute("UPDATE owner_leases SET expires_at='2000-01-01T00:00:00Z' WHERE owner_id='fixture'", []).unwrap();
+        (store, client) = open_worker_runtime(&config, "next-runtime").await;
+        fence_offline.store(false, Ordering::Relaxed);
+        client.fence_all_executions().await.unwrap();
+        worker = spawn(&store, &client);
+    } else {
+        fence_offline.store(false, Ordering::Relaxed);
+    }
+    let groups = tokio::time::timeout(limit, async {
+        loop {
+            let groups = store.runtime_status().unwrap().agent_groups;
+            assert!(
+                groups
+                    .iter()
+                    .all(|g| g.assignment_generation != 1 || g.assignment_lifecycle != "blocked"),
+                "a stopped unassignment must retire instead of becoming a blocked lost turn"
+            );
+            assert!(
+                captured.resumed.lock().unwrap().is_empty(),
+                "a stopped unassignment must never resume its old native session"
+            );
+            if groups.iter().any(|group| {
+                group.assignment_generation == 2 && group.assignment_lifecycle == "active"
+            }) {
+                break groups;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("retire the old generation and materialize its immutable reassignment");
+    let retired = groups.iter().find(|group| group.assignment_generation == 1).unwrap();
+    let current = groups.iter().find(|group| group.assignment_generation == 2).unwrap();
+    assert_eq!(
+        retired.assignment_lifecycle, "retired",
+        "the stopped old generation must retire after recovery"
+    );
+    assert!(
+        captured.resumed.lock().unwrap().is_empty(),
+        "a stopped unassignment must never resume its old native session"
+    );
+    assert_eq!(current.provider_session_id.as_deref(), Some("fresh-provider-2"));
+    if let Some(reason) = &reason {
+        let body: String = f.db().query_row("SELECT body FROM operational_status_facts WHERE assignment_id=(SELECT assignment_id FROM assignments WHERE generation=1)", [], |row| row.get(0)).expect("the failed or unknown old turn must have a configured Operational Status");
+        assert!(body.contains(outcome.lifecycle()));
+        assert!(body.contains(reason));
+    }
+    let (lifecycle, error) = turn_state();
+    assert_eq!(lifecycle, outcome.lifecycle());
+    if let Some(reason) = &reason {
+        assert_terminal_reason(error.as_deref(), reason);
+    }
+    assert_eq!(*captured.close_attempts.lock().unwrap(), ["fresh-provider"]);
+    assert_eq!(captured.memory.lock().unwrap().len(), 2);
+    if !restart {
+        let execution: (String, String) = f.db().query_row(
+            "SELECT client_id,builtin_execution_id FROM builtin_upstream,turns WHERE turn_id=?1",
+            [&writer.turn_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        let fenced: bool = rusqlite::Connection::open(&platform_database).unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM execution_fences WHERE client_id=?1 AND execution_id=?2)",
+            (&execution.0, &execution.1), |row| row.get(0),
+        ).unwrap();
+        assert!(fenced, "the platform must persist the fence for the old execution");
+    }
+    shutdown.send(true).unwrap();
+    worker.await.unwrap().unwrap();
+    http.abort();
+}
+
+async fn open_worker_runtime(
+    config: &crate::config::Config,
+    owner: &str,
+) -> (Arc<StoreActor>, Arc<crate::builtin::BuiltinClient>) {
+    let store = Arc::new(
+        StoreActor::start(config.runtime.database().into(), config.runtime.backups().into())
+            .unwrap(),
+    );
+    let lease = store.acquire_runtime_lease("runtime".into(), owner.into(), 60).unwrap();
+    let client = crate::builtin::BuiltinClient::connect(config, Arc::clone(&store))
+        .await
+        .unwrap()
+        .with_runtime(lease)
+        .unwrap();
+    (store, client)
+}
+
+#[tokio::test]
+async fn worker_stops_a_running_unassigned_issue_only_after_its_quiet_window() {
+    use sha2::{Digest as _, Sha256};
+    use tokio::time::{Duration, timeout};
+
+    let f = Fixture::new(true);
+    let config = f.config.clone();
+    let spec = GroupSpec::new(GroupKind::Issue, &config, &f.store, "owner/repository").unwrap();
+    std::fs::create_dir_all(spec.profile.workspace()).unwrap();
+    let instructions = provider::issue_system_prompt(&config, &spec.profile, 1);
+    f.db()
+        .execute(
+            "UPDATE provider_sessions SET instruction_revision=?1",
+            [hex::encode(Sha256::digest(instructions.as_bytes()))],
+        )
+        .unwrap();
+    let captured = Arc::new(Captured::default());
+    let (github, http) = issue_context_server("Current instructions").await;
+    let store = Arc::new(
+        StoreActor::start(config.runtime.database().into(), config.runtime.backups().into())
+            .unwrap(),
+    );
+    let policy = SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 };
+    let mut wake = revision();
+    wake.kind = EventKind::Wake;
+    wake.cross_surface_invalidation = false;
+    store.ingest_event(wake, policy).unwrap();
+    let (shutdown, stop) = tokio::sync::watch::channel(false);
+    let (reports, _receiver) = tokio::sync::mpsc::channel(8);
+    let worker = tokio::spawn(agent_group_worker(
+        Arc::clone(&store),
+        github,
+        config,
+        spec,
+        Arc::new(Factory(Arc::clone(&captured))),
+        reports,
+        stop,
+    ));
+    let limit = Duration::from_secs(5);
+    timeout(limit, async {
+        while !f.db().query_row("SELECT EXISTS(SELECT 1 FROM turns WHERE provider_turn_id='after-revision' AND lifecycle='running')", [], |row| row.get::<_, bool>(0)).unwrap() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("the provider must start a real turn before unassignment");
+    let unassign = unassignment("assignment-removed");
+    let event = store.ingest_event(unassign, policy).unwrap().event_id.unwrap();
+
+    // A second provider input acknowledges a worker tick inside the window.
+    let mut urgent = revision();
+    urgent.delivery_guid = "urgent-while-assigned".into();
+    urgent.object_version = Some("v3".into());
+    urgent.kind = EventKind::Wake;
+    urgent.cross_surface_invalidation = false;
+    urgent.mention_candidate = true;
+    let mention = store.ingest_event(urgent, policy).unwrap().event_id.unwrap();
+    store.resolve_mention(mention, true, policy).unwrap();
+    timeout(limit, captured.steered.notified()).await.expect("turn stays active during debounce");
+    assert!(captured.close_attempts.lock().unwrap().is_empty());
+
+    *captured.close_error.lock().unwrap() =
+        Some(SessionError::Unknown("native task still alive".into()));
+    f.db()
+        .execute("UPDATE events SET observed_at='2000-01-01T00:00:00Z' WHERE event_id=?1", [&event])
+        .unwrap();
+    timeout(limit, captured.closed.notified())
+        .await
+        .expect("settled unassignment must stop a running native turn");
+    assert_eq!(store.runtime_status().unwrap().agent_groups[0].assignment_lifecycle, "active");
+    *captured.close_error.lock().unwrap() = None;
+    timeout(limit, async {
+        while store.runtime_status().unwrap().agent_groups[0].assignment_lifecycle != "retired" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("confirmed native stop must retire the generation");
+    let terminal: String = f
+        .db()
+        .query_row(
+            "SELECT lifecycle FROM turns WHERE provider_turn_id='after-revision'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(terminal, "unknown", "closing the session alone cannot identify a turn outcome");
+    assert_eq!(captured.inputs.lock().unwrap().len(), 1);
+    shutdown.send(true).unwrap();
+    worker.await.unwrap().unwrap();
+    let status = f
+        .db()
+        .query_row(
+            "SELECT body FROM operational_status_facts WHERE assignment_id='assignment'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap();
+    assert!(
+        status.as_deref().is_some_and(|body| body.contains("执行状态：unknown")
+            && body.contains("unassignment did not observe the active turn terminal")),
+        "an unobserved turn terminal must publish the configured operational status: {status:?}"
+    );
     http.abort();
 }

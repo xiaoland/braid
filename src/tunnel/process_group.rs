@@ -23,17 +23,32 @@ impl OwnedGroup {
     }
 
     pub(super) async fn close(&mut self, child: &mut Child) -> io::Result<()> {
-        self.signal(Some(Signal::SIGTERM))?;
-        if let Ok(result) = timeout(Duration::from_secs(2), self.wait(child)).await {
-            result?;
-        } else {
-            self.signal(Some(Signal::SIGKILL))?;
-            timeout(Duration::from_secs(2), self.wait(child)).await.map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "owned Tunnel process group did not stop")
-            })??;
+        if let Err(error) = self.signal_and_wait(child, Signal::SIGTERM).await {
+            if error.kind() != io::ErrorKind::TimedOut
+                && error.raw_os_error() != Some(Errno::EPERM as i32)
+            {
+                return Err(error);
+            }
+            self.signal_and_wait(child, Signal::SIGKILL).await?;
         }
         self.armed = false;
         Ok(())
+    }
+
+    async fn signal_and_wait(&self, child: &mut Child, signal: Signal) -> io::Result<()> {
+        let denied = match self.signal(Some(signal)) {
+            Ok(_) => None,
+            // Darwin also returns EPERM for a group containing only zombies.
+            // Reap and wait for ESRCH; EPERM itself never proves termination.
+            Err(error) if error.raw_os_error() == Some(Errno::EPERM as i32) => Some(error),
+            Err(error) => return Err(error),
+        };
+        match timeout(Duration::from_secs(2), self.wait(child)).await {
+            Ok(result) => result,
+            Err(_) => Err(denied.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "owned Tunnel process group did not stop")
+            })),
+        }
     }
 
     fn signal(&self, signal: Option<Signal>) -> io::Result<bool> {
@@ -47,7 +62,12 @@ impl OwnedGroup {
     async fn wait(&self, child: &mut Child) -> io::Result<()> {
         loop {
             let wrapper_gone = child.try_wait()?.is_some();
-            if !self.signal(None)? && wrapper_gone {
+            let group_gone = match self.signal(None) {
+                Ok(exists) => !exists,
+                Err(error) if error.raw_os_error() == Some(Errno::EPERM as i32) => false,
+                Err(error) => return Err(error),
+            };
+            if group_gone && wrapper_gone {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

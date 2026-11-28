@@ -28,10 +28,9 @@ manifest 的文件。旧材料可由 operator 显式配置 `GH_CONFIG_DIR` 作�
 | `SessionFactory::start/resume` | 创建或恢复会话并返回中立句柄。Codex 内部共享 app-server，Pi 每个会话持有独立进程；上层接口相同。 |
 | `send_user_msg(msg, steering)` | Idle 时申请启动 turn；已知拒收返回 Deferred，queue 保留输入。Acknowledged 只代表原生执行明确接纳，结果不明返回具体 Unknown。 |
 | `steer_user_msg(msg, expected_turn_id)` | 只向已观察且仍匹配的 active turn 投递，不偷换为新 turn；明确拒收返回 Deferred，结果不明保留具体 Unknown。 |
-| `interrupt()` | 尝试停止已观察到的 active turn；terminal 仍通过事件流返回。 |
 | `events()` | 将 provider 的响应与通知去重为 TurnStarted / TurnTerminal；dispatch 前订阅，同一 receiver 随 RunningAgentTurn 交给 driver。失效的 active handle 合成 Unknown，不能伪造失败。 |
 | `is_unavailable()` | 句柄失效后永久返回 true；idle 或晚订阅也可观察。恢复创建新句柄，不复活旧句柄。 |
-| `close()` | 确认所属执行停止后释放资源；失败保留句柄与具体原因，阻断替代执行，不能影响其它会话。 |
+| `close()` | adapter 先请求中断所属活动 turn，再确认执行停止并释放资源。关闭失败时保留句柄与原因，阻止替代执行。 |
 
 具体 `AgentProvider` 接口只在 adapter 内使用。共享 Codex 进程退出会使其所有
 句柄失效；独立 Pi 进程退出只影响所属句柄。释放旧句柄会取消旧监听任务，
@@ -178,6 +177,9 @@ execution 静止，长期服务 busy 也不统一阻断普通输入。
 锁定材料关闭先请求 owned stop，再释放 stdin 发送 EOF、等待父进程，最后用固定 Node
 执行同一材料的离线清理并核对 exact execution 回执。Mac 与 Linux 都核对 OS 出生身份、
 登记进程组和继承 execution 标记；身份或停止范围不明时返回 unknown。
+工厂创建或恢复 Pi 会话时，物理执行在句柄交给 Group 前归工厂所有。握手、会话绑定或初始
+Context 持久化失败后，工厂等待同一执行的关闭结果；清理未确认时，返回构造与清理两者的原因。
+原生 background Bash 工具各自记录命令退出码与进程树收口证据；清理不明时向调用者报告错误。
 这不构成安全沙箱，也不追踪主动擦除标记、脱离登记范围的进程或撤销已发出的外部请求。
 外部基础 Pi 仍使用 abort 与父退出依据，不声称具备插件后代清理合同。
 

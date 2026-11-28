@@ -25,7 +25,7 @@ fn comment(body: &str) -> CommentSnapshot {
         deleted: false,
     }
 }
-fn processed(o: &context::CanonicalObservation) -> CanonicalObjectState {
+pub(super) fn processed(o: &context::CanonicalObservation) -> CanonicalObjectState {
     CanonicalObjectState {
         node_id: o.object_node_id.clone(),
         database_id: Some(o.database_id.clone()),
@@ -43,7 +43,7 @@ fn processed(o: &context::CanonicalObservation) -> CanonicalObjectState {
         root_fields: o.root_fields(),
     }
 }
-fn observe(f: &Fixture, github: &GitHubClient, current: &CanonicalContext) -> usize {
+pub(super) fn observe(f: &Fixture, github: &GitHubClient, current: &CanonicalContext) -> usize {
     let observations = context::canonical_observations(current);
     let root = &observations[0];
     let basis = f.store.begin_observation(root.work_item_node_id.clone()).unwrap();
@@ -225,8 +225,12 @@ async fn contract_restoration_cycles_survive_polling_and_share_a_real_ingress_re
                 events: vec![invalid],
                 policy: policy()
             })
-            .is_err()
+            .unwrap_err()
+            .to_string()
+            .contains(
+                "state receipt cannot acknowledge changed metadata or an unproven transition"
+            )
     );
-    assert_eq!(f.store.processed_objects("pr".into()).unwrap(), expected);
+    assert_eq!(f.store.begin_observation("pr".into()).unwrap().objects, expected);
     http.abort();
 }

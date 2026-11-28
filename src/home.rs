@@ -78,17 +78,13 @@ pub struct UserHome {
 impl UserHome {
     /// Resolve the user root from CLI override, env, or default `~/.braid`.
     pub fn resolve(cli_override: Option<&Path>) -> Result<Self> {
-        if let Some(path) = cli_override {
-            return Self::new(expand_home(path)?);
-        }
-        if let Some(env) = std::env::var_os(BRAID_USER_HOME_ENV) {
-            return Self::new(PathBuf::from(env));
-        }
-        Self::new(default_user_home()?)
-    }
-
-    #[allow(clippy::unnecessary_wraps)]
-    pub fn new(root: PathBuf) -> Result<Self> {
+        let root = if let Some(path) = cli_override {
+            expand_home(path)?
+        } else if let Some(env) = std::env::var_os(BRAID_USER_HOME_ENV) {
+            PathBuf::from(env)
+        } else {
+            default_user_home()?
+        };
         let root = if root.is_absolute() {
             root
         } else {
@@ -307,29 +303,13 @@ pub fn resolve_config_path(
     cli_config: Option<&Path>,
     cli_instance: Option<&str>,
 ) -> Result<PathBuf> {
-    let user = UserHome::resolve(None)?;
-    resolve_config_path_with_user_home(&user, cli_config, cli_instance)
-}
-
-/// Resolve a config file path from the standard precedence chain, using a
-/// caller-supplied user home for testability.
-///
-/// Precedence:
-/// 1. `cli_config`
-/// 2. `BRAID_INSTANCE_HOME`
-/// 3. `cli_instance` / `BRAID_INSTANCE`
-/// 4. registry default (`default_instance`, or single instance)
-pub(crate) fn resolve_config_path_with_user_home(
-    user: &UserHome,
-    cli_config: Option<&Path>,
-    cli_instance: Option<&str>,
-) -> Result<PathBuf> {
     if let Some(path) = cli_config {
         return Ok(path.to_path_buf());
     }
     if let Some(env) = std::env::var_os(BRAID_INSTANCE_HOME_ENV) {
         return Ok(PathBuf::from(env).join("config.toml"));
     }
+    let user = UserHome::resolve(None)?;
     let registry = user.load_registry()?;
 
     let key = if let Some(key) = cli_instance {

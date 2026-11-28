@@ -1332,7 +1332,7 @@ pub fn filter_html_comments(markdown: &str) -> String {
             _ => false,
         };
         if is_comment && let Some(range) = source_range(markdown, &line_offsets, data.sourcepos) {
-            ranges.push(range);
+            comment_ranges(markdown, range, &mut ranges);
         }
     }
     if ranges.is_empty() {
@@ -1357,6 +1357,44 @@ pub fn filter_html_comments(markdown: &str) -> String {
     }
     visible.push_str(&markdown[cursor..]);
     visible
+}
+
+// A CommonMark HTML block includes the rest of its closing line. Remove the
+// comments inside that block, not visible text following the closing delimiter.
+fn comment_ranges(markdown: &str, (start, end): (usize, usize), ranges: &mut Vec<(usize, usize)>) {
+    let source = &markdown[start..end];
+    let bytes = source.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor..].starts_with(b"<!--") {
+            let comment_end = source[cursor + 4..]
+                .find("-->")
+                .map_or(bytes.len(), |offset| cursor + 4 + offset + 3);
+            ranges.push((start + cursor, start + comment_end));
+            cursor = comment_end;
+        } else if bytes[cursor] == b'<'
+            && (bytes.get(cursor + 1).is_some_and(u8::is_ascii_alphabetic)
+                || bytes.get(cursor + 1) == Some(&b'/')
+                    && bytes.get(cursor + 2).is_some_and(u8::is_ascii_alphabetic))
+        {
+            // A comment delimiter in an HTML attribute is literal attribute
+            // content. Skip the tag while respecting its quoted values.
+            let mut quote = None;
+            cursor += 1;
+            while cursor < bytes.len() {
+                let byte = bytes[cursor];
+                cursor += 1;
+                match (quote, byte) {
+                    (None, b'>') => break,
+                    (None, b'\'' | b'"') => quote = Some(byte),
+                    (Some(delimiter), _) if byte == delimiter => quote = None,
+                    _ => {}
+                }
+            }
+        } else {
+            cursor += 1;
+        }
+    }
 }
 
 fn line_offsets(markdown: &str) -> Vec<usize> {
@@ -3017,3 +3055,7 @@ struct PrFirstRepository {
 #[cfg(test)]
 #[path = "context/reading_tests.rs"]
 mod reading_tests;
+
+#[cfg(test)]
+#[path = "context/filter_tests.rs"]
+mod filter_tests;

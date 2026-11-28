@@ -298,7 +298,7 @@ impl GroupDriver<'_> {
             };
         let Some(candidate) = candidate else { return };
         if candidate.action == "unassign" && self.collaboration.is_builtin() {
-            if let Err(error) = self.settle_builtin_pr_unassignment(candidate).await {
+            if let Err(error) = self.settle_idle_unassignment(candidate.event_id).await {
                 tracing::error!(%error, "cannot settle built-in PR unassignment");
             }
             return;
@@ -306,25 +306,6 @@ impl GroupDriver<'_> {
         if let Err(error) = Box::pin(self.materialize_pr_assignment(candidate)).await {
             tracing::error!(%error, "cannot materialize PR Implementation Agent assignment");
         }
-    }
-
-    async fn settle_builtin_pr_unassignment(&self, candidate: AssignmentCandidate) -> Result<()> {
-        // The immutable unassign event retires this generation even if a later
-        // assignment has already restored the same actor in the current snapshot.
-        for active in
-            self.store.provider_resume_candidates(self.spec.profile.id.clone(), "pr".into())?
-        {
-            if active.number == candidate.number {
-                self.quiesce_session(&active.provider_session_id).await?;
-            }
-        }
-        let outcome = self.store.retire_unassigned_work_item(candidate.event_id, 0)?;
-        if outcome.settled
-            && let Some(session) = outcome.fenced_provider_session
-        {
-            self.quiesce_session(&session).await?;
-        }
-        Ok(())
     }
 
     pub(super) async fn materialize_pr_assignment(

@@ -150,7 +150,9 @@ mod tests {
         let mut candidate = f.config.clone();
         candidate.profiles.iter_mut().find(|p| p.id == "issue-codex").unwrap().model =
             Some("changed-model".into());
-        assert_eq!(check(&candidate).state, CheckState::Fail);
+        let report = check(&candidate);
+        assert_eq!(report.state, CheckState::Fail);
+        assert!(report.detail.contains("does not match retained"), "{}", report.detail);
         assert_eq!(
             f.db()
                 .query_row(

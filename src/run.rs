@@ -431,18 +431,19 @@ mod tests {
 
     #[test]
     fn observability_changes_do_not_change_the_frozen_run_recipe() {
-        let fixture = crate::writer::tests::Fixture::new(false);
-        let mut config = fixture.config.clone();
-        let frozen = config.runtime.database().with_extension("frozen.toml");
-        let original = toml::to_string_pretty(&config).unwrap();
-        std::fs::write(&frozen, &original).unwrap();
-        config.telemetry.incident_mode = !config.telemetry.incident_mode;
-        config.telemetry.sample_ratio = 1.0;
-        check_frozen_recipe(&frozen, &toml::to_string_pretty(&config).unwrap()).unwrap();
+        let original = include_str!("../config.example.toml");
+        let frozen =
+            std::env::temp_dir().join(format!("braid-recipe-{}.toml", uuid::Uuid::now_v7()));
+        std::fs::write(&frozen, original).unwrap();
+        let mut requested: toml::Table = original.parse().unwrap();
+        requested["telemetry"]["incident_mode"] = true.into();
+        requested["telemetry"]["sample_ratio"] = 1.0.into();
+        check_frozen_recipe(&frozen, &toml::to_string(&requested).unwrap()).unwrap();
         assert_eq!(std::fs::read_to_string(&frozen).unwrap(), original);
-        config.profiles[0].model = Some("different-model".into());
+        requested["profiles"][0]["model"] = "different-model".into();
         let error =
-            check_frozen_recipe(&frozen, &toml::to_string_pretty(&config).unwrap()).unwrap_err();
+            check_frozen_recipe(&frozen, &toml::to_string(&requested).unwrap()).unwrap_err();
+        std::fs::remove_file(frozen).unwrap();
         assert!(error.is::<ConfigurationChanged>());
     }
 }

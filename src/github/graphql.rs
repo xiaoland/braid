@@ -180,15 +180,15 @@ struct GraphQlRequest<'a, V: ?Sized> {
 }
 
 #[derive(Deserialize)]
-pub(super) struct GraphQlEnvelope<T> {
-    pub(super) data: Option<T>,
+struct GraphQlEnvelope<T> {
+    data: Option<T>,
     #[serde(default)]
-    pub(super) errors: Vec<GraphQlError>,
+    errors: Vec<GraphQlError>,
 }
 
 #[derive(Deserialize)]
-pub(super) struct GraphQlError {
-    pub(super) message: String,
+struct GraphQlError {
+    message: String,
     #[serde(rename = "type", default)]
     kind: Option<String>,
 }

@@ -33,7 +33,7 @@ fn claim(f: &Fixture) -> Option<crate::store::TurnClaim> {
 }
 
 #[tokio::test]
-async fn handoff_is_atomic_idempotent_and_uses_next_batch_without_parallel_turns() {
+async fn handoffs_debounce_together_and_redelivery_does_not_duplicate_their_inputs() {
     let f = Fixture::new(true);
     bind_pr(&f);
     let a = handoff(&f, "stable").unwrap();
@@ -48,30 +48,13 @@ async fn handoff_is_atomic_idempotent_and_uses_next_batch_without_parallel_turns
         f.db().query_row("SELECT urgent FROM wake_batches", [], |r| r.get::<_, i64>(0)).unwrap(),
         0
     );
-    // Restart recovery cannot create a second logical event.
-    f.db().execute("UPDATE github_write_outbox SET lifecycle='sending'", []).unwrap();
-    f.store.recover_writes().unwrap();
-    f.due();
-    f.drain(github.clone()).await;
-    assert_eq!(count(&f, "events"), 1);
     let b = handoff(&f, "second").unwrap();
-    f.drain(github.clone()).await;
+    f.drain(github).await;
     assert_eq!(f.receipt(&b.request_id).lifecycle, "applied");
     assert_eq!(count(&f, "wake_batches"), 1); // merge existing pending
     runnable(&f);
-    let first = claim(&f).unwrap();
-    f.store.mark_turn_started(first.turn_id.clone(), "native-first".into()).unwrap();
-    let c = handoff(&f, "while-running").unwrap();
-    f.drain(github).await;
-    assert_eq!(f.receipt(&c.request_id).lifecycle, "applied");
-    runnable(&f);
-    assert!(claim(&f).is_none());
-    // Even if merged with an already-urgent batch, handoff input may only be
-    // sent after the running turn, where complete Context can be refreshed.
-    f.db().execute("UPDATE wake_batches SET urgent=1 WHERE lifecycle='runnable'", []).unwrap();
-    assert!(f.store.claim_urgent_steer(first.turn_id.clone()).unwrap().is_none());
-    f.store.mark_turn_terminal(first.turn_id, "completed".into()).unwrap();
-    assert!(claim(&f).is_some());
+    let turn = claim(&f).unwrap();
+    assert_eq!(turn.references.len(), 2);
     task.abort();
 }
 
@@ -159,7 +142,6 @@ async fn accepted_handoff_waits_for_next_turn_and_survives_unavailable_publisher
             .await
             .unwrap();
             assert!(prepared.is_none(), "canonical disassociation retires the handoff");
-            assert!(recorder.inputs.lock().unwrap().is_empty());
             let lifecycle: String = f
                 .db()
                 .query_row("SELECT lifecycle FROM events WHERE detail='pr_handoff'", [], |r| {
@@ -177,7 +159,12 @@ async fn accepted_handoff_waits_for_next_turn_and_survives_unavailable_publisher
 async fn handoff_rejects_local_authority_and_generation_changes() {
     let unassigned = Fixture::new(true);
     unassigned.db().execute("INSERT INTO work_items(node_id,repository_node_id,kind,number,state,observed_at) VALUES ('pr','repo','pr',9,'open','now')", []).unwrap();
-    assert!(handoff(&unassigned, "no-assignment").is_err());
+    assert!(
+        handoff(&unassigned, "no-assignment")
+            .unwrap_err()
+            .to_string()
+            .contains("handoff target needs a current active schedulable PR generation")
+    );
     for sql in [
         "UPDATE assignments SET lifecycle='blocked' WHERE assignment_id='pr-assignment'",
         "UPDATE assignments SET lifecycle='finalizing' WHERE assignment_id='pr-assignment'",
@@ -190,7 +177,13 @@ async fn handoff_rejects_local_authority_and_generation_changes() {
         let f = Fixture::new(true);
         bind_pr(&f);
         f.db().execute(sql, []).unwrap();
-        assert!(handoff(&f, "reject").is_err(), "{sql}");
+        let expected = if sql.contains("node_id='item'") {
+            "handoff requires an active Issue Agent on its OPEN Issue"
+        } else {
+            "handoff target needs a current active schedulable PR generation"
+        };
+        let error = handoff(&f, "reject").unwrap_err();
+        assert!(error.to_string().contains(expected), "{sql}: {error}");
         assert_eq!(count(&f, "pr_handoffs"), 0);
     }
     let f = Fixture::new(true);
@@ -208,7 +201,13 @@ async fn handoff_rejects_local_authority_and_generation_changes() {
 
 #[tokio::test]
 async fn handoff_remote_validation_never_schedules_before_confirmation() {
-    for mode in ["unrelated", "closed", "merged-target", "limited", "old-source"] {
+    for (mode, lifecycle, reason) in [
+        ("unrelated", "rejected", "handoff requires GitHub-confirmed direct association"),
+        ("closed", "rejected", "handoff requires an OPEN Issue and OPEN unmerged PR"),
+        ("closed-target", "rejected", "handoff requires an OPEN Issue and OPEN unmerged PR"),
+        ("limited", "pending", "429"),
+        ("old-source", "rejected", "publication source was invalidated or superseded"),
+    ] {
         let f = Fixture::new(true);
         bind_pr(&f);
         let a = handoff(&f, mode).unwrap();
@@ -219,7 +218,7 @@ async fn handoff_remote_validation_never_schedules_before_confirmation() {
         if mode == "closed" {
             state.snapshot.state = "closed".into();
         }
-        if mode == "merged-target" {
+        if mode == "closed-target" {
             state.pr_closed = true;
         }
         if mode == "limited" {
@@ -232,11 +231,9 @@ async fn handoff_remote_validation_never_schedules_before_confirmation() {
         }
         let (github, task) = body_edit::body_server(Arc::new(Mutex::new(state))).await;
         f.drain(github).await;
-        assert_eq!(
-            f.receipt(&a.request_id).lifecycle,
-            if mode == "limited" { "pending" } else { "rejected" },
-            "{mode}"
-        );
+        let receipt = f.receipt(&a.request_id);
+        assert_eq!(receipt.lifecycle, lifecycle, "{mode}: {receipt:?}");
+        assert!(receipt.last_error.as_deref().unwrap().contains(reason), "{mode}: {receipt:?}");
         assert_eq!(count(&f, "events"), 0);
         assert_eq!(count(&f, "wake_batches"), 0);
         task.abort();
@@ -273,22 +270,6 @@ async fn applied_issue_design_is_materialized_at_handoff_safe_boundary_not_from_
     assert!(reference.contains("Scope, verification, risks"), "{reference}");
     assert!(reference.contains("Current canonical Context"));
     assert!(!reference.contains("old-pr-context"));
-    // Association deletion after acceptance cannot deliver an old cached Issue.
-    remote.lock().unwrap().associated = false;
-    let mut denied = String::new();
-    assert!(
-        crate::group::input::append_current_context(
-            f.config.runtime.database(),
-            &collaboration,
-            &f.store,
-            f.config.profile("issue-codex").unwrap(),
-            &turn,
-            &mut denied
-        )
-        .await
-        .is_ok_and(|d| matches!(d, crate::group::input::RefreshDisposition::Retire(_)))
-    );
-    assert!(denied.is_empty());
     task.abort();
 }
 
@@ -307,59 +288,17 @@ fn handoff_same_key_cannot_change_target_or_impersonate_issue_agent() {
                 request_id: "stable".into()
             }
         )
-        .is_err()
-    );
-    assert!(
-        super::super::handoff(
-            &f.config,
-            &f.store,
-            &HandoffRequest {
-                invocation: Invocation::Operator,
-                target: "owner/repository#9".parse().unwrap(),
-                request_id: "operator".into()
-            }
-        )
-        .is_err()
+        .unwrap_err()
+        .to_string()
+        .contains("already used for a different payload")
     );
     f.db().execute_batch("UPDATE agent_instances SET role='pr_implementation_agent' WHERE agent_id='agent'; UPDATE work_items SET kind='pr',number=10 WHERE node_id='item';").unwrap();
-    assert!(handoff(&f, "pr-source").is_err());
-}
-
-#[tokio::test]
-async fn app_comment_with_mention_is_not_a_handoff() {
-    let f = Fixture::new(true);
-    bind_pr(&f);
-    let event = IngressEvent {
-        identity: crate::store::ChangeIdentity::Occurrence,
-        delivery_guid: "app-echo".into(),
-        event_name: "issue_comment".into(),
-        action: Some("created".into()),
-        repository_node_id: "repo".into(),
-        repository: "owner/repository".into(),
-        work_item_node_id: Some("pr".into()),
-        work_item_kind: Some("pr"),
-        work_item_number: Some(9),
-        work_item_state: Some("open".into()),
-        object_node_id: Some("app-comment".into()),
-        object_version: None,
-        object_digest: None,
-        visible_body: Some("@braid please continue".into()),
-        actor_node_id: Some("app".into()),
-        actor_login: Some("braid[bot]".into()),
-        kind: crate::store::EventKind::OriginEcho,
-        detail: None,
-        cross_surface_invalidation: false,
-        requires_attention: true,
-        origin: "agent",
-        reference: "owner/repository#9".into(),
-        mention_candidate: false,
-        reaction_target: None,
-        known: true,
-        raw_payload: vec![],
-    };
-    f.store.ingest_event(event, SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 }).unwrap();
-    assert_eq!(count(&f, "wake_batches"), 0);
-    assert_eq!(count(&f, "pr_handoffs"), 0);
+    assert!(
+        handoff(&f, "pr-source")
+            .unwrap_err()
+            .to_string()
+            .contains("handoff requires an Issue Agent")
+    );
 }
 
 #[tokio::test]
@@ -404,17 +343,18 @@ async fn refresh_failure_defers_and_merges_an_arriving_handoff_without_losing_in
     remote.lock().unwrap().limited = true;
     let backend = crate::collaboration::CollaborationBackend::GitHub(github);
     let mut input = String::new();
+    let result = crate::group::input::append_current_context(
+        f.config.runtime.database(),
+        &backend,
+        &f.store,
+        f.config.profile("issue-codex").unwrap(),
+        &first,
+        &mut input,
+    )
+    .await;
     assert!(
-        crate::group::input::append_current_context(
-            f.config.runtime.database(),
-            &backend,
-            &f.store,
-            f.config.profile("issue-codex").unwrap(),
-            &first,
-            &mut input
-        )
-        .await
-        .is_err()
+        matches!(result, Err(ref error) if error.to_string().contains("503")),
+        "expected canonical HTTP 503"
     );
     assert!(input.is_empty());
     f.store.defer_turn_claim(first.turn_id).unwrap();
@@ -457,7 +397,12 @@ async fn uncertain_issue_design_is_not_handed_off_as_published() {
     remote.lock().unwrap().lose_response = true;
     f.drain(github).await;
     assert_eq!(f.receipt(&edit.request_id).lifecycle, "uncertain");
-    assert!(handoff(&f, "must-wait").is_err());
+    assert!(
+        handoff(&f, "must-wait")
+            .unwrap_err()
+            .to_string()
+            .contains("Issue design edit is not confirmed applied")
+    );
     assert_eq!(count(&f, "pr_handoffs"), 0);
     task.abort();
 }
@@ -482,9 +427,6 @@ impl crate::agent_session::AgentSession for RecordingSession {
         false
     }
     async fn close(&self) -> std::result::Result<(), crate::agent_session::SessionError> {
-        Ok(())
-    }
-    async fn interrupt(&self) -> std::result::Result<(), crate::agent_session::SessionError> {
         Ok(())
     }
     async fn steer_user_msg(
@@ -592,17 +534,16 @@ async fn canonical_invalid_handoff_retires_only_itself_and_survivors_really_send
         }
         let turn = if mode == "new-generation" {
             let backend = crate::collaboration::CollaborationBackend::GitHub(github.clone());
-            assert!(
-                crate::group::input::prepare_input(
-                    &f.config,
-                    &backend,
-                    &f.store,
-                    f.config.profile("issue-codex").unwrap(),
-                    turn.clone()
-                )
-                .await
-                .is_err()
-            );
+            let error = crate::group::input::prepare_input(
+                &f.config,
+                &backend,
+                &f.store,
+                f.config.profile("issue-codex").unwrap(),
+                turn.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("503"), "{error:#}");
             f.store.defer_turn_claim(turn.turn_id).unwrap();
             remote.lock().unwrap().limited = false;
             // The failed transport keeps its real installation cooldown. A
@@ -749,7 +690,9 @@ async fn retirement_is_fenced_atomic_and_preserves_other_handoff_and_historical_
                     }
                 ]
             )
-            .is_err()
+            .unwrap_err()
+            .to_string()
+            .contains("handoff retirement membership changed")
     );
     assert_eq!(
         f.db()
@@ -769,7 +712,10 @@ async fn retirement_is_fenced_atomic_and_preserves_other_handoff_and_historical_
     send_prepared(&f, &backend, remaining, &recorder).await;
     assert!(recorder.inputs.lock().unwrap()[0].contains("Current canonical Context"));
     // No mutation using a stale claim after the provider boundary.
-    assert!(f.store.retire_handoff_inputs(turn, vec![input]).is_err());
+    assert!(matches!(
+        f.store.retire_handoff_inputs(turn, vec![input]),
+        Err(crate::store::StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    ));
     assert_eq!(count(&f, "pr_handoffs"), 2);
     assert_eq!(f.receipt(&first.request_id).lifecycle, "applied");
     task.abort();

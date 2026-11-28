@@ -29,6 +29,68 @@ events are never pass oracles.
 验收按本页描述操作真实产品并保留原始证据。自动测试、模拟和包 smoke 可验证
 局部实现，但不能替代本页的真实产品验收。GitHub 对象和人工判断仍是产品验收依据。
 
+## 开发回归与产品验收的分层
+
+修改代码时，先运行所属边界的回归，再由 CI 验证 macOS arm64 和 Linux x86_64。
+每个测试须能指出具体可信回归；不同层保护不同风险时分别保留。不要为了减少
+测试数量删除协议、数据库兼容、授权或停止证明，也不要把测试自建的配置、状态机
+或回执当作生产实现的证明。
+
+| 契约 | 主要自动证明归属 | 仍需真实验收的部分 |
+| --- | --- | --- |
+| 配置、凭据导入、headless setup、公开回执 | `tests/` 中实际 binary 子进程；配置与 doctor 的局部不变式 | GitHub App 转换、登录、provider 认证与安装后的工具环境 |
+| GitHub 准入、完整读取、发布及 uncertain 写入 | `producer`、`context`、`github`、`writer` 的生产 owner，外部 HTTP 固定夹具 | 实际 webhook、GitHub 权限、native 关联及跨仓库行为 |
+| durable intent、租约、迁移和重放 | `store` 的真实 SQLite actor；旧 schema 建库、备份还原、关闭重开 | 已发布旧 binary 升级及现场恢复，不能以直接造库代替 |
+| Context 替换和 provider 事件 | `group`、`provider` 的真实编排；受控外部会话通知和停止回执 | 真实模型消费新 Context、适配器后台执行停止、长轮次中撤销职责 |
+| 内建对象与观测存储 | `platform`、`console` 的 HTTP→SQLite/Git 回归、真实 Console 二进制和两页并发编辑；独立 OTLP 编码器输入 | 完整操作旅程、实际 Harness 与跨宿主运行 |
+| 原生执行与材料 | Node 真实进程树、已安装的 Pi background 插件与 RPC；Profile snapshot 和 auth 文件重新读取 | 其余插件组合、真实模型工具调用及跨宿主进程行为 |
+| 采样与完整敏感证据 | `telemetry` 中真实 SDK→HTTP→protobuf；每次独立子进程初始化 SDK | 生产 Collector 的权限、保留、查询及完整长旅程关联 |
+
+默认入口与 `.github/workflows/ci.yml` 一致：
+
+```shell
+cargo fmt --check
+agent-build cargo clippy --locked --all-targets -- -D warnings
+agent-build cargo test --locked --all-targets
+node --test native/pi/tests/*.test.mjs
+```
+
+`agent-build` 是本机编译串行入口；CI 直接运行相同 Cargo 命令。局部迭代可加
+`--bin braid <模块名>::` 或 `--test <文件名>` 筛选。Linux CI 另启用
+`opentelemetry-otlp/internal-logs`，单独复跑
+`telemetry::tests::telemetry_isolates_collector_rejection_bodies_from_ordinary_diagnostics`，
+验证 SDK 开启内部诊断时，Collector 返回的敏感正文仍不会进入普通日志。
+这不改变发行 binary 的 feature。标为 ignored 的 `telemetry_child` 只供父测试
+用独立子进程调用，父测试负责检查退出状态与所有输出；不能单独计作通过。
+
+Linux CI 在同一次 Cargo 构建后启动一个独立平台，从两个 Chromium 页面编辑同一
+Issue。先提交的一页保存成功，过期页面显示该对象的修订冲突并保留正文；取消刷新
+保留草稿，确认放弃后重新打开才读到已提交正文。复跑时使用本次构建的二进制：
+
+```shell
+npm ci --prefix tests/browser --ignore-scripts
+BRAID_BINARY=/absolute/path/to/braid CHROME_BIN=/absolute/path/to/chromium \
+  node --test tests/browser/draft.test.mjs
+```
+
+Pi 安装或 Rust 适配器变更时，Linux CI 复用本轮编译并按 lock 安装 background
+插件。安装包自带的 Node 验证真实 RPC、工具执行和 EOF 退出。Rust 工厂用例使材料绑定
+在原生启动后失败，并读取工厂返回前留在该执行目录的停止回执。安装步骤需要访问发行
+站点和 npm。其它插件组合和含模型会话各自单独记录。修改打包入口、编译锁或包内材料的 PR，以及实际发行均在两个目标平台运行
+`scripts/verify-package.sh DIST RELEASE_TAG RUST_TARGET`；它从校验和指定的
+归档中运行 binary，核对版本、示例配置及迁移后重开的数据库。
+
+负向用例应断言错误阶段、类型或关键诊断，并有能够到达该守卫的合法前置条件。
+恢复用例应先让真实 owner 写入，关闭并重新打开，再从消费者取回结果。新缺陷
+修复保留同一输入下修复前红、修复后绿的证据。两份 checkout 做对照时，各设独立
+`CARGO_TARGET_DIR`：Cargo 集成测试按固定路径启动 binary，共享 target 曾使另一份
+checkout 的同名产物被当成最新。核对运行的测试名和失败诊断；缺少对照时说明原因。删除或
+迁移测试前，核对原断言在保留测试中的归属；仅重复编译同一模块不算额外证明。
+
+全绿支持上述局部合同，不授予产品发布资格。真实 campaign 仍按下列场景记录
+`pass`、`fail` 或 `unavailable`，尤其不得把 Provider terminal、HTTP 请求受理或
+命令 `prepared` 回执当作任务完成、持久采用或停止确认。
+
 ## Campaign Setup
 
 Create a real Issue whose description contains a distinguishable design fact,
@@ -45,6 +107,25 @@ and pristine worktree states before activating Braid. Record whether the
 installation exposes native Agent App assignment or uses the Trusted Braid
 Mention fallback; the campaign must not claim one mode while exercising the
 other.
+
+### 固定真实 Context 夹具
+
+在专用 campaign 配置上记录 Issue、PR、直接关联的已关闭 Issue、可见评论、
+折叠/删除评论 ID、一个仅出现在第二页的评论标记，以及各自的预期正文片段。
+独立预期来自操作者预先创建的工作项和 GitHub 页面。固定夹具后，在权限受限的
+证据目录执行以下公开命令。命令会在 campaign 的本地账本中记录读取到的修订。
+
+```shell
+"$BRAID_BIN" context issue "$ISSUE" --config "$CONFIG" --page-size 1 > "$EVIDENCE/issue.md"
+"$BRAID_BIN" context pr "$PR" --config "$CONFIG" --page-size 1 > "$EVIDENCE/pr.md"
+```
+
+逐项用真实 GitHub 页面和预先记录的预期核对输出。完整可见正文和后页标记必须
+出现，折叠/删除评论只含各自的元数据，隐藏标记不出现；PR 的关联 Issue 身份与
+数量符合 GitHub，已关闭 Issue 的旧正文不出现。记录每项输入、对象身份和
+pass/fail/unavailable。对超过 hard limit 的独立配置，分别保留 stdout、stderr
+和退出码：必须因 Context 超限失败且 stdout 没有部分正文。缺少对应夹具时
+该项为 unavailable。关于 Agent 实际收到、采用哪版 Context，按旅程 1、3、4 取证。
 
 ## Required Journeys
 

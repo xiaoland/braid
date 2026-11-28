@@ -53,7 +53,8 @@ fn accepted_input_and_turn_terminal_survive_a_missing_publication_table() {
         assert_eq!(intents, ["eyes", "rocket", expected]);
         let owner =
             f.store.acquire_runtime_lease("runtime".into(), "publisher".into(), 60).unwrap();
-        assert!(f.store.claim_github_write(owner.clone()).is_err());
+        let error = f.store.claim_github_write(owner.clone()).unwrap_err();
+        assert!(error.to_string().contains("no such table: github_write_outbox"), "{error}");
         db.execute_batch("ALTER TABLE unavailable_outbox RENAME TO github_write_outbox").unwrap();
         for content in ["eyes", expected] {
             let write = f.store.claim_github_write(owner.clone()).unwrap().unwrap();
@@ -118,14 +119,21 @@ fn context_reset_commits_with_publisher_unavailable_and_clears_a_late_rocket() {
         assert_eq!(lifecycles, ("interrupted".into(), "materializing".into()));
         db.execute_batch("ALTER TABLE unavailable_outbox RENAME TO github_write_outbox").unwrap();
 
-        let rocket = if restarted {
+        drop(db);
+        let (f, owner, rocket) = if restarted {
+            f.store.release_runtime_lease(owner).unwrap();
+            let f = f.reopen();
+            let owner = f
+                .store
+                .acquire_runtime_lease("runtime".into(), "new publisher".into(), 60)
+                .unwrap();
             f.store.recover_writes().unwrap();
             let retry = f.store.claim_github_write(owner.clone()).unwrap().unwrap();
             assert_eq!(retry.intent_id, rocket.intent_id);
             assert_eq!(retry.lifecycle, "uncertain");
-            retry
+            (f, owner, retry)
         } else {
-            rocket
+            (f, owner, rocket)
         };
         f.store.finish_github_write(rocket, "applied", Some("92".into()), None, None).unwrap();
         let removal = f.store.claim_github_write(owner.clone()).unwrap().unwrap();

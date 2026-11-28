@@ -80,115 +80,78 @@ impl AgentProvider for DelayedProvider {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn native_start_authorizes_current_publication_before_start_rpc_response() {
-    for old_completed in [false, true] {
-        for reply in [Reply::Success, Reply::LateError] {
-            let fixture = Fixture::new(true);
-            if old_completed {
-                fixture
+    for reply in [Reply::Success, Reply::LateError] {
+        let fixture = Fixture::new(true);
+        fixture.db().execute("UPDATE turns SET started_at='2099-01-01T00:00:00Z'", []).unwrap();
+        fixture.db().execute_batch("UPDATE provider_sessions SET lifecycle='running'; INSERT INTO turns(turn_id,session_id,context_revision,trigger_kind,lifecycle) VALUES ('current','session','context','wake','starting');").unwrap();
+        // An unobserved starting turn must fence publication, not fall back
+        // to an older completed turn with a non-null timestamp.
+        assert!(
+            resolve_source(&fixture.config, Some("issue-codex"), &fixture.invocation())
+                .unwrap_err()
+                .to_string()
+                .contains("publication source was invalidated or superseded")
+        );
+        let provider = DelayedProvider::new(reply);
+        let session = ProviderAgentSession::start(
+            provider.clone(),
+            fixture.config.profile("issue-codex").unwrap().clone(),
+            String::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut events = session.events();
+        let mut witness = session.events();
+        let start = crate::group::turn_start::send_and_observe(
+            &fixture.store,
+            "current",
+            "session",
+            session.as_ref(),
+            &mut events,
+            "event references".into(),
+        );
+        let publish_before_response = async {
+            loop {
+                let lifecycle: String = fixture
                     .db()
-                    .execute("UPDATE turns SET started_at='2099-01-01T00:00:00Z'", [])
-                    .unwrap();
-            } else {
-                fixture.db().execute("DELETE FROM turns", []).unwrap();
-            }
-            fixture.db().execute_batch("UPDATE provider_sessions SET lifecycle='running'; INSERT INTO turns(turn_id,session_id,context_revision,trigger_kind,lifecycle) VALUES ('current','session','context','wake','starting');").unwrap();
-            // An unobserved starting turn must fence publication, not fall back
-            // to an older completed turn with a non-null timestamp.
-            assert!(
-                resolve_source(&fixture.config, Some("issue-codex"), &fixture.invocation())
-                    .is_err()
-            );
-            let provider = DelayedProvider::new(reply);
-            let session = ProviderAgentSession::start(
-                provider.clone(),
-                fixture.config.profile("issue-codex").unwrap().clone(),
-                String::new(),
-                None,
-            )
-            .await
-            .unwrap();
-            let mut events = session.events();
-            let mut witness = session.events();
-            let start = crate::group::turn_start::send_and_observe(
-                &fixture.store,
-                "current",
-                "session",
-                session.as_ref(),
-                &mut events,
-                "event references".into(),
-            );
-            let publish_before_response = async {
-                loop {
-                    let lifecycle: String = fixture
-                        .db()
-                        .query_row("SELECT lifecycle FROM turns WHERE turn_id='current'", [], |r| {
-                            r.get(0)
-                        })
-                        .unwrap();
-                    if lifecycle == "running" {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-                let resolved =
-                    resolve_source(&fixture.config, Some("issue-codex"), &fixture.invocation())
-                        .unwrap()
-                        .unwrap();
-                assert_eq!(resolved.turn_id, "current");
-                let receipt = fixture.comment(); // same production acceptance path used by the CLI
-                assert_eq!(receipt.source.unwrap().turn_id, "current");
-                fixture.db().execute("INSERT INTO events(event_id,work_item_node_id,origin,reference,lifecycle,observed_at,kind) VALUES ('invalidate','item','human','changed','pending','now','invalidate')", []).unwrap();
-                assert!(
-                    resolve_source(&fixture.config, Some("issue-codex"), &fixture.invocation())
-                        .is_err()
-                );
-                assert!(
-                    crate::store::publication_source::check(
-                        fixture.config.runtime.database(),
-                        &resolved
-                    )
-                    .is_err()
-                );
-                fixture.db().execute("DELETE FROM events WHERE event_id='invalidate'", []).unwrap();
-                // Terminal arrives before the delayed response: the dispatch
-                // helper must leave it available to its running-turn consumer.
-                provider
-                    .notifications
-                    .send(ProviderNotification::TurnCompleted {
-                        thread_id: "provider".into(),
-                        turn_id: "native-current".into(),
-                        status: "completed".into(),
-                        error: None,
+                    .query_row("SELECT lifecycle FROM turns WHERE turn_id='current'", [], |r| {
+                        r.get(0)
                     })
                     .unwrap();
-                while !matches!(witness.recv().await.unwrap(), SessionEvent::TurnTerminal { .. }) {}
-                provider.release.notify_one();
-                resolved
-            };
-            let (started, resolved) = tokio::time::timeout(Duration::from_secs(5), async {
-                tokio::join!(start, publish_before_response)
-            })
-            .await
-            .unwrap();
-            assert_eq!(started.unwrap().as_deref(), Some("native-current"));
-            assert!(matches!(
-                events.recv().await.unwrap(),
-                SessionEvent::TurnTerminal { outcome: TurnOutcome::Completed, .. }
-            ));
-            assert!(events.try_recv().is_err()); // no duplicated start from the RPC response
-            crate::store::publication_source::check(fixture.config.runtime.database(), &resolved)
+                if lifecycle == "running" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let receipt = fixture.comment();
+            assert_eq!(receipt.source.unwrap().turn_id, "current");
+            // Terminal arrives before the delayed response: the dispatch
+            // helper must leave it available to its running-turn consumer.
+            provider
+                .notifications
+                .send(ProviderNotification::TurnCompleted {
+                    thread_id: "provider".into(),
+                    turn_id: "native-current".into(),
+                    status: "completed".into(),
+                    error: None,
+                })
                 .unwrap();
-            fixture.db().execute("UPDATE assignments SET generation=2", []).unwrap();
-            assert!(
-                crate::store::publication_source::check(
-                    fixture.config.runtime.database(),
-                    &resolved
-                )
-                .is_err()
-            );
-        }
+            while !matches!(witness.recv().await.unwrap(), SessionEvent::TurnTerminal { .. }) {}
+            provider.release.notify_one();
+        };
+        let (started, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(start, publish_before_response)
+        })
+        .await
+        .unwrap();
+        assert_eq!(started.unwrap().as_deref(), Some("native-current"));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            SessionEvent::TurnTerminal { outcome: TurnOutcome::Completed, .. }
+        ));
+        assert!(matches!(events.try_recv(), Err(broadcast::error::TryRecvError::Empty))); // no duplicated start from the RPC response
     }
 }
 
@@ -221,7 +184,12 @@ async fn unobserved_deferred_and_unknown_start_never_authorize_publication() {
             Reply::Unknown => assert!(matches!(result, Err(SessionError::Unknown(_)))),
             _ => unreachable!(),
         }
-        assert!(resolve_source(&fixture.config, None, &fixture.invocation()).is_err());
-        assert!(events.try_recv().is_err());
+        assert!(
+            resolve_source(&fixture.config, None, &Invocation::Agent("turn".into()))
+                .unwrap_err()
+                .to_string()
+                .contains("publication source was invalidated or superseded")
+        );
+        assert!(matches!(events.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
     }
 }

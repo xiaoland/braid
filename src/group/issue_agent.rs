@@ -255,60 +255,6 @@ pub(super) async fn resolve_issue_worktree_ref(
 }
 
 impl GroupDriver<'_> {
-    /// Retire an explicitly unassigned built-in generation. GitHub unassignments
-    /// first check current assignees and debounce because webhook assignment flapping
-    /// can be superseded; built-in events record an authoritative responsibility change.
-    pub(super) async fn settle_issue_unassignment(
-        &self,
-        candidate: AssignmentCandidate,
-    ) -> Result<()> {
-        let store = self.store;
-        let github = self.collaboration;
-        let config = self.config;
-        let sessions = &self.sessions;
-        let repository = if github.is_builtin() {
-            RepositoryName::local(&candidate.repository)
-        } else {
-            candidate.repository.parse::<RepositoryName>()?
-        };
-        if !github.is_builtin() {
-            let locator = WorkItemLocator { repository, number: candidate.number };
-            let issue = github.materialize_issue(&locator).await?;
-            if issue
-                .assignees
-                .iter()
-                .any(|assignee| github.assignee_matches(assignee, &self.spec.profile.id))
-            {
-                store.ignore_assignment_event(candidate.event_id)?;
-                return Ok(());
-            }
-        }
-        if github.is_builtin() {
-            for active in
-                store.provider_resume_candidates(self.spec.profile.id.clone(), "issue".into())?
-            {
-                if active.number == candidate.number {
-                    self.quiesce_session(&active.provider_session_id).await?;
-                }
-            }
-        }
-        let outcome = store.retire_unassigned_work_item(
-            candidate.event_id,
-            if github.is_builtin() { 0 } else { config.scheduler.quiet_seconds },
-        )?;
-        if !outcome.settled {
-            return Ok(());
-        }
-        if let Some(provider_session_id) = &outcome.fenced_provider_session
-            && let Some(session) = sessions.get(provider_session_id).await
-            && let Err(error) = session.interrupt().await
-        {
-            tracing::warn!(%error, "cannot interrupt retired Issue Agent turn");
-        }
-        tracing::info!(issue = candidate.number, "retired unassigned Issue Agent Group");
-        Ok(())
-    }
-
     pub(super) async fn materialize_next_issue_assignment(&self) {
         let store = self.store;
         let candidate =
@@ -321,7 +267,7 @@ impl GroupDriver<'_> {
             };
         let Some(candidate) = candidate else { return };
         if candidate.action == "unassign" {
-            if let Err(error) = self.settle_issue_unassignment(candidate).await {
+            if let Err(error) = self.settle_idle_unassignment(candidate.event_id).await {
                 tracing::error!(%error, "cannot settle Issue unassignment");
             }
             return;

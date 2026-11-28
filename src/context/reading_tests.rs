@@ -21,8 +21,8 @@ fn core(pr: bool, version: usize) -> Value {
     }
     value
 }
-fn comment() -> Value {
-    json!({"id":"C1","fullDatabaseId":"2","author":null,"body":"Complete comment body","createdAt":"2026-01-01","updatedAt":"2026-01-01","lastEditedAt":null,"isMinimized":false,"minimizedReason":null,"isPinned":false})
+fn comment(id: &str, body: &str) -> Value {
+    json!({"id":id,"fullDatabaseId":if id == "C1" {"2"} else {"3"},"author":null,"body":body,"createdAt":"2026-01-01","updatedAt":"2026-01-01","lastEditedAt":null,"isMinimized":false,"minimizedReason":null,"isPinned":false})
 }
 #[allow(clippy::too_many_lines)]
 async fn server(
@@ -70,8 +70,17 @@ async fn server(
                         ]
                     } {
                         object[field] = page(
-                            if field == "comments" && !multi {
-                                json!([comment()])
+                            if field == "comments" {
+                                let first_body = if drift && version == 0 {
+                                    "Discarded draft"
+                                } else {
+                                    "First comment"
+                                };
+                                let mut nodes = vec![comment("C1", first_body)];
+                                if !multi {
+                                    nodes.push(comment("C2", "Complete comment body"));
+                                }
+                                json!(nodes)
                             } else {
                                 json!([])
                             },
@@ -80,7 +89,9 @@ async fn server(
                     }
                 } else if !op.ends_with("Core") {
                     object["items"] = page(
-                        if op.ends_with("Comments") { json!([comment()]) } else { json!([]) },
+                        if matches!(op, "IssueComments" | "PrComments") && request["variables"]["cursor"] == "next" {
+                            json!([comment("C2", "Complete comment body")])
+                        } else { json!([]) },
                         false,
                     );
                 }
@@ -103,7 +114,7 @@ async fn server(
                 let mut repository = json!({"id":"R1","nameWithOwner":"owner/repo"});
                 repository[if pr { "pullRequest" } else { "issue" }] = object;
                 let mut result = json!({"data":{"repository":repository,"rateLimit":{"cost":1}}});
-                if op == "ReviewThreadComments" { result["data"]=json!({"node":{"items":page(json!([comment()]),false)},"rateLimit":{"cost":1}}); }
+                if op == "ReviewThreadComments" { result["data"]=json!({"node":{"items":page(json!([comment("C1","Review thread discussion")]),false)},"rateLimit":{"cost":1}}); }
                 if fault == Some("partial") && op.ends_with("FirstPages") {
                     result["errors"] = json!([{"message":"incomplete"}]);
                 }
@@ -154,66 +165,25 @@ async fn materialize(client: &GitHubClient, pr: bool) -> Result<Value, ContextEr
     }
 }
 
-// Measure the pre-combination request bill using the original connection queries,
-// not a source-count assertion. Projects are disabled, associations/threads empty.
-async fn legacy_bill(client: &GitHubClient, pr: bool) {
-    let locator = "owner/repo#1".parse().unwrap();
-    if pr {
-        read_pr_marker(client, &locator, 100).await.unwrap();
-        for query in [
-            PR_ASSIGNEES_QUERY,
-            PR_LABELS_QUERY,
-            PR_ASSOCIATED_ISSUES_QUERY,
-            PR_COMMENTS_QUERY,
-            PR_REVIEWS_QUERY,
-            PR_REVIEW_THREADS_QUERY,
-        ] {
-            paginate_pr::<Value>(client, &locator, 100, query, "legacy bill").await.unwrap();
-        }
-        read_pr_marker(client, &locator, 100).await.unwrap();
-    } else {
-        read_issue_marker(client, &locator, 100).await.unwrap();
-        for query in [
-            ISSUE_ASSIGNEES_QUERY,
-            ISSUE_LABELS_QUERY,
-            ISSUE_LINKED_BRANCHES_QUERY,
-            ISSUE_SUB_ISSUES_QUERY,
-            ISSUE_BLOCKED_BY_QUERY,
-            ISSUE_BLOCKING_QUERY,
-            ISSUE_ASSOCIATED_PRS_QUERY,
-            ISSUE_COMMENTS_QUERY,
-            ISSUE_DUPLICATES_QUERY,
-        ] {
-            paginate_issue::<Value>(client, &locator, 100, query, "legacy bill").await.unwrap();
-        }
-        read_issue_marker(client, &locator, 100).await.unwrap();
-    }
-}
-
 #[tokio::test]
 async fn single_page_bill_and_multipage_output_equivalence() {
     for pr in [false, true] {
-        let (client, ops, task) = server(pr, false, false, None).await;
-        legacy_bill(&client, pr).await;
-        assert_eq!(ops.lock().unwrap().len(), if pr { 10 } else { 13 });
-        assert_eq!(
-            ops.lock()
-                .unwrap()
-                .iter()
-                .filter(|op| op.ends_with("AssociatedPrs") || op.ends_with("AssociatedIssues"))
-                .count(),
-            3
-        );
-        task.abort();
         let (client, ops, task) = server(pr, false, false, None).await;
         let single = materialize(&client, pr).await.unwrap();
         assert_eq!(ops.lock().unwrap().len(), 5);
         assert_eq!(ops.lock().unwrap().iter().filter(|op| op.ends_with("Core")).count(), 2);
         assert_eq!(single["body"], "Full body");
+        let comments = single[if pr { "conversation" } else { "comments" }].as_array().unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0]["node_id"], "C1");
+        assert_eq!(comments[0]["body"], "First comment");
+        assert_eq!(comments[1]["node_id"], "C2");
+        assert_eq!(comments[1]["body"], "Complete comment body");
         task.abort();
+
         let (client, ops, task) = server(pr, true, false, None).await;
         let multi = materialize(&client, pr).await.unwrap();
-        assert_eq!(single, multi);
+        assert_eq!(multi, single);
         assert_eq!(ops.lock().unwrap().len(), 6);
         task.abort();
     }
@@ -224,30 +194,46 @@ async fn drift_discards_and_retries_whole_snapshot_and_partial_errors_fail() {
         let (client, ops, task) = server(pr, false, true, None).await;
         let snapshot = materialize(&client, pr).await.unwrap();
         assert_eq!(snapshot["updated_at"], "1");
+        let comments = snapshot[if pr { "conversation" } else { "comments" }].as_array().unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0]["body"], "First comment");
         assert_eq!(ops.lock().unwrap().len(), 10);
         task.abort();
-        let (client, ops, task) = server(pr, false, false, Some("partial")).await;
-        assert!(materialize(&client, pr).await.is_err());
-        assert_eq!(ops.lock().unwrap().len(), 3);
-        task.abort();
     }
+    let (client, _, task) = server(false, false, false, Some("partial")).await;
+    let error = materialize(&client, false).await.unwrap_err();
+    assert!(
+        matches!(error, ContextError::GitHub(GitHubError::GraphQl(ref message)) if message == "incomplete"),
+        "wrong failure: {error}"
+    );
+    task.abort();
 }
 
 #[tokio::test]
 async fn malformed_pagination_and_unknown_union_never_return_complete_context() {
     for fault in ["missing_cursor", "unknown_union"] {
         let (client, _, task) = server(false, false, false, Some(fault)).await;
-        assert!(materialize(&client, false).await.is_err());
+        let error = materialize(&client, false).await.unwrap_err();
+        match fault {
+            "missing_cursor" => assert!(
+                matches!(error, ContextError::Incomplete { connection: "comments", ref reason, .. } if reason == "hasNextPage was true without an endCursor"),
+                "wrong failure: {error}"
+            ),
+            "unknown_union" => assert!(
+                matches!(error, ContextError::GitHub(GitHubError::Octocrab(ref message)) if message.contains("unknown variant `FutureType`")),
+                "wrong failure: {error}"
+            ),
+            _ => unreachable!(),
+        }
         task.abort();
     }
 }
 #[tokio::test]
 async fn associated_issue_and_review_thread_bodies_are_fully_materialized() {
-    let (client, ops, task) = server(true, false, false, Some("rich")).await;
+    let (client, _, task) = server(true, false, false, Some("rich")).await;
     let result = materialize(&client, true).await.unwrap();
     assert_eq!(result["associated_issues"][0]["body"], "Full body");
-    assert_eq!(result["associated_issues"][0]["comments"][0]["body"], "Complete comment body");
-    assert_eq!(result["review_threads"][0]["comments"][0]["body"], "Complete comment body");
-    assert_eq!(ops.lock().unwrap().len(), 11);
+    assert_eq!(result["associated_issues"][0]["comments"][1]["body"], "Complete comment body");
+    assert_eq!(result["review_threads"][0]["comments"][0]["body"], "Review thread discussion");
     task.abort();
 }
