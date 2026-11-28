@@ -1,0 +1,23 @@
+name: pi-runtime
+on:
+  pull_request:
+    paths: ['native/pi/**', '.github/workflows/pi-runtime.yml']
+  push:
+    branches: [main]
+    paths: ['native/pi/**', '.github/workflows/pi-runtime.yml']
+permissions:
+  contents: read
+
+jobs:
+  installed-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+      - name: Exercise an installed Pi runtime without a model
+        run: |
+          export BRAID_TEST_PI_INSTALL="$RUNNER_TEMP/pi-background"
+          node native/pi/install.mjs "$BRAID_TEST_PI_INSTALL" --plugins background
+          node --test native/pi/acceptance/installed-runtime.test.mjs

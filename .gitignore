@@ -13,3 +13,5 @@
 svc.local.json
 AGENTS.local.md
 # svc:end local-config
+
+/tests/browser/node_modules/

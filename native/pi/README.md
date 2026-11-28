@@ -40,6 +40,15 @@ subagents、background、Context7 和 MCPorter 的局部补丁仅随相应插件
 仍包含尚无公开接线点的插件内部修复及 owned process/service 登记。
 它们不是无补丁上游发行，不应删掉停止或交接能力来换取零补丁。
 
+对全新安装仅选择 `background` 后，可直接验证交付的 Node、Pi SDK 与扩展、工具环境和停止回执。
+下面的验收使用临时 HOME、离线模型描述和本地 Bash，不需要模型账号。它也会检查新建
+session 文件、结束 RPC 输入后进程正常退出，以及随后从执行目录取得完整停止回执。
+
+```sh
+node native/pi/install.mjs "$PWD/runtime/pi-background" --plugins background
+BRAID_TEST_PI_INSTALL="$PWD/runtime/pi-background" node --test native/pi/acceptance/installed-runtime.test.mjs
+```
+
 锁定的 pi-subagents 0.56.0 对自定义角色 frontmatter 使用字符串列表解析，
 `fallbackModels: []` 和 `fallbackModels: false` 都会成为模型名称，不能用于禁用回退。
 只有主模型时省略该字段；需要限制模型范围时配置插件的 modelScope，并通过实际

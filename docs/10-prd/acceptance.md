@@ -42,8 +42,8 @@ events are never pass oracles.
 | GitHub 准入、完整读取、发布及 uncertain 写入 | `producer`、`context`、`github`、`writer` 的生产 owner，外部 HTTP 固定夹具 | 实际 webhook、GitHub 权限、native 关联及跨仓库行为 |
 | durable intent、租约、迁移和重放 | `store` 的真实 SQLite actor；旧 schema 建库、备份还原、关闭重开 | 已发布旧 binary 升级及现场恢复，不能以直接造库代替 |
 | Context 替换和 provider 事件 | `group`、`provider` 的真实编排；受控外部会话通知和停止回执 | 真实模型消费新 Context、适配器后台执行停止、长轮次中撤销职责 |
-| 内建对象与观测存储 | `platform`、`console` 的 HTTP→SQLite/Git 回归；独立 OTLP 编码器输入 | 浏览器草稿、并发交互、serve 装配和实际 Harness 控制 |
-| 原生执行与材料 | Node 真实进程树；Profile snapshot 和 auth 文件重新读取 | 锁定 Pi 安装、插件组合、真实模型工具调用及跨宿主进程行为 |
+| 内建对象与观测存储 | `platform`、`console` 的 HTTP→SQLite/Git 回归、真实 Console 二进制和两页并发编辑；独立 OTLP 编码器输入 | 完整操作旅程、实际 Harness 与跨宿主运行 |
+| 原生执行与材料 | Node 真实进程树、已安装的 Pi background 插件与 RPC；Profile snapshot 和 auth 文件重新读取 | 其余插件组合、真实模型工具调用及跨宿主进程行为 |
 | 采样与完整敏感证据 | `telemetry` 中真实 SDK→HTTP→protobuf；每次独立子进程初始化 SDK | 生产 Collector 的权限、保留、查询及完整长旅程关联 |
 
 默认入口与 `.github/workflows/ci.yml` 一致：
@@ -62,6 +62,23 @@ node --test native/pi/tests/*.test.mjs
 实际启用 SDK 内部错误诊断，验证 Collector 返回的敏感正文不会进入普通日志。
 这不改变发行 binary 的 feature。标为 ignored 的 `telemetry_child` 只供父测试
 用独立子进程调用，父测试负责检查退出状态与所有输出；不能单独计作通过。
+
+Linux CI 在同一次 Cargo 构建后启动一个独立平台，从两个 Chromium 页面编辑同一
+Issue。先提交的一页保存成功，过期页面显示该对象的修订冲突并保留正文；取消刷新
+保留草稿，确认放弃后重新打开才读到已提交正文。复跑时使用本次构建的二进制：
+
+```shell
+npm ci --prefix tests/browser --ignore-scripts
+BRAID_BINARY=/absolute/path/to/braid CHROME_BIN=/absolute/path/to/chromium \
+  node --test tests/browser/draft.test.mjs
+```
+
+Pi 安装变更触发独立的 Linux `pi-runtime` 工作流：按 lock 安装 background
+插件，启动安装包中的 Node/Pi，以真实 RPC 读取状态、运行工具、关闭执行并离线
+检查回执。安装步骤需要访问发行站点和 npm；模型未参与。其它插件组合和含模型
+会话各自单独记录。发行工作流在每个平台上传前运行
+`scripts/verify-package.sh DIST RELEASE_TAG RUST_TARGET`；它从校验和指定的
+归档中运行 binary，核对版本、示例配置及迁移后重开的数据库。
 
 负向用例应断言错误阶段、类型或关键诊断，并有能够到达该守卫的合法前置条件。
 恢复用例应先让真实 owner 写入，关闭并重新打开，再从消费者取回结果。新缺陷
@@ -88,6 +105,29 @@ and pristine worktree states before activating Braid. Record whether the
 installation exposes native Agent App assignment or uses the Trusted Braid
 Mention fallback; the campaign must not claim one mode while exercising the
 other.
+
+### 固定真实 Context 夹具
+
+在专用 campaign 配置上记录 Issue、PR、直接关联的已关闭 Issue、可见评论、
+折叠/删除评论 ID、一个仅出现在第二页的评论标记，以及各自的预期正文片段。
+独立预期来自操作者预先创建的工作项和 GitHub 页面。固定夹具后，在权限受限的
+证据目录执行以下公开命令。命令会在 campaign 的本地账本中记录读取到的修订。
+
+```shell
+"$BRAID_BIN" context issue "$ISSUE" --config "$CONFIG" --page-size 1 > "$EVIDENCE/issue.md"
+"$BRAID_BIN" context issue "$ISSUE" --config "$CONFIG" > "$EVIDENCE/issue-default.md"
+"$BRAID_BIN" context pr "$PR" --config "$CONFIG" --page-size 1 > "$EVIDENCE/pr.md"
+"$BRAID_BIN" context pr "$PR" --config "$CONFIG" > "$EVIDENCE/pr-default.md"
+cmp "$EVIDENCE/issue.md" "$EVIDENCE/issue-default.md"
+cmp "$EVIDENCE/pr.md" "$EVIDENCE/pr-default.md"
+```
+
+比对两种分页得到的字节后，再逐项核对独立预期：完整可见正文和后页标记必须
+出现，折叠/删除评论只含各自的元数据，隐藏标记不出现；PR 的关联 Issue 身份与
+数量符合 GitHub，已关闭 Issue 的旧正文不出现。记录每项输入、对象身份和
+pass/fail/unavailable。对超过 hard limit 的独立配置，分别保留 stdout、stderr
+和退出码：必须因 Context 超限失败且 stdout 没有部分正文。缺少对应夹具时
+该项为 unavailable。关于 Agent 实际收到、采用哪版 Context，按旅程 1、3、4 取证。
 
 ## Required Journeys
 

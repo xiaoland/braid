@@ -33,7 +33,9 @@ jobs:
         env:
           BRAID_BUILD_TARGET: ${{ matrix.target }}
           BRAID_RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
-        run: scripts/package.sh
+        run: |
+          scripts/package.sh
+          scripts/verify-package.sh dist "$BRAID_RELEASE_TAG" "$BRAID_BUILD_TARGET"
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}

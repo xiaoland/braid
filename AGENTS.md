@@ -68,6 +68,13 @@ this repository; do not modify user-scope Agent instructions.
 - Product acceptance is real black-box GitHub-to-Agent behavior. Compile,
   formatting, lint, protocol probes, and diagnostic scripts support delivery
   but do not substitute for `docs/10-prd/acceptance.md`.
+- Route regressions through the owner of the decision. Use the built binary for
+  CLI, process and browser contracts, and the existing binary unit target for
+  private Rust modules. Importing source files into integration tests registers
+  their unit tests again under a different executable.
+- A restart claim needs a durable write and a fresh reader. Assert the reason for
+  rejection with otherwise valid prerequisites. When retiring a fixture, check
+  its callers outside tests and remove any accessors needed solely by that fixture.
 - The Agent may make coherent verified commits in this repository without
   per-commit approval. Pushes, releases, external GitHub mutations, and changes
   outside this repository retain their own authority gates.

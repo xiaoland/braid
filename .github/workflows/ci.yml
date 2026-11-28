@@ -33,6 +33,13 @@ jobs:
       - run: cargo check --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
+      - name: Verify conflicting Console edits in two browser pages
+        if: matrix.name == 'linux'
+        env:
+          CHROME_BIN: /usr/bin/google-chrome
+        run: |
+          npm ci --prefix tests/browser --ignore-scripts
+          node --test tests/browser/draft.test.mjs
       - name: Verify OTLP internal diagnostics stay out of ordinary logs
         if: matrix.name == 'linux'
         run: cargo test --locked --bin braid --features opentelemetry-otlp/internal-logs telemetry::tests
