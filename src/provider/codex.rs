@@ -399,3 +399,31 @@ fn parse_codex_notification(frame: &Value) -> Option<ProviderNotification> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_errors_do_not_finish_a_codex_turn_before_its_terminal_frame() {
+        assert!(
+            parse_codex_notification(&json!({
+                "method":"error","params":{"threadId":"thread-A","turnId":"turn-B",
+                "error":{"message":"connection lost"},"willRetry":true}
+            }))
+            .is_none()
+        );
+        let started = parse_codex_notification(&json!({"method":"turn/started","params":{
+            "threadId":"thread-A","turn":{"id":"turn-B","status":"inProgress"}
+        }}));
+        assert!(matches!(started, Some(ProviderNotification::TurnStarted { thread_id, turn_id })
+            if thread_id == "thread-A" && turn_id == "turn-B"));
+        let terminal = parse_codex_notification(&json!({"method":"turn/completed","params":{
+            "threadId":"thread-A","turn":{"id":"turn-B","status":"failed","error":{"message":"retry exhausted"}}
+        }}));
+        assert!(
+            matches!(terminal, Some(ProviderNotification::TurnCompleted { thread_id, turn_id, status, error: Some(reason) })
+            if thread_id == "thread-A" && turn_id == "turn-B" && status == "failed" && reason == "retry exhausted")
+        );
+    }
+}

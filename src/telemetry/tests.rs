@@ -76,11 +76,11 @@ fn telemetry_child() {
         assert_eq!(
             telemetry::emit_payload_event(&telemetry::PayloadEvidence {
                 github_body: &payload,
-                github_summary: &payload,
-                credential: &payload,
-                provider_transcript: &payload,
-                webhook_payload: &payload,
-                local_path: &payload,
+                github_summary: &format!("summary:{payload}"),
+                credential: &format!("credential:{payload}"),
+                provider_transcript: &format!("transcript:{payload}"),
+                webhook_payload: &format!("webhook:{payload}"),
+                local_path: &format!("/diagnostic/{payload}"),
             }),
             sampled
         );
@@ -280,47 +280,7 @@ fn verify_otlp(requests: &[(String, Vec<u8>)], ratio: &str, probe: bool) {
             other => panic!("unexpected signal {other}"),
         }
     }
-    let payload = format!("{SENTINEL}{}END", "x".repeat(100_000));
-    let mut payload_records = 0;
-    for record in log_records {
-        assert!(
-            !serde_json::to_string(&record).unwrap().contains(RESPONSE_SENTINEL),
-            "collector response recursed into OTLP logs"
-        );
-        let matches: Vec<_> = record.attributes.iter().filter(|attribute| {
-            attribute.value.as_ref().is_some_and(|value| matches!(&value.value, Some(opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(text)) if text.contains(SENTINEL)))
-        }).collect();
-        if matches.is_empty() {
-            continue;
-        }
-        payload_records += 1;
-        assert_eq!(ratio, "1");
-        assert!(
-            span_ids.contains(&(record.trace_id.clone(), record.span_id.clone())),
-            "payload missing exported parent"
-        );
-        for attribute in matches {
-            let text = serde_json::to_value(attribute.value.as_ref().unwrap()).unwrap().to_string();
-            assert!(text.contains(&payload), "incomplete {}", attribute.key);
-        }
-        if record.attributes.iter().any(|attribute| attribute.key == "provider.stream")
-            && !record.attributes.iter().any(|attribute| attribute.key == "provider.execution.id")
-        {
-            for key in ["braid.provider_session.id", "braid.assignment.id", "braid.turn.id"] {
-                assert!(record.attributes.iter().any(|attribute| attribute.key == key));
-            }
-        }
-    }
-    assert_eq!(
-        payload_records,
-        if ratio == "0" {
-            0
-        } else if probe {
-            1
-        } else {
-            6
-        }
-    );
+    verify_payload_records(log_records, &span_ids, ratio == "1", probe);
     if ratio == "0" {
         assert!(span_ids.is_empty());
     }
@@ -333,4 +293,80 @@ fn verify_otlp(requests: &[(String, Vec<u8>)], ratio: &str, probe: bool) {
         panic!("{counter} is not a counter");
     };
     assert!(sum.data_points.iter().any(|point| matches!(point.value, Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(value)) if value > 0)));
+}
+
+fn verify_payload_records(
+    log_records: Vec<opentelemetry_proto::tonic::logs::v1::LogRecord>,
+    span_ids: &[(Vec<u8>, Vec<u8>)],
+    retained: bool,
+    probe: bool,
+) {
+    let payload = format!("{SENTINEL}{}END", "x".repeat(100_000));
+    let mut expected_streams: std::collections::BTreeSet<&str> = if retained && !probe {
+        ["request", "stdout", "stderr", "cleanup.stdout", "cleanup.stderr"].into()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let mut payload_events = 0;
+    for record in log_records {
+        assert!(
+            !serde_json::to_string(&record).unwrap().contains(RESPONSE_SENTINEL),
+            "collector response recursed into OTLP logs"
+        );
+        let fields: std::collections::BTreeMap<_, _> = record
+            .attributes
+            .iter()
+            .filter_map(|field| {
+                use opentelemetry_proto::tonic::common::v1::any_value::Value;
+                match field.value.as_ref()?.value.as_ref()? {
+                    Value::StringValue(text) => Some((field.key.as_str(), text.as_str())),
+                    _ => None,
+                }
+            })
+            .collect();
+        if !fields.values().any(|value| value.contains(SENTINEL)) {
+            continue;
+        }
+        assert!(retained);
+        assert!(
+            span_ids.contains(&(record.trace_id.clone(), record.span_id.clone())),
+            "payload missing exported parent"
+        );
+        if let Some(&stream) = fields.get("provider.stream") {
+            assert!(expected_streams.remove(stream), "duplicate or unexpected stream {stream}");
+            assert!(
+                fields.get("provider.transcript") == Some(&payload.as_str()),
+                "{stream} incomplete"
+            );
+            if stream.starts_with("cleanup.") {
+                assert_eq!(fields.get("provider.execution.id"), Some(&"execution-test"));
+            } else {
+                for (key, expected) in [
+                    ("braid.provider_session.id", "session-test"),
+                    ("braid.assignment.id", "assignment-test"),
+                    ("braid.turn.id", "turn-test"),
+                ] {
+                    assert_eq!(fields.get(key), Some(&expected), "{stream}: {key}");
+                }
+            }
+        } else {
+            payload_events += 1;
+            for (field, prefix) in [
+                ("github.comment.body", ""),
+                ("github.comment.summary", "summary:"),
+                ("credential", "credential:"),
+                ("provider.transcript", "transcript:"),
+                ("github.webhook.payload", "webhook:"),
+                ("local.path", "/diagnostic/"),
+            ] {
+                assert!(
+                    fields.get(field).and_then(|value| value.strip_prefix(prefix))
+                        == Some(payload.as_str()),
+                    "missing, incomplete, or misrouted {field}"
+                );
+            }
+        }
+    }
+    assert!(expected_streams.is_empty(), "missing streams: {expected_streams:?}");
+    assert_eq!(payload_events, usize::from(retained));
 }

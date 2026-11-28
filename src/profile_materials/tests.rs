@@ -1,12 +1,16 @@
 use super::*;
 use serde_json::{Value, json};
 
-fn configuration(root: &Path, kind: CredentialKind) -> Config {
+fn configuration(root: &Path, kind: CredentialKind, install: Option<&Path>) -> Config {
     let mut config: Config = toml::from_str(include_str!("../../config.example.toml")).unwrap();
     for runtime in &mut config.runtimes {
         runtime.adapter_type = "pi".into();
         runtime.version = "1.1.0".into();
         runtime.home = None;
+        if let Some(install) = install {
+            runtime.executable = install.join("pi");
+            runtime.native_runtime = Some(install.join("runtime-manifest.json"));
+        }
     }
     for profile in &mut config.profiles {
         profile.adapter_type = "pi".into();
@@ -60,7 +64,7 @@ fn snapshot_writes_native_model_fields_and_keeps_credentials_out_of_models_json(
     ] {
         let directory = root.join(name);
         fs::create_dir_all(&directory).unwrap();
-        let config = configuration(&directory, kind);
+        let config = configuration(&directory, kind, None);
         let profile = &config.profiles[0];
         let materials = collect(&config, profile).unwrap();
         let home_key = uuid::Uuid::now_v7().to_string();
@@ -87,4 +91,56 @@ fn snapshot_writes_native_model_fields_and_keeps_credentials_out_of_models_json(
         assert_eq!(fs::read(home.join("models.json")).unwrap(), br#"{"providers":{}}"#);
     }
     fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "installed Pi distribution; run with BRAID_TEST_PI_INSTALL and PI_OFFLINE=1"]
+async fn failed_home_binding_stops_the_installed_execution_before_returning() {
+    let install = PathBuf::from(std::env::var_os("BRAID_TEST_PI_INSTALL").unwrap());
+    let root = std::env::temp_dir().join(format!("braid-pi-bind-{}", uuid::Uuid::now_v7()));
+    let homes = root.join(".braid/pi-homes");
+    fs::create_dir_all(&homes).unwrap();
+    // A real post-launch metadata write fails after the SDK has opened its session.
+    fs::write(homes.join("index"), "not a directory").unwrap();
+    let config = configuration(&root, CredentialKind::None, Some(&install));
+    let profile = config.profiles[0].clone();
+    let factories = crate::provider::session_factories(&config).unwrap();
+    let factory = &factories[&profile.id];
+    let result = factory.start(profile, String::new(), "initial context".into()).await;
+
+    let mut executions = fs::read_dir(root.join(".braid/native-executions")).unwrap();
+    let execution = executions.next().unwrap().unwrap();
+    assert!(executions.next().is_none());
+    let id = execution.file_name();
+    let receipt = fs::read(execution.path().join("execution-stop.json"));
+    if receipt.is_err() {
+        // Reclaim only this test's execution when an old/broken adapter abandons it.
+        let cleanup = std::process::Command::new(install.join("bin/node"))
+            .arg(install.join("managed.mjs"))
+            .args(["cleanup", "--execution-dir"])
+            .arg(execution.path())
+            .arg("--execution-id")
+            .arg(&id)
+            .output()
+            .unwrap();
+        assert!(cleanup.status.success());
+        let cleanup: Value = serde_json::from_slice(&cleanup.stdout).unwrap();
+        assert_eq!(cleanup["status"], "stopped", "{cleanup}");
+    }
+    fs::remove_dir_all(root).unwrap();
+    assert!(
+        matches!(result, Err(crate::agent_session::SessionError::Failed(ref reason))
+        if reason.contains("cannot bind Pi session native home")),
+        "{:?}",
+        result.err()
+    );
+    let receipt: Value = serde_json::from_slice(
+        &receipt.expect("failed factory construction omitted the owned-stop receipt"),
+    )
+    .unwrap();
+    assert_eq!(receipt["execution_id"], id.to_str().unwrap());
+    assert_eq!(receipt["scope"], "execution");
+    assert_eq!(receipt["status"], "stopped");
+    assert_eq!(receipt["coverage"], "registered-process-groups-and-inherited-execution-markers");
 }

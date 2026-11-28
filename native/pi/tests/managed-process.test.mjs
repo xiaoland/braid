@@ -69,13 +69,14 @@ function execution(t) {
   };
 }
 
-function assertNotExecuting(pid) {
+function isExecuting(pid) {
   // Independent OS observation: do not reuse managed.mjs's process selector
   // as the expected value for its own stop decision. Zombies cannot execute.
   const observed = spawnSync('/bin/ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8' });
   assert.equal(observed.error, undefined);
   assert.ok(observed.status === 0 || observed.status === 1, observed.stderr);
-  assert.ok(!observed.stdout.trim() || /^[ZX]/.test(observed.stdout.trim()), `PID ${pid} still executes: ${observed.stdout}`);
+  const state = observed.stdout.trim();
+  return Boolean(state) && !/^[ZX]/.test(state);
 }
 
 test('owned stop reaches a real grandchild and fences later launches', { timeout: 20000 }, async t => {
@@ -92,11 +93,11 @@ test('owned stop reaches a real grandchild and fences later launches', { timeout
   assert.ok(Number.isInteger(leaf) && leaf > 1);
   fixture.track(started.payload_pid);
   fixture.track(leaf);
-  assert.doesNotThrow(() => process.kill(leaf, 0));
+  assert.equal(isExecuting(leaf), true);
   const terminal = await finishManagedProcess(child, { observation: 'test_stop', observed_at: Date.now() });
   assert.equal(terminal.status, 'stopped', JSON.stringify(terminal));
-  assertNotExecuting(started.payload_pid);
-  assertNotExecuting(leaf);
+  assert.equal(isExecuting(started.payload_pid), false);
+  assert.equal(isExecuting(leaf), false);
   await child.managedClose;
   const persisted = JSON.parse(fs.readFileSync(path.join(fixture.directory, 'terminals', `${started.start_id}.json`), 'utf8'));
   assert.equal(persisted.execution_id, fixture.id);
@@ -123,7 +124,7 @@ test('ambiguous persisted ownership reports unknown without killing the payload'
     const result = await cleanupOwnedExecution({ directory: fixture.directory, id: fixture.id });
     assert.equal(result.status, 'unknown');
     assert.match(result.reason, /another boot identity/);
-    assert.doesNotThrow(() => process.kill(started.payload_pid, 0));
+    assert.equal(isExecuting(started.payload_pid), true);
     const persisted = JSON.parse(fs.readFileSync(path.join(fixture.directory, 'execution-stop.json'), 'utf8'));
     assert.equal(persisted.status, 'unknown');
   } finally {
