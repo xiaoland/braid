@@ -424,8 +424,10 @@ fn object_digest(node_id: &str, version: &str, body: Option<&str>) -> String {
 
 pub fn has_visible_mention(markdown: &str, handle: &str) -> bool {
     let mention = if handle.starts_with('@') { handle.to_owned() } else { format!("@{handle}") };
+    // A CommonMark comment block can include visible prose after its closing delimiter.
+    let visible = markdown.contains("<!--").then(|| context::filter_html_comments(markdown));
     let arena = Arena::new();
-    let root = parse_document(&arena, markdown, &Options::default());
+    let root = parse_document(&arena, visible.as_deref().unwrap_or(markdown), &Options::default());
     let mut stack = root.children().collect::<Vec<_>>();
     while let Some(node) = stack.pop() {
         let data = node.data.borrow();

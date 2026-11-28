@@ -54,7 +54,10 @@ fn exact_visible_mention_excludes_code_quotes_comments_and_other_handles() {
         ("```text\n@braid\n```", false),
         ("> @braid", false),
         ("<!-- @braid -->", false),
-        ("<!-- hidden -->\n\n@braid", true),
+        ("<!-- hidden --> @braid", true),
+        ("<!-- hidden --> `@braid`", false),
+        ("<!-- hidden --> [review](/@braid)", false),
+        ("<!-- hidden --> [@braid](/review)", true),
     ] {
         for handle in ["braid", "@braid"] {
             assert_eq!(has_visible_mention(body, handle), expected, "{body:?}, {handle}");
