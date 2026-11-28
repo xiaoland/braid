@@ -165,10 +165,14 @@ fn instance_selectors_route_to_the_expected_config_and_doctor_names_cross_instan
             home.join(expected).join("state/braid.sqlite3").to_str().unwrap()
         );
     }
+    let output = command().args(["migrate", "apply", "--instance", "second"]).output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
     let output = command().args(["status", "--instance", "second", "--json"]).output().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["config_schema"], 2);
+    assert_eq!(status["database"]["pending_migrations"], 0);
+    assert!(status["database"]["schema_version"].as_u64().unwrap() > 0);
     let output = command().args(["doctor", "--json"]).output().unwrap();
     assert!(!output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

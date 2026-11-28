@@ -76,7 +76,7 @@ BRAID_BINARY=/absolute/path/to/braid CHROME_BIN=/absolute/path/to/chromium \
 Pi 安装变更触发独立的 Linux `pi-runtime` 工作流：按 lock 安装 background
 插件，启动安装包中的 Node/Pi，以真实 RPC 读取状态、运行工具、关闭执行并离线
 检查回执。安装步骤需要访问发行站点和 npm；模型未参与。其它插件组合和含模型
-会话各自单独记录。发行工作流在每个平台上传前运行
+会话各自单独记录。修改打包入口和包内材料的 PR 以及实际发行均在两个目标平台运行
 `scripts/verify-package.sh DIST RELEASE_TAG RUST_TARGET`；它从校验和指定的
 归档中运行 binary，核对版本、示例配置及迁移后重开的数据库。
 

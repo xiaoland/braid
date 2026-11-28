@@ -63,6 +63,7 @@ test('并发编辑被拒绝后保留本页草稿，重新打开对象可读到�
   await first.getByText('第一位操作者已保存', { exact: true }).filter({ visible: true }).first().waitFor();
   await second.getByRole('button', save).click();
   await second.getByRole('status').getByText(/object #1 revision is \d+, expected \d+/).waitFor();
+  await second.getByRole('button', save).and(second.locator(':enabled')).waitFor();
   assert.equal(await editor(second).inputValue(), '第二位操作者的草稿');
 
   await second.getByRole('button', { name: '刷新', exact: true }).click();
