@@ -8,6 +8,7 @@ use crate::{
     store::{EventKind, IngressEvent, SchedulerPolicy, StoreActor},
     writer::tests::{Fixture, issue_context_server},
 };
+use rusqlite::OptionalExtension as _;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -891,7 +892,6 @@ async fn builtin_running_unassignment(
     store.advance_scheduler().unwrap();
 
     let (session_id, turn_id) = tokio::time::timeout(limit, async {
-        use rusqlite::OptionalExtension as _;
         loop {
             let running = f
                 .db()
@@ -1143,15 +1143,19 @@ async fn worker_stops_a_running_unassigned_issue_only_after_its_quiet_window() {
     assert_eq!(captured.inputs.lock().unwrap().len(), 1);
     shutdown.send(true).unwrap();
     worker.await.unwrap().unwrap();
-    let status: String = f
+    let status = f
         .db()
         .query_row(
             "SELECT body FROM operational_status_facts WHERE assignment_id='assignment'",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )
-        .expect("an unobserved turn terminal must publish the configured operational status");
-    assert!(status.contains("unknown"));
-    assert!(status.contains("unassignment did not observe the active turn terminal"));
+        .optional()
+        .unwrap();
+    assert!(
+        status.as_deref().is_some_and(|body| body.contains("执行状态：unknown")
+            && body.contains("unassignment did not observe the active turn terminal")),
+        "an unobserved turn terminal must publish the configured operational status: {status:?}"
+    );
     http.abort();
 }
