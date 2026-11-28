@@ -6,9 +6,9 @@ GitHub mutation authority by itself.
 
 ## Supported Shape
 
-The first supported artifact is a signed/checksummed macOS arm64 `braid` binary.
-It runs without Python, PDM, Cargo, or a source checkout. Linux x86_64 is the
-next target. Runtime prerequisites remain explicit:
+The packaged macOS arm64 `braid` archive has a SHA-256 checksum. The binary runs
+without Python, PDM, Cargo, or a source checkout. Linux x86_64 is the next target.
+Runtime prerequisites remain explicit:
 
 - Git and `gh` for Agent workflows;
 - the configured Codex or Pi executable and its credentials;
@@ -53,23 +53,24 @@ Everything below is scoped by trust boundary:
 ```text
 ~/.braid/
   registry.toml                 # instance registry (SSoT)
-  config.toml                   # optional user defaults (future)
   secrets/                      # user-level provider API keys
   instances/<key>/
     config.toml                 # instance config, schema version 2
     github-app.pem              # GitHub App private key
     secrets.toml                # webhook secret
+    source/                      # repository checkout used to provision worktrees
     state/
       braid.sqlite3
       backups/
-      worktrees/<repository>/<pr-number>-<assignment-generation>/
+      worktrees/
     provider/                   # adapter home (e.g. Codex provider state)
-    logs/                       # optional sampled-log export
 ```
 
 The default `runtime.root` is `<config_dir>/state`. `braid setup` writes
 `instances/<key>` explicitly with the layout above. Multiple instances share
 the same user root but have isolated databases, webhooks, and worktrees.
+The [worktree contract](../20-product-tdd/README.md#durable-state-and-migrations)
+describes generation paths and overrides.
 
 ## Database Lifecycle
 
