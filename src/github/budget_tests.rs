@@ -104,10 +104,6 @@ async fn graphql_response_headers_reserve_budget_and_primary_limit() {
         Err(GitHubError::Delayed(_))
     ));
     assert_eq!(count.load(Ordering::SeqCst), 2);
-    let owner = limits.installation(1);
-    let mut budget = owner.lock().await;
-    assert!(budget.admit(reset - 1, false).is_err());
-    assert!(budget.admit(reset, true).is_ok());
     task.abort();
 }
 

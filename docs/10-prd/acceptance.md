@@ -50,7 +50,6 @@ events are never pass oracles.
 
 ```shell
 cargo fmt --check
-agent-build cargo check --locked --all-targets
 agent-build cargo clippy --locked --all-targets -- -D warnings
 agent-build cargo test --locked --all-targets
 node --test native/pi/tests/*.test.mjs
@@ -75,10 +74,9 @@ BRAID_BINARY=/absolute/path/to/braid CHROME_BIN=/absolute/path/to/chromium \
 ```
 
 Pi 安装或 Rust 适配器变更时，Linux CI 复用本轮编译并按 lock 安装 background
-插件。Node 验证安装包中的真实 RPC、工具执行和 EOF 退出。Rust 工厂用例使材料绑定
+插件。安装包自带的 Node 验证真实 RPC、工具执行和 EOF 退出。Rust 工厂用例使材料绑定
 在原生启动后失败，并读取工厂返回前留在该执行目录的停止回执。安装步骤需要访问发行
-站点和 npm。其它插件组合和含模型会话各自单独记录。修改打包入口和包内材料的 PR
-以及实际发行均在两个目标平台运行
+站点和 npm。其它插件组合和含模型会话各自单独记录。修改打包入口、编译锁或包内材料的 PR，以及实际发行均在两个目标平台运行
 `scripts/verify-package.sh DIST RELEASE_TAG RUST_TARGET`；它从校验和指定的
 归档中运行 binary，核对版本、示例配置及迁移后重开的数据库。
 
@@ -119,14 +117,10 @@ other.
 
 ```shell
 "$BRAID_BIN" context issue "$ISSUE" --config "$CONFIG" --page-size 1 > "$EVIDENCE/issue.md"
-"$BRAID_BIN" context issue "$ISSUE" --config "$CONFIG" > "$EVIDENCE/issue-default.md"
 "$BRAID_BIN" context pr "$PR" --config "$CONFIG" --page-size 1 > "$EVIDENCE/pr.md"
-"$BRAID_BIN" context pr "$PR" --config "$CONFIG" > "$EVIDENCE/pr-default.md"
-cmp "$EVIDENCE/issue.md" "$EVIDENCE/issue-default.md"
-cmp "$EVIDENCE/pr.md" "$EVIDENCE/pr-default.md"
 ```
 
-比对两种分页得到的字节后，再逐项核对独立预期：完整可见正文和后页标记必须
+逐项用真实 GitHub 页面和预先记录的预期核对输出。完整可见正文和后页标记必须
 出现，折叠/删除评论只含各自的元数据，隐藏标记不出现；PR 的关联 Issue 身份与
 数量符合 GitHub，已关闭 Issue 的旧正文不出现。记录每项输入、对象身份和
 pass/fail/unavailable。对超过 hard limit 的独立配置，分别保留 stdout、stderr

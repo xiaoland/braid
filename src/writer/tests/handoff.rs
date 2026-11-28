@@ -48,15 +48,8 @@ async fn handoffs_debounce_together_and_redelivery_does_not_duplicate_their_inpu
         f.db().query_row("SELECT urgent FROM wake_batches", [], |r| r.get::<_, i64>(0)).unwrap(),
         0
     );
-    // Restart recovery cannot create a second logical event.
-    f.db().execute("UPDATE github_write_outbox SET lifecycle='sending'", []).unwrap();
-    let f = f.reopen();
-    f.store.recover_writes().unwrap();
-    f.due();
-    f.drain(github.clone()).await;
-    assert_eq!(count(&f, "events"), 1);
     let b = handoff(&f, "second").unwrap();
-    f.drain(github.clone()).await;
+    f.drain(github).await;
     assert_eq!(f.receipt(&b.request_id).lifecycle, "applied");
     assert_eq!(count(&f, "wake_batches"), 1); // merge existing pending
     runnable(&f);

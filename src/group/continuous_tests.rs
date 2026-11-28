@@ -230,15 +230,6 @@ async fn soft_pressure_reset_replaces_memory_and_delivers_input_with_publication
     assert!(!active.claim.trusted_mention);
     assert_eq!(captured.inputs.lock().unwrap().len(), 1);
     assert!(driver.start_next_agent_turn().await.is_none());
-    assert_eq!(
-        f.db()
-            .query_row("SELECT count(*) FROM context_resets WHERE lifecycle='applied'", [], |r| r
-                .get::<_, i64>(
-                0
-            ))
-            .unwrap(),
-        1
-    );
     let publisher =
         f.store.acquire_runtime_lease("runtime".into(), "publisher".into(), 60).unwrap();
     let error = f.store.claim_github_write(publisher.clone()).unwrap_err();
@@ -429,82 +420,55 @@ async fn unknown_replay_cannot_replace_a_session_without_confirmed_stop() {
 }
 
 #[tokio::test]
-async fn persisted_idle_reset_uses_only_confirmed_native_stop_after_restart() {
-    for confirm_stop in [false, true] {
-        let f = Fixture::new(true);
-        let captured = Arc::new(Captured::default());
-        let (github, http) = issue_context_server("Persisted revised contract").await;
-        let collaboration = CollaborationBackend::GitHub(github);
-        let spec =
-            GroupSpec::new(GroupKind::Issue, &f.config, &f.store, "owner/repository").unwrap();
-        f.store
-            .ingest_event(revision(), SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 })
-            .unwrap();
-        let reset = f
-            .store
-            .begin_context_reset(None, "issue".into(), "issue-codex".into())
-            .unwrap()
-            .unwrap();
-        assert_eq!(reset.active_turn_id, None);
-        assert_eq!(
-            f.store.runtime_status().unwrap().agent_groups[0].session_lifecycle.as_deref(),
-            Some("reset_pending")
-        );
-        if confirm_stop {
-            let driver = worker::GroupDriver {
-                store: &f.store,
-                config: &f.config,
-                collaboration: &collaboration,
-                spec: &spec,
-                sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
-            };
-            driver
-                .sessions
-                .resume("provider".into(), spec.profile.clone(), "instructions".into())
-                .await
-                .unwrap();
-            assert!(driver.quiesce_session("provider").await.unwrap());
-            assert_eq!(*captured.close_attempts.lock().unwrap(), ["provider"]);
-        }
-        drop(f.store);
-        let store = StoreActor::start(
-            f.config.runtime.database().into(),
-            f.config.runtime.backups().into(),
-        )
+async fn persisted_native_stop_allows_an_idle_reset_to_finish_after_restart() {
+    let f = Fixture::new(true);
+    let captured = Arc::new(Captured::default());
+    let (github, http) = issue_context_server("Persisted revised contract").await;
+    let collaboration = CollaborationBackend::GitHub(github);
+    let spec = GroupSpec::new(GroupKind::Issue, &f.config, &f.store, "owner/repository").unwrap();
+    f.store
+        .ingest_event(revision(), SchedulerPolicy { quiet_seconds: 0, event_threshold: 1 })
         .unwrap();
+    let reset =
+        f.store.begin_context_reset(None, "issue".into(), "issue-codex".into()).unwrap().unwrap();
+    assert_eq!(reset.active_turn_id, None);
+    {
         let driver = worker::GroupDriver {
-            store: &store,
+            store: &f.store,
             config: &f.config,
             collaboration: &collaboration,
             spec: &spec,
             sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
         };
-        assert!(driver.materialize_next_context_reset().await);
-        let status = store.runtime_status().unwrap();
-        assert_eq!(status.batches.len(), 1, "the revised contract still requires attention");
-        if confirm_stop {
-            assert_eq!(status.context_resets[0].lifecycle, "applied");
-            assert!(!driver.materialize_next_context_reset().await);
-            let memory = captured.memory.lock().unwrap().clone();
-            assert_eq!(memory.len(), 1);
-            assert!(memory[0].contains("Persisted revised contract"));
-            let running = driver.start_next_agent_turn().await.unwrap();
-            assert_eq!(running.claim.references, ["Human revised the Issue description"]);
-            assert_eq!(captured.inputs.lock().unwrap().len(), 1);
-        } else {
-            assert_eq!(status.context_resets[0].lifecycle, "blocked");
-            assert!(
-                status.agent_groups[0]
-                    .context_error
-                    .as_deref()
-                    .unwrap()
-                    .contains("no stop evidence")
-            );
-            assert!(captured.memory.lock().unwrap().is_empty());
-            assert!(driver.start_next_agent_turn().await.is_none());
-        }
-        http.abort();
+        driver
+            .sessions
+            .resume("provider".into(), spec.profile.clone(), "instructions".into())
+            .await
+            .unwrap();
+        assert!(driver.quiesce_session("provider").await.unwrap());
+        assert_eq!(*captured.close_attempts.lock().unwrap(), ["provider"]);
     }
+    drop(f.store);
+    let store =
+        StoreActor::start(f.config.runtime.database().into(), f.config.runtime.backups().into())
+            .unwrap();
+    let driver = worker::GroupDriver {
+        store: &store,
+        config: &f.config,
+        collaboration: &collaboration,
+        spec: &spec,
+        sessions: SessionManager::new(Arc::new(Factory(captured.clone()))),
+    };
+    assert!(driver.materialize_next_context_reset().await);
+    let status = store.runtime_status().unwrap();
+    assert_eq!(status.context_resets[0].lifecycle, "applied");
+    let memory = captured.memory.lock().unwrap().clone();
+    assert_eq!(memory.len(), 1);
+    assert!(memory[0].contains("Persisted revised contract"));
+    let running = driver.start_next_agent_turn().await.unwrap();
+    assert_eq!(running.claim.references, ["Human revised the Issue description"]);
+    assert_eq!(captured.inputs.lock().unwrap().len(), 1);
+    http.abort();
 }
 
 #[tokio::test]
@@ -695,7 +659,7 @@ async fn builtin_running_unassignment(
         store::BuiltinWriterTurn,
     };
     use axum::http::StatusCode;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let f = Fixture::new(false);
     let root = f.config.runtime.database().parent().unwrap();
@@ -725,16 +689,19 @@ async fn builtin_running_unassignment(
     // A missing terminal is the cold-recovery case. Hold the first fence response
     // there so only the native side can produce the observed durable stop.
     let fence_entered = Arc::new(tokio::sync::Notify::new());
+    let fence_attempts = Arc::new(AtomicUsize::new(0));
     let fence_response = Arc::new(tokio::sync::Semaphore::new(usize::from(terminal.is_some())));
     let routes = crate::platform::router(&platform).unwrap().layer(axum::middleware::from_fn({
         let offline = Arc::clone(&offline);
         let fence_offline = Arc::clone(&fence_offline);
         let fence_entered = Arc::clone(&fence_entered);
+        let fence_attempts = Arc::clone(&fence_attempts);
         let fence_response = Arc::clone(&fence_response);
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let offline = Arc::clone(&offline);
             let fence_offline = Arc::clone(&fence_offline);
             let fence_entered = Arc::clone(&fence_entered);
+            let fence_attempts = Arc::clone(&fence_attempts);
             let fence_response = Arc::clone(&fence_response);
             async move {
                 use axum::response::IntoResponse as _;
@@ -746,6 +713,7 @@ async fn builtin_running_unassignment(
                 if request.uri().path() == "/api/platform/executions/fence"
                     && fence_offline.load(Ordering::Relaxed)
                 {
+                    fence_attempts.fetch_add(1, Ordering::Relaxed);
                     fence_entered.notify_one();
                     let _permit = fence_response.acquire().await.unwrap();
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -867,13 +835,25 @@ async fn builtin_running_unassignment(
             )
             .unwrap()
     };
+    let native_stop_recorded = || {
+        f.db()
+            .query_row(
+                "SELECT execution_stopped_at IS NOT NULL FROM provider_sessions
+                 WHERE provider_session_id=?1",
+                [&writer.session_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    };
     // The turn may already carry an input rejection. A terminal error is
     // appended to that diagnosis, and a successful terminal adds no reason.
     let assert_terminal_reason = |error: Option<&str>, reason: &str| {
         assert_eq!(error.and_then(|body| body.lines().last()), Some(reason), "{error:?}");
     };
+    let missing_terminal = terminal.is_none();
     let (outcome, reason) = if let Some((outcome, reason)) = terminal {
         tokio::time::timeout(limit, async {
+            fence_entered.notified().await;
             while turn_state().0 != outcome.lifecycle() {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
@@ -883,26 +863,43 @@ async fn builtin_running_unassignment(
         if let Some(reason) = &reason {
             assert_terminal_reason(turn_state().1.as_deref(), reason);
         }
+        tokio::time::timeout(limit, async {
+            while fence_attempts.load(Ordering::Relaxed) < 2 {
+                fence_entered.notified().await;
+            }
+        })
+        .await
+        .expect("an unavailable fence must be retried before replacing the old execution");
         (outcome, reason)
     } else {
         tokio::time::timeout(limit, async {
             fence_entered.notified().await;
-            while !f.db().query_row(
-                "SELECT execution_stopped_at IS NOT NULL FROM provider_sessions WHERE provider_session_id=?1",
-                [&writer.session_id], |row| row.get::<_, bool>(0),
-            ).unwrap() {
+            while !native_stop_recorded() {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-        }).await.expect("native stop must reach SQLite while the fence response is withheld");
-        fence_response.add_permits(1);
+        })
+        .await
+        .expect("native stop must reach SQLite while the fence response is withheld");
         assert_eq!(turn_state().0, "running");
         (
             crate::agent_session::TurnOutcome::Unknown,
             Some("unassignment did not observe the active turn terminal".to_owned()),
         )
     };
+    assert!(native_stop_recorded(), "native stop must be durable with the fence unavailable");
     assert_eq!(*captured.close_attempts.lock().unwrap(), ["fresh-provider"]);
-    assert_eq!(store.runtime_status().unwrap().agent_groups[0].assignment_lifecycle, "active");
+    let groups = store.runtime_status().unwrap().agent_groups;
+    assert_eq!(groups.len(), 1, "a new assignment cannot materialize before the fence");
+    assert_eq!(groups[0].assignment_generation, 1);
+    assert_eq!(groups[0].assignment_lifecycle, "active");
+    assert_eq!(
+        captured.memory.lock().unwrap().len(),
+        1,
+        "a replacement native session cannot start before the fence"
+    );
+    if missing_terminal {
+        fence_response.add_permits(1);
+    }
     if restart {
         worker.abort();
         assert!(worker.await.unwrap_err().is_cancelled());
@@ -972,7 +969,7 @@ async fn builtin_running_unassignment(
             "SELECT EXISTS(SELECT 1 FROM execution_fences WHERE client_id=?1 AND execution_id=?2)",
             (&execution.0, &execution.1), |row| row.get(0),
         ).unwrap();
-        assert!(fenced, "the platform must persist the old execution fence before replacement");
+        assert!(fenced, "the platform must persist the fence for the old execution");
     }
     shutdown.send(true).unwrap();
     worker.await.unwrap().unwrap();

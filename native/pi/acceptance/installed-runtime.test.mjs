@@ -33,7 +33,9 @@ test('installed background-only Pi opens a fresh session, serves tools and close
   };
   const pi = path.join(install, 'pi');
   const node = path.join(install, 'bin/node');
-  assert.equal(execFileSync(pi, ['--version'], { cwd: root, env, encoding: 'utf8', timeout: 30000 }).trim(), '1.1.0');
+  const packageConfig = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const expectedVersion = packageConfig.dependencies['@earendil-works/pi-coding-agent'];
+  assert.equal(execFileSync(pi, ['--version'], { cwd: root, env, encoding: 'utf8', timeout: 30000 }).trim(), expectedVersion);
   const child = spawn(node, [
     path.join(install, 'process-owner.mjs'), 'launch', '--start-id', start, '--kind', 'root', '--',
     pi, '--mode', 'rpc', '--session', session, '--provider', 'fixture', '--model', 'offline',

@@ -97,7 +97,17 @@ fn schema13_unknown_turn_replays_input_without_erasing_history_or_duplicating_re
     ));
     assert_eq!(store.runtime_status().unwrap().batches.len(), 1);
 
-    // The Group calls completion only after its adapter has confirmed the old stop.
+    // Record the stop evidence the Group supplies before completing a reset.
+    store.set_provider_stop("old-physical".into(), true).unwrap();
+    assert!(
+        db.query_row(
+            "SELECT execution_stopped_at IS NOT NULL FROM provider_sessions
+             WHERE provider_session_id='old-physical'",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    );
     store
         .complete_context_reset(
             status.context_resets[0].reset_id.clone(),

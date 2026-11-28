@@ -135,7 +135,7 @@ struct Remote {
     target_kind: TargetKind,
     head_created: bool,
     comments: Vec<Value>,
-    comment_reads: usize,
+    comment_requests: Vec<&'static str>,
     lose_comment_response: bool,
     writes: usize,
     limit: Option<u64>,
@@ -166,8 +166,8 @@ async fn server(
             if matches!(remote.lock().unwrap().target_kind, TargetKind::PullRequest) { item["pull_request"] = json!({"url":"pr"}); }
             Json(item).into_response()
         }}))
-        .route("/repos/owner/repository/issues/1/comments", get(move || { let remote=listing.clone(); async move { let mut state=remote.lock().unwrap(); state.comment_reads+=1; Json(state.comments.clone()) } }).post(move |Json(body): Json<Value>| { let remote=writing.clone(); async move {
-            let mut remote=remote.lock().unwrap(); remote.writes+=1;
+        .route("/repos/owner/repository/issues/1/comments", get(move || { let remote=listing.clone(); async move { let mut state=remote.lock().unwrap(); state.comment_requests.push("GET"); Json(state.comments.clone()) } }).post(move |Json(body): Json<Value>| { let remote=writing.clone(); async move {
+            let mut remote=remote.lock().unwrap(); remote.comment_requests.push("POST"); remote.writes+=1;
             let comment=json!({"id":99,"node_id":"comment","url":"https://api.github.com/repos/owner/repository/issues/comments/99","html_url":"https://github.com/owner/repository/issues/1#issuecomment-99","issue_url":"https://api.github.com/repos/owner/repository/issues/1","body":body["body"],"created_at":time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap(),"updated_at":"now","user":{"login":"braid[bot]","id":1,"node_id":"app","type":"Bot","site_admin":false,"avatar_url":"https://example.invalid","url":"https://example.invalid","html_url":"https://example.invalid"}});
             remote.comments.push(comment);
             if remote.lose_comment_response { return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE); }
@@ -305,16 +305,28 @@ async fn outbox_delivery_recovery_and_rate_deadline_use_production_executor() {
 }
 
 #[tokio::test]
-async fn uncertain_comment_recovery_scans_the_remote_conversation_once() {
+async fn uncertain_comment_can_be_created_after_a_canonical_read_finds_no_match() {
     let fixture = Fixture::new(false);
     let receipt = fixture.comment();
-    fixture.db().execute("UPDATE github_write_outbox SET lifecycle='uncertain'", []).unwrap();
+    let owner = fixture
+        .store
+        .acquire_runtime_lease("runtime".into(), "before-restart".into(), 3600)
+        .unwrap();
+    let attempt = fixture.store.claim_github_write(owner.clone()).unwrap().unwrap();
+    assert_eq!(attempt.intent_id, receipt.intent_id);
+    // The process exits after claiming the write, before sending a request.
+    fixture.store.release_runtime_lease(owner).unwrap();
+    let fixture = fixture.reopen();
+    assert_eq!(fixture.store.recover_writes().unwrap(), 1);
+
     let remote = Arc::new(Mutex::new(Remote::default()));
     let (github, http) = server(remote.clone(), true).await;
     fixture.drain(github).await;
-    assert_eq!(fixture.receipt(&receipt.request_id).lifecycle, "applied");
+    let result = fixture.receipt(&receipt.request_id);
+    assert_eq!(result.lifecycle, "applied");
+    assert_eq!(result.remote_database_id.as_deref(), Some("99"));
     let remote = remote.lock().unwrap();
-    assert_eq!(remote.comment_reads, 1);
+    assert_eq!(remote.comment_requests.first(), Some(&"GET"));
     assert_eq!(remote.writes, 1);
     http.abort();
 }

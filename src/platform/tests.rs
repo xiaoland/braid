@@ -314,8 +314,28 @@ async fn published_candidate_diff_and_merge_use_the_frozen_commit_after_branch_m
     let tree = commit.tree().unwrap();
     let blob = git.find_blob(tree.get_name("README.md").unwrap().id()).unwrap();
     assert_eq!(blob.content(), b"published candidate\n");
-    assert_eq!(fixture.get("/api/control/items/1").await["item"]["state"], "open");
     assert_eq!(fixture.get("/api/control/items/2").await["item"]["state"], "closed");
+
+    // The merge-attempt ledger is distinct from the adopted object and event facts.
+    let db = rusqlite::Connection::open(&fixture.config.database).unwrap();
+    db.execute_batch("ALTER TABLE local_merges RENAME TO offline_merges").unwrap();
+    assert_eq!(fixture.get("/api/control/items/1").await["item"]["state"], "open");
+    let item = fixture.get("/api/platform/items/2").await;
+    assert_eq!(item["head_commit"], published.to_string());
+    let context = fixture.get("/api/platform/context/2").await;
+    assert_eq!(context["merged"], true);
+    let (status, rejected) = fixture
+        .post(
+            "/api/control/commands",
+            &json!({"requestId":"reopen", "expectedRevision":item["revision"],
+                "command":{"type":"reopen","number":2}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert!(
+        rejected["error"]["message"].as_str().unwrap().contains("merged PR cannot be reopened"),
+        "{rejected}"
+    );
     fixture.shutdown().await;
 }
 
@@ -471,11 +491,11 @@ async fn prepared_merge_without_a_bound_commit_does_not_reexecute_on_retry() {
 }
 
 #[tokio::test]
-async fn a_bound_but_unadopted_merge_cannot_use_retry_to_bypass_revocation() {
+async fn bound_merge_without_git_adoption_keeps_its_blocked_receipt() {
     let mut fixture = Fixture::new().await;
-    let capability = assigned_pr(&fixture).await;
-    let request = json!({"requestId":"merge-locked", "expectedRevision":2,
-        "actor":"worker", "writer":capability, "command":{"type":"merge", "number":2}});
+    open_pr(&fixture).await;
+    let request = json!({"requestId":"merge-locked", "expectedRevision":1,
+        "command":{"type":"merge", "number":2}});
     let git = git2::Repository::open(&fixture.config.source).unwrap();
     let base = git.refname_to_id("refs/heads/main").unwrap();
     let lock = git.path().join("refs/heads/main.lock");
@@ -489,10 +509,6 @@ async fn a_bound_but_unadopted_merge_cannot_use_retry_to_bypass_revocation() {
     assert!(blocked["result"]["merge"]["merge_commit"].is_string());
     assert_eq!(git.refname_to_id("refs/heads/main").unwrap(), base);
     std::fs::remove_file(lock).unwrap();
-    let (status, revoked) = fixture.post("/api/platform/grants/revoke", &json!({
-        "requestId":"revoke-pr", "clientId":"harness", "itemNumber":2, "actor":"worker", "expectedEpoch":1,
-    })).await;
-    assert_eq!(status, StatusCode::OK, "{revoked}");
     let item = fixture.get("/api/control/items/2").await;
     let events = fixture.get("/api/platform/events?after=0").await;
     fixture.restart().await;

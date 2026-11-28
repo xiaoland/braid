@@ -162,11 +162,14 @@ mod tests {
                 .unwrap();
             assert_eq!(state, expected);
         }
-        assert_eq!(
-            db.query_row("SELECT count(*) FROM github_write_outbox", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
+        let queued = db
+            .prepare("SELECT intent_id,lifecycle FROM github_write_outbox")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(queued, [("missing".to_owned(), "pending".to_owned())]);
         assert_eq!(
             db.query_row("SELECT count(*) FROM assignments", [], |r| r.get::<_, i64>(0)).unwrap(),
             0,

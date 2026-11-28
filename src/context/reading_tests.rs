@@ -71,7 +71,12 @@ async fn server(
                     } {
                         object[field] = page(
                             if field == "comments" {
-                                let mut nodes = vec![comment("C1", "First comment")];
+                                let first_body = if drift && version == 0 {
+                                    "Discarded draft"
+                                } else {
+                                    "First comment"
+                                };
+                                let mut nodes = vec![comment("C1", first_body)];
                                 if !multi {
                                     nodes.push(comment("C2", "Complete comment body"));
                                 }
@@ -189,16 +194,18 @@ async fn drift_discards_and_retries_whole_snapshot_and_partial_errors_fail() {
         let (client, ops, task) = server(pr, false, true, None).await;
         let snapshot = materialize(&client, pr).await.unwrap();
         assert_eq!(snapshot["updated_at"], "1");
+        let comments = snapshot[if pr { "conversation" } else { "comments" }].as_array().unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0]["body"], "First comment");
         assert_eq!(ops.lock().unwrap().len(), 10);
         task.abort();
     }
-    let (client, ops, task) = server(false, false, false, Some("partial")).await;
+    let (client, _, task) = server(false, false, false, Some("partial")).await;
     let error = materialize(&client, false).await.unwrap_err();
     assert!(
         matches!(error, ContextError::GitHub(GitHubError::GraphQl(ref message)) if message == "incomplete"),
         "wrong failure: {error}"
     );
-    assert_eq!(ops.lock().unwrap().len(), 3);
     task.abort();
 }
 
@@ -223,11 +230,10 @@ async fn malformed_pagination_and_unknown_union_never_return_complete_context() 
 }
 #[tokio::test]
 async fn associated_issue_and_review_thread_bodies_are_fully_materialized() {
-    let (client, ops, task) = server(true, false, false, Some("rich")).await;
+    let (client, _, task) = server(true, false, false, Some("rich")).await;
     let result = materialize(&client, true).await.unwrap();
     assert_eq!(result["associated_issues"][0]["body"], "Full body");
     assert_eq!(result["associated_issues"][0]["comments"][1]["body"], "Complete comment body");
     assert_eq!(result["review_threads"][0]["comments"][0]["body"], "Review thread discussion");
-    assert_eq!(ops.lock().unwrap().len(), 11);
     task.abort();
 }

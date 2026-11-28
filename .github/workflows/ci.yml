@@ -32,7 +32,6 @@ jobs:
           node-version: 24.15.0
       - run: node --test native/pi/tests/*.test.mjs
       - run: cargo fmt --check
-      - run: cargo check --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
       - name: Verify the installed Pi runtime and factory cleanup
@@ -43,12 +42,12 @@ jobs:
           PI_OFFLINE: '1'
         run: |
           if git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null &&
-             git diff --quiet "$BASE_SHA" HEAD -- native/pi src/provider.rs src/provider src/profile_materials.rs src/profile_materials src/agent_session.rs Cargo.toml Cargo.lock .github/workflows/ci.yml; then
+             git diff --quiet "$BASE_SHA" HEAD -- native/pi src/config.rs src/provider src/profile_materials.rs src/profile_materials src/agent_session.rs Cargo.toml Cargo.lock .github/workflows/ci.yml; then
             echo 'Installed Pi inputs unchanged'
             exit 0
           fi
           node native/pi/install.mjs "$BRAID_TEST_PI_INSTALL" --plugins background
-          node --test native/pi/acceptance/installed-runtime.test.mjs
+          "$BRAID_TEST_PI_INSTALL/bin/node" --test native/pi/acceptance/installed-runtime.test.mjs
           cargo test --locked --bin braid profile_materials::tests::failed_home_binding_stops_the_installed_execution_before_returning -- --ignored --exact
       - name: Verify conflicting Console edits in two browser pages
         if: matrix.name == 'linux'

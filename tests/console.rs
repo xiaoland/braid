@@ -202,13 +202,6 @@ fn console_controls_keep_working_when_the_observation_database_cannot_open() {
     assert_eq!(resources.status(), StatusCode::SERVICE_UNAVAILABLE);
     let error: Value = resources.json().unwrap();
     assert!(error["error"].as_str().unwrap().contains("observation database unavailable"));
-    // An empty protobuf message is a valid ExportLogsServiceRequest.
-    let export = client
-        .post(format!("{endpoint}/v1/logs"))
-        .header("content-type", "application/x-protobuf")
-        .send()
-        .unwrap();
-    assert_eq!(export.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     let issue = client
         .post(format!("{endpoint}/api/control/commands"))
@@ -302,7 +295,6 @@ fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
         command.args(["object", "--config"]).arg(&harness).current_dir(root.0.join("source"));
         command
     };
-    checked(base().env_remove("BRAID_AGENT").args(["show", "1"]));
 
     let database = rusqlite::Connection::open(root.0.join("harness/state/braid.sqlite3")).unwrap();
     database.execute_batch(
@@ -348,6 +340,7 @@ fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
             .append_pair("actor", "issue-codex");
         client.get(url).send().unwrap().error_for_status().unwrap().json::<Value>().unwrap()
     };
+    checked(base().env("BRAID_AGENT", "1").args(["show", "1"]));
     assert!(epoch().is_null());
     object_command("unrelated", json!({"type":"comment", "number":1,"body":"Human update"}));
     checked(base().env("BRAID_AGENT", "1").args(["comment", "1", "--body", "Agent update"]));

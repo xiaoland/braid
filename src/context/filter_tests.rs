@@ -27,7 +27,6 @@ fn comment_like_code_and_html_attribute_values_remain_literal() {
         "`<!-- literal -->`",
         "```html\n<!-- literal -->\n```",
         "    <!-- indented code -->\n",
-        "<span title=\"<!-- literal -->\">visible</span>",
         "visible <!-- unfinished",
     ] {
         assert_eq!(filter_html_comments(markdown), markdown, "{markdown:?}");

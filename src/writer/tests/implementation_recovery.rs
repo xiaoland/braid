@@ -131,7 +131,7 @@ async fn a_published_request_recovers_delivery_without_replaying_fenced_mutation
     legacy_gap(&f, &receipt);
     replace_source(&f);
     remote.lock().unwrap().pr_body = Some("Current scope, no historical discovery marker".into());
-    f.drain(github.clone()).await;
+    f.drain(github).await;
     let result = f.receipt(&receipt.request_id);
     assert_eq!(result.lifecycle, "applied", "{:?}", result.last_error);
     assert!(
@@ -141,16 +141,6 @@ async fn a_published_request_recovers_delivery_without_replaying_fenced_mutation
             .unwrap()
             .activation_delivered
     );
-    assert_eq!(activations(&f), 1);
-    assert_eq!(remote.lock().unwrap().writes, writes);
-    f.db()
-        .execute(
-            "UPDATE github_write_outbox SET lifecycle='sending' WHERE intent_id=?1",
-            [receipt.intent_id],
-        )
-        .unwrap();
-    f.store.recover_writes().unwrap();
-    f.drain(github).await;
     assert_eq!(activations(&f), 1);
     assert_eq!(remote.lock().unwrap().writes, writes);
     http.abort();

@@ -7,6 +7,8 @@ on:
       - 'scripts/package.sh'
       - 'scripts/verify-package.sh'
       - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       - 'config.example.toml'
       - 'deploy/otel-collector.example.yaml'
       - 'LICENSE'

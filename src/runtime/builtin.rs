@@ -1047,25 +1047,10 @@ mod tests {
         .unwrap()
         .merge_commit;
         assert_eq!(git.refname_to_id(DELIVERY_REF).unwrap().to_string(), merged);
-        let db = rusqlite::Connection::open(&declaration.database).unwrap();
-        db.execute_batch("ALTER TABLE local_merges RENAME TO offline_merges").unwrap();
-        assert_eq!(client.candidate(pr.number).await.unwrap(), candidate.to_string());
-        let root_view: serde_json::Value =
-            client.get(&format!("api/control/items/{}", root.number)).await.unwrap();
-        assert_eq!(root_view["item"]["number"], root.number);
-        let context = client.context(pr.number).await.unwrap();
-        assert!(matches!(context, crate::context::CanonicalContext::PullRequest(pr) if pr.merged));
-        let error = platform.set_state(pr.number, true, "human").unwrap_err();
-        assert!(error.to_string().contains("merged PR cannot be reopened"), "{error:#}");
-        db.execute_batch("ALTER TABLE offline_merges RENAME TO local_merges").unwrap();
         platform.set_state(child.number, false, "human").unwrap();
         let outside = platform.create_child_issue("Outside", "Other run", "human", None).unwrap();
         platform.set_state(outside.number, false, "human").unwrap();
 
-        let healthy: crate::platform::objects::ScopeSnapshot =
-            client.get(&format!("api/platform/scope/{}", root.number)).await.unwrap();
-        assert_eq!(healthy.delivery_commit.as_deref(), Some(merged.as_str()));
-        assert_eq!(healthy.pull_requests.len(), 1);
         let blob = git.blob(b"delivery ref cannot peel to a commit").unwrap();
         let delivery_path = git.path().join(DELIVERY_REF);
         std::fs::write(&delivery_path, format!("{blob}\n")).unwrap();
