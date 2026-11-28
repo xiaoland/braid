@@ -23,7 +23,8 @@ Braid performs these steps automatically:
 3. Parses the tunnel output to obtain a public HTTPS URL such as
    `https://<random>.trycloudflare.com`.
 4. Appends `/webhook` to form the public webhook endpoint.
-5. Sends a signed `ping` probe to that endpoint to confirm GitHub can reach it.
+5. Sends a signed `ping` through that endpoint to verify it reaches Braid's
+   ingress and passes signature verification.
 6. Once reachable, updates the GitHub App's webhook URL to the public endpoint.
 7. Runs the runtime normally.
 8. On clean shutdown, restores the GitHub App's previous webhook URL.
@@ -57,7 +58,9 @@ maps instance keys to their home directories, so `--instance` (or
 
 ## Troubleshooting
 
-- If the tunnel does not converge within 45 seconds, Braid retries up to 3
-  tunnel candidates and then fails with `QuickTunnel` error details in the logs.
+- Braid tries at most five tunnel candidates. Each candidate has up to 45
+  seconds to publish its URL and register the connection. Braid then allows
+  time for DNS propagation before probing the public endpoint. If all
+  candidates fail, Braid reports the last error.
 - `braid tunnel probe --instance <KEY> --url <public-url>` can verify a
   specific URL manually, but normal `serve --tunnel` does this automatically.

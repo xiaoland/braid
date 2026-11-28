@@ -4,12 +4,6 @@ This repository implements Braid: GitHub Issue and pull-request state become the
 durable working memory of local Coding Agents. Apply these instructions only in
 this repository; do not modify user-scope Agent instructions.
 
-<!-- svc:begin navigation sha256=48c8d7b497ed094589c4a192f3ef97450fd7f614712dc1b4b22e9a20578360cd -->
-## SVC
-
-Use the installed `svc` CLI when SVC guidance or project integration is relevant. Discover the current interface through `svc --help` and `svc <command> --help`; `svc lookup` reads the SVC Corpus, not CLI help. Treat unmarked project instructions and documentation as Consumer-owned.
-<!-- svc:end navigation -->
-
 ## Knowledge Owners
 
 - Product purpose, promises, workflows, and scope:
@@ -53,9 +47,13 @@ Use the installed `svc` CLI when SVC guidance or project integration is relevant
 
 ## Repository Workflow
 
+- After fetching, use the remote default branch for mainline work. For work
+  based on a pending PR, verify its head and base and use a dedicated worktree.
+- Use the binary built from that checkout for source verification. The
+  installed `braid` can be from a different release.
 - The clean Rust runtime replaces the obsolete Python prototype; do not carry
   old turn-mirror abstractions, schemas, or compatibility aliases into Rust.
-- Runtime: Rust 1.93+ for the first implementation; commit `Cargo.lock`.
+- Use the toolchain pinned by `rust-toolchain.toml` and commit `Cargo.lock`.
 - Prefer readable deep modules aligned with the Product TDD owners. Do not pass
   `serde_json::Value` across internal boundaries when a typed enum/struct owns
   the contract.
@@ -69,3 +67,14 @@ Use the installed `svc` CLI when SVC guidance or project integration is relevant
 - The Agent may make coherent verified commits in this repository without
   per-commit approval. Pushes, releases, external GitHub mutations, and changes
   outside this repository retain their own authority gates.
+
+<!-- svc:begin -->
+## SVC
+
+Use `svc --help` or `svc <command> --help`.
+
+- `svc status`: inspect project state
+- `svc dev`: manage declared development targets
+
+If `AGENTS.local.md` exists, read it after this file. It is ignored local guidance; shared rules belong here.
+<!-- svc:end -->
