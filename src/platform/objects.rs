@@ -1178,7 +1178,8 @@ fn settle_merge(
             result: Some(serde_json::to_value(merge)?),
             error: None,
         },
-    )
+    )?;
+    Ok(())
 }
 
 fn was_merged(connection: &Connection, number: u64) -> Result<bool> {
