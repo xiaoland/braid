@@ -267,10 +267,7 @@ impl GroupDriver<'_> {
             };
         let Some(candidate) = candidate else { return };
         if candidate.action == "unassign" {
-            if let Err(error) = self
-                .settle_unassignment(crate::store::UnassignmentTarget::Event(candidate.event_id))
-                .await
-            {
+            if let Err(error) = self.settle_idle_unassignment(candidate.event_id).await {
                 tracing::error!(%error, "cannot settle Issue unassignment");
             }
             return;

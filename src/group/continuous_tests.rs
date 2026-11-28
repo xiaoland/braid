@@ -18,6 +18,7 @@ struct Captured {
     steer_error: Mutex<Option<SessionError>>,
     close_error: Mutex<Option<SessionError>>,
     close_attempts: Mutex<Vec<String>>,
+    close_terminal: Mutex<Option<(crate::agent_session::TurnOutcome, Option<String>)>>,
     closed: tokio::sync::Notify,
     steered: tokio::sync::Notify,
 }
@@ -38,11 +39,17 @@ impl SessionFactory for Factory {
         _instructions: String,
         context: String,
     ) -> Result<CreatedSession, SessionError> {
-        self.0.memory.lock().unwrap().push(context);
+        let mut memories = self.0.memory.lock().unwrap();
+        memories.push(context);
+        let id = if memories.len() == 1 {
+            "fresh-provider".to_owned()
+        } else {
+            format!("fresh-provider-{}", memories.len())
+        };
         Ok(CreatedSession {
-            id: "fresh-provider".into(),
+            id: id.clone(),
             session: Arc::new(Session {
-                id: "fresh-provider".into(),
+                id,
                 captured: self.0.clone(),
                 events: broadcast::channel(8).0,
             }),
@@ -76,7 +83,17 @@ impl AgentSession for Session {
     async fn close(&self) -> Result<(), SessionError> {
         self.captured.closed.notify_one();
         self.captured.close_attempts.lock().unwrap().push(self.id.clone());
-        self.captured.close_error.lock().unwrap().clone().map_or(Ok(()), Err)
+        if let Some(error) = self.captured.close_error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        if let Some((outcome, error)) = self.captured.close_terminal.lock().unwrap().take() {
+            let _ = self.events.send(SessionEvent::TurnTerminal {
+                provider_turn_id: "after-revision".into(),
+                outcome,
+                error,
+            });
+        }
+        Ok(())
     }
     async fn send_user_msg(&self, msg: String, steering: bool) -> Result<SendResult, SessionError> {
         assert!(!steering);
@@ -667,8 +684,24 @@ async fn stopping_native_execution_does_not_wait_for_execution_fence() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn builtin_turn_runs_without_writer_service_and_cannot_mint_after_reassignment() {
+    builtin_running_unassignment(crate::agent_session::TurnOutcome::Completed, None).await;
+}
+
+#[tokio::test]
+async fn worker_preserves_a_failed_turn_during_unassignment_while_the_platform_fence_is_offline() {
+    builtin_running_unassignment(
+        crate::agent_session::TurnOutcome::Failed,
+        Some("provider failed while stopping".into()),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn builtin_running_unassignment(
+    outcome: crate::agent_session::TurnOutcome,
+    reason: Option<String>,
+) {
     use crate::{
         builtin::BuiltinClient,
         platform::{PlatformConfig, objects::PlatformObjects},
@@ -755,25 +788,33 @@ async fn builtin_turn_runs_without_writer_service_and_cannot_mint_after_reassign
         store.ingest_builtin_event(pending.event, policy, pending.event_id).unwrap();
         cursor = pending.event_id;
     }
-    let assignment =
-        store.assignment_candidates("test-space".into(), "issue".into(), 1).unwrap().pop().unwrap();
-    let materialization = store
-        .begin_agent_assignment(
-            assignment.event_id,
-            spec.profile_record.clone(),
-            Some("old memory".into()),
-            false,
-        )
-        .unwrap()
-        .unwrap();
-    store
-        .complete_agent_assignment(
-            materialization,
-            "provider".into(),
-            "old memory".into(),
-            "instructions".into(),
-        )
-        .unwrap();
+    let captured = Arc::new(Captured::default());
+    let (shutdown, stop) = tokio::sync::watch::channel(false);
+    let (reports, _receiver) = tokio::sync::mpsc::channel(8);
+    let actor = spec.profile.id.clone();
+    let worker = tokio::spawn(agent_group_worker_backend(
+        Arc::clone(&store),
+        Arc::new(CollaborationBackend::Builtin(Arc::clone(&client))),
+        config,
+        spec,
+        Arc::new(Factory(Arc::clone(&captured))),
+        reports,
+        stop,
+    ));
+    let limit = std::time::Duration::from_secs(5);
+    tokio::time::timeout(limit, async {
+        while !store
+            .runtime_status()
+            .unwrap()
+            .agent_groups
+            .iter()
+            .any(|group| group.assignment_generation == 1 && group.assignment_lifecycle == "active")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("assignment materializes before the first user input");
     platform.reply(issue.number, "Run this turn", "human", None).unwrap();
     for pending in platform.events(cursor, 100).unwrap() {
         store.ingest_builtin_event(pending.event, policy, pending.event_id).unwrap();
@@ -781,70 +822,87 @@ async fn builtin_turn_runs_without_writer_service_and_cannot_mint_after_reassign
     }
     store.advance_scheduler().unwrap();
 
-    let captured = Arc::new(Captured::default());
-    let collaboration = CollaborationBackend::Builtin(Arc::clone(&client));
-    let driver = worker::GroupDriver {
-        store: &store,
-        config: &config,
-        collaboration: &collaboration,
-        spec: &spec,
-        sessions: SessionManager::new(Arc::new(Factory(Arc::clone(&captured)))),
-    };
-    driver
-        .sessions
-        .resume("provider".into(), spec.profile.clone(), "instructions".into())
-        .await
-        .unwrap();
-    let running = driver.start_next_agent_turn().await.unwrap_or_else(|| {
-        panic!("writer service must not gate a turn: {:?}", store.runtime_status().unwrap().batches)
-    });
+    let (session_id, turn_id) = tokio::time::timeout(limit, async {
+        loop {
+            if let Some(group) = store
+                .runtime_status()
+                .unwrap()
+                .agent_groups
+                .into_iter()
+                .find(|group| group.turn_lifecycle.as_deref() == Some("running"))
+            {
+                break (group.provider_session_id.unwrap(), group.active_turn_id.unwrap());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("writer service must not gate a real turn");
     assert_eq!(captured.inputs.lock().unwrap().len(), 1);
-    let writer = BuiltinWriterTurn {
-        session_id: running.claim.provider_session_id,
-        turn_id: running.claim.turn_id,
-        item_number: issue.number,
-        actor: spec.profile.id.clone(),
-    };
+    let writer =
+        BuiltinWriterTurn { session_id, turn_id, item_number: issue.number, actor: actor.clone() };
     let offline_error = client.writer_grant(writer.clone()).await.unwrap_err();
     assert!(offline_error.to_string().contains("503"));
 
     // The old turn never minted a grant. Name equality must not revive it
     // after an unassign/reassign and before those events reach the Harness.
-    platform.assign(issue.number, Some(&spec.profile.id), "human").unwrap();
+    platform.assign(issue.number, Some(&actor), "human").unwrap();
     offline.store(false, Ordering::Relaxed);
     let error = client.writer_grant(writer.clone()).await.unwrap_err();
     assert!(error.to_string().contains("writer authority changed"), "{error:#}");
     offline.store(true, Ordering::Relaxed);
-    // An immutable unassignment still retires the old generation after a
-    // reassignment. Native close alone cannot replace the platform's fence.
+    *captured.close_terminal.lock().unwrap() = Some((outcome, reason.clone()));
+    fence_offline.store(true, Ordering::Relaxed);
     for pending in platform.events(cursor, 100).unwrap() {
         store.ingest_builtin_event(pending.event, policy, pending.event_id).unwrap();
     }
-    let revoked = || crate::store::UnassignmentTarget::RunningTurn(writer.turn_id.clone());
-    fence_offline.store(true, Ordering::Relaxed);
-    let error = driver.settle_unassignment(revoked()).await.unwrap_err();
-    assert!(error.to_string().contains("execution fence unconfirmed"), "{error:#}");
-    assert_eq!(*captured.close_attempts.lock().unwrap(), ["provider"]);
+    // The adapter returned a terminal during close. The worker must retain it
+    // even across a failed independent fence, before creating another generation.
+    let turn_state = || {
+        f.db()
+            .query_row(
+                "SELECT lifecycle,error FROM turns WHERE turn_id=?1",
+                [&writer.turn_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap()
+    };
+    tokio::time::timeout(limit, async {
+        while turn_state().0 != outcome.lifecycle() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("observed provider terminal must be durable while the platform fence is offline");
+    assert_eq!(turn_state().1, reason);
+    assert_eq!(*captured.close_attempts.lock().unwrap(), ["fresh-provider"]);
     assert_eq!(store.runtime_status().unwrap().agent_groups[0].assignment_lifecycle, "active");
     fence_offline.store(false, Ordering::Relaxed);
-    assert!(driver.settle_unassignment(revoked()).await.unwrap());
-    assert_eq!(*captured.close_attempts.lock().unwrap(), ["provider"]);
-    assert_eq!(store.runtime_status().unwrap().agent_groups[0].assignment_lifecycle, "retired");
-    client.fence_all_executions().await.unwrap();
-    let fenced = client.writer_grant(writer).await.unwrap_err();
-    assert!(fenced.to_string().contains("no current writer authority"));
-    let reassignment =
-        store.assignment_candidates("test-space".into(), "issue".into(), 1).unwrap().pop().unwrap();
-    assert_eq!(reassignment.action, "assign");
-    driver.materialize_issue_assignment(reassignment).await.unwrap();
-    let groups = store.runtime_status().unwrap().agent_groups;
-    assert_eq!(groups.len(), 2);
+    let groups = tokio::time::timeout(limit, async {
+        loop {
+            let groups = store.runtime_status().unwrap().agent_groups;
+            if groups.iter().any(|group| {
+                group.assignment_generation == 2 && group.assignment_lifecycle == "active"
+            }) {
+                break groups;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("retire the old generation and materialize its immutable reassignment");
     let retired = groups.iter().find(|group| group.assignment_generation == 1).unwrap();
     let current = groups.iter().find(|group| group.assignment_generation == 2).unwrap();
     assert_eq!(retired.assignment_lifecycle, "retired");
-    assert_eq!(current.assignment_lifecycle, "active");
-    assert_eq!(current.provider_session_id.as_deref(), Some("fresh-provider"));
-    assert_eq!(captured.memory.lock().unwrap().len(), 1);
+    assert_eq!(current.provider_session_id.as_deref(), Some("fresh-provider-2"));
+    assert_eq!(turn_state(), (outcome.lifecycle().to_owned(), reason));
+    assert_eq!(*captured.close_attempts.lock().unwrap(), ["fresh-provider"]);
+    assert_eq!(captured.memory.lock().unwrap().len(), 2);
+    client.fence_all_executions().await.unwrap();
+    let fenced = client.writer_grant(writer).await.unwrap_err();
+    assert!(fenced.to_string().contains("no current writer authority"));
+    shutdown.send(true).unwrap();
+    worker.await.unwrap().unwrap();
     http.abort();
 }
 
@@ -938,7 +996,7 @@ async fn worker_stops_a_running_unassigned_issue_only_after_its_quiet_window() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(terminal, "interrupted");
+    assert_eq!(terminal, "unknown", "closing the session alone cannot identify a turn outcome");
     assert_eq!(captured.inputs.lock().unwrap().len(), 1);
     shutdown.send(true).unwrap();
     worker.await.unwrap().unwrap();

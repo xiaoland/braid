@@ -28,7 +28,7 @@ mod builtin_execution;
 mod run_progress;
 mod unassignment;
 pub use builtin_execution::BuiltinExecutionCommand;
-pub(crate) use unassignment::{Unassignment, UnassignmentTarget};
+pub(crate) use unassignment::{ObservedTurnTerminal, Unassignment, UnassignmentTarget};
 mod runs;
 pub use runs::RunCommand;
 mod gh_writes;
@@ -1326,13 +1326,21 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub(crate) fn retire_unassigned_work_item(
+    pub(crate) fn settle_unassignment(
         &self,
-        change: Unassignment,
-    ) -> Result<(), StoreError> {
+        change: &Unassignment,
+        terminal: Option<ObservedTurnTerminal>,
+        stopped: bool,
+    ) -> Result<bool, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::RetireUnassignedWorkItem(change.event_id, change.assignment_id, reply))
+            .send(Command::SettleUnassignment(
+                change.event_id.clone(),
+                change.assignment_id.clone(),
+                terminal,
+                stopped,
+                reply,
+            ))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1734,7 +1742,13 @@ enum Command {
     ),
     IgnoreAssignmentEvent(String, Sender<Result<(), StoreError>>),
     DueUnassignment(UnassignmentTarget, u64, Sender<Result<Option<Unassignment>, StoreError>>),
-    RetireUnassignedWorkItem(String, Option<String>, Sender<Result<(), StoreError>>),
+    SettleUnassignment(
+        String,
+        Option<String>,
+        Option<ObservedTurnTerminal>,
+        bool,
+        Sender<Result<bool, StoreError>>,
+    ),
     CompleteAgentAssignment(
         AgentMaterialization,
         String,
@@ -2081,11 +2095,13 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::DueUnassignment(target, quiet_seconds, reply) => {
                 let _ = reply.send(unassignment::due(database, &target, quiet_seconds));
             }
-            Command::RetireUnassignedWorkItem(event_id, assignment_id, reply) => {
-                let _ = reply.send(retire_unassigned_work_item(
+            Command::SettleUnassignment(event_id, assignment_id, terminal, stopped, reply) => {
+                let _ = reply.send(settle_unassignment(
                     database,
                     &event_id,
                     assignment_id.as_deref(),
+                    terminal.as_ref(),
+                    stopped,
                 ));
             }
             Command::CompleteAgentAssignment(
@@ -4341,12 +4357,14 @@ fn begin_agent_assignment(
     Ok(Some(materialization))
 }
 
-/// Consume this change and retire its current generation after provider shutdown.
-fn retire_unassigned_work_item(
+/// Keep observed native terminal facts even when revoking platform authority must retry.
+fn settle_unassignment(
     database: &Path,
     event_id: &str,
     expected_assignment: Option<&str>,
-) -> Result<(), StoreError> {
+    terminal: Option<&ObservedTurnTerminal>,
+    stopped: bool,
+) -> Result<bool, StoreError> {
     require_current_schema(database)?;
     let now = now_rfc3339();
     let mut connection = open_read_write(database)?;
@@ -4368,13 +4386,39 @@ fn retire_unassigned_work_item(
         )
         .optional()?;
     let Some((assignment_id, agent_id, work_item_node_id)) = target else {
+        if !stopped {
+            return Ok(false);
+        }
         transaction.execute(
             "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
             [event_id],
         )?;
         transaction.commit()?;
-        return Ok(());
+        return Ok(false);
     };
+    let mut recorded_terminal = false;
+    if let Some(terminal) = terminal {
+        let updated = transaction.execute(
+            "UPDATE turns SET lifecycle=?2,ended_at=?3,error=CASE WHEN ?4 IS NULL THEN error
+             WHEN error IS NULL THEN ?4 ELSE error || char(10) || ?4 END
+             WHERE turn_id=?1 AND lifecycle IN ('starting','running')
+               AND session_id IN (SELECT session_id FROM provider_sessions WHERE agent_id=?5)",
+            params![terminal.turn_id, terminal.outcome.lifecycle(), now, terminal.error, agent_id],
+        )?;
+        recorded_terminal = updated == 1;
+        if recorded_terminal {
+            record_terminal_feedback(
+                &transaction,
+                &terminal.turn_id,
+                terminal.outcome.lifecycle(),
+                &now,
+            )?;
+        }
+    }
+    if !stopped {
+        transaction.commit()?;
+        return Ok(recorded_terminal);
+    }
     let unconfirmed: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM provider_sessions WHERE agent_id=?1
          AND lifecycle NOT IN ('retired','replaced') AND execution_stopped_at IS NULL)",
@@ -4385,7 +4429,8 @@ fn retire_unassigned_work_item(
         return Err(StoreError::InvalidData("unassignment lacks a confirmed native stop".into()));
     }
     transaction.execute(
-        "UPDATE turns SET lifecycle='interrupted',ended_at=?2
+        "UPDATE turns SET lifecycle='unknown',ended_at=?2,
+         error=coalesce(error || char(10),'') || 'unassignment did not observe the active turn terminal'
          WHERE lifecycle IN ('starting','running')
            AND session_id IN (SELECT session_id FROM provider_sessions WHERE agent_id=?1)",
         params![agent_id, now],
@@ -4416,7 +4461,7 @@ fn retire_unassigned_work_item(
         [event_id],
     )?;
     transaction.commit()?;
-    Ok(())
+    Ok(recorded_terminal)
 }
 
 fn ignore_assignment_event(database: &Path, event_id: &str) -> Result<(), StoreError> {
@@ -5351,6 +5396,19 @@ fn fence_session_and_request_reset(
     Ok(())
 }
 
+fn record_terminal_feedback(
+    tx: &rusqlite::Transaction<'_>,
+    turn_id: &str,
+    lifecycle: &str,
+    now: &str,
+) -> Result<(), StoreError> {
+    if lifecycle != "unknown" {
+        let feedback = if lifecycle == "completed" { "+1" } else { "confused" };
+        reaction_feedback::record_turn(tx, turn_id, feedback, now)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn mark_turn_terminal(database: &Path, turn_id: &str, lifecycle: &str) -> Result<(), StoreError> {
     require_current_schema(database)?;
@@ -5400,10 +5458,7 @@ fn mark_turn_terminal(database: &Path, turn_id: &str, lifecycle: &str) -> Result
         "UPDATE turns SET lifecycle=?2,ended_at=?3 WHERE turn_id=?1",
         params![turn_id, lifecycle, now],
     )?;
-    if lifecycle != "unknown" {
-        let feedback = if lifecycle == "completed" { "+1" } else { "confused" };
-        reaction_feedback::record_turn(&transaction, turn_id, feedback, &now)?;
-    }
+    record_terminal_feedback(&transaction, turn_id, lifecycle, &now)?;
     let finalization = trigger_kind == "finalization";
     let final_assignment_lifecycle =
         if work_item_kind == "pr" && work_item_state.eq_ignore_ascii_case("merged") {

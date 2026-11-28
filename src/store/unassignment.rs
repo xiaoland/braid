@@ -7,6 +7,13 @@ pub(crate) enum UnassignmentTarget {
     RunningTurn(String),
 }
 
+#[derive(Clone)]
+pub(crate) struct ObservedTurnTerminal {
+    pub turn_id: String,
+    pub outcome: crate::agent_session::TurnOutcome,
+    pub error: Option<String>,
+}
+
 pub(crate) struct Unassignment {
     pub event_id: String,
     pub(super) assignment_id: Option<String>,
