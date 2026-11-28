@@ -529,7 +529,7 @@ impl AgentProvider for PiProvider {
     ) -> Result<ProviderTurn, ProviderError> {
         let mut state = self.state.lock().await;
         let native = Self::request(&mut state, json!({"type":"get_state"})).await?;
-        validate_managed_state(&state, &native)?;
+        observe_managed_state(&state, &native)?;
         if native_is_busy(&native)? {
             return Err(ProviderError::Deferred(
                 "Pi is streaming, compacting or has queued input".into(),
@@ -980,27 +980,31 @@ fn native_is_busy(response: &Value) -> Result<bool, ProviderError> {
     Ok(streaming || compacting || pending != 0)
 }
 
-fn validate_managed_state(state: &PiState, response: &Value) -> Result<(), ProviderError> {
-    if let Some(execution) = state.process.as_ref().and_then(|process| process.execution.as_ref()) {
-        let managed = execution.state(response)?;
-        tracing::info!(name = "braid.provider.execution", provider.kind = "pi",
-            provider.execution.id = %execution.id, provider.managed.state = ?managed.status,
-            error.reason = managed.reason.as_deref().unwrap_or(""),
-            "Pi native managed state observation");
-    }
-    Ok(())
+fn observe_managed_state(
+    state: &PiState,
+    response: &Value,
+) -> Result<Option<runtime::ManagedState>, ProviderError> {
+    let Some(execution) = state.process.as_ref().and_then(|process| process.execution.as_ref())
+    else {
+        return Ok(None);
+    };
+    let managed = execution.state(response)?;
+    tracing::info!(name = "braid.provider.execution", provider.kind = "pi",
+        provider.execution.id = %execution.id, provider.managed.state = ?managed.status,
+        error.reason = managed.reason.as_deref().unwrap_or(""),
+        "Pi native managed state observation");
+    Ok(Some(managed))
 }
 
 fn validate_started_runtime(state: &PiState, response: &Value) -> Result<(), ProviderError> {
-    if let Some(execution) = state.process.as_ref().and_then(|process| process.execution.as_ref()) {
-        let managed =
-            execution.state(response).map_err(|error| ProviderError::Unknown(error.to_string()))?;
-        if matches!(managed.status, runtime::ManagedStatus::Unknown) {
-            return Err(ProviderError::Unknown(format!(
-                "Pi managed execution is unavailable at startup: {}",
-                managed.reason.as_deref().unwrap_or("native returned unknown without a reason")
-            )));
-        }
+    if let Some(managed) = observe_managed_state(state, response)
+        .map_err(|error| ProviderError::Unknown(error.to_string()))?
+        && matches!(managed.status, runtime::ManagedStatus::Unknown)
+    {
+        return Err(ProviderError::Unknown(format!(
+            "Pi managed execution is unavailable at startup: {}",
+            managed.reason.as_deref().unwrap_or("native returned unknown without a reason")
+        )));
     }
     Ok(())
 }

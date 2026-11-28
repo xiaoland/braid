@@ -43,10 +43,13 @@ subagents、background、Context7 和 MCPorter 的局部补丁仅随相应插件
 对全新安装仅选择 `background` 后，可直接验证交付的 Node、Pi SDK 与扩展、工具环境和停止回执。
 下面的验收使用临时 HOME、离线模型描述和本地 Bash，不需要模型账号。它也会检查新建
 session 文件、结束 RPC 输入后进程正常退出，以及随后从执行目录取得完整停止回执。
+另一个用例通过 SDK 调用所选插件的 Bash 工具，检查命令退出 0 时仍能报告归属未确认。
 
 ```sh
 node native/pi/install.mjs "$PWD/runtime/pi-background" --plugins background
-BRAID_TEST_PI_INSTALL="$PWD/runtime/pi-background" node --test native/pi/acceptance/installed-runtime.test.mjs
+export BRAID_TEST_PI_INSTALL="$PWD/runtime/pi-background"
+"$BRAID_TEST_PI_INSTALL/bin/node" --test native/pi/acceptance/installed-runtime.test.mjs
+PI_OFFLINE=1 cargo test --locked --bin braid failed_home_binding_stops_the_installed_execution_before_returning -- --ignored
 ```
 
 锁定的 pi-subagents 0.56.0 对自定义角色 frontmatter 使用字符串列表解析，
