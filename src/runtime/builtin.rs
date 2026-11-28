@@ -904,8 +904,6 @@ mod tests {
             PlatformConfig,
             objects::{CommandRequest, ControlReceipt, ObjectCommand, PlatformObjects},
         };
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::sync::Notify;
 
         const DELIVERY_REF: &str = "refs/heads/delivery";
         let fixture = crate::writer::tests::Fixture::new(false);
@@ -931,25 +929,21 @@ mod tests {
             backups: runtime.join("platform-backups"),
             listen: address.to_string(),
         };
-        let two_open_polls = Arc::new(Notify::new());
+        let (completed_reads, mut boundary_reads) = tokio::sync::mpsc::unbounded_channel();
         let routes =
-            crate::platform::router(&declaration).unwrap().layer(axum::middleware::from_fn({
-                let two_open_polls = Arc::clone(&two_open_polls);
-                let boundary_reads = Arc::new(AtomicUsize::new(0));
+            crate::platform::router(&declaration).unwrap().layer(axum::middleware::from_fn(
                 move |request: axum::extract::Request, next: axum::middleware::Next| {
-                    let two_open_polls = Arc::clone(&two_open_polls);
-                    let boundary_reads = Arc::clone(&boundary_reads);
+                    let completed_reads = completed_reads.clone();
                     async move {
                         let boundary = request.uri().path().ends_with("/boundary");
                         let response = next.run(request).await;
-                        // Event intake reads once, followed by two finite outcome polls.
-                        if boundary && boundary_reads.fetch_add(1, Ordering::Relaxed) == 2 {
-                            two_open_polls.notify_one();
+                        if boundary && response.status().is_success() {
+                            let _ = completed_reads.send(());
                         }
                         response
                     }
-                }
-            }));
+                },
+            ));
         let http = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
 
         let mut platform =
@@ -998,7 +992,10 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.state, "applied");
         std::fs::rename(&offline_directory, &git_directory).unwrap();
-        assert!(git.find_reference(DELIVERY_REF).is_err());
+        assert_eq!(
+            git.find_reference(DELIVERY_REF).err().unwrap().code(),
+            git2::ErrorCode::NotFound
+        );
         let candidate = git
             .commit(
                 None,
@@ -1023,7 +1020,25 @@ mod tests {
         platform.link(root.number, pr.number, "human").unwrap();
         platform.publish(pr.number, &declaration.source, &candidate.to_string(), "human").unwrap();
         assert_eq!(git.refname_to_id(DELIVERY_REF).unwrap(), base);
-        let merged = platform.merge(pr.number, &declaration.source, "human").unwrap().merge_commit;
+        let receipt: ControlReceipt = client
+            .post(
+                "api/control/commands",
+                &CommandRequest {
+                    request_id: "test-run-merge".into(),
+                    expected_revision: Some(platform.item(pr.number).unwrap().revision),
+                    command: ObjectCommand::Merge { number: pr.number },
+                    actor: "human".into(),
+                    writer: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.state, "applied", "{:?}", receipt.error);
+        let merged = serde_json::from_value::<crate::platform::objects::MergeResult>(
+            receipt.result.unwrap(),
+        )
+        .unwrap()
+        .merge_commit;
         assert_eq!(git.refname_to_id(DELIVERY_REF).unwrap().to_string(), merged);
         let db = rusqlite::Connection::open(&declaration.database).unwrap();
         db.execute_batch("ALTER TABLE local_merges RENAME TO offline_merges").unwrap();
@@ -1033,7 +1048,8 @@ mod tests {
         assert_eq!(root_view["item"]["number"], root.number);
         let context = client.context(pr.number).await.unwrap();
         assert!(matches!(context, crate::context::CanonicalContext::PullRequest(pr) if pr.merged));
-        assert!(platform.set_state(pr.number, true, "human").is_err());
+        let error = platform.set_state(pr.number, true, "human").unwrap_err();
+        assert!(error.to_string().contains("merged PR cannot be reopened"), "{error:#}");
         db.execute_batch("ALTER TABLE offline_merges RENAME TO local_merges").unwrap();
         platform.set_state(child.number, false, "human").unwrap();
         let outside = platform.create_child_issue("Outside", "Other run", "human", None).unwrap();
@@ -1062,12 +1078,18 @@ mod tests {
         }
 
         let (_availability, provider_status) = watch::channel(ProviderAvailability::Starting);
+        // Observe this polling loop independently of any earlier object intake.
+        while boundary_reads.try_recv().is_ok() {}
         let outcome = finite_outcome(&config, &client, &store, &provider_status);
         tokio::pin!(outcome);
         tokio::time::timeout(Duration::from_secs(5), async {
             tokio::select! {
                 result = &mut outcome => panic!("open root stopped polling: {result:?}"),
-                () = two_open_polls.notified() => {},
+                () = async {
+                    for _ in 0..2 {
+                        boundary_reads.recv().await.expect("boundary observer closed");
+                    }
+                } => {},
             }
         })
         .await

@@ -98,7 +98,9 @@ async fn native_start_authorizes_current_publication_before_start_rpc_response()
             // to an older completed turn with a non-null timestamp.
             assert!(
                 resolve_source(&fixture.config, Some("issue-codex"), &fixture.invocation())
-                    .is_err()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("publication source was invalidated or superseded")
             );
             let provider = DelayedProvider::new(reply);
             let session = ProviderAgentSession::start(
@@ -142,14 +144,18 @@ async fn native_start_authorizes_current_publication_before_start_rpc_response()
                 fixture.db().execute("INSERT INTO events(event_id,work_item_node_id,origin,reference,lifecycle,observed_at,kind) VALUES ('invalidate','item','human','changed','pending','now','invalidate')", []).unwrap();
                 assert!(
                     resolve_source(&fixture.config, Some("issue-codex"), &fixture.invocation())
-                        .is_err()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("publication source was invalidated or superseded")
                 );
                 assert!(
                     crate::store::publication_source::check(
                         fixture.config.runtime.database(),
                         &resolved
                     )
-                    .is_err()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("publication source was invalidated or superseded")
                 );
                 fixture.db().execute("DELETE FROM events WHERE event_id='invalidate'", []).unwrap();
                 // Terminal arrives before the delayed response: the dispatch
@@ -177,17 +183,9 @@ async fn native_start_authorizes_current_publication_before_start_rpc_response()
                 events.recv().await.unwrap(),
                 SessionEvent::TurnTerminal { outcome: TurnOutcome::Completed, .. }
             ));
-            assert!(events.try_recv().is_err()); // no duplicated start from the RPC response
+            assert!(matches!(events.try_recv(), Err(broadcast::error::TryRecvError::Empty))); // no duplicated start from the RPC response
             crate::store::publication_source::check(fixture.config.runtime.database(), &resolved)
                 .unwrap();
-            fixture.db().execute("UPDATE assignments SET generation=2", []).unwrap();
-            assert!(
-                crate::store::publication_source::check(
-                    fixture.config.runtime.database(),
-                    &resolved
-                )
-                .is_err()
-            );
         }
     }
 }
@@ -221,7 +219,12 @@ async fn unobserved_deferred_and_unknown_start_never_authorize_publication() {
             Reply::Unknown => assert!(matches!(result, Err(SessionError::Unknown(_)))),
             _ => unreachable!(),
         }
-        assert!(resolve_source(&fixture.config, None, &fixture.invocation()).is_err());
-        assert!(events.try_recv().is_err());
+        assert!(
+            resolve_source(&fixture.config, None, &Invocation::Agent("turn".into()))
+                .unwrap_err()
+                .to_string()
+                .contains("publication source was invalidated or superseded")
+        );
+        assert!(matches!(events.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
     }
 }

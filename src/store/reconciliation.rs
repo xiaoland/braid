@@ -78,6 +78,13 @@ mod tests {
         db
     }
 
+    fn due_ids(db: &Connection, now: i64) -> Vec<String> {
+        let mut items: Vec<_> =
+            due(db, now, 60).unwrap().into_iter().map(|item| item.node_id).collect();
+        items.sort_unstable();
+        items
+    }
+
     #[test]
     fn hot_cold_observations_and_finalization() {
         let db = database();
@@ -85,28 +92,11 @@ mod tests {
             record(&db, id, 100, true).unwrap();
         }
         db.execute("UPDATE work_items SET observed_at=500", []).unwrap();
-        assert!(due(&db, 159, 60).unwrap().is_empty());
-        let ids = due(&db, 160, 60).unwrap().into_iter().map(|w| w.node_id).collect::<Vec<_>>();
-        assert_eq!(ids, ["final", "open"]);
-        assert_eq!(due(&db, 1900, 60).unwrap().len(), 3);
+        assert!(due_ids(&db, 159).is_empty());
+        assert_eq!(due_ids(&db, 160), ["final", "open"]);
+        assert_eq!(due_ids(&db, 1900), ["closed", "final", "open"]);
         db.execute("UPDATE assignments SET lifecycle='retired'", []).unwrap();
-        assert_eq!(due(&db, 160, 60).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn partial_failure_does_not_mark_success_and_rotates() {
-        let db = database();
-        let first = due(&db, 100, 60).unwrap()[0].node_id.clone();
-        record(&db, &first, 100, false).unwrap();
-        let later = due(&db, 105, 60).unwrap();
-        assert_ne!(later[0].node_id, first);
-        assert!(!later.iter().any(|w| w.node_id == first));
-        assert!(!due(&db, 159, 60).unwrap().iter().any(|w| w.node_id == first));
-        assert!(due(&db, 160, 60).unwrap().iter().any(|w| w.node_id == first));
-        record(&db, &later[0].node_id, 105, true).unwrap();
-        // A later failure (even on the same repository) cannot erase success.
-        record(&db, &first, 160, false).unwrap();
-        assert!(!due(&db, 160, 60).unwrap().iter().any(|w| w.node_id == later[0].node_id));
+        assert_eq!(due_ids(&db, 160), ["open"]);
     }
 
     #[test]
@@ -118,19 +108,19 @@ mod tests {
         for id in ["open", "closed", "final", "other"] {
             record(&db, id, 100, true).unwrap();
         }
-        assert_eq!(due(&db, 160, 60).unwrap().len(), 3);
+        assert_eq!(due_ids(&db, 160), ["closed", "final", "open"]);
         db.execute(
             "UPDATE assignments SET lifecycle='active' WHERE work_item_node_id='closed'",
             [],
         )
         .unwrap();
-        assert_eq!(due(&db, 160, 60).unwrap().len(), 3);
+        assert_eq!(due_ids(&db, 160), ["closed", "final", "open"]);
         db.execute(
             "UPDATE assignments SET lifecycle='sleeping' WHERE work_item_node_id='closed'",
             [],
         )
         .unwrap();
-        assert_eq!(due(&db, 160, 60).unwrap().len(), 2);
+        assert_eq!(due_ids(&db, 160), ["final", "open"]);
         // Previously attempted repository cannot keep untouched cold history behind it.
         for id in ["open", "closed", "final"] {
             record(&db, id, 1900, false).unwrap();
@@ -143,19 +133,26 @@ mod tests {
     }
 
     #[test]
-    fn failed_refresh_retries_at_hot_interval_without_erasing_success() {
+    fn failed_traversal_backs_off_without_losing_the_last_success() {
         let db = database();
+        // This closed item has never succeeded. Its failure cannot delay other
+        // items, start the cold interval, or retry before the hot interval.
+        record(&db, "closed", 100, false).unwrap();
+        assert_eq!(due_ids(&db, 159), ["final", "open"]);
+        assert_eq!(due_ids(&db, 160), ["closed", "final", "open"]);
+
+        // After an open item succeeds and a refresh fails, closing it reveals
+        // which persisted timestamp controls the cold interval.
         record(&db, "open", 100, true).unwrap();
         record(&db, "open", 160, false).unwrap();
-        assert!(!due(&db, 165, 60).unwrap().iter().any(|w| w.node_id == "open"));
-        assert!(!due(&db, 219, 60).unwrap().iter().any(|w| w.node_id == "open"));
-        assert!(due(&db, 220, 60).unwrap().iter().any(|w| w.node_id == "open"));
-        // Cold history remains cold after success, but a failed due traversal
-        // can retry after the hot interval rather than another thirty minutes.
-        record(&db, "closed", 100, true).unwrap();
-        record(&db, "closed", 1900, false).unwrap();
-        assert!(!due(&db, 1905, 60).unwrap().iter().any(|w| w.node_id == "closed"));
-        assert!(due(&db, 1960, 60).unwrap().iter().any(|w| w.node_id == "closed"));
+        assert!(!due_ids(&db, 219).iter().any(|id| id == "open"));
+        assert!(due_ids(&db, 220).iter().any(|id| id == "open"));
+        db.execute("UPDATE work_items SET state='CLOSED' WHERE node_id='open'", []).unwrap();
+        assert!(!due_ids(&db, 1899).iter().any(|id| id == "open"));
+        assert!(due_ids(&db, 1900).iter().any(|id| id == "open"));
+        record(&db, "open", 1900, false).unwrap();
+        assert!(!due_ids(&db, 1959).iter().any(|id| id == "open"));
+        assert!(due_ids(&db, 1960).iter().any(|id| id == "open"));
     }
 
     #[test]

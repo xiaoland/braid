@@ -26,7 +26,9 @@ pub use scheduler_status::BatchEligibility;
 mod builtin;
 mod builtin_execution;
 mod run_progress;
+mod unassignment;
 pub use builtin_execution::BuiltinExecutionCommand;
+pub(crate) use unassignment::{Unassignment, UnassignmentTarget};
 mod runs;
 pub use runs::RunCommand;
 mod gh_writes;
@@ -478,16 +480,6 @@ pub struct ProfileRecord {
     pub effective_digest: String,
     pub provider_kind: String,
     pub tags: String,
-}
-
-/// Outcome of a settled (or not yet settled) native unassignment.
-#[derive(Debug, Clone)]
-pub struct UnassignmentOutcome {
-    /// false while the debounce window is still open; the event stays pending.
-    pub settled: bool,
-    /// The provider session whose in-flight turn was fenced by the
-    /// retirement; the caller best-effort interrupts it.
-    pub fenced_provider_session: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1015,18 +1007,6 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    #[cfg(test)]
-    pub(crate) fn processed_objects(
-        &self,
-        work_item: String,
-    ) -> Result<Vec<CanonicalObjectState>, StoreError> {
-        let (reply, receiver) = mpsc::channel();
-        self.sender
-            .send(Command::ProcessedObjects(work_item, reply))
-            .map_err(|_| StoreError::ActorUnavailable)?;
-        receiver.recv().map_err(|_| StoreError::ActorStopped)?
-    }
-
     pub(crate) fn begin_observation(
         &self,
         work_item: String,
@@ -1334,14 +1314,25 @@ impl StoreActor {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    pub fn retire_unassigned_work_item(
+    pub(crate) fn due_unassignment(
         &self,
-        event_id: String,
-        debounce_seconds: u64,
-    ) -> Result<UnassignmentOutcome, StoreError> {
+        target: UnassignmentTarget,
+        quiet_seconds: u64,
+    ) -> Result<Option<Unassignment>, StoreError> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::RetireUnassignedWorkItem(event_id, debounce_seconds, reply))
+            .send(Command::DueUnassignment(target, quiet_seconds, reply))
+            .map_err(|_| StoreError::ActorUnavailable)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub(crate) fn retire_unassigned_work_item(
+        &self,
+        change: Unassignment,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::RetireUnassignedWorkItem(change.event_id, change.assignment_id, reply))
             .map_err(|_| StoreError::ActorUnavailable)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -1667,8 +1658,6 @@ enum Command {
     RecordImplementationProgress(String, ImplementationProgress, Sender<Result<(), StoreError>>),
     DueReconciliationWorkItems(u64, Sender<Result<Vec<TrackedWorkItem>, StoreError>>),
     RecordReconciliation(String, bool, Sender<Result<(), StoreError>>),
-    #[cfg(test)]
-    ProcessedObjects(String, Sender<Result<Vec<CanonicalObjectState>, StoreError>>),
     BeginObservation(String, Sender<Result<ObservationBasis, StoreError>>),
     CommitObservation(Box<ObservationCommit>, Sender<Result<usize, StoreError>>),
     RecordPublicationVersion(String, String, String, String, Sender<Result<(), StoreError>>),
@@ -1744,7 +1733,8 @@ enum Command {
         Sender<Result<Option<AgentMaterialization>, StoreError>>,
     ),
     IgnoreAssignmentEvent(String, Sender<Result<(), StoreError>>),
-    RetireUnassignedWorkItem(String, u64, Sender<Result<UnassignmentOutcome, StoreError>>),
+    DueUnassignment(UnassignmentTarget, u64, Sender<Result<Option<Unassignment>, StoreError>>),
+    RetireUnassignedWorkItem(String, Option<String>, Sender<Result<(), StoreError>>),
     CompleteAgentAssignment(
         AgentMaterialization,
         String,
@@ -1927,13 +1917,6 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
                 });
                 let _ = reply.send(result);
             }
-            #[cfg(test)]
-            Command::ProcessedObjects(work_item, reply) => {
-                let _ = reply.send(
-                    open_read_only(database)
-                        .and_then(|connection| observations::load(&connection, &work_item)),
-                );
-            }
             Command::BeginObservation(work_item, reply) => {
                 let _ = reply.send(observations::begin(database, &work_item));
             }
@@ -2095,9 +2078,15 @@ fn actor_loop(database: &Path, backups: &Path, receiver: Receiver<Command>) {
             Command::IgnoreAssignmentEvent(event_id, reply) => {
                 let _ = reply.send(ignore_assignment_event(database, &event_id));
             }
-            Command::RetireUnassignedWorkItem(event_id, debounce_seconds, reply) => {
-                let _ =
-                    reply.send(retire_unassigned_work_item(database, &event_id, debounce_seconds));
+            Command::DueUnassignment(target, quiet_seconds, reply) => {
+                let _ = reply.send(unassignment::due(database, &target, quiet_seconds));
+            }
+            Command::RetireUnassignedWorkItem(event_id, assignment_id, reply) => {
+                let _ = reply.send(retire_unassigned_work_item(
+                    database,
+                    &event_id,
+                    assignment_id.as_deref(),
+                ));
             }
             Command::CompleteAgentAssignment(
                 materialization,
@@ -4352,83 +4341,55 @@ fn begin_agent_assignment(
     Ok(Some(materialization))
 }
 
-/// Settle a native unassignment after its debounce window: retire the active
-/// Agent Group. An in-flight turn is fenced `interrupted`; the caller
-/// best-effort interrupts it through the session. The event is consumed once
-/// settled; while the debounce window is open the event stays pending.
+/// Consume this change and retire its current generation after provider shutdown.
 fn retire_unassigned_work_item(
     database: &Path,
     event_id: &str,
-    debounce_seconds: u64,
-) -> Result<UnassignmentOutcome, StoreError> {
+    expected_assignment: Option<&str>,
+) -> Result<(), StoreError> {
     require_current_schema(database)?;
     let now = now_rfc3339();
     let mut connection = open_read_write(database)?;
     configure_connection(&connection)?;
     let transaction = connection.transaction()?;
-    let event = transaction
+    // Bind retirement to the generation whose native execution was stopped.
+    // A re-delivered change cannot affect a later assignment of the same item.
+    let target = transaction
         .query_row(
-            "SELECT work_item_node_id,observed_at FROM events
-             WHERE event_id=?1 AND lifecycle='pending' AND kind='unassign'",
-            [event_id],
-            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+            "SELECT a.assignment_id,ai.agent_id,a.work_item_node_id FROM events e
+         JOIN assignments a ON a.work_item_node_id=e.work_item_node_id
+         JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
+         WHERE e.event_id=?1 AND e.kind='unassign' AND e.lifecycle='pending'
+           AND a.assignment_id=?2 AND a.lifecycle IN ('materializing','active','finalizing')",
+            params![event_id, expected_assignment],
+            |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            },
         )
         .optional()?;
-    let Some((work_item_node_id, observed_at)) = event else {
-        transaction.commit()?;
-        return Ok(UnassignmentOutcome { settled: true, fenced_provider_session: None });
-    };
-    let observed = OffsetDateTime::parse(&observed_at, &Rfc3339)
-        .map_err(|error| StoreError::InvalidData(format!("event observed_at: {error}")))?;
-    let settled = (OffsetDateTime::now_utc() - observed)
-        >= time::Duration::seconds(i64::try_from(debounce_seconds).unwrap_or(i64::MAX));
-    if !settled {
-        transaction.commit()?;
-        return Ok(UnassignmentOutcome { settled: false, fenced_provider_session: None });
-    }
-    let active = work_item_node_id
-        .as_deref()
-        .map(|node_id| {
-            transaction
-                .query_row(
-                    "SELECT a.assignment_id,ai.agent_id FROM assignments a
-                     JOIN agent_instances ai ON ai.assignment_id=a.assignment_id
-                     WHERE a.work_item_node_id=?1
-                       AND a.lifecycle IN ('materializing','active','finalizing')
-                     ORDER BY a.generation DESC LIMIT 1",
-                    [node_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()
-        })
-        .transpose()?;
-    let Some((assignment_id, agent_id)) = active.flatten() else {
+    let Some((assignment_id, agent_id, work_item_node_id)) = target else {
         transaction.execute(
             "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
             [event_id],
         )?;
         transaction.commit()?;
-        return Ok(UnassignmentOutcome { settled: true, fenced_provider_session: None });
+        return Ok(());
     };
-    let fenced = transaction
-        .query_row(
-            "SELECT ps.provider_session_id FROM provider_sessions ps
-             JOIN turns t ON t.session_id=ps.session_id
-             WHERE ps.agent_id=?1 AND t.lifecycle IN ('starting','running')
-             ORDER BY t.rowid DESC LIMIT 1",
-            [&agent_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if let Some(provider_session_id) = &fenced {
-        transaction.execute(
-            "UPDATE turns SET lifecycle='interrupted',ended_at=?2
-             WHERE lifecycle IN ('starting','running')
-               AND session_id IN (SELECT session_id FROM provider_sessions WHERE agent_id=?1)",
-            params![agent_id, now],
-        )?;
-        let _ = provider_session_id;
+    let unconfirmed: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provider_sessions WHERE agent_id=?1
+         AND lifecycle NOT IN ('retired','replaced') AND execution_stopped_at IS NULL)",
+        [&agent_id],
+        |row| row.get(0),
+    )?;
+    if unconfirmed {
+        return Err(StoreError::InvalidData("unassignment lacks a confirmed native stop".into()));
     }
+    transaction.execute(
+        "UPDATE turns SET lifecycle='interrupted',ended_at=?2
+         WHERE lifecycle IN ('starting','running')
+           AND session_id IN (SELECT session_id FROM provider_sessions WHERE agent_id=?1)",
+        params![agent_id, now],
+    )?;
     transaction.execute(
         "UPDATE provider_sessions SET lifecycle='retired'
          WHERE agent_id=?1 AND lifecycle NOT IN ('retired','replaced')",
@@ -4445,19 +4406,17 @@ fn retire_unassigned_work_item(
         "UPDATE assignments SET lifecycle='retired',retired_at=?2 WHERE assignment_id=?1",
         params![assignment_id, now],
     )?;
-    if let Some(node_id) = &work_item_node_id {
-        transaction.execute(
-            "UPDATE wake_batches SET lifecycle='consumed',updated_at=?2
-             WHERE work_item_node_id=?1 AND lifecycle IN ('pending','runnable')",
-            params![node_id, now],
-        )?;
-    }
+    transaction.execute(
+        "UPDATE wake_batches SET lifecycle='consumed',updated_at=?2
+         WHERE work_item_node_id=?1 AND lifecycle IN ('pending','runnable')",
+        params![work_item_node_id, now],
+    )?;
     transaction.execute(
         "UPDATE events SET lifecycle='consumed' WHERE event_id=?1 AND lifecycle='pending'",
         [event_id],
     )?;
     transaction.commit()?;
-    Ok(UnassignmentOutcome { settled: true, fenced_provider_session: fenced })
+    Ok(())
 }
 
 fn ignore_assignment_event(database: &Path, event_id: &str) -> Result<(), StoreError> {

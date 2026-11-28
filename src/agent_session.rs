@@ -106,17 +106,6 @@ pub trait AgentSession: Send + Sync {
         msg: String,
         expected_turn_id: &str,
     ) -> Result<SendResult, SessionError>;
-
-    /// Best-effort termination of the in-flight turn — the control-plane
-    /// sibling of steering: both are immediate operations addressed to the
-    /// observed active turn, but `interrupt` carries control (terminate)
-    /// rather than input.
-    ///
-    /// Idempotent at the state-machine boundary: no in-flight turn (or a turn
-    /// that already completed) is `Ok(())`. The terminal still arrives through
-    /// the event stream — `Interrupted` when honored, or the natural outcome
-    /// if the turn completed first — so callers never wait on a side channel.
-    async fn interrupt(&self) -> Result<(), SessionError>;
 }
 
 /// An adapter-created handle and the opaque identity to bind in the durable store.

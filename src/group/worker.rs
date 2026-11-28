@@ -172,6 +172,35 @@ impl GroupDriver<'_> {
         }
     }
 
+    pub(super) async fn settle_unassignment(
+        &self,
+        target: crate::store::UnassignmentTarget,
+    ) -> Result<bool> {
+        let builtin = self.collaboration.is_builtin();
+        let quiet = if builtin { 0 } else { self.config.scheduler.quiet_seconds };
+        let Some(change) = self.store.due_unassignment(target, quiet)? else { return Ok(false) };
+        if !builtin {
+            let locator = crate::github::WorkItemLocator {
+                repository: change.repository.parse()?,
+                number: change.number,
+            };
+            let issue = self.collaboration.materialize_issue(&locator).await?;
+            if issue
+                .assignees
+                .iter()
+                .any(|actor| self.collaboration.assignee_matches(actor, &self.spec.profile.id))
+            {
+                self.store.ignore_assignment_event(change.event_id)?;
+                return Ok(false);
+            }
+        }
+        for (session, stopped) in &change.sessions {
+            self.require_quiesced(session, *stopped).await?;
+        }
+        self.store.retire_unassigned_work_item(change)?;
+        Ok(true)
+    }
+
     pub(super) async fn retain_sessions(
         &self,
         retained: &HashSet<String>,
@@ -301,6 +330,9 @@ impl GroupDriver<'_> {
     ) {
         let store = self.store;
         let mut running: Option<RunningAgentTurn> = None;
+        // A native close may end the event stream while its independent
+        // platform fence is still being retried.
+        let mut settling_unassignment = false;
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut recovery = tokio::time::Instant::now();
@@ -318,7 +350,7 @@ impl GroupDriver<'_> {
                     } else {
                         std::future::pending().await
                     }
-                }, if running.is_some() => {
+                }, if running.is_some() && !settling_unassignment => {
                     match event {
                         Ok(crate::agent_session::SessionEvent::TurnStarted { provider_turn_id }) => {
                             tracing::debug!(%provider_turn_id, "AgentSession turn started");
@@ -373,7 +405,7 @@ impl GroupDriver<'_> {
                     }
                 }
                 _ = tick.tick() => {
-                    if running.as_ref().is_some_and(|active| active.events.is_closed()) {
+                    if !settling_unassignment && running.as_ref().is_some_and(|active| active.events.is_closed()) {
                         self.fence_running(&mut running, "AgentSession event stream closed").await;
                     }
                     // A closed finite root fences new execution; shutdown owns physical cleanup.
@@ -398,6 +430,23 @@ impl GroupDriver<'_> {
                         recovery = tokio::time::Instant::now() + Duration::from_secs(2);
                     }
                     if let Some(active) = &mut running {
+                        if self.spec.kind == GroupKind::Issue || self.collaboration.is_builtin() {
+                            let target = crate::store::UnassignmentTarget::RunningTurn(active.claim.turn_id.clone());
+                            match self.settle_unassignment(target).await {
+                                Ok(true) => {
+                                    settling_unassignment = false;
+                                    running = None;
+                                    continue;
+                                }
+                                Ok(false) => { settling_unassignment = false; }
+                                Err(error) => {
+                                    settling_unassignment = true;
+                                    tracing::warn!(%error, "cannot settle active unassignment");
+                                    self.publish_turn_error(&active.claim, "unknown", &error.to_string());
+                                    continue;
+                                }
+                            }
+                        }
                         self.begin_active_context_reset(active).await;
                         if active.reset_id.is_none()
                             && let Some(reason) = self.forward_urgent_steer(active).await {

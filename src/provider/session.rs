@@ -556,20 +556,6 @@ impl AgentSession for ProviderAgentSession {
             }
         }
     }
-
-    async fn interrupt(&self) -> Result<(), SessionError> {
-        let _command = self.commands.lock().await;
-        let (thread, turn) = {
-            let inner = self.inner.lock().await;
-            (inner.thread_id.clone(), inner.current_turn_id.clone())
-        };
-        match (thread, turn) {
-            (Some(thread), Some(turn)) => {
-                self.provider.interrupt(&thread, &turn).await.map_err(map_provider_error)
-            }
-            _ => Ok(()),
-        }
-    }
 }
 
 pub(super) fn map_provider_error(error: ProviderError) -> SessionError {

@@ -296,8 +296,9 @@ async fn a_legacy_local_tombstone_is_corrected_by_presence_without_waking_for_st
         assert_eq!(observe(&f, &github, &c, basis).unwrap(), 1);
         let restored = f
             .store
-            .processed_objects("item".into())
+            .begin_observation("item".into())
             .unwrap()
+            .objects
             .into_iter()
             .find(|o| o.node_id == "comment")
             .unwrap();
@@ -324,10 +325,10 @@ async fn an_admitted_delete_during_the_api_read_rejects_the_whole_old_snapshot()
             SchedulerPolicy { quiet_seconds: 30, event_threshold: 8 },
         )
         .unwrap();
-    let expected = f.store.processed_objects("item".into()).unwrap();
+    let expected = f.store.begin_observation("item".into()).unwrap().objects;
     let error = observe(&f, &github, &c, basis).unwrap_err().to_string();
     assert!(error.contains("events arrived during canonical traversal"), "{error}");
-    assert_eq!(f.store.processed_objects("item".into()).unwrap(), expected);
+    assert_eq!(f.store.begin_observation("item".into()).unwrap().objects, expected);
     http.abort();
 }
 

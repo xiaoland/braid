@@ -20,7 +20,7 @@ Each Work Item/Profile pair has an Assignment Generation and one state:
 | `debouncing` | Wake Events are accumulating against one quiet deadline/count. |
 | `running` | One provider turn is active. |
 | `reset_pending` | Current Context was invalidated; old output is fenced while interruption/terminal converges. |
-| `sleeping` | Closed/unassigned lifecycle retained for possible reopen/reassignment policy. |
+| `sleeping` | Closed lifecycle retained for a possible reopen. |
 | `retired` | Merged PR or superseded generation; no automatic resume. |
 | `blocked` | Complete Context, Profile, provider, worktree, or external authority is unavailable. |
 
@@ -118,11 +118,11 @@ classified as Agent-origin.
 
 ## Assignment and Terminal Lifecycle
 
-- In native Agent App assignment mode, Issue unassignment starts/resets the
-  same Quiet Window. Once settled, Braid safely interrupts an active turn,
-  archives its physical session, and moves the generation to `sleeping`.
-  Reassignment starts a new generation/session. Ordinary-App mention fallback
-  does not fabricate assign/unassign lifecycle events.
+- GitHub 原生指派模式按 Quiet Window 合并 Issue 撤销指派事件。窗口到期后，
+  Group 重读当前 assignees。若仍已指派则消费这次事件。确认撤销时，正在执行的
+  worker 和空闲 worker 使用同一停止流程。内建平台直接处理不可撤回的撤销事件。
+  Group 确认原生会话停止和平台执行权限撤销后，才将该代记为 `retired` 并终结
+  尚在运行的 turn。关闭失败保留撤销事件和原代。重新指派创建新一代及新会话。
 - Issue/PR close or PR merge never interrupts the current turn. The lifecycle
   event grants exactly one Finalization Turn after the current terminal, or
   immediately when idle. Afterwards closed Issue and closed-unmerged PR groups
@@ -223,10 +223,8 @@ Responsibilities do not overlap:
 - **`AgentSession`** only dispatches: idle, it starts a new turn; running and
   `steering`, it forwards input only to the expected active turn; running and
   not steering, it defers without accepting the message. It never queues;
-  redelivery is the queue's job. `interrupt()` is
-  the control-plane sibling of steering — an immediate operation on the
-  observed in-flight turn that carries termination rather than input; the
-  terminal still arrives via the event stream.
+  redelivery is the queue's job. The adapter handles native interruption as part
+  of confirming session shutdown.
 - **Group** 决定 Work Item 的物化、恢复、Context replacement、睡眠和退役，
   `SessionManager` 只索引中立句柄。替换完整 Context 不等于创建新的逻辑 Agent；
   adapter 的物理 ID 是可替换的执行绑定。
