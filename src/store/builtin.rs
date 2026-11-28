@@ -1,7 +1,8 @@
 //! Harness-owned upstream position and writer capabilities; never platform object state.
 use super::{
-    OptionalExtension, Path, StoreError, Uuid, configure_connection, open_read_write, params,
-    require_current_schema, sqlite_i64_to_u64, sqlite_u64,
+    BuiltinExecutionCommand, OptionalExtension, Path, StoreError, Uuid, builtin_execution,
+    configure_connection, open_read_write, params, require_current_schema, sqlite_i64_to_u64,
+    sqlite_u64,
 };
 
 #[derive(Debug, Clone)]
@@ -21,21 +22,31 @@ pub struct BuiltinGrant {
     pub grant_id: Option<String>,
     pub token: Option<String>,
     pub lifecycle: String,
+    pub authority_cursor: Option<u64>,
+    pub execution_id: String,
+}
+
+#[derive(Clone)]
+pub struct BuiltinWriterTurn {
+    pub session_id: String,
+    pub turn_id: String,
+    pub item_number: u64,
+    pub actor: String,
 }
 
 pub enum BuiltinCommand {
     State,
     Bind { space_id: String, repository: String, instance: String },
     Advance(u64),
-    Grants,
-    Grant(String),
-    Prepare { session_id: String, item_number: u64, actor: String },
-    Activate { session_id: String, grant_id: String, epoch: u64, token: String },
-    Revoke { session_id: String, epoch: u64 },
+    Execution(BuiltinExecutionCommand),
+    WriterGrant(BuiltinWriterTurn),
+    BeginMint { turn: BuiltinWriterTurn, expected_epoch: u64 },
+    Activate { request_id: String, session_id: String, grant_id: String, epoch: u64, token: String },
+    RejectMint { request_id: String, session_id: String },
 }
 pub enum BuiltinReply {
     Binding(BuiltinBinding),
-    Grants(Vec<BuiltinGrant>),
+    Fences(Vec<String>),
     Grant(Option<BuiltinGrant>),
     Done,
 }
@@ -50,9 +61,130 @@ fn grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<BuiltinGrant> {
         grant_id: row.get(5)?,
         token: row.get(6)?,
         lifecycle: row.get(7)?,
+        authority_cursor: row
+            .get::<_, Option<i64>>(8)?
+            .map(|cursor| sqlite_i64_to_u64(cursor, "grant authority cursor"))
+            .transpose()?,
+        execution_id: row.get(9)?,
     })
 }
-const SELECT: &str = "SELECT session_id,item_number,actor,request_id,epoch,grant_id,token,lifecycle FROM builtin_writer_grants";
+const SELECT: &str = "SELECT session_id,item_number,actor,request_id,epoch,grant_id,token,lifecycle,authority_cursor,execution_id FROM builtin_writer_grants";
+
+fn session_grant(
+    tx: &rusqlite::Connection,
+    session_id: &str,
+    execution_id: &str,
+) -> Result<Option<BuiltinGrant>, StoreError> {
+    Ok(tx
+        .query_row(
+            &format!("{SELECT} WHERE session_id=?1 AND execution_id=?2"),
+            params![session_id, execution_id],
+            grant,
+        )
+        .optional()?)
+}
+
+pub(super) fn cursor_at_turn_claim(
+    tx: &rusqlite::Connection,
+    batch: &str,
+    trigger: &str,
+) -> Result<Option<i64>, StoreError> {
+    // An unprocessed ownership transition may already be in this cursor.
+    // The running turn can compute, but only a settled generation may mint.
+    Ok(tx
+        .query_row(
+            "SELECT cursor FROM builtin_upstream WHERE singleton=1 AND ?2!='finalization'
+         AND NOT EXISTS (
+           SELECT 1 FROM events e JOIN wake_batches b ON b.work_item_node_id=e.work_item_node_id
+           WHERE b.batch_id=?1 AND e.lifecycle IN ('pending','materializing')
+             AND (e.kind IN ('assign','unassign') OR
+                  (e.kind='lifecycle' AND e.detail IN ('closed','merged')))
+         )",
+            params![batch, trigger],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn writer_execution(
+    tx: &rusqlite::Connection,
+    turn: &BuiltinWriterTurn,
+) -> Result<(i64, String), StoreError> {
+    let cursor = tx
+        .query_row(
+            "SELECT t.builtin_writer_cursor,t.builtin_execution_id
+         FROM turns t JOIN provider_sessions s ON s.session_id=t.session_id
+         JOIN agent_instances g ON g.agent_id=s.agent_id
+         JOIN assignments a ON a.assignment_id=g.assignment_id
+         JOIN work_items i ON i.node_id=a.work_item_node_id
+         WHERE t.turn_id=?1 AND s.provider_session_id=?2 AND i.number=?3 AND g.profile_id=?4
+           AND t.lifecycle IN ('starting','running') AND s.lifecycle='running'
+           AND a.lifecycle='active' AND g.lifecycle='idle' AND t.builtin_writer_cursor IS NOT NULL
+           AND s.builtin_execution_id=t.builtin_execution_id AND s.builtin_execution_state='open'
+           AND EXISTS (SELECT 1 FROM owner_leases l WHERE l.scope='runtime'
+                       AND l.owner_id=s.builtin_execution_owner AND l.expires_at>?5)",
+            params![
+                turn.turn_id,
+                turn.session_id,
+                sqlite_u64(turn.item_number, "grant item")?,
+                turn.actor,
+                super::now_rfc3339()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    cursor
+        .ok_or_else(|| StoreError::InvalidData("Agent turn has no current writer authority".into()))
+}
+
+fn writer_grant(
+    tx: &rusqlite::Connection,
+    turn: &BuiltinWriterTurn,
+    execution_id: &str,
+) -> Result<Option<BuiltinGrant>, StoreError> {
+    let current = session_grant(tx, &turn.session_id, execution_id)?;
+    if current
+        .as_ref()
+        .is_some_and(|grant| grant.item_number != turn.item_number || grant.actor != turn.actor)
+    {
+        return Err(StoreError::InvalidData(
+            "writer capability is fenced or belongs to another responsibility".into(),
+        ));
+    }
+    Ok(current)
+}
+
+fn begin_mint(
+    tx: &rusqlite::Connection,
+    turn: &BuiltinWriterTurn,
+    expected_epoch: u64,
+) -> Result<BuiltinReply, StoreError> {
+    let (cursor, execution_id) = writer_execution(tx, turn)?;
+    if let Some(current) = writer_grant(tx, turn, &execution_id)?
+        && (current.lifecycle == "pending"
+            || (current.lifecycle == "active" && current.epoch > expected_epoch))
+    {
+        return Ok(BuiltinReply::Grant(Some(current)));
+    }
+    tx.execute(
+        "INSERT INTO builtin_writer_grants(session_id,item_number,actor,request_id,epoch,lifecycle,authority_cursor,execution_id)
+         VALUES(?1,?2,?3,?4,?5,'pending',?6,?7)
+         ON CONFLICT(session_id) DO UPDATE SET request_id=excluded.request_id,epoch=excluded.epoch,
+             authority_cursor=excluded.authority_cursor,execution_id=excluded.execution_id,
+             grant_id=NULL,token=NULL,lifecycle='pending'",
+        params![turn.session_id,sqlite_u64(turn.item_number,"grant item")?,turn.actor,
+            Uuid::now_v7().to_string(),sqlite_u64(expected_epoch,"grant epoch")?,cursor,execution_id],
+    )?;
+    Ok(BuiltinReply::Grant(session_grant(tx, &turn.session_id, &execution_id)?))
+}
+
+pub(super) fn advance_cursor(tx: &rusqlite::Connection, cursor: u64) -> Result<(), StoreError> {
+    tx.execute(
+        "UPDATE builtin_upstream SET cursor=?1 WHERE singleton=1 AND cursor<=?1",
+        [sqlite_u64(cursor, "upstream cursor")?],
+    )?;
+    Ok(())
+}
 
 // Every command uses the same transaction boundary and commits exactly once.
 #[allow(clippy::too_many_lines)]
@@ -65,7 +197,7 @@ pub(super) fn execute(
     configure_connection(&connection)?;
     // CLI callers share this ledger with the runtime; reserve writes before reading their snapshot.
     let behavior = match &command {
-        BuiltinCommand::State | BuiltinCommand::Grants | BuiltinCommand::Grant(_) => {
+        BuiltinCommand::State | BuiltinCommand::WriterGrant(_) => {
             rusqlite::TransactionBehavior::Deferred
         }
         _ => rusqlite::TransactionBehavior::Immediate,
@@ -108,57 +240,40 @@ pub(super) fn execute(
             BuiltinReply::Binding(binding)
         }
         BuiltinCommand::Advance(cursor) => {
-            tx.execute(
-                "UPDATE builtin_upstream SET cursor=?1 WHERE singleton=1 AND cursor<=?1",
-                [sqlite_u64(cursor, "upstream cursor")?],
-            )?;
+            advance_cursor(&tx, cursor)?;
             BuiltinReply::Done
         }
-        BuiltinCommand::Grants => {
-            let rows = tx
-                .prepare(&format!("{SELECT} WHERE lifecycle!='revoked'"))?
-                .query_map([], grant)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            BuiltinReply::Grants(rows)
+        BuiltinCommand::Execution(command) => builtin_execution::execute(&tx, command)?,
+        BuiltinCommand::WriterGrant(turn) => {
+            let (_, execution_id) = writer_execution(&tx, &turn)?;
+            BuiltinReply::Grant(writer_grant(&tx, &turn, &execution_id)?)
         }
-        BuiltinCommand::Grant(session) => BuiltinReply::Grant(
-            tx.query_row(&format!("{SELECT} WHERE session_id=?1"), [session], grant).optional()?,
-        ),
-        BuiltinCommand::Prepare { session_id, item_number, actor } => {
-            let old = tx
-                .query_row(&format!("{SELECT} WHERE session_id=?1"), [&session_id], grant)
-                .optional()?;
-            if old
-                .as_ref()
-                .is_some_and(|grant| grant.item_number != item_number || grant.actor != actor)
-            {
-                return Err(StoreError::InvalidData(
-                    "provider session writer grant is bound to a different item/actor".into(),
-                ));
-            }
-            if old.as_ref().is_some_and(|g| g.lifecycle != "revoked") {
-                BuiltinReply::Grant(old)
-            } else {
-                let epoch:i64=tx.query_row("SELECT COALESCE(MAX(epoch),0) FROM builtin_writer_grants WHERE item_number=?1 AND actor=?2",params![sqlite_u64(item_number,"grant item")?,actor],|r|r.get(0))?;
-                tx.execute("INSERT INTO builtin_writer_grants(session_id,item_number,actor,request_id,epoch,lifecycle) VALUES(?1,?2,?3,?4,?5,'pending') ON CONFLICT(session_id) DO UPDATE SET request_id=excluded.request_id,epoch=excluded.epoch,grant_id=NULL,token=NULL,lifecycle='pending'",params![session_id,sqlite_u64(item_number,"grant item")?,actor,Uuid::now_v7().to_string(),epoch])?;
-                BuiltinReply::Grant(Some(tx.query_row(
-                    &format!("{SELECT} WHERE session_id=?1"),
-                    [session_id],
-                    grant,
-                )?))
-            }
+        BuiltinCommand::BeginMint { turn, expected_epoch } => {
+            begin_mint(&tx, &turn, expected_epoch)?
         }
-        BuiltinCommand::Activate { session_id, grant_id, epoch, token } => {
-            let updated=tx.execute("UPDATE builtin_writer_grants SET grant_id=?2,epoch=?3,token=?4,lifecycle='active' WHERE session_id=?1 AND lifecycle='pending'",params![session_id,grant_id,sqlite_u64(epoch,"grant epoch")?,token])?;
+        BuiltinCommand::Activate { request_id, session_id, grant_id, epoch, token } => {
+            let updated = tx.execute(
+                "UPDATE builtin_writer_grants SET grant_id=?3,epoch=?4,token=?5,lifecycle='active'
+                 WHERE session_id=?1 AND request_id=?2
+                   AND EXISTS(SELECT 1 FROM provider_sessions s WHERE
+                     s.builtin_execution_id=builtin_writer_grants.execution_id AND
+                     s.builtin_execution_state='open')
+                   AND (lifecycle='pending' OR (lifecycle='active' AND grant_id=?3 AND epoch=?4 AND token=?5))",
+                params![session_id,request_id,grant_id,sqlite_u64(epoch,"grant epoch")?,token],
+            )?;
             if updated != 1 {
                 return Err(StoreError::InvalidData(
-                    "writer grant intent is no longer pending; refusing stale admission".into(),
+                    "writer grant intent is no longer current".into(),
                 ));
             }
             BuiltinReply::Done
         }
-        BuiltinCommand::Revoke { session_id, epoch } => {
-            tx.execute("UPDATE builtin_writer_grants SET epoch=?2,token=NULL,lifecycle='revoked' WHERE session_id=?1",params![session_id,sqlite_u64(epoch,"grant epoch")?])?;
+        BuiltinCommand::RejectMint { request_id, session_id } => {
+            tx.execute(
+                "UPDATE builtin_writer_grants SET lifecycle='revoked'
+                 WHERE session_id=?1 AND request_id=?2 AND lifecycle='pending'",
+                params![session_id, request_id],
+            )?;
             BuiltinReply::Done
         }
     };

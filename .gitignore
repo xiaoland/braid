@@ -8,3 +8,8 @@
 .DS_Store
 .pi/
 .wrangler/
+
+# svc:begin local-config sha256=0cb2591848c4e5675766aa516f16dfb9981fc52e1dcbadd8cec89b6982db927d
+svc.local.json
+AGENTS.local.md
+# svc:end local-config

@@ -1,10 +1,10 @@
 //! HTTP access to Braid's authoritative local objects; OTLP is observation only.
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use axum::{
     Json, Router,
-    extract::{Path, State, rejection::JsonRejection},
+    extract::{Path, Query, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::{
     platform::config::PlatformConfig,
     platform::objects::{
-        CommandFailure, CommandRequest, ControlPolicy, ControlReceipt, PlatformObjects,
+        CommandFailure, CommandRequest, ControlPolicy, ControlReceipt, Item, PlatformObjects,
     },
 };
 
@@ -22,28 +22,44 @@ struct ControlState {
     database: std::path::PathBuf,
     repository: String,
     policy: ControlPolicy,
-    commands: Mutex<()>,
+    git_commands: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub fn router(config: &PlatformConfig) -> Result<Router> {
     super::store::initialize(config)?;
-    PlatformObjects::open(&config.database, &config.repository)?
-        .pin_existing_candidates(&config.source)?;
     let state = Arc::new(ControlState {
         database: config.database.clone(),
         repository: config.repository.clone(),
-        commands: Mutex::new(()),
+        git_commands: Arc::new(tokio::sync::Mutex::new(())),
         policy: ControlPolicy { source: config.source.clone() },
+    });
+    let retention = state.clone();
+    tokio::spawn(async move {
+        let permit = retention.git_commands.clone().lock_owned().await;
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            PlatformObjects::open_read_only(&retention.database, &retention.repository)?
+                .pin_existing_candidates(&retention.policy.source)
+        })
+        .await;
+        match outcome {
+            Ok(Err(error)) => tracing::warn!(%error, "cannot restore platform candidate retention"),
+            Err(error) => tracing::warn!(%error, "platform candidate retention task stopped"),
+            Ok(Ok(())) => {}
+        }
     });
     Ok(Router::new()
         .route("/api/control/snapshot", get(snapshot))
         .route("/api/control/items", get(items))
         .route("/api/platform/repository", get(repository))
+        .route("/api/platform/items/{number}", get(platform_item))
         .route("/api/platform/context/{number}", get(context))
         .route("/api/platform/scope/{number}", get(scope))
+        .route("/api/platform/scope/{number}/boundary", get(scope_boundary))
         .route("/api/platform/events", get(events))
         .route("/api/platform/writes", post(writes))
-        .route("/api/platform/grants", post(grant))
+        .route("/api/platform/executions/fence", post(fence_execution))
+        .route("/api/platform/grants", get(grant_epoch).post(grant))
         .route("/api/platform/grants/revoke", post(revoke))
         .route("/api/control/items/{number}", get(item))
         .route("/api/control/items/{number}/diff", get(diff))
@@ -61,6 +77,12 @@ async fn item(
     Path(number): Path<u64>,
 ) -> Result<Json<Value>, HttpError> {
     run_read(state, move |objects| objects.control_item(number)).await.map(Json)
+}
+async fn platform_item(
+    State(state): State<Arc<ControlState>>,
+    Path(number): Path<u64>,
+) -> Result<Json<Item>, HttpError> {
+    run_read(state, move |objects| objects.item(number)).await.map(Json)
 }
 async fn diff(
     State(state): State<Arc<ControlState>>,
@@ -91,11 +113,16 @@ async fn command(
         })?
         .0;
     let request_id = request.request_id.clone();
+    let git_permit = if request.command.requires_git() {
+        Some(state.git_commands.clone().lock_owned().await)
+    } else {
+        None
+    };
     let result = tokio::task::spawn_blocking(move || {
+        let _git_permit = git_permit;
         let span=tracing::info_span!("control.command",request_id=%request.request_id,operation=request.command.operation(),target_number=?request.command.target(),expected_revision=?request.expected_revision);
         let _entered=span.enter();
         let started=std::time::Instant::now();
-        let _command=state.commands.lock().map_err(|e|CommandFailure{code:"unavailable".into(),message:format!("control command owner lock failed: {e}")})?;
         let mut objects = PlatformObjects::open(&state.database, &state.repository).map_err(|e| {
             CommandFailure { code: "unavailable".into(), message: format!("{e:#}") }
         })?;
@@ -123,7 +150,7 @@ async fn run_read<T: Send + 'static>(
 ) -> Result<T, HttpError> {
     tokio::task::spawn_blocking(move || {
         let objects = PlatformObjects::open_read_only(&state.database, &state.repository)?;
-        objects.verify_source(&state.policy.source)?;
+        objects.verify_source_binding(&state.policy.source)?;
         read(&objects)
     })
     .await
@@ -166,11 +193,28 @@ async fn items(State(state): State<Arc<ControlState>>) -> Result<Json<Value>, Ht
 async fn repository(State(state): State<Arc<ControlState>>) -> Result<Json<Value>, HttpError> {
     run_read(state, PlatformObjects::repository_info).await.map(Json)
 }
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextQuery {
+    execution_client_id: Option<String>,
+    execution_run_id: Option<String>,
+}
+
 async fn context(
     State(state): State<Arc<ControlState>>,
     Path(number): Path<u64>,
+    Query(query): Query<ContextQuery>,
 ) -> Result<Json<Value>, HttpError> {
-    run_read(state, move |o| Ok(serde_json::to_value(o.context(number)?)?)).await.map(Json)
+    run_read(state, move |objects| {
+        let context = if let Some(client_id) = query.execution_client_id {
+            objects.execution_context(number, &client_id, query.execution_run_id.as_deref())?
+        } else {
+            objects.context(number)?
+        };
+        Ok(serde_json::to_value(context)?)
+    })
+    .await
+    .map(Json)
 }
 #[derive(serde::Deserialize)]
 struct EventQuery {
@@ -203,6 +247,27 @@ async fn writes(
     .map(Json)
     .map_err(HttpError::internal)
 }
+async fn fence_execution(
+    State(state): State<Arc<ControlState>>,
+    Json(request): Json<super::execution::FenceExecution>,
+) -> Result<Json<super::execution::FenceExecution>, HttpError> {
+    tokio::task::spawn_blocking(move || super::execution::fence(&state.database, request))
+        .await
+        .map_err(HttpError::internal)?
+        .map(Json)
+        .map_err(HttpError::internal)
+}
+async fn grant_epoch(
+    State(state): State<Arc<ControlState>>,
+    Query(identity): Query<super::grants::GrantIdentity>,
+) -> Result<Json<Option<super::grants::GrantEpoch>>, HttpError> {
+    tokio::task::spawn_blocking(move || super::grants::current_epoch(&state.database, &identity))
+        .await
+        .map_err(HttpError::internal)?
+        .map(Json)
+        .map_err(HttpError::internal)
+}
+
 async fn grant(
     State(state): State<Arc<ControlState>>,
     Json(request): Json<super::grants::GrantRequest>,
@@ -251,4 +316,18 @@ async fn scope(
     Path(number): Path<u64>,
 ) -> Result<Json<super::objects::ScopeSnapshot>, HttpError> {
     run_read(state, move |o| o.scope(number)).await.map(Json)
+}
+
+async fn scope_boundary(
+    State(state): State<Arc<ControlState>>,
+    Path(number): Path<u64>,
+) -> Result<Json<super::objects::ScopeBoundary>, HttpError> {
+    tokio::task::spawn_blocking(move || {
+        let objects = PlatformObjects::open_read_only(&state.database, &state.repository)?;
+        objects.scope_boundary(number)
+    })
+    .await
+    .map_err(HttpError::internal)?
+    .map(Json)
+    .map_err(HttpError::internal)
 }

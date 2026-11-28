@@ -75,6 +75,104 @@ async fn handoff_is_atomic_idempotent_and_uses_next_batch_without_parallel_turns
     task.abort();
 }
 
+fn add_runnable_event(f: &Fixture, id: &str, reference: &str, urgent: bool) {
+    let mut connection = f.db();
+    let tx = connection.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO events(event_id,work_item_node_id,kind,origin,reference,lifecycle,observed_at)
+         VALUES (?1,'pr','wake','human',?2,'pending','now')",
+        rusqlite::params![id, reference],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO wake_batches(batch_id,work_item_node_id,event_count,quiet_deadline,urgent,lifecycle,created_at,updated_at)
+         VALUES (?1,'pr',1,'now',?2,'runnable','now','now')",
+        rusqlite::params![id, urgent],
+    ).unwrap();
+    tx.execute("INSERT INTO wake_batch_events VALUES (?1,?1,0)", [id]).unwrap();
+    tx.commit().unwrap();
+}
+
+#[tokio::test]
+async fn accepted_handoff_waits_for_next_turn_and_survives_unavailable_publisher() {
+    for associated in [true, false] {
+        let f = Fixture::new(true);
+        bind_pr(&f);
+        add_runnable_event(&f, "running", "Already running", false);
+        let running = claim(&f).unwrap();
+        f.store.mark_turn_started(running.turn_id.clone(), "native-running".into()).unwrap();
+
+        let receipt = handoff(&f, "arrives-during-steer").unwrap();
+        let remote = Arc::new(Mutex::new(body_edit::BodyRemote::new(false)));
+        let (github, task) = body_edit::body_server(remote.clone()).await;
+        add_runnable_event(&f, "steer", "Emergency human input", true);
+        let steer = f.store.claim_urgent_steer(running.turn_id.clone()).unwrap().unwrap();
+        assert_eq!(steer.turn.references, ["Emergency human input"]);
+
+        // The provider is replying to that exact snapshot when the handoff joins its batch.
+        f.drain(github.clone()).await;
+        assert_eq!(f.receipt(&receipt.request_id).lifecycle, "applied");
+        let facts: (String, i64, String, i64, i64, Option<String>) = f.db().query_row(
+            "SELECT h.source_repository,h.source_number,h.target_assignment_id,h.target_generation,
+                    e.next_turn_only,p.target_assignment_id
+             FROM handoff_inputs h JOIN events e ON e.event_id=h.event_id
+             JOIN pr_handoffs p ON p.event_id=h.event_id",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+        ).unwrap();
+        assert_eq!(facts, ("owner/repository".into(), 1, "pr-assignment".into(), 1, 1, None));
+
+        // Remove publisher table names altogether. A query that still joins them errors.
+        f.db()
+            .execute_batch(
+                "ALTER TABLE pr_handoffs RENAME TO unavailable_handoff_receipts;
+             ALTER TABLE write_intents RENAME TO unavailable_write_intents;
+             ALTER TABLE github_write_outbox RENAME TO unavailable_write_outbox;",
+            )
+            .unwrap();
+        assert!(f.store.gh_write_receipt(receipt.request_id).is_err());
+        assert!(f.store.claim_urgent_steer(running.turn_id.clone()).unwrap().is_none());
+        f.store.consume_steer_batch(&steer).unwrap();
+        assert!(f.store.claim_urgent_steer(running.turn_id.clone()).unwrap().is_none());
+        assert!(claim(&f).is_none());
+        f.store.mark_turn_terminal(running.turn_id, "completed".into()).unwrap();
+
+        remote.lock().unwrap().associated = associated;
+        let next = claim(&f).expect("handoff survives late steer settlement");
+        assert_eq!(next.references.len(), 1);
+        assert!(next.references[0].contains("Explicit Issue handoff"));
+        let recorder = RecordingSession::new();
+        let backend = crate::collaboration::CollaborationBackend::GitHub(github);
+        if associated {
+            send_prepared(&f, &backend, next, &recorder).await;
+            let inputs = recorder.inputs.lock().unwrap();
+            assert_eq!(inputs.len(), 1);
+            assert!(inputs[0].contains("Explicit Issue handoff"));
+            assert!(inputs[0].contains("Current canonical Context"));
+        } else {
+            let prepared = crate::group::input::prepare_input(
+                &f.config,
+                &backend,
+                &f.store,
+                f.config.profile("issue-codex").unwrap(),
+                next,
+            )
+            .await
+            .unwrap();
+            assert!(prepared.is_none(), "canonical disassociation retires the handoff");
+            assert!(recorder.inputs.lock().unwrap().is_empty());
+            let lifecycle: String = f
+                .db()
+                .query_row("SELECT lifecycle FROM events WHERE detail='pr_handoff'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(lifecycle, "consumed");
+        }
+        assert!(claim(&f).is_none(), "the handoff must not surface twice");
+        task.abort();
+    }
+}
+
 #[tokio::test]
 async fn handoff_rejects_local_authority_and_generation_changes() {
     let unassigned = Fixture::new(true);
@@ -89,7 +187,7 @@ async fn handoff_rejects_local_authority_and_generation_changes() {
         "UPDATE assignments SET lifecycle='blocked' WHERE assignment_id='pr-assignment'",
         "UPDATE assignments SET lifecycle='finalizing' WHERE assignment_id='pr-assignment'",
         "DELETE FROM provider_sessions WHERE session_id='pr-session'",
-        "INSERT INTO provider_sessions SELECT 'latest-pr-session',agent_id,provider_kind,'latest-pr-provider',context_revision,instruction_revision,'blocked',started_at,resume_count,last_resumed_at,last_resume_error FROM provider_sessions WHERE session_id='pr-session'",
+        "INSERT INTO provider_sessions(session_id,agent_id,provider_kind,provider_session_id,context_revision,instruction_revision,lifecycle,started_at,resume_count,last_resumed_at,last_resume_error) SELECT 'latest-pr-session',agent_id,provider_kind,'latest-pr-provider',context_revision,instruction_revision,'blocked',started_at,resume_count,last_resumed_at,last_resume_error FROM provider_sessions WHERE session_id='pr-session'",
         "UPDATE work_items SET state='closed' WHERE node_id='pr'",
         "UPDATE work_items SET state='merged' WHERE node_id='pr'",
         "UPDATE work_items SET state='closed' WHERE node_id='item'",
@@ -644,7 +742,7 @@ async fn invalid_handoff_only_batch_ends_and_returns_claim_without_losing_concur
 
 #[tokio::test]
 async fn retirement_is_fenced_atomic_and_preserves_other_handoff_and_historical_source() {
-    use crate::store::handoff::{RetiredInput, RetirementReason};
+    use crate::store::handoff_inputs::{RetiredInput, RetirementReason};
     let f = Fixture::new(true);
     bind_pr(&f);
     let first = handoff(&f, "first").unwrap();

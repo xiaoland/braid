@@ -76,17 +76,27 @@ transcript authority. A full Context is rebuilt from the selected upstream befor
 Harness 的 `collaboration` adapter 从所选上游取得当前对象与默认分支，Group、
 Context、queue、provider 和停止证明共用。内建 adapter 使用 HTTP 平台接口，
 在自己的 ledger 保存平台身份、事件 cursor 和 delivery 去重。平台对象变化
-与稳定事件原子提交，事件不因某一消费者读过而消失；Harness 成功 ingest 后才
-推进自己的 cursor，状态 outbox 通过幂等接口写回平台。
+与稳定事件原子提交，事件不因某一消费者读过而消失。Harness 在同一事务接纳
+事件并推进自己的 cursor。平台对象提交指派和生命周期时只记录权威事件。
+签发及使用 grant 时用该事件版本和 run root 版本判定有效性，重放旧身份不能恢复授权。
+输入和执行独立记录状态与反馈义务，outbox 通过幂等接口领取并写回平台。
 
-平台 actor 与 Harness Profile 分别拥有含义。Harness gateway 核验当前工作区及
-执行身份，使用平台 writer grant。平台提交事务检查 grant epoch、对象 revision
-和 request ID；执行替换先撤销旧 grant，撤销确认后才能完成 fencing。平台
-保存授权版本，不保存原生会话状态；撤销前已经提交的命令仍属于合法历史。
+平台 actor 与 Harness Profile 分别拥有含义。内建轮次认领时保存已接纳事件位置，
+发送原生 prompt 时通过只读 Context 核验当前指派和 run 范围，无需请求 writer grant。
+Harness 在首次发送轮次前保存不可复用的执行代次，并绑定当前 runtime lease。
+Agent 首次写入时，gateway 使用当前工作区和精确 session/turn 身份，按认领时的
+事件位置和执行代次申请 grant。平台签发和提交事务都检查代次封禁，另核验适用的
+指派、生命周期、run root、grant epoch、对象 revision 和 request ID。
+
+Harness 先关闭该代次的本地授权入口，再分别请求平台的永久封禁和原生停止。
+平台封禁接受从未申请 grant 的代次，并与签发及最终提交串行化。封禁路径不读取
+grant、发布意图或回执。替代执行要求已确认的平台封禁和原生停止。原生恢复必须
+使用新的代次。封禁前已提交的命令属于合法历史。
 
 PR 交接固定 commit OID。Harness 验证工作树责任，平台只在绑定 Git 对象库中
 验证提交并保留可达引用。首版要求两者能访问同一 Git 对象库，不提供远程
-Git 托管。合并用持久意图与 ref CAS 处理 SQLite/Git 边界；模型 Completed 不
+Git 托管。对象和范围查询从平台对象读取身份，候选采用回执用于交付判定。
+合并用持久意图与 ref CAS 处理 SQLite/Git 边界；模型 Completed 不
 意味着候选被采用或 Issue 完成。旧 local:*对象与事件身份在显式导入时保留，
 历史迁移不可变；平台与 Harness 的 schema 此后各自演进。
 
@@ -230,9 +240,10 @@ synchronous durability. One DB actor serializes writes. The Harness ledger owns:
   per Issue, independent of association fan-out;
 - `canonical_objects` for the latest observed Context metadata and tombstones;
 - `processed_objects` for the separately acknowledged complete observation and
-  semantic equality fingerprint, committed atomically with its event decisions;
-- `publication_versions` for exact version/content evidence of a correlated
-  Agent edit, never inferred from a presentation marker;
+  semantic equality fingerprint, including root title and body fingerprints,
+  committed atomically with its event decisions;
+- `publication_versions` for the exact version and content observed when
+  settling an edit intent. Echo classification uses upstream authorship;
 - `deliveries` and `events` for webhook/reconciliation dedupe/classification and
   independently recorded attention;
 - `implementation_requests.activation_event_id` for durable PR activation delivery;
@@ -307,7 +318,8 @@ are outside it and converge only when GitHub reports them.
 
 Console 的 OTLP Collector 保存原始传输批次与完整解码记录，使用独立数据库，
 不能写回对象或执行权威。资源身份、runtime generation、session、turn 与原生
-协议身份显式关联；采样和未关联记录是证据缺口，不是空闲状态。Web 查询分页
+协议身份显式关联；采样和未关联记录可能留下证据缺口。观测库启动失败时，Collector 和证据读取
+返回不可用，权威控制和平台 API 仍可启动。Web 查询分页
 读取该读模型，当前对象来自协作平台 API，执行状态来自 Harness ledger 与 runtime manager。
 
 平台通过有类型的应用命令修改对象。命令 request ID、内容摘要、预期 revision
@@ -331,5 +343,7 @@ Console 不调用 CLI，也不复制 Factory 的实验、赛事或容器生命�
 有限 `run` 与常驻 `serve` 是 Harness 的运行方式，平台仍是独立上游。`run`
 复用调度、原生 provider 和停止屏障，以独立 ledger 隔离一项 root 工作。父子 Issue、
 关联 PR、交付 ref 和 grant 边界由平台保存；输入绑定、执行状态和终态由 Harness 保存。
+范围登记与开放状态的查询使用对象账本。首个范围候选按需建立交付分支，
+关闭后的运行判定读取实际 Git 交付证据。
 Console 调用同一应用入口并读取当前 run ledger，OTLP 不承担终态权威。
 具体准入、关闭及接续合同见[生命周期说明](lifecycle.md#有限-root-运行)，输入与操作见[run 指南](../user-manual/run.md)。

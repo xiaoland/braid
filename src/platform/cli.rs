@@ -64,6 +64,7 @@ pub async fn run(arguments: PlatformArguments) -> Result<()> {
                 listen,
             };
             declaration.validate()?;
+            declaration.validate_git_source()?;
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]

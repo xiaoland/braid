@@ -19,6 +19,13 @@ impl CollaborationBackend {
         matches!(self, Self::Builtin(_))
     }
 
+    pub(crate) fn github_app_actor_node_id(&self) -> Option<&str> {
+        match self {
+            Self::GitHub(github) => Some(&github.identity().actor_node_id),
+            Self::Builtin(_) => None,
+        }
+    }
+
     pub(crate) async fn materialize_issue(
         &self,
         locator: &WorkItemLocator,
@@ -60,21 +67,16 @@ impl CollaborationBackend {
             Self::Builtin(client) => client.candidate(number).await,
         }
     }
-    pub(crate) async fn ensure_grant(
-        &self,
-        session_id: &str,
-        number: u64,
-        actor: &str,
-    ) -> Result<()> {
+    pub(crate) fn bind_execution(&self, turn_id: &str) -> Result<()> {
         match self {
             Self::GitHub(_) => Ok(()),
-            Self::Builtin(client) => client.ensure_grant(session_id, number, actor).await,
+            Self::Builtin(client) => client.bind_execution(turn_id),
         }
     }
-    pub(crate) async fn revoke_session(&self, session_id: &str) -> Result<()> {
+    pub(crate) async fn fence_session(&self, session_id: &str) -> Result<()> {
         match self {
             Self::GitHub(_) => Ok(()),
-            Self::Builtin(client) => client.revoke_session(session_id).await,
+            Self::Builtin(client) => client.fence_session(session_id).await,
         }
     }
 

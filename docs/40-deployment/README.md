@@ -76,6 +76,7 @@ Everything below is scoped by trust boundary:
     config.toml                 # Harness config, schema version 3 (GitHub v2 still readable)
     github-app.pem              # GitHub App private key
     secrets.toml                # webhook secret
+    source/                     # repository checkout used to provision worktrees
     state/
       braid.sqlite3
       backups/
@@ -330,8 +331,10 @@ the next compatible resume; Braid neither starts a parallel turn nor calls it a
 success or failure.
 
 Quick Tunnel URLs are temporary. A dedicated supervisor owns the child, public
-verification and App URL synchronization independently of Agent execution. Child
-exit or an explicit `Tunnel not found` marks connectivity unavailable and starts
+verification and App URL synchronization independently of Agent execution.
+The first public registration also runs under this supervisor. A failed candidate
+leaves connectivity degraded while local ingress and reconciliation continue.
+Child exit or an explicit `Tunnel not found` marks connectivity unavailable and starts
 bounded, backed-off candidate rebuilding without restarting `serve` or its Agent
 sessions. Every 60 seconds it verifies a signed public request receives ingress
 202 and that the App still names that URL. A failed check reports degraded
@@ -402,7 +405,30 @@ Schema 13 只修复 Operational Status 的公开投影。已有 generation 的�
 Schema 14 将事件与批次的唯一关系限定在单个批次内。结果 unknown 的轮次重放时，
 新批次可保留原 Event References 与 trusted mention 身份，旧轮次的输入历史不变。
 迁移不把 unknown 当作已停止；替代执行仍须经过旧执行停止与 Context replacement
-屏障。升级前停止服务并备份；旧 binary 不能打开 schema 14 账本。
+屏障。
+
+Schema 15 单独保存 adapter 已确认的原生停止依据，覆盖重启后的 Context 替换
+和重开。迁移为旧会话保留空的停止记录，避免从旧生命周期推断执行已停。升级
+前停止服务并备份；旧 binary 不能打开 schema 15 账本。
+
+Schema 16 在轮次认领时保存内建事件 cursor，记下已发起的 writer grant 申请和
+正在确认的撤权。升级时一并更换内建 Platform 与 Harness 二进制。新平台的 grant
+签发要求 Harness 提供认领时的 cursor。历史轮次保留空 cursor。
+
+Harness schema 17 与 Platform schema 4 引入执行代次。先停止旧 Harness，再升级
+Platform 以禁用缺少执行代次的旧 grant 并保留原始回执，随后升级 Harness。升级只
+改变平台授予的写入资格。历史会话仍按原有原生停止证据判定。新 Harness 可继续
+接纳事件，平台支持执行封禁并确认既有代次后才启动 Provider。
+
+Schema 18 将已知 GitHub Operational Status 评论 ID 迁入 Context 的角色账本，
+保留可独立核对的旧待确认请求及多候选歧义。Schema 19 将已接纳 PR 交接的来源、
+目标代次和下一轮约束迁入输入账本。旧交接证据缺损时，在发送 Provider 前单独
+退休相应输入。Schema 20 保留旧 eyes 的精确 GitHub 目标。新的反馈由输入和轮次
+账本持有，发布器领取后才投影到 outbox。迁移保留旧发布尝试与回执。
+Schema 21 在首次完整对账时建立标题和正文各自的基线。缺少可证实作者的历史
+变更按外部变化处理。
+Schema 22 在输入和执行账本持久记录待公开的 Operational Status，发布器恢复后
+继续投影，保留原有评论身份和历史回执。
 
 ## Health and Status
 
@@ -467,10 +493,12 @@ Harness 配置 schema 3 选择 `[github]` 或 `[builtin]`。原 GitHub schema 2 
 数据库迁移至 schema 6，平台此后使用自己的 schema，不读取执行表。迁移及
 启动命令见[内建平台指南](../user-manual/local.md)。
 
-平台当前 schema 3 持有自己的嵌入迁移名称与 SHA-256 校验。旧平台 schema 1
-在启动时先备份再向前升级，保留空间身份、对象和回执；不通过重建空库升级。
+平台当前 schema 5 持有自己的嵌入迁移名称与 SHA-256 校验。已有平台在启动时
+先备份再向前升级，保留空间身份、对象和回执。
 未知版本或迁移校验不一致明确拒绝。历史候选与合并提交保留平台专属 Git 引用，
-避免工作分支移动或清理后丢失已接受的提交。
+避免工作分支移动或清理后丢失已接受的提交。已注册平台在 Git 工作区离线时仍可
+提供数据库对象、事件和范围查询。创建候选、Git diff、合并和判定最终交付时会
+重新检查相应 Git 数据。首次注册仍验证绑定工作区和默认分支。
 
 两个上游经过同一 Harness 运行入口、lease、调度和 Group/provider 停止合同。
 内建 adapter 使用 HTTP 平台接口，事件 cursor 和 grant 能力保留在 Harness
@@ -478,8 +506,10 @@ ledger；平台不为每个消费者修改事件。`--transport-only` 接入对�
 不启动原生模型会话。GitHub 专属命令在内建上游明确拒绝。
 
 Agent 子进程取得 `BRAID_CONFIG` 与 `BRAID_AGENT`，对象 gateway 通过专属 cwd、
-当前 assignment/session/turn 选择有效 grant；平台提交事务核验授权版本。撤销
-失败传播并阻断执行替换，不把一次 gateway 读取当作提交时仍有效的证明。同
+当前 assignment/session/turn 按需使用或申请有效 grant。普通 prompt 发送无需
+等待签发。平台签发和提交事务核验执行代次及当前指派和范围的权威事件版本。
+同名重新指派、范围登记、关闭和重开都使旧 grant 失效。
+平台封禁或原生停止无法确认时阻断执行替换。同
 账户进程不是安全沙箱的隔离对手。平台对象、provider history 与 Git 资料保留
 各自身份和数据库，停止 Harness 不删除平台。
 

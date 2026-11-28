@@ -1,5 +1,5 @@
 //! A processed observation is a delivery commitment, not a Context cache update.
-use super::{CanonicalObjectState, IngressEvent, SchedulerPolicy, StoreError};
+use super::{CanonicalObjectState, IngressEvent, ObservedRootFields, SchedulerPolicy, StoreError};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use sha2::{Digest as _, Sha256};
 use std::path::Path;
@@ -82,25 +82,35 @@ pub(super) fn load(
     work_item: &str,
 ) -> Result<Vec<CanonicalObjectState>, StoreError> {
     let mut statement = connection.prepare(
-        "SELECT node_id,database_id,object_kind,version,digest,lifecycle,author_node_id,author_login,metadata_digest
+        "SELECT node_id,database_id,object_kind,version,digest,lifecycle,author_node_id,
+                author_login,metadata_digest,title_digest,body_digest,title_event_id
          FROM processed_objects WHERE work_item_node_id=?1 ORDER BY node_id",
     )?;
-    let rows = statement.query_map([work_item], |row| {
-        Ok(CanonicalObjectState {
-            node_id: row.get(0)?,
-            database_id: row.get(1)?,
-            object_kind: row.get(2)?,
-            version: row.get(3)?,
-            digest: row.get(4)?,
-            lifecycle: row.get(5)?,
-            author_node_id: row.get(6)?,
-            author_login: row.get(7)?,
-            metadata_digest: row.get(8)?,
-        })
-    })?;
+    let rows =
+        statement.query_map([work_item], |row| {
+            let title: Option<String> = row.get(9)?;
+            let body: Option<String> = row.get(10)?;
+            let title_event_id = row.get(11)?;
+            Ok(CanonicalObjectState {
+                root_fields: title.zip(body).map(|(title_digest, body_digest)| {
+                    ObservedRootFields { title_digest, body_digest, title_event_id }
+                }),
+                node_id: row.get(0)?,
+                database_id: row.get(1)?,
+                object_kind: row.get(2)?,
+                version: row.get(3)?,
+                digest: row.get(4)?,
+                lifecycle: row.get(5)?,
+                author_node_id: row.get(6)?,
+                author_login: row.get(7)?,
+                metadata_digest: row.get(8)?,
+            })
+        })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+// Observation, canonical frontier and synthesized events commit together.
+#[allow(clippy::too_many_lines)]
 pub(super) fn commit(
     database: &Path,
     observation: &ObservationCommit,
@@ -177,7 +187,27 @@ pub(super) fn commit(
     }
     tx.execute("DELETE FROM processed_objects WHERE work_item_node_id=?1", [work_item])?;
     for object in &observation.current {
-        tx.execute("INSERT INTO processed_objects(work_item_node_id,node_id,database_id,object_kind,version,digest,lifecycle,author_node_id,author_login,metadata_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![work_item,object.node_id,object.database_id,object.object_kind,object.version,object.digest,object.lifecycle,object.author_node_id,object.author_login,object.metadata_digest])?;
+        let root = object.root_fields.as_ref();
+        tx.execute(
+            "INSERT INTO processed_objects(work_item_node_id,node_id,database_id,object_kind,
+               version,digest,lifecycle,author_node_id,author_login,metadata_digest,title_digest,
+               body_digest,title_event_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                work_item,
+                object.node_id,
+                object.database_id,
+                object.object_kind,
+                object.version,
+                object.digest,
+                object.lifecycle,
+                object.author_node_id,
+                object.author_login,
+                object.metadata_digest,
+                root.map(|r| &r.title_digest),
+                root.map(|r| &r.body_digest),
+                root.and_then(|r| r.title_event_id.as_deref()),
+            ],
+        )?;
     }
     tx.commit()?;
     for object in &observation.current {
@@ -326,11 +356,72 @@ pub(super) fn record_publication(
     Ok(())
 }
 
-pub(super) fn is_agent_version(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VersionOrigin {
+    External,
+    Agent,
+    Unknown,
+}
+
+pub(crate) struct NativeVersionEvidence {
+    pub(crate) origin: VersionOrigin,
+    pub(crate) prior_title: Option<String>,
+    pub(crate) prior_body: Option<String>,
+}
+
+impl NativeVersionEvidence {
+    pub(crate) fn unknown() -> Self {
+        Self { origin: VersionOrigin::Unknown, prior_title: None, prior_body: None }
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct NativeEditPayload {
+    #[serde(default)]
+    changes: NativeEditChanges,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct NativeEditChanges {
+    title: Option<NativeEditField>,
+    body: Option<NativeEditField>,
+}
+
+#[derive(serde::Deserialize)]
+struct NativeEditField {
+    from: Option<String>,
+}
+
+/// Only received native events can supplement canonical actor evidence.
+pub(super) fn native_version_evidence(
     connection: &Connection,
     node: &str,
     version: &str,
     digest: &str,
-) -> Result<bool, StoreError> {
-    connection.query_row("SELECT EXISTS(SELECT 1 FROM publication_versions WHERE node_id=?1 AND version=?2 AND digest=?3) OR EXISTS(SELECT 1 FROM events WHERE object_node_id=?1 AND object_version=?2 AND body_digest=?3 AND origin='agent')",params![node,version,digest],|row| row.get(0)).map_err(Into::into)
+    action: &str,
+) -> Result<NativeVersionEvidence, StoreError> {
+    let origin: Option<(String, Vec<u8>)> = connection.query_row(
+        "SELECT e.origin,d.raw_payload FROM events e JOIN deliveries d ON d.delivery_guid=e.delivery_guid
+         WHERE e.object_node_id=?1 AND e.object_version=?2 AND e.body_digest=?3
+           AND d.action=?4 AND e.lifecycle!='superseded' AND e.origin IN ('external','agent')
+           AND d.event_name IN ('issues','pull_request','issue_comment','pull_request_review',
+                                'pull_request_review_comment')
+           AND d.delivery_guid NOT LIKE 'reconcile-%'
+         ORDER BY e.origin='external' DESC LIMIT 1",
+        params![node, version, digest, action],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    let Some((origin, payload)) = origin else { return Ok(NativeVersionEvidence::unknown()) };
+    if origin == "external" {
+        return Ok(NativeVersionEvidence {
+            origin: VersionOrigin::External,
+            ..NativeVersionEvidence::unknown()
+        });
+    }
+    let changes = serde_json::from_slice::<NativeEditPayload>(&payload).unwrap_or_default().changes;
+    Ok(NativeVersionEvidence {
+        origin: VersionOrigin::Agent,
+        prior_title: changes.title.and_then(|title| title.from),
+        prior_body: changes.body.and_then(|body| body.from),
+    })
 }

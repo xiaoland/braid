@@ -1,5 +1,5 @@
 #![allow(clippy::large_futures)]
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use tokio::{
@@ -7,16 +7,16 @@ use tokio::{
     time::{Duration, MissedTickBehavior},
 };
 
-use super::{SessionManager, provider::materialized_profile};
+use super::{SessionManager, availability::ProviderReport, provider::materialized_profile};
 use crate::{
-    agent_session::SessionFactory,
+    agent_session::{SessionError, SessionFactory},
     collaboration::CollaborationBackend,
     config::{Config, Profile},
     github::GitHubClient,
     store::{ProfileRecord, StoreActor, TurnClaim},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum GroupKind {
     Issue,
     Pr,
@@ -91,7 +91,7 @@ pub(crate) async fn agent_group_worker(
     config: Config,
     spec: GroupSpec,
     factory: Arc<dyn SessionFactory>,
-    reports: tokio::sync::mpsc::Sender<crate::health::ProviderHealthUpdate>,
+    reports: tokio::sync::mpsc::Sender<ProviderReport>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     agent_group_worker_backend(
@@ -112,7 +112,7 @@ pub(crate) async fn agent_group_worker_backend(
     config: Config,
     spec: GroupSpec,
     factory: Arc<dyn SessionFactory>,
-    reports: tokio::sync::mpsc::Sender<crate::health::ProviderHealthUpdate>,
+    reports: tokio::sync::mpsc::Sender<ProviderReport>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let driver = GroupDriver {
@@ -120,17 +120,72 @@ pub(crate) async fn agent_group_worker_backend(
         collaboration: &collaboration,
         config: &config,
         spec: &spec,
-        sessions: SessionManager::new(factory, Arc::clone(&collaboration)),
+        sessions: SessionManager::new(factory),
     };
     driver.drive(&reports, &mut shutdown).await;
     driver
-        .sessions
-        .retain(&std::collections::HashSet::new())
+        .retain_sessions(&HashSet::new())
         .await
-        .context("shutdown did not confirm all executions stopped")
+        .context("shutdown did not confirm all sessions quiesced")
 }
 
 impl GroupDriver<'_> {
+    async fn stop_execution(&self, id: &str) -> Result<bool, SessionError> {
+        let stopped = self.sessions.stop(id).await?;
+        if stopped {
+            self.store.set_provider_stop(id.into(), true).map_err(|error| {
+                SessionError::Failed(format!("cannot record native stop: {error}"))
+            })?;
+        }
+        Ok(stopped)
+    }
+
+    /// Closing a native process and fencing its execution authority each
+    /// have their own evidence. Both operations must be attempted even if
+    /// one authority is unavailable.
+    pub(super) async fn quiesce_session(&self, id: &str) -> Result<bool, SessionError> {
+        let (stop, fence) =
+            tokio::join!(self.stop_execution(id), self.collaboration.fence_session(id),);
+        match (stop, fence) {
+            (Ok(stopped), Ok(())) => Ok(stopped),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(SessionError::Failed(format!(
+                "execution fence unconfirmed for {id}: {error:#}"
+            ))),
+            (Err(stop), Err(fence)) => Err(SessionError::Failed(format!(
+                "{stop}; execution fence unconfirmed for {id}: {fence:#}"
+            ))),
+        }
+    }
+
+    pub(super) async fn require_quiesced(
+        &self,
+        id: &str,
+        recorded_stop: bool,
+    ) -> Result<(), SessionError> {
+        if self.quiesce_session(id).await? || recorded_stop {
+            Ok(())
+        } else {
+            Err(SessionError::Failed(
+                "old execution has no stop evidence after restart; replacement is blocked".into(),
+            ))
+        }
+    }
+
+    pub(super) async fn retain_sessions(
+        &self,
+        retained: &HashSet<String>,
+    ) -> Result<(), SessionError> {
+        let mut failure = None;
+        for id in self.sessions.obsolete(retained).await {
+            if let Err(error) = self.quiesce_session(&id).await {
+                tracing::error!(%error, provider_session = %id, "session quiescence unconfirmed");
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     pub(super) fn publish_turn_error(&self, claim: &TurnClaim, lifecycle: &str, reason: &str) {
         if let Err(error) = self.store.record_turn_error(claim.turn_id.clone(), reason.to_owned()) {
             tracing::error!(%error, turn = %claim.turn_id, "cannot retain complete turn error");
@@ -156,7 +211,7 @@ impl GroupDriver<'_> {
         let Some(mut active) = running.take() else {
             return;
         };
-        let closed = self.sessions.remove(&active.claim.provider_session_id).await;
+        let closed = self.quiesce_session(&active.claim.provider_session_id).await;
         let mut terminal = None;
         while let Ok(event) = active.events.try_recv() {
             if let crate::agent_session::SessionEvent::TurnTerminal {
@@ -191,16 +246,6 @@ impl GroupDriver<'_> {
             let _ = self
                 .store
                 .mark_turn_terminal(active.claim.turn_id.clone(), outcome.lifecycle().into());
-            if active.claim.trusted_mention && outcome != crate::agent_session::TurnOutcome::Unknown
-            {
-                let reaction = if outcome == crate::agent_session::TurnOutcome::Completed {
-                    "+1"
-                } else {
-                    "confused"
-                };
-                let _ =
-                    self.store.enqueue_turn_reaction(active.claim.turn_id.clone(), reaction.into());
-            }
         }
         if matches!(
             outcome,
@@ -234,7 +279,7 @@ impl GroupDriver<'_> {
                     self.store.mark_turn_terminal(active.claim.turn_id.clone(), "unknown".into());
             }
             self.publish_turn_error(&active.claim, "unknown", reason);
-            if let Err(error) = self.sessions.remove(&active.claim.provider_session_id).await {
+            if let Err(error) = self.quiesce_session(&active.claim.provider_session_id).await {
                 if let Some(run) = &self.config.finite_run {
                     run.admission.close();
                 }
@@ -251,7 +296,7 @@ impl GroupDriver<'_> {
     #[allow(clippy::too_many_lines)]
     async fn drive(
         &self,
-        reports: &tokio::sync::mpsc::Sender<crate::health::ProviderHealthUpdate>,
+        reports: &tokio::sync::mpsc::Sender<ProviderReport>,
         shutdown: &mut watch::Receiver<bool>,
     ) {
         let store = self.store;
@@ -294,7 +339,7 @@ impl GroupDriver<'_> {
                                         active.claim.turn_id.clone(),
                                         lifecycle.into(),
                                     );
-                                    if let Err(error) = self.sessions.remove(&active.claim.provider_session_id).await {
+                                    if let Err(error) = self.quiesce_session(&active.claim.provider_session_id).await {
                                         if let Some(run)=&self.config.finite_run {run.admission.close();}
                                         let reason = format!("Context reset could not confirm old writer revocation and execution stop: {error}");
                                         if let Err(error) = store.fail_context_reset(reset_id.clone(), reason.clone()) {
@@ -304,18 +349,14 @@ impl GroupDriver<'_> {
                                     }
                                 } else {
                                     let _ = store.mark_turn_terminal(active.claim.turn_id.clone(), lifecycle.into());
-                                    if active.claim.trusted_mention && lifecycle != "unknown" {
-                                        let reaction = if lifecycle == "completed" { "+1" } else { "confused" };
-                                        let _ = store.enqueue_turn_reaction(active.claim.turn_id.clone(), reaction.into());
-                                    }
                                 }
                                 if matches!(lifecycle, "failed" | "unknown") {
                                     let reason = format!("provider turn {provider_turn_id}: {}", error.as_deref().unwrap_or("provider did not supply a terminal reason"));
                                     self.publish_turn_error(&active.claim, lifecycle, &reason);
                                 }
-                                if lifecycle == "unknown"
+                                if (lifecycle == "unknown" || active.claim.trigger_kind == "finalization")
                                     && active.reset_id.is_none()
-                                    && let Err(stop_error) = self.sessions.remove(&active.claim.provider_session_id).await {
+                                    && let Err(stop_error) = self.quiesce_session(&active.claim.provider_session_id).await {
                                     if let Some(run)=&self.config.finite_run {run.admission.close();}
                                     tracing::error!(%stop_error, "old execution stop remains unconfirmed");
                                     self.publish_turn_error(&active.claim, "unknown", &format!("{}; old execution stop failed: {stop_error}", error.as_deref().unwrap_or("provider outcome unknown")));
@@ -350,9 +391,9 @@ impl GroupDriver<'_> {
                         available = result.is_ok();
                         let error = result.err().map(|error| error.to_string());
                         if let Some(error) = &error { tracing::warn!(%error, kind = self.spec.kind.as_str(), "session recovery unavailable"); }
-                        if reports.send(crate::health::ProviderHealthUpdate {
+                        if reports.send(ProviderReport {
                             repository: self.spec.repository.clone(),
-                            group: self.spec.kind.as_str(), error,
+                            group: self.spec.kind, error,
                         }).await.is_err() { return; }
                         recovery = tokio::time::Instant::now() + Duration::from_secs(2);
                     }

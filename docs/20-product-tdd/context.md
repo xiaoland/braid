@@ -111,8 +111,23 @@ suffix and any HTML attribute values. Text that resembles `<!-- -->` inside fenc
 code remains. Malformed HTML that the parser does not recognize as a comment is
 ordinary visible text.
 
-Operational Status Comments are excluded by their persisted GitHub comment IDs.
-Agent comments remain included. No hidden marker is required.
+GitHub Operational Status Comments are excluded by their persisted comment IDs.
+Before publication, Braid declares a stable role for the Work Item, Profile,
+and assignment generation, and records the digest of each complete rendered
+body. The body carries the role identifier in an HTML comment. A complete
+canonical conversation read can bind the role to a GitHub comment when its App
+actor, Work Item, role identifier, and full body match the declaration and
+identify a single comment. Both Context and reconciliation use this binding,
+including when the first POST succeeded and its publication receipt was lost.
+The role marker carries only the identifier. Regular Agent discussion remains
+included.
+
+Upgrades preserve known historical comment IDs. For an unresolved legacy
+create, canonical observation can bind a unique same-App, same-Work Item comment
+with the recorded full body and a creation time in the recovery window. When
+multiple identities match, Braid leaves the role unbound. A previously bound
+role continues to identify the same comment after edits, minimization, or
+deletion.
 
 ## Snapshot, Revision, and Version Ordering
 

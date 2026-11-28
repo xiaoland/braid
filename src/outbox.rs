@@ -251,10 +251,22 @@ pub(crate) async fn outbox_worker(
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut recovered = false;
     loop {
         tokio::select! {
             _ = shutdown.changed() => return,
-            _ = tick.tick() => drain_one_write(&store, &github, &config, &owner).await,
+            _ = tick.tick() => {
+                if !recovered {
+                    match store.recover_writes() {
+                        Ok(_) => recovered = true,
+                        Err(error) => {
+                            tracing::error!(%error, "cannot recover GitHub outbox");
+                            continue;
+                        }
+                    }
+                }
+                drain_one_write(&store, &github, &config, &owner).await;
+            },
         }
     }
 }

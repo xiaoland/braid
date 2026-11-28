@@ -70,17 +70,17 @@ pub async fn serve(args: ConsoleArgs) -> Result<()> {
             crate::platform::PlatformConfig::load(&path)
         })
         .transpose()?;
-    let mut databases = vec![resolved_path(&args.database)?];
-    if let Some(config) = &config {
-        databases.push(resolved_path(config.runtime.database())?);
-    }
-    if let Some(platform) = &platform {
-        databases.push(resolved_path(&platform.database)?);
-    }
-    for (i, path) in databases.iter().enumerate() {
-        if databases[..i].contains(path) {
-            bail!("Console, Harness and platform databases must be separate");
-        }
+    let harness_database =
+        config.as_ref().map(|config| resolved_path(config.runtime.database())).transpose()?;
+    let platform_database =
+        platform.as_ref().map(|platform| resolved_path(&platform.database)).transpose()?;
+    let observation_database = resolved_path(&args.database);
+    if (harness_database.is_some() && harness_database == platform_database)
+        || observation_database.as_ref().is_ok_and(|path| {
+            harness_database.as_ref() == Some(path) || platform_database.as_ref() == Some(path)
+        })
+    {
+        bail!("Console, Harness and platform databases must be separate");
     }
     let mut platform_listener = None;
     let mut platform_endpoint =
@@ -108,18 +108,16 @@ pub async fn serve(args: ConsoleArgs) -> Result<()> {
     });
     let mut manager = None;
     let mut telemetry = None;
-    let storage = Arc::new(Mutex::new(storage::Storage::open(&args.database)?));
-    let mut app = api::routes(api::ApiState { storage });
-    if let Some(endpoint) = platform_endpoint {
-        app = app.merge(proxy::router(endpoint)?);
-    }
-    app = app.route(
+    let mut app = Router::new().route(
         "/api/console",
         get(move || {
             let metadata = metadata.clone();
             async move { axum::Json(metadata) }
         }),
     );
+    if let Some(endpoint) = platform_endpoint {
+        app = app.merge(proxy::router(endpoint)?);
+    }
     if let Some(mut config) = config.take() {
         let store = StoreActor::start(
             config.runtime.database().to_path_buf(),
@@ -157,30 +155,40 @@ pub async fn serve(args: ConsoleArgs) -> Result<()> {
             &format!("braid-console-platform:{}", platform.repository),
         )?);
     }
+    let platform_service = platform
+        .zip(platform_listener)
+        .map(|(config, listener)| crate::platform::router(&config).map(|router| (listener, router)))
+        .transpose()?;
+    let storage =
+        observation_database.and_then(|_| storage::Storage::open(&args.database)).with_context(
+            || format!("initialize Console observation database {}", args.database.display()),
+        );
+    if let Err(error) = &storage {
+        eprintln!("Console observation unavailable: {error:#}");
+    }
     app = app
+        .merge(api::routes(storage))
         .merge(web_routes())
         .layer(DefaultBodyLimit::max(collector::MAX_BATCH_BYTES))
         .layer(middleware::from_fn(move |request, next| same_origin(request, next, address)));
-    let (platform_stop, platform_task) =
-        if let (Some(platform), Some(listener)) = (platform, platform_listener) {
-            let router = crate::platform::router(&platform)?;
-            let (stop, mut receiver) = tokio::sync::watch::channel(false);
-            let task = tokio::spawn(async move {
-                axum::serve(listener, router)
-                    .with_graceful_shutdown(async move {
-                        while !*receiver.borrow() {
-                            if receiver.changed().await.is_err() {
-                                break;
-                            }
+    let (platform_stop, platform_task) = if let Some((listener, router)) = platform_service {
+        let (stop, mut receiver) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    while !*receiver.borrow() {
+                        if receiver.changed().await.is_err() {
+                            break;
                         }
-                    })
-                    .await
-                    .context("serve managed platform")
-            });
-            (Some(stop), Some(task))
-        } else {
-            (None, None)
-        };
+                    }
+                })
+                .await
+                .context("serve managed platform")
+        });
+        (Some(stop), Some(task))
+    } else {
+        (None, None)
+    };
     println!("Braid Console http://{address}");
     let stop_manager = manager.clone();
     let shutdown_errors = Arc::new(Mutex::new(Vec::new()));
@@ -311,8 +319,10 @@ async fn same_origin(request: Request, next: Next, address: SocketAddr) -> Respo
 }
 
 fn resolved_path(path: &std::path::Path) -> Result<PathBuf> {
-    if path.exists() {
-        return path.canonicalize().context("resolve database path");
+    match path.canonicalize() {
+        Ok(path) => return Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("resolve database path"),
     }
     let parent = path.parent().context("database path has no parent")?;
     let name = path.file_name().context("database path has no filename")?;

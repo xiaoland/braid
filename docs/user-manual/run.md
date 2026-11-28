@@ -10,7 +10,7 @@ braid run --config /absolute/path/to/harness/config.toml --run-id feature-a \
   --delivery-ref refs/heads/run/feature-a --max-concurrency 2
 ```
 
-现有 root 必须是没有父 Issue 的顶层任务；已作为其它任务子项的 Issue 不能直接注册为 run root。已有 root 则把 `--description-file` 换成 `--root-issue 42`，二者不可同时提供。description 创建的 root 通过固定请求 ID 去重；`run-id` 绑定输入、交付 ref、并发和已解析配置。同一个 ID 接续不能换需求或配方。完成后再次调用只回读既有完成结果，不重新生成。未确认旧执行停止时禁止替代启动。
+现有 root 必须是没有父 Issue 的顶层任务；已作为其它任务子项的 Issue 不能直接注册为 run root。已有 root 则把 `--description-file` 换成 `--root-issue 42`，二者不可同时提供。description 创建的 root 通过固定请求 ID 去重；`run-id` 绑定输入、交付 ref、并发和执行相关的解析配置。同一个 ID 接续可以调整遥测采样或输出端点，仍使用原需求和执行配方。完成后再次调用只回读既有完成结果，不重新生成。未确认旧执行停止时禁止替代启动。
 
 每次 run 有独立 Harness ledger、工作树和冻结配置，存于原 `runtime.root/runs/<run-id>/`。平台仍保存唯一的 Issue/PR 工作图；run 不接管 `serve` 的旧指派和无关对象。description 或现有 root、子项和关联 PR 通过公开平台 API 读取和修改，不直接操作平台数据库。配置和原生历史仍包含实例允许保存的材料，应按该实例的授权范围保留。
 
@@ -20,7 +20,7 @@ root 使用专属协调职责，Agent 自行决定拆分方式、依赖顺序和
 
 子 Issue 用 `braid object issue --title ... --body-file ... --parent <父Issue>` 创建。创建和父子关系在同一平台事务提交，不提供事后随意重绑入口。创建未指派对象不启动成员。平台将子项生命周期、候选发布、讨论和设计变化送回祖先；讨论及设计通知仅包含对象和变化类型，正文仍按需读取。root 根据当前对象事实采用成果，不依赖模型会话记忆推断交接完成。
 
-run 的交付 ref 必须明确写为 `refs/heads/...`。平台冻结 root、run ID、Harness client 与该 ref 的关系，Agent 不能修改这项运行授权，范围内 PR 的 base 和合并目标由平台校验。运行初始化缺失交付分支，但不隐含向默认分支合并。建议每 run 使用独立交付分支；合并仍检查确切候选、base 是否移动以及分支检出状态。
+run 的交付 ref 必须明确写为 `refs/heads/...`。平台冻结 root、run ID、Harness client 与该 ref 的关系，Agent 不能修改这项运行授权，范围内 PR 的 base 和合并目标由平台校验。若交付分支尚不存在，平台在处理首个范围内 PR 的候选时，从当前默认分支创建它。已有交付分支保持原位。建议每 run 使用独立交付分支。合并仍检查确切候选、base 是否移动以及分支检出状态。
 
 root writer 只能协调自己的后代 Issue 和关联 PR；子项不获得任意仓库管理身份。注册 root 关闭时整个范围 writer 立即失效，子项不能在收尾期间继续发布。普通 `serve` 的关联 Issue 关闭规则不因此改变。root 应在范围义务收敛后最后关闭；提前关闭不作为成功，需由操作者明确重开才能继续。
 

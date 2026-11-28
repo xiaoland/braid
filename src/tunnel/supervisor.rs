@@ -1,14 +1,10 @@
 //! Own webhook connectivity independently of Agent execution and its owner lease.
-use super::{QuickTunnel, restore_webhook, signed_public_probe_once, start_verified_quick_tunnel};
-use crate::{
-    config::Config,
-    github::{AppWebhookConfig, GitHubClient},
-    health::HealthSnapshot,
-};
+use super::{QuickTunnel, signed_public_probe_once, start_verified_quick_tunnel};
+use crate::{config::Config, github::GitHubClient, health::Health};
 use anyhow::{Context as _, Result, bail};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use tokio::{
-    sync::{RwLock, watch},
+    sync::watch,
     time::{Duration, Instant, MissedTickBehavior},
 };
 
@@ -16,81 +12,115 @@ struct Supervisor {
     config: Config,
     github: Arc<GitHubClient>,
     secret: Arc<Vec<u8>>,
-    health: Arc<RwLock<HealthSnapshot>>,
-    prior: AppWebhookConfig,
+    health: Health,
+}
+
+enum CheckFailure {
+    PublicProbe(anyhow::Error),
+    AppWebhook(anyhow::Error),
+}
+
+/// Keep every candidate this runtime may have installed. A PATCH can take
+/// effect even if cancellation or a network error prevents its confirmation.
+#[derive(Default)]
+struct WebhookHandoff {
+    prior_url: Option<String>,
+    attempted_urls: HashSet<String>,
+}
+
+impl WebhookHandoff {
+    fn record_patch(&mut self, actual: &str, expected: &str) {
+        self.prior_url.get_or_insert_with(|| actual.to_owned());
+        self.attempted_urls.insert(expected.to_owned());
+    }
+
+    fn restoration_url(&self, actual: &str) -> Option<&str> {
+        self.prior_url
+            .as_deref()
+            .filter(|prior| *prior != actual && self.attempted_urls.contains(actual))
+    }
+
+    async fn restore(&self, github: &GitHubClient) -> Result<()> {
+        if self.prior_url.is_none() {
+            return Ok(());
+        }
+        let actual = github.app_webhook_config().await?;
+        if let Some(prior_url) = self.restoration_url(&actual.url) {
+            github.update_app_webhook(prior_url, None).await?;
+            if github.app_webhook_config().await?.url != prior_url {
+                bail!("App webhook URL did not converge to its prior URL");
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) async fn supervise(
     config: Config,
     github: Arc<GitHubClient>,
     secret: Arc<Vec<u8>>,
-    health: Arc<RwLock<HealthSnapshot>>,
-    initial: QuickTunnel,
-    prior: AppWebhookConfig,
+    health: Health,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    Supervisor { config, github, secret, health, prior }.run(initial, shutdown).await
+    Supervisor { config, github, secret, health }.run(shutdown).await
 }
 
 impl Supervisor {
-    async fn publish(
+    fn publish(
         &self,
         state: &'static str,
         sync: &'static str,
         error: Option<String>,
         verified: Option<String>,
     ) {
-        let mut health = self.health.write().await;
-        health.tunnel = state;
-        health.webhook_sync = sync;
-        health.tunnel_error = error;
-        if let Some(url) = verified {
-            health.webhook_url = Some(url);
-            health.tunnel_verified_at = Some(time::OffsetDateTime::now_utc().to_string());
-        }
+        let verified = verified.map(|url| (url, time::OffsetDateTime::now_utc().to_string()));
+        self.health.update(|health| {
+            health.tunnel = state;
+            health.webhook_sync = sync;
+            health.tunnel_error = error;
+            if let Some((url, checked_at)) = verified {
+                health.webhook_url = Some(url);
+                health.tunnel_verified_at = Some(checked_at);
+            }
+        });
     }
 
-    async fn sync(&self, tunnel: &QuickTunnel) -> Result<String> {
-        let expected = format!("{}/webhook", tunnel.url);
+    async fn sync(&self, expected: &str, handoff: &mut WebhookHandoff) -> Result<()> {
         let actual = self.github.app_webhook_config().await?;
-        if actual.url != expected {
-            self.github
-                .update_app_webhook(&expected, Some(std::str::from_utf8(&self.secret)?))
-                .await?;
+        if actual.url != expected || !handoff.attempted_urls.contains(expected) {
+            let secret = std::str::from_utf8(&self.secret).context("webhook secret is UTF-8")?;
+            handoff.record_patch(&actual.url, expected);
+            self.github.update_app_webhook(expected, Some(secret)).await?;
+            if self.github.app_webhook_config().await?.url != expected {
+                bail!("App webhook URL did not converge to the verified Tunnel");
+            }
         }
-        let confirmed = self.github.app_webhook_config().await?;
-        if confirmed.url != expected {
-            bail!("App webhook URL did not converge to the verified Tunnel");
-        }
-        Ok(expected)
+        Ok(())
     }
 
-    async fn verify(&self, tunnel: &QuickTunnel) -> Result<bool> {
-        let expected = format!("{}/webhook", tunnel.url);
+    async fn probe(&self, expected: &str) -> Result<()> {
         signed_public_probe_once(
-            &expected,
+            expected,
             &self.secret,
             self.config.repository(),
             &self.github.identity().repository_node_id,
         )
-        .await?;
-        Ok(self.github.app_webhook_config().await?.url == expected)
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn run(self, initial: QuickTunnel, mut shutdown: watch::Receiver<bool>) -> Result<()> {
-        let mut published = format!("{}/webhook", initial.url);
-        let mut tunnel = Some(initial);
-        let mut stop_failure = None;
-        let mut synchronized = true;
+    async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        let mut handoff = WebhookHandoff::default();
+        let mut tunnel: Option<QuickTunnel> = None;
+        let mut synchronized = false;
         let mut failures = 0_u8;
         let mut backoff = 10_u64;
         let mut next_attempt = Instant::now();
         let mut next_probe = Instant::now() + Duration::from_secs(60);
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            tokio::select! { biased; _=shutdown.changed()=>break, _=tick.tick()=>{} }
+        let mut stop_failure = loop {
+            tokio::select! { biased; _=shutdown.changed()=>break None, _=tick.tick()=>{} }
             let failure = tunnel.as_mut().and_then(|running| {
                 if running.has_exited().unwrap_or(true) {
                     Some("Tunnel process exited")
@@ -99,158 +129,178 @@ impl Supervisor {
                 }
             });
             if let Some(reason) = failure {
-                self.publish("unavailable", "pending", Some(reason.into()), None).await;
+                self.publish("unavailable", "pending", Some(reason.into()), None);
                 if let Some(old) = tunnel.take()
                     && let Err(error) = old.stop().await
                 {
-                    self.publish("stop_unconfirmed", "blocked", Some(error.to_string()), None)
-                        .await;
-                    stop_failure = Some(anyhow::Error::from(error));
-                    let _ = shutdown.changed().await;
-                    break;
+                    break Some(error.into());
                 }
                 synchronized = false;
                 next_attempt = Instant::now();
             }
-            if tunnel.is_none() {
+            let candidate_started = if tunnel.is_none() {
                 if Instant::now() < next_attempt {
                     continue;
                 }
-                self.publish("verifying", "pending", None, None).await;
-                let local = format!("http://{}", self.config.server.ingress);
-                let started = tokio::select! {
-                    biased; _=shutdown.changed()=>break,
-                    result=start_verified_quick_tunnel(&self.config,&local,&self.secret,self.config.repository(),&self.github.identity().repository_node_id)=>result,
-                };
+                let started = start_verified_quick_tunnel(
+                    &self.config,
+                    &self.secret,
+                    &self.github.identity().repository_node_id,
+                    &mut shutdown,
+                )
+                .await;
                 match started {
-                    Ok((candidate, _public_webhook)) => {
+                    Ok(Some(candidate)) => {
                         tunnel = Some(candidate);
                         synchronized = false;
+                        true
                     }
+                    Ok(None) => break None,
                     Err(error) => {
                         if matches!(
                             error.downcast_ref::<super::TunnelError>(),
                             Some(super::TunnelError::Stop(_))
                         ) {
-                            self.publish(
-                                "stop_unconfirmed",
-                                "blocked",
-                                Some(error.to_string()),
-                                None,
-                            )
-                            .await;
-                            stop_failure = Some(error);
-                            let _ = shutdown.changed().await;
-                            break;
+                            break Some(error);
                         }
-                        self.publish("unavailable", "pending", Some(error.to_string()), None).await;
+                        tracing::warn!(%error, "Quick Tunnel candidate failed, retrying");
+                        self.publish("degraded", "pending", Some(error.to_string()), None);
                         next_attempt = Instant::now() + Duration::from_secs(backoff);
                         backoff = (backoff * 2).min(120);
                         continue;
                     }
                 }
-            }
-            let running = tunnel.as_ref().expect("candidate established above");
-            if !synchronized {
-                if Instant::now() < next_attempt {
-                    continue;
-                }
-                let sync = tokio::select! {
-                    biased; _=shutdown.changed()=>break,
-                    result=tokio::time::timeout(Duration::from_secs(30),self.sync(running))=>result.context("App webhook synchronization timed out").and_then(|r|r),
-                };
-                match sync {
-                    Ok(url) => {
-                        published.clone_from(&url);
-                        synchronized = true;
-                        failures = 0;
-                        backoff = 10;
-                        next_probe = Instant::now() + Duration::from_secs(60);
-                        self.publish("connected", "confirmed", None, Some(url)).await;
-                        tracing::info!(
-                            "Quick Tunnel and App webhook recovered without restarting Agent execution"
-                        );
-                    }
-                    Err(error) => {
-                        self.publish("sync_pending", "pending", Some(error.to_string()), None)
-                            .await;
-                        next_attempt = Instant::now() + Duration::from_secs(backoff);
-                        backoff = (backoff * 2).min(120);
-                    }
-                }
+            } else {
+                false
+            };
+            let check_at = if synchronized { next_probe } else { next_attempt };
+            if Instant::now() < check_at {
                 continue;
             }
-            if Instant::now() < next_probe {
-                continue;
-            }
-            next_probe = Instant::now() + Duration::from_secs(60);
+            let expected = tunnel.as_ref().expect("candidate established above").webhook_url();
+            let check = async {
+                // A newly established candidate already passed the signed probe.
+                if !candidate_started {
+                    self.probe(&expected).await.map_err(CheckFailure::PublicProbe)?;
+                }
+                if synchronized {
+                    let actual = self
+                        .github
+                        .app_webhook_config()
+                        .await
+                        .map_err(|error| CheckFailure::AppWebhook(error.into()))?;
+                    Ok(actual.url == expected)
+                } else {
+                    self.sync(&expected, &mut handoff).await.map_err(CheckFailure::AppWebhook)?;
+                    Ok(true)
+                }
+            };
+            let check_budget = Duration::from_secs(if synchronized { 20 } else { 30 });
             let verification = tokio::select! {
-                biased; _=shutdown.changed()=>break,
-                result=tokio::time::timeout(Duration::from_secs(20),self.verify(running))=>result.context("public webhook verification timed out").and_then(|r|r),
+                biased; _=shutdown.changed()=>break None,
+                result=tokio::time::timeout(check_budget,check)=>result
+                    .context("checking the App webhook timed out")
+                    .map_err(CheckFailure::AppWebhook)
+                    .and_then(|result| result),
             };
             match verification {
                 Ok(true) => {
+                    if !synchronized {
+                        tracing::info!("Quick Tunnel and App webhook connected");
+                    }
+                    synchronized = true;
                     failures = 0;
-                    self.publish("connected", "confirmed", None, Some(published.clone())).await;
+                    backoff = 10;
+                    next_probe = Instant::now() + Duration::from_secs(60);
+                    self.publish("connected", "confirmed", None, Some(expected));
                 }
                 Ok(false) => {
                     synchronized = false;
+                    failures = 0;
                     next_attempt = Instant::now();
                     self.publish(
                         "sync_pending",
                         "mismatch",
                         Some("App webhook URL no longer names the verified Tunnel".into()),
                         None,
-                    )
-                    .await;
+                    );
                 }
-                Err(error) => {
+                Err(CheckFailure::AppWebhook(error)) => {
+                    failures = 0;
+                    if synchronized {
+                        self.publish("degraded", "unknown", Some(error.to_string()), None);
+                        next_probe = Instant::now() + Duration::from_secs(60);
+                    } else {
+                        tracing::warn!(%error, "Quick Tunnel webhook synchronization pending");
+                        self.publish("sync_pending", "pending", Some(error.to_string()), None);
+                        next_attempt = Instant::now() + Duration::from_secs(backoff);
+                        backoff = (backoff * 2).min(120);
+                    }
+                }
+                Err(CheckFailure::PublicProbe(error)) => {
                     failures = failures.saturating_add(1);
-                    self.publish("degraded", "unknown", Some(error.to_string()), None).await;
+                    self.publish("degraded", "unknown", Some(error.to_string()), None);
                     if failures >= 3 {
                         if let Some(old) = tunnel.take()
                             && let Err(error) = old.stop().await
                         {
-                            self.publish(
-                                "stop_unconfirmed",
-                                "blocked",
-                                Some(error.to_string()),
-                                None,
-                            )
-                            .await;
-                            stop_failure = Some(anyhow::Error::from(error));
-                            let _ = shutdown.changed().await;
-                            break;
+                            break Some(error.into());
                         }
                         synchronized = false;
                         next_attempt = Instant::now() + Duration::from_secs(10);
+                    } else if synchronized {
+                        next_probe = Instant::now() + Duration::from_secs(60);
+                    } else {
+                        next_attempt = Instant::now() + Duration::from_secs(backoff);
+                        backoff = (backoff * 2).min(120);
                     }
                 }
             }
+        };
+        if let Some(error) = &stop_failure {
+            self.publish("stop_unconfirmed", "blocked", Some(error.to_string()), None);
+            if !*shutdown.borrow() {
+                let _ = shutdown.changed().await;
+            }
         }
-        // Do not overwrite an operator's unrelated replacement URL on shutdown.
-        let owned = tunnel.as_ref().map_or(published, |t| format!("{}/webhook", t.url));
         if let Some(running) = tunnel
             && let Err(error) = running.stop().await
         {
             tracing::warn!(%error,"cannot stop Quick Tunnel during shutdown");
             stop_failure = Some(anyhow::Error::from(error));
         }
-        let restoration = tokio::time::timeout(Duration::from_secs(8), async {
-            if self.github.app_webhook_config().await?.url == owned {
-                restore_webhook(&self.github, &self.prior).await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await;
-        if !matches!(restoration, Ok(Ok(()))) {
-            tracing::warn!("prior App webhook restoration is unconfirmed");
+        let restoration =
+            tokio::time::timeout(Duration::from_secs(8), handoff.restore(&self.github))
+                .await
+                .context("restoring the prior App webhook timed out")
+                .and_then(|result| result);
+        if let Err(error) = restoration {
+            tracing::warn!(%error, "prior App webhook restoration is unconfirmed");
         }
         if let Some(error) = stop_failure {
-            self.publish("stop_unconfirmed", "blocked", Some(error.to_string()), None).await;
+            self.publish("stop_unconfirmed", "blocked", Some(error.to_string()), None);
             return Err(error.context("Quick Tunnel execution stop is unconfirmed"));
         }
-        self.publish("unavailable", "stopped", None, None).await;
+        self.publish("unavailable", "stopped", None, None);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WebhookHandoff;
+
+    #[test]
+    fn shutdown_restores_the_original_url_after_an_unconfirmed_patch() {
+        let mut handoff = WebhookHandoff::default();
+        assert_eq!(handoff.restoration_url("candidate-1"), None);
+
+        handoff.record_patch("original", "candidate-1");
+        handoff.record_patch("candidate-1", "candidate-2");
+
+        assert_eq!(handoff.restoration_url("candidate-1"), Some("original"));
+        assert_eq!(handoff.restoration_url("candidate-2"), Some("original"));
+        assert_eq!(handoff.restoration_url("original"), None);
+        assert_eq!(handoff.restoration_url("operator-update"), None);
     }
 }

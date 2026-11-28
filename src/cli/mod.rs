@@ -580,9 +580,7 @@ pub async fn run() -> Result<()> {
             )?;
             let generation = uuid::Uuid::now_v7().to_string();
             crate::telemetry::set_runtime_generation(Some(generation));
-            let health = std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::runtime::initial_health(&config, true),
-            ));
+            let health = crate::health::Health::new(crate::runtime::initial_health(&config, true));
             let (stop, shutdown) = tokio::sync::watch::channel(false);
             let mut runtime = Box::pin(crate::run::run_managed(config, request, shutdown, health));
             let result = tokio::select! {result=&mut runtime=>result, signal=crate::runtime::wait_for_shutdown_signal()=> {let _=stop.send(true);signal?;runtime.await}};

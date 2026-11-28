@@ -31,7 +31,7 @@ impl PlatformConfig {
                 *value = parent.join(&*value);
             }
         }
-        config.source = config.source.canonicalize()?;
+        config.source = resolve_storage(&config.source)?;
         config.database = resolve_storage(&config.database)?;
         config.backups = resolve_storage(&config.backups)?;
         config.validate()?;
@@ -61,20 +61,27 @@ impl PlatformConfig {
         );
         ensure!(!self.database.is_dir(), "platform database path is a directory");
         ensure!(!self.backups.is_file(), "platform backups path is a file");
+        ensure!(git2::Reference::is_valid_name(&self.default_ref()), "invalid default branch");
+        Ok(())
+    }
+
+    pub(crate) fn validate_git_source(&self) -> Result<()> {
         let git = git2::Repository::open(&self.source)?;
         ensure!(!git.is_bare(), "platform source must have a worktree");
         ensure!(
             git.workdir().context("platform source worktree root")?.canonicalize()? == self.source,
             "platform source must name its Git worktree root"
         );
-        let branch = if self.default_branch.starts_with("refs/heads/") {
+        git.find_reference(&self.default_ref())?.peel_to_commit()?;
+        Ok(())
+    }
+
+    fn default_ref(&self) -> String {
+        if self.default_branch.starts_with("refs/heads/") {
             self.default_branch.clone()
         } else {
             format!("refs/heads/{}", self.default_branch)
-        };
-        ensure!(git2::Reference::is_valid_name(&branch), "invalid default branch");
-        git.find_reference(&branch)?.peel_to_commit()?;
-        Ok(())
+        }
     }
 }
 

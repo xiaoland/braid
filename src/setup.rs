@@ -795,12 +795,6 @@ fn build_config(
     Ok(config)
 }
 
-/// Prepare the instance-scoped provider home so the runtime can actually
-/// authenticate. Codex isolates `CODEX_HOME` per instance, so its global
-/// credentials do not apply: import `~/.codex/auth.json` when present,
-/// otherwise print explicit login instructions. Pi uses its explicit model
-/// route and, when declared, its provider API key file; it needs no home
-/// bootstrap.
 /// The instance source checkout: one Git clone of the configured repository,
 /// shared by all Profiles as the worktree provisioning source. Clone when
 /// missing or empty; never overwrite a non-Git directory.
@@ -827,6 +821,8 @@ fn ensure_source_checkout(source: &Path, repository: &str, git: &Path) -> Result
     Ok(())
 }
 
+/// Prepare the instance-scoped provider home so the runtime can authenticate.
+/// Codex imports its global credentials when present; Pi uses its explicit route.
 fn bootstrap_provider_home(home: &Path, adapter_type: &str) -> Result<()> {
     fs::create_dir_all(home)
         .with_context(|| format!("cannot create provider home {}", home.display()))?;

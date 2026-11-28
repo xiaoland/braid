@@ -241,6 +241,15 @@ creation; an edited comment's unknown current actor cannot inherit the creator's
 trusted-mention authority. Already-active responsibilities still receive ordinary
 attention for real revisions when the current action actor is unknown.
 
+Root Issue and PR reconciliation retains separate fingerprints for title and body.
+An edit qualifies as an Agent echo only when every changed field has matching
+native authorship evidence. A title change uses the observed rename transition and
+a body change uses the observed editor evidence. A matching signed webhook can
+supply a field's previous value and actor. Changes in other canonical metadata
+and changes with unresolved authorship retain external attention. Publication
+receipts establish command outcomes, while reconciliation uses upstream
+authorship evidence independently.
+
 迁移建立新的观察边界，不能据此证明历史丢失输入已执行。Schema 12 将已接受且
 固定精确 PR、却没有 activation receipt 的错误 applied ensure 重新交给唯一 outbox。
 这是原请求的交付恢复，不根据任意 native 关联新建职责；当前 canonical 源/目标、
@@ -539,10 +548,11 @@ the final read/PATCH interval remains a documented concurrency limitation.
 
 ### Explicit existing-generation PR handoff
 
-`writer::handoff` reuses source-bound `Invocation`, `AcceptedRequest`, and the
-single `github_write_outbox`. Schema 10 `pr_handoffs` binds each accepted intent
-to the current active target assignment and records its unique dedicated Wake
-reference. Operator/PR sources, inactive/blocked/missing targets, finalizing
+`writer::handoff` uses the source-bound `Invocation`, `AcceptedRequest` and
+`github_write_outbox` during admission. Once accepted, Schema 19 keeps the
+source Issue, target assignment generation and next-turn-only constraint in the
+input ledger. The handoff receipt references that event.
+Operator/PR sources, inactive/blocked/missing targets, finalizing
 assignments and non-OPEN sources/targets are refused. Queued/uncertain Issue
 body edits must be resolved before acceptance/delivery; no workflow DAG is added.
 The existing GitHub reads recheck OPEN state and native `closingIssuesReferences`
@@ -552,9 +562,12 @@ All network awaits are outside SQLite transactions.
 In the outbox attempt settlement transaction, Braid rechecks the source fence,
 current target assignment and scheduling eligibility; inserts the ordinary
 `wake/pr_handoff` event once; merges its batch with normal quiet/count; and commits
-the receipt/outbox state. A stale fence rejects without partially delivering a
-Wake. At dispatch, an ordinary claimed handoff batch freshly materializes and
-renders the full canonical PR/associated Issue Context before provider send.
+the receipt/outbox state. A stale fence rejects admission before delivery. At
+dispatch, the input ledger supplies the frozen constraint. The worker
+materializes and renders the current PR and associated Issue Context before
+provider send. An urgent steer receipt acknowledges the event IDs actually
+sent. An accepted handoff arriving during that call remains queued for the next
+ordinary turn.
 Failure defers the unsent claim. This appends current working data to the existing
 session, not a Context reset, urgent steer or parallel turn; it does not advance
 the session's replacement fence. The boundary rechecks the bound target and

@@ -40,6 +40,7 @@ fn stored(o: &context::CanonicalObservation) -> crate::store::CanonicalObjectSta
         author_node_id: o.author_node_id.clone(),
         author_login: o.author_login.clone(),
         metadata_digest: o.metadata_digest.clone(),
+        root_fields: o.root_fields(),
     }
 }
 fn scope(c: &CanonicalContext) -> ReconcileScope {
@@ -79,7 +80,8 @@ async fn issue(
         CanonicalContext::Issue(context::materialize_issue(&github, &locator, 100).await.unwrap());
     let CanonicalContext::Issue(i) = &mut c else { unreachable!() };
     i.comments = vec![comment(node, "current visible content")];
-    context::reconcile_local_state(&mut c, &f.store).unwrap();
+    context::reconcile_local_state(&mut c, &f.store, Some(&github.identity().actor_node_id))
+        .unwrap();
     (c, github, http)
 }
 fn seed(f: &Fixture, c: &CanonicalContext) {
@@ -94,7 +96,7 @@ fn seed(f: &Fixture, c: &CanonicalContext) {
         .unwrap();
 }
 fn managed(f: &Fixture, node: &str, root: &str) {
-    f.db().execute("INSERT INTO status_comments(work_item_node_id,profile_id,assignment_generation,remote_comment_node_id,body_digest,lifecycle,updated_at) VALUES(?1,'issue-codex',1,?2,?3,'applied','now')",rusqlite::params![root,node,"a".repeat(64)]).unwrap();
+    f.db().execute("INSERT INTO operational_comment_roles(role_id,work_item_node_id,profile_id,assignment_generation,comment_node_id) VALUES(?1,?2,'issue-codex',1,?3)",rusqlite::params!["a".repeat(32),root,node]).unwrap();
 }
 fn poison(f: &Fixture, node: &str) {
     for table in ["processed_objects", "canonical_objects"] {
@@ -120,6 +122,103 @@ fn raw(node: &str, guid: &str, deleted: bool) -> IngressEvent {
 }
 
 #[tokio::test]
+async fn canonical_reads_recognize_a_status_create_whose_receipt_was_lost() {
+    for producer_first in [true, false] {
+        let f = Fixture::new(true);
+        let remote = Arc::new(Mutex::new(body_edit::BodyRemote::new(false)));
+        let (github, http) = body_edit::body_server(remote.clone()).await;
+        f.store
+            .enqueue_assignment_operational_status(
+                "assignment".into(),
+                "Provider unavailable".into(),
+            )
+            .unwrap();
+        let owner =
+            f.store.acquire_runtime_lease("runtime".into(), "publisher".into(), 3600).unwrap();
+        let write = f.store.claim_github_write(owner.clone()).unwrap().unwrap();
+        assert_eq!(write.operation, "comment_create");
+        github.create_issue_comment(1, &write.content).await.unwrap();
+        f.store.release_runtime_lease(owner).unwrap();
+        f.store.recover_writes().unwrap();
+        // The publisher stays off after the first remote mutation. Neither the
+        // role claiming path nor the canonical observation can use its ACK.
+        {
+            let mut state = remote.lock().unwrap();
+            let mut discussion = state.issue_comments[0].clone();
+            discussion["id"] = json!("discussion");
+            discussion["fullDatabaseId"] = json!("100");
+            discussion["body"] = json!(write.content.replacen(
+                "Provider unavailable",
+                "Provider log reviewed in an ordinary App comment",
+                1
+            ));
+            let mut imitation = state.issue_comments[0].clone();
+            imitation["id"] = json!("imitation");
+            imitation["fullDatabaseId"] = json!("101");
+            imitation["author"] = json!({"id":"human", "login":"participant"});
+            state.issue_comments.extend([discussion, imitation]);
+        }
+        let mut canonical = CanonicalContext::Issue(
+            context::materialize_issue(&github, &"owner/repository#1".parse().unwrap(), 100)
+                .await
+                .unwrap(),
+        );
+        let basis = f.store.begin_observation("item".into()).unwrap();
+        if producer_first {
+            observe(&f, &github, &canonical, basis).unwrap();
+            let status_observed: String = f
+                .db()
+                .query_row(
+                    "SELECT kind FROM events WHERE object_node_id='status' AND detail='observed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status_observed, EventKind::Noop.as_str());
+        }
+        context::reconcile_local_state(
+            &mut canonical,
+            &f.store,
+            Some(&github.identity().actor_node_id),
+        )
+        .unwrap();
+        let CanonicalContext::Issue(issue) = &canonical else { unreachable!() };
+        let visible =
+            issue.comments.iter().map(|comment| comment.node_id.as_str()).collect::<Vec<_>>();
+        assert_eq!(visible, ["discussion", "imitation"]);
+        let rendered = context::render_complete(&canonical, 0.5, 100_000);
+        assert!(rendered.text.contains("ordinary App comment"));
+        assert!(!rendered.text.contains("braid-operational-status:v1:"));
+        let db = f.db();
+        let recognized: String = db
+            .query_row("SELECT comment_node_id FROM operational_comment_roles", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(recognized, "status");
+        let receipt: (Option<String>, String) = db
+            .query_row(
+                "SELECT s.remote_comment_node_id,o.lifecycle FROM status_comments s
+             JOIN github_write_outbox o ON o.intent_id=s.write_intent_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(receipt, (None, "uncertain".into()));
+        assert_eq!(
+            db.query_row(
+                "SELECT lifecycle FROM canonical_objects WHERE node_id='status'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "active"
+        );
+        http.abort();
+    }
+}
+
+#[tokio::test]
 async fn operational_projection_never_turns_observed_members_into_tombstones() {
     for pr in [false, true] {
         let f = Fixture::new(true);
@@ -134,7 +233,8 @@ async fn operational_projection_never_turns_observed_members_into_tombstones() {
                 context::materialize_issue(&github, &locator, 100).await.unwrap(),
             )
         };
-        context::reconcile_local_state(&mut c, &f.store).unwrap();
+        context::reconcile_local_state(&mut c, &f.store, Some(&github.identity().actor_node_id))
+            .unwrap();
         let root = scope(&c).work_item_node_id;
         managed(&f, "status", &root);
         let mut echo = raw("status", "status-created", false);
@@ -154,7 +254,8 @@ async fn operational_projection_never_turns_observed_members_into_tombstones() {
             comment("status", "private operational diagnostic"),
             comment("ordinary", "> **Braid Operational Status** is just user prose"),
         ]);
-        context::reconcile_local_state(&mut c, &f.store).unwrap();
+        context::reconcile_local_state(&mut c, &f.store, Some(&github.identity().actor_node_id))
+            .unwrap();
         let lifecycle: String = f
             .db()
             .query_row("SELECT lifecycle FROM canonical_objects WHERE node_id='status'", [], |r| {

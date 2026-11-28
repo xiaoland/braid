@@ -129,20 +129,36 @@ function table(headers,rows){
 }
 async function overview(token){
   const capabilities=await api('/api/console');
-  const [resources,runtime,harness]=await Promise.all([api('/api/resources'),capabilities.harness.configured?api('/api/runtime').catch(e=>({unavailable:e.message})):null,capabilities.harness.configured?api('/api/harness/snapshot').catch(e=>({error:e.message})):null]);
+  const observation=api('/api/resources').then(resources=>({resources}),error=>({error}));
+  const [runtime,harness]=await Promise.all([capabilities.harness.configured?api('/api/runtime').catch(e=>({unavailable:e.message})):null,capabilities.harness.configured?api('/api/harness/snapshot').catch(e=>({error:e.message})):null]);
   if(token!==generation)return;
+  const summary=el('div'),details=el('div');
+  content.replaceChildren(summary,panel('Harness 权威状态',!runtime?empty('未接入 Harness；平台和 Collector 可独立使用。'):runtime.unavailable?el('div',{
+    class:'notice error'
+  },runtime.unavailable):runtimePanel(runtime)),panel('平台接入',capabilities.platform.configured?el('p',{},`${capabilities.platform.endpoint} · ${capabilities.platform.managed?'Console 托管独立监听':'外部独立监听'} · Harness 上游 ${capabilities.harness.backend||'未接入'}`):empty('未声明内建平台。GitHub Harness 的启停与观测仍可使用；此处不提供 GitHub 对象编辑。')),harness?panel('Harness 调度事实',raw(harness,'Session、Turn、队列、Assignment 与 Worktree')):el('div'),details);
+  const {resources,error}=await observation;
+  if(token!==generation)return;
+  if(error){
+    summary.replaceWith(panel('采集状态',el('div',{class:'notice error'},error.message)));
+    details.remove();
+    return;
+  }
   const counts=el('dl',{class:'counts','aria-label':'采集摘要'},
     ...[['已接收记录',resources.records??0],['接收批次',resources.batches??0],['资源来源',(resources.resources||[]).length],['接收错误',resources.receive_errors??0],['重复批次',resources.duplicate_batches??0],['最近接收',stamp(resources.last_received)]].map(([title,value])=>el('div',{},el('dt',{},title),el('dd',{class:title==='接收错误'&&value?'bad':null},value))));
-  content.replaceChildren(counts,panel('Harness 权威状态',!runtime?empty('未接入 Harness；平台和 Collector 可独立使用。'):runtime.unavailable?el('div',{
-    class:'notice error'
-  },runtime.unavailable):runtimePanel(runtime)),panel('平台接入',capabilities.platform.configured?el('p',{},`${capabilities.platform.endpoint} · ${capabilities.platform.managed?'Console 托管独立监听':'外部独立监听'} · Harness 上游 ${capabilities.harness.backend||'未接入'}`):empty('未声明内建平台。GitHub Harness 的启停与观测仍可使用；此处不提供 GitHub 对象编辑。')),harness?panel('Harness 调度事实',raw(harness,'Session、Turn、队列、Assignment 与 Worktree')):el('div'),panel('采集来源',(resources.resources||[]).length?table(['实例','服务','首次 / 最近接收','记录数'],resources.resources.map(r=>[r.instance||'未标识',r.service||'未标识',`${stamp(r.first_received)} / ${stamp(r.last_received)}`,r.records])):empty('Collector 正在等待 OTLP 数据。请检查 Braid 的 exporter 目标。')),panel('数据边界',el('p',{
+  summary.replaceWith(counts);
+  details.replaceWith(panel('采集来源',(resources.resources||[]).length?table(['实例','服务','首次 / 最近接收','记录数'],resources.resources.map(r=>[r.instance||'未标识',r.service||'未标识',`${stamp(r.first_received)} / ${stamp(r.last_received)}`,r.records])):empty('Collector 正在等待 OTLP 数据。请检查 Braid 的 exporter 目标。')),panel('数据边界',el('p',{
     class:'body'
   },'接收时间表示 Collector 收到数据的时刻，不是运行完成时间。采样、网络错误或 exporter 停止都可能造成未收到的内容。没有上游序列与交付回执时，采集缺口不可量化；Trace 缺少父 Span、Transcript 缺少消息均保留为未确认。'),raw(resources,'完整采集状态')));
   if(resources.receive_errors){
-    const errors=await api('/api/receive-errors?limit=100');
-    if(token===generation)content.append(panel('接收错误（最近已加载，完整原因保留）',table(['接收时刻','信号 / HTTP','原因','原始数据'],errors.errors.map(e=>[stamp(e.received_at),`${e.signal} / ${e.status}`,el('pre',{},e.reason),el('a',{
-      href:'/api/receive-errors/'+encodeURIComponent(e.id)
-    },'下载失败请求正文')]))));
+    try{
+      const errors=await api('/api/receive-errors?limit=100');
+      if(token===generation)content.append(panel('接收错误（最近已加载，完整原因保留）',table(['接收时刻','信号 / HTTP','原因','原始数据'],errors.errors.map(e=>[stamp(e.received_at),`${e.signal} / ${e.status}`,el('pre',{},e.reason),el('a',{
+        href:'/api/receive-errors/'+encodeURIComponent(e.id)
+      },'下载失败请求正文')]))));
+    }
+    catch(e){
+      if(token===generation)content.append(panel('接收错误',el('div',{class:'notice error'},e.message)));
+    }
   }
 }
 function runtimePanel(runtime){
