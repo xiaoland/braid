@@ -837,20 +837,27 @@ impl PlatformObjects {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if let Some((state, Some(commit))) = &receipt
-            && (state == "applied"
-                || (state == "prepared"
-                    && git.refname_to_id(&base_ref)? == git2::Oid::from_str(commit)?))
-        {
-            let result =
-                MergeResult { number, merge_commit: commit.clone(), base_ref, recovered: true };
-            self.finish_merge(&result, author, request_id)?;
-            return Ok(result);
+        if let Some((state, commit)) = receipt {
+            if state == "applied" {
+                let result = MergeResult {
+                    number,
+                    merge_commit: commit.context("applied merge lacks a commit")?,
+                    base_ref,
+                    recovered: true,
+                };
+                self.finish_merge(&result, author, request_id)?;
+                return Ok(result);
+            }
+            // The owner retries through recover_merge_request with its bound receipt.
+            // A new request cannot adopt or attribute the original owner's Git effect.
+            ensure!(
+                state != "prepared",
+                "another merge request already owns this prepared intent; inspect its original receipt"
+            );
+            bail!(
+                "previous merge attempt failed or conflicted; inspect its stored error and create a new PR candidate"
+            );
         }
-        ensure!(
-            receipt.as_ref().is_none_or(|(s, _)| s == "prepared"),
-            "previous merge attempt failed or conflicted; inspect its stored error and create a new PR candidate"
-        );
         ensure!(item.state == "open", "PR #{number} is closed");
         ensure!(
             git.refname_to_id(&base_ref)? == expected_base,
@@ -862,11 +869,7 @@ impl PlatformObjects {
             "head revision moved since this PR candidate was created"
         );
         reject_checked_out(&git, &base_ref)?;
-        let merge_commit = if let Some((_, Some(commit))) = receipt {
-            git2::Oid::from_str(&commit)?
-        } else {
-            self.prepare_merge(&git, &item, expected_base, expected_head)?
-        };
+        let merge_commit = self.prepare_merge(&git, &item, expected_base, expected_head)?;
         let result = self.prepare_merge_request(&item, &base_ref, merge_commit, request_id)?;
         self.adopt_merge_ref(
             &git,
@@ -996,19 +999,18 @@ impl PlatformObjects {
         let tx = write_transaction(&mut self.connection)?;
         validate_writer(&tx, self.writer.as_ref())?;
         validate_revision(&tx, &self.repository, self.revision_guard)?;
-        tx.execute("INSERT OR IGNORE INTO local_merges(pr_number,expected_base,expected_head,merge_commit,lifecycle,created_at,updated_at) VALUES(?1,?2,?3,?4,'prepared',?5,?5)", params![sql_id(item.number)?,item.base_commit,item.head_commit,commit.to_string(),now()])?;
-        let (base,head,commit,state):(String,String,Option<String>,String)=tx.query_row("SELECT expected_base,expected_head,merge_commit,lifecycle FROM local_merges WHERE pr_number=?1",[sql_id(item.number)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        let inserted = tx.execute(
+            "INSERT INTO local_merges(pr_number,expected_base,expected_head,merge_commit,lifecycle,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,'prepared',?5,?5) ON CONFLICT(pr_number) DO NOTHING",
+            params![sql_id(item.number)?, item.base_commit, item.head_commit, commit.to_string(), now()],
+        )?;
         ensure!(
-            Some(&base) == item.base_commit.as_ref() && Some(&head) == item.head_commit.as_ref(),
-            "another merge intent already owns a different candidate"
-        );
-        ensure!(
-            matches!(state.as_str(), "prepared" | "applied"),
-            "canonical merge intent is {state}; inspect its persisted failure"
+            inserted == 1,
+            "another merge request already owns this intent; inspect its original receipt"
         );
         let result = MergeResult {
             number: item.number,
-            merge_commit: commit.context("canonical merge intent lacks a commit")?,
+            merge_commit: commit.to_string(),
             base_ref: base_ref.into(),
             recovered: false,
         };

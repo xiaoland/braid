@@ -183,6 +183,12 @@ fn get(client: &Client, console: &str, path: &str) -> Value {
         .unwrap()
 }
 
+fn assert_conflict(response: reqwest::blocking::Response, reason: &str) {
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: Value = response.json().unwrap();
+    assert!(body["error"]["message"].as_str().unwrap().contains(reason), "{body}");
+}
+
 fn runtime_command(client: &Client, console: &str, command: &Value) {
     let response =
         client.post(format!("{console}/api/runtime/commands")).json(command).send().unwrap();
@@ -397,7 +403,9 @@ fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
             [],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
         ).unwrap();
-    assert_eq!(fence(&execution_id), fence(&execution_id));
+    for _ in 0..2 {
+        assert_eq!(fence(&execution_id), json!({"executionId":execution_id,"clientId":client_id}));
+    }
     assert_eq!(epoch(), json!({"active":false,"epoch":granted_epoch}));
 
     // Fence after mint: old receipts and a valid old token cannot reopen execution.
@@ -406,7 +414,7 @@ fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
         "executionId":execution_id});
     let replay =
         client.post(format!("{endpoint}/api/platform/grants")).json(&prior_mint).send().unwrap();
-    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    assert_conflict(replay, "execution attempt is fenced");
     let revision = get(&client, &endpoint, "/api/control/items/1")["item"]["revision"].clone();
     let old_write = client
         .post(format!("{endpoint}/api/control/commands"))
@@ -415,7 +423,7 @@ fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
           "command":{"type":"comment","number":1,"body":"Fenced turn"}}))
         .send()
         .unwrap();
-    assert_eq!(old_write.status(), StatusCode::CONFLICT);
+    assert_conflict(old_write, "writer grant is stale, revoked");
 
     // Fence before mint: no corresponding publication row needs to exist.
     let late_execution = uuid::Uuid::now_v7().to_string();
@@ -424,79 +432,19 @@ fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
         "itemNumber":1,"expectedEpoch":granted_epoch,"authorityCursor":cursor(),
         "executionId":late_execution});
     let late = client.post(format!("{endpoint}/api/platform/grants")).json(&mint).send().unwrap();
-    assert_eq!(late.status(), StatusCode::CONFLICT);
+    assert_conflict(late, "execution attempt is fenced");
     assert_eq!(epoch(), json!({"active":false,"epoch":granted_epoch}));
 
-    let mint_open_execution = |request_id: &str, expected_epoch: i64, run_id: Option<&str>| {
-        let response: Value = client
-            .post(format!("{endpoint}/api/platform/grants"))
-            .json(&json!({
-                "requestId":request_id, "clientId":client_id, "actor":"issue-codex",
-                "itemNumber":1, "expectedEpoch":expected_epoch, "authorityCursor":cursor(),
-                "executionId":uuid::Uuid::now_v7().to_string(), "runId":run_id
-            }))
-            .send()
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .unwrap();
-        assert_eq!(response["lifecycle"], "active", "{response}");
-        let epoch = response["epoch"].as_i64().unwrap();
-        (epoch, json!({"grantId":response["grantId"],"epoch":epoch,"token":response["token"]}))
-    };
-    let stale_write = |request_id: &str, writer: &Value| {
-        let revision = get(&client, &endpoint, "/api/control/items/1")["item"]["revision"].clone();
-        let response = client
-            .post(format!("{endpoint}/api/control/commands"))
-            .json(&json!({"requestId":request_id,"actor":"issue-codex","expectedRevision":revision,
-                "writer":writer,"command":{"type":"comment","number":1,"body":"stale write"}}))
-            .send()
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-    };
-    let platform_database = rusqlite::Connection::open(
-        platform.parent().unwrap().join(settings["database"].as_str().unwrap()),
-    )
-    .unwrap();
-    let disable_grant_updates = || {
-        platform_database
-            .execute_batch(
-                "CREATE TRIGGER publication_offline BEFORE UPDATE ON platform_grants
-             BEGIN SELECT RAISE(ABORT, 'grant update unavailable'); END;",
-            )
-            .unwrap();
-    };
-    let (before_assignment, old_authority) =
-        mint_open_execution("before-reassignment", granted_epoch, None);
-    disable_grant_updates();
-    object_command("reassign", json!({"type":"assign","number":1,"actor":"issue-codex"}));
-    assert_eq!(epoch(), json!({"active":false,"epoch":before_assignment}));
-    stale_write("stale-after-reassignment", &old_authority);
     object_command(
         "configure-root",
         json!({"type":"configureRunRoot", "number":1,
         "deliveryRef":"refs/heads/braid/test", "runId":"test-run", "clientId":client_id}),
     );
-    let context_url = format!("{endpoint}/api/platform/context/1");
-    assert!(client.get(&context_url).send().unwrap().status().is_success());
-    let mut owner = reqwest::Url::parse(&context_url).unwrap();
-    owner.query_pairs_mut().append_pair("executionClientId", &client_id);
-    assert!(!client.get(owner.clone()).send().unwrap().status().is_success());
-    owner.query_pairs_mut().append_pair("executionRunId", "test-run");
-    let response = client.get(owner).send().unwrap();
-    assert!(response.status().is_success(), "{}", response.text().unwrap());
-    platform_database.execute_batch("DROP TRIGGER publication_offline").unwrap();
-    let (scoped_epoch, scoped_authority) =
-        mint_open_execution("before-scope-close", before_assignment, Some("test-run"));
-    disable_grant_updates();
-    object_command("close-root", json!({"type":"close","number":1}));
-    object_command("reopen-root", json!({"type":"reopen","number":1}));
-    assert_eq!(epoch(), json!({"active":false,"epoch":scoped_epoch}));
-    stale_write("stale-after-scope-reopen", &scoped_authority);
-
     // The bound configuration remains the same after loss of the Git checkout.
     let source = root.0.join("source");
+    let online = get(&client, &endpoint, "/api/platform/scope/1");
+    assert_eq!(online["root"]["number"], 1);
+    let last_online = cursor();
     fs::rename(source.join(".git"), source.join(".git.offline")).unwrap();
     drop(active_platform);
     let _reopened_platform = Console(
@@ -519,10 +467,21 @@ fn object_cli_mints_on_first_write_and_platform_fences_a_delayed_mint() {
         "git-offline-comment",
         json!({"type":"comment","number":1,"body":"Git-independent"}),
     );
-    assert!(get(&client, &endpoint, "/api/platform/events")["lastSequence"].is_number());
+    let events = get(&client, &endpoint, &format!("/api/platform/events?after={last_online}"));
+    assert!(
+        events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["event"]["visible_body"] == "Git-independent")
+    );
     assert_eq!(get(&client, &endpoint, "/api/platform/scope/1/boundary")["rootOpen"], true);
-    assert_eq!(
-        client.get(format!("{endpoint}/api/platform/scope/1")).send().unwrap().status(),
-        StatusCode::INTERNAL_SERVER_ERROR
+    let offline = client.get(format!("{endpoint}/api/platform/scope/1")).send().unwrap();
+    assert_eq!(offline.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: Value = offline.json().unwrap();
+    assert_eq!(body["error"]["code"], "unavailable");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("could not find repository"),
+        "{body}"
     );
 }

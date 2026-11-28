@@ -16,11 +16,7 @@ use opentelemetry_proto::tonic::{
 use prost::Message as _;
 use reqwest::StatusCode;
 use serde_json::Value;
-use std::{
-    io::Write as _,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{io::Write as _, path::PathBuf};
 
 struct Collector {
     root: PathBuf,
@@ -48,11 +44,10 @@ impl Collector {
     }
 
     async fn start(&mut self) {
-        let storage =
-            Arc::new(Mutex::new(Storage::open(&self.root.join("observations.sqlite3")).unwrap()));
+        let storage = Storage::open(&self.root.join("observations.sqlite3"));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         self.url = format!("http://{}", listener.local_addr().unwrap());
-        let app = api::routes(api::ApiState { storage });
+        let app = api::routes(storage);
         let (stop, stopped) = tokio::sync::oneshot::channel();
         self.stop = Some(stop);
         self.server = Some(tokio::spawn(async move {
@@ -206,6 +201,9 @@ async fn otlp_signals_raw_bytes_duplicates_and_cursor_pages_survive_reopening() 
     gzip.write_all(&log_body()).unwrap();
     let log = gzip.finish().unwrap();
     let metric = metric_body();
+    let millis =
+        || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let earliest = millis();
     for (signal, encoding, body) in [
         ("traces", "identity", trace.as_slice()),
         ("logs", "gzip", log.as_slice()),
@@ -228,6 +226,8 @@ async fn otlp_signals_raw_bytes_duplicates_and_cursor_pages_survive_reopening() 
     assert_eq!(first[1]["signal"], "logs");
     assert_eq!(first[1]["session"], "log-session");
     assert_eq!(first[1]["data"]["body"]["stringValue"], "retained evidence");
+    assert_eq!(first[1]["data"]["timeUnixNano"], "150");
+    assert!((earliest..=millis()).contains(&u128::from(first[1]["received_at"].as_u64().unwrap())));
     for record in first {
         assert_eq!(record["service"], "contract-service");
         assert!(record["duplicate_of"].is_null());
@@ -255,9 +255,23 @@ async fn otlp_signals_raw_bytes_duplicates_and_cursor_pages_survive_reopening() 
             .unwrap()
             .is_empty()
     );
-    let filtered = collector.get("/api/records?signal=logs&session=log-session&turn=turn-B").await;
-    assert_eq!(filtered["records"].as_array().unwrap().len(), 1);
-    assert_eq!(filtered["records"][0]["data"]["body"]["stringValue"], "retained evidence");
+    for (filter, expected) in [
+        ("signal=logs", vec!["logs"]),
+        ("session=span-session", vec!["traces", "traces"]),
+        ("turn=turn-B", vec!["logs"]),
+        ("trace=11111111111111111111111111111111", vec!["traces", "logs", "traces"]),
+        ("instance=absent", vec![]),
+        ("signal=logs&turn=turn-A", vec![]),
+    ] {
+        let page = collector.get(&format!("/api/records?{filter}")).await;
+        let signals = page["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["signal"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(signals, expected, "{filter}");
+    }
     let raw = collector
         .client
         .get(format!("{}/api/batches/{log_batch}", collector.url))
@@ -294,41 +308,72 @@ async fn expect_error(response: reqwest::Response, status: StatusCode, code: i32
 #[tokio::test]
 async fn malformed_exports_reach_their_expected_guard_and_retain_rejected_bytes() {
     let mut collector = Collector::new().await;
-    for (encoding, body, status, reason) in [
-        ("br", vec![0xff], StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported Content-Encoding: br"),
-        ("identity", vec![0xff], StatusCode::BAD_REQUEST, "decode OTLP logs protobuf"),
-        ("gzip", vec![0xff], StatusCode::BAD_REQUEST, "decode gzip OTLP body"),
-    ] {
-        expect_error(collector.export("logs", encoding, &body).await, status, 3, reason).await;
+    let valid = log_body();
+    let invalid = [
+        (
+            "application/x-protobuf",
+            "br",
+            &[1][..],
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported Content-Encoding: br",
+        ),
+        (
+            "application/x-protobuf",
+            "identity",
+            &[0xff][..],
+            StatusCode::BAD_REQUEST,
+            "decode OTLP logs protobuf",
+        ),
+        (
+            "application/x-protobuf",
+            "gzip",
+            &[0x1f, 0x00][..],
+            StatusCode::BAD_REQUEST,
+            "decode gzip OTLP body",
+        ),
+        (
+            "application/json",
+            "identity",
+            valid.as_slice(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type",
+        ),
+    ];
+    for (content_type, encoding, body, status, reason) in invalid {
+        let response = collector
+            .client
+            .post(format!("{}/v1/logs", collector.url))
+            .header("content-type", content_type)
+            .header("content-encoding", encoding)
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        expect_error(response, status, 3, reason).await;
     }
-    let wrong_type = collector
-        .client
-        .post(format!("{}/v1/logs", collector.url))
-        .header("content-type", "application/json")
-        .body(log_body())
-        .send()
-        .await
-        .unwrap();
-    expect_error(wrong_type, StatusCode::UNSUPPORTED_MEDIA_TYPE, 3, "Content-Type").await;
     assert_eq!(collector.get("/api/resources").await["batches"], 0);
-    let errors = collector.get("/api/receive-errors").await;
-    assert_eq!(errors["errors"].as_array().unwrap().len(), 4);
-    let id = errors["errors"][1]["id"].as_i64().unwrap();
     collector.shutdown().await;
     collector.start().await;
-    assert_eq!(collector.get("/api/receive-errors").await, errors);
-    let body = collector
-        .client
-        .get(format!("{}/api/receive-errors/{id}", collector.url))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
-    assert_eq!(body.as_ref(), [0xff]);
+    let page = collector.get("/api/receive-errors").await;
+    let errors = page["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), invalid.len());
+    for (error, (_, _, body, status, reason)) in errors.iter().zip(invalid) {
+        assert_eq!(error["status"], status.as_u16());
+        assert!(error["reason"].as_str().unwrap().contains(reason));
+        let id = error["id"].as_i64().unwrap();
+        let raw = collector
+            .client
+            .get(format!("{}/api/receive-errors/{id}", collector.url))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(raw.as_ref(), body, "{reason}");
+    }
     collector.shutdown().await;
 }
 

@@ -20,7 +20,30 @@ pub struct CommandRequest {
     pub writer: Option<super::super::grants::WriterGrant>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+// Schema-5 Local receipts bound these fields to a Human command. New envelopes
+// also bind actor and writer, so the checksums differ after an explicit import.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalRequest {
+    request_id: String,
+    expected_revision: Option<u64>,
+    command: ObjectCommand,
+}
+
+impl CommandRequest {
+    fn matches_imported_receipt(&self, stored: &str, stored_digest: &str) -> bool {
+        self.actor == "human"
+            && self.writer.is_none()
+            && hex::encode(Sha256::digest(stored)) == stored_digest
+            && serde_json::from_str::<LocalRequest>(stored).is_ok_and(|prior| {
+                self.request_id == prior.request_id
+                    && self.expected_revision == prior.expected_revision
+                    && self.command == prior.command
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -89,7 +112,7 @@ pub enum ObjectCommand {
     },
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -268,9 +291,15 @@ impl PlatformObjects {
         payload: &str,
         digest: &str,
     ) -> Result<Option<ControlReceipt>, CommandFailure> {
-        let existing=self.connection.query_row("SELECT payload_sha256 FROM control_receipts WHERE scope='objects' AND request_id=?1",[&request.request_id],|r|r.get::<_,String>(0)).optional().map_err(CommandFailure::rejected)?;
-        if let Some(existing) = existing {
-            if existing != digest {
+        let existing = self.connection.query_row(
+            "SELECT payload_sha256,request_json FROM control_receipts WHERE scope='objects' AND request_id=?1",
+            [&request.request_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ).optional().map_err(CommandFailure::rejected)?;
+        if let Some((stored_digest, stored_request)) = existing {
+            if stored_digest != digest
+                && !request.matches_imported_receipt(&stored_request, &stored_digest)
+            {
                 return Err(CommandFailure::conflict(
                     "requestId was already used for a different command",
                 ));
